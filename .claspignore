@@ -1,0 +1,7 @@
+# clasp 會以 .clasp.json 的 rootDir (dist/) 為基準比對路徑
+# 僅保留 GAS 所需的 .js / .gs / .html 與 appsscript.json
+**/**
+!*.js
+!*.gs
+!*.html
+!appsscript.json

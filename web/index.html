@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="快速記帳" />
+  <meta name="theme-color" content="#0F172A" />
+  <title>快速記帳 | 個人現金流</title>
+  <style>
+    :root {
+      --bg: #F1F5F9;
+      --surface: #FFFFFF;
+      --surface-alt: #F8FAFC;
+      --text: #0F172A;
+      --text-muted: #64748B;
+      --border: #E2E8F0;
+      --primary: #1D4ED8;
+      --primary-soft: #DBEAFE;
+      --success: #15803D;
+      --success-soft: #DCFCE7;
+      --warning: #B45309;
+      --warning-soft: #FEF3C7;
+      --danger: #B91C1C;
+      --danger-soft: #FEE2E2;
+      --radius: 16px;
+      --shadow: 0 4px 20px rgba(15, 23, 42, 0.06);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0B1120;
+        --surface: #131C31;
+        --surface-alt: #1E293B;
+        --text: #F8FAFC;
+        --text-muted: #94A3B8;
+        --border: #263449;
+        --primary: #3B82F6;
+        --primary-soft: rgba(59, 130, 246, 0.18);
+        --success: #4ADE80;
+        --success-soft: rgba(34, 197, 94, 0.18);
+        --warning: #FBBF24;
+        --warning-soft: rgba(245, 158, 11, 0.18);
+        --danger: #F87171;
+        --danger-soft: rgba(239, 68, 68, 0.18);
+        --shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      margin: 0;
+      padding: env(safe-area-inset-top, 12px) 14px calc(28px + env(safe-area-inset-bottom, 12px));
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Noto Sans TC", "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+
+    .container {
+      max-width: 480px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    /* Header & Budget Card */
+    .budget-card {
+      background: linear-gradient(135deg, #1B365D 0%, #1E40AF 100%);
+      color: #FFFFFF;
+      border-radius: var(--radius);
+      padding: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .budget-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .app-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+    }
+
+    .month-badge {
+      font-size: 12px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.18);
+      font-weight: 600;
+    }
+
+    .budget-numbers {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 8px;
+    }
+
+    .remaining-label {
+      font-size: 12px;
+      opacity: 0.85;
+    }
+
+    .remaining-value {
+      font-size: 26px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+    }
+
+    .spent-meta {
+      text-align: right;
+      font-size: 12px;
+      opacity: 0.9;
+    }
+
+    .progress-track {
+      height: 8px;
+      background: rgba(255, 255, 255, 0.22);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 999px;
+      background: #4ADE80;
+      transition: width 0.35s ease, background-color 0.35s ease;
+    }
+
+    .progress-fill.warn { background: #FBBF24; }
+    .progress-fill.over { background: #F87171; }
+
+    .fx-bar {
+      margin-top: 10px;
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      opacity: 0.85;
+    }
+
+    /* Form Card */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .section-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      display: block;
+    }
+
+    /* Segmented Type Control */
+    .type-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .type-secondary {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .type-btn {
+      border: 1.5px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+      padding: 10px 6px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      text-align: center;
+    }
+
+    .type-btn.active {
+      border-color: var(--primary);
+      background: var(--primary-soft);
+      color: var(--primary);
+    }
+
+    .type-btn[data-type="其他收入"].active {
+      border-color: var(--success);
+      background: var(--success-soft);
+      color: var(--success);
+    }
+
+    .type-btn[data-type="稅金與大額"].active {
+      border-color: var(--warning);
+      background: var(--warning-soft);
+      color: var(--warning);
+    }
+
+    /* Amount Row */
+    .amount-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface-alt);
+      border: 1.5px solid var(--border);
+      border-radius: 14px;
+      padding: 8px 12px;
+      margin-bottom: 8px;
+    }
+
+    .amount-box:focus-within {
+      border-color: var(--primary);
+    }
+
+    .currency-toggle {
+      display: flex;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .curr-btn {
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      padding: 7px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .curr-btn.active {
+      background: var(--primary);
+      color: #FFFFFF;
+    }
+
+    .amount-input {
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 26px;
+      font-weight: 800;
+      text-align: right;
+      outline: none;
+      min-width: 0;
+    }
+
+    .quick-amounts {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+
+    .quick-btn {
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text-muted);
+      border-radius: 999px;
+      padding: 5px 11px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .quick-btn:active {
+      transform: scale(0.96);
+    }
+
+    .fx-preview {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--primary);
+      margin-left: auto;
+    }
+
+    /* Category Chips */
+    .chip-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .chip {
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+      padding: 7px 13px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .chip.active {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #FFFFFF;
+      font-weight: 700;
+    }
+
+    /* Fields */
+    .row-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .field {
+      margin-bottom: 12px;
+    }
+
+    .field input {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 12px;
+      border: 1.5px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+      font-size: 15px;
+      outline: none;
+    }
+
+    .field input:focus {
+      border-color: var(--primary);
+    }
+
+    /* Submit Button */
+    .submit-btn {
+      width: 100%;
+      border: none;
+      border-radius: 14px;
+      padding: 14px;
+      background: var(--primary);
+      color: #FFFFFF;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 6px 16px rgba(29, 78, 216, 0.25);
+      transition: opacity 0.15s ease, transform 0.1s ease;
+    }
+
+    .submit-btn:active { transform: scale(0.98); }
+    .submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* Recent List */
+    .recent-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .recent-title {
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .recent-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .recent-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 12px;
+      background: var(--surface-alt);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+
+    .recent-left {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .recent-name {
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .recent-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .recent-amt {
+      font-size: 14px;
+      font-weight: 700;
+      text-align: right;
+      flex-shrink: 0;
+      margin-left: 10px;
+    }
+
+    .recent-amt.income { color: var(--success); }
+    .recent-amt.invest { color: var(--primary); }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+      transform: translateX(-50%) translateY(90px);
+      background: #0F172A;
+      color: #FFFFFF;
+      padding: 12px 18px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.25);
+      transition: transform 0.25s ease, opacity 0.25s ease;
+      opacity: 0;
+      z-index: 999;
+      max-width: 90vw;
+      text-align: center;
+    }
+
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+
+    .toast.error { background: #B91C1C; }
+    .toast.success { background: #15803D; }
+
+    .empty-tip {
+      font-size: 13px;
+      color: var(--text-muted);
+      text-align: center;
+      padding: 12px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- 當月日常消費預算進度卡片 -->
+    <section class="budget-card">
+      <div class="budget-top">
+        <span class="app-title">💰 快速記帳</span>
+        <span class="month-badge" id="monthBadge">載入中...</span>
+      </div>
+      <div class="budget-numbers">
+        <div>
+          <div class="remaining-label">本月日常預算剩餘</div>
+          <div class="remaining-value" id="remainingBudget">NT$ --</div>
+        </div>
+        <div class="spent-meta">
+          <div id="spentText">已消費 NT$ --</div>
+          <div id="budgetLimitText">預算上限 NT$ --</div>
+        </div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill" id="budgetProgress"></div>
+      </div>
+      <div class="fx-bar">
+        <span id="usagePctText">預算使用率：--%</span>
+        <span id="fxRateText">USD/TWD：--</span>
+      </div>
+    </section>
+
+    <!-- 記帳輸入表單 -->
+    <form class="card" id="expenseForm" autocomplete="off">
+      <label class="section-label">1. 交易類型</label>
+      <div class="type-grid">
+        <button type="button" class="type-btn active" data-type="日常花費">日常花費</button>
+        <button type="button" class="type-btn" data-type="稅金與大額">稅金 / 大額</button>
+        <button type="button" class="type-btn" data-type="其他收入">其他收入</button>
+      </div>
+      <div class="type-secondary">
+        <button type="button" class="type-btn" data-type="投資流出">臨時加碼投資</button>
+        <button type="button" class="type-btn" data-type="固定支出">固定支出補登</button>
+      </div>
+
+      <label class="section-label" for="amountInput">2. 金額與幣別</label>
+      <div class="amount-box">
+        <div class="currency-toggle">
+          <button type="button" class="curr-btn active" data-curr="TWD">TWD</button>
+          <button type="button" class="curr-btn" data-curr="USD">USD</button>
+        </div>
+        <input
+          id="amountInput"
+          class="amount-input"
+          type="number"
+          inputmode="decimal"
+          step="any"
+          min="0.01"
+          placeholder="0"
+          required
+        />
+      </div>
+
+      <div class="quick-amounts">
+        <button type="button" class="quick-btn" data-add="100">+100</button>
+        <button type="button" class="quick-btn" data-add="500">+500</button>
+        <button type="button" class="quick-btn" data-add="1000">+1000</button>
+        <span class="fx-preview" id="fxPreview"></span>
+      </div>
+
+      <label class="section-label">3. 分類</label>
+      <div class="chip-group" id="categoryChips"></div>
+
+      <div class="row-2">
+        <div class="field" style="margin-bottom:0">
+          <label class="section-label" for="dateInput">4. 日期</label>
+          <input id="dateInput" type="date" required />
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label class="section-label" for="itemNameInput">5. 項目名稱</label>
+          <input id="itemNameInput" type="text" placeholder="留空則同分類" maxlength="80" />
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:12px">
+        <label class="section-label" for="noteInput">6. 備註（選填）</label>
+        <input id="noteInput" type="text" placeholder="例如：刷中信卡、7-11、房屋稅" maxlength="200" />
+      </div>
+
+      <label
+        id="recurringToggleBox"
+        style="display:none;align-items:center;gap:10px;padding:10px 12px;margin-bottom:14px;border-radius:12px;background:var(--surface-alt);border:1.5px solid var(--border);font-size:13px;cursor:pointer;"
+      >
+        <input id="makeRecurringCheckbox" type="checkbox" style="width:18px;height:18px;accent-color:var(--primary);" />
+        <span>
+          <strong>設為每月固定自動入帳</strong>
+          <small style="display:block;color:var(--text-muted);font-size:11px;">未勾選即為「一次性」入帳；勾選後會同步加入 Recurring_Config</small>
+        </span>
+      </label>
+
+      <button type="submit" class="submit-btn" id="submitBtn">送出寫入流水帳</button>
+    </form>
+
+    <!-- 最近 5 筆流水帳紀錄 -->
+    <section class="card">
+      <div class="recent-header">
+        <span class="recent-title">最近 5 筆記帳紀錄</span>
+        <span style="font-size:11px;color:var(--text-muted)">自動同步至 CashFlow_Log</span>
+      </div>
+      <div class="recent-list" id="recentList">
+        <div class="empty-tip">讀取中...</div>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const state = {
+      selectedType: '日常花費',
+      selectedCurrency: 'TWD',
+      selectedCategory: '餐飲',
+      usdTwdRate: 32.5,
+      categories: {
+        日常花費: ['餐飲', '交通', '日用品', '娛樂', '醫療', '服飾', '交際', '其他'],
+        稅金與大額: ['所得稅', '房屋/地價稅', '汽機車稅費', '保費', '年度大額支出', '家電/維修', '其他'],
+        其他收入: ['獎金', '股息/配息', '退稅', '房租收入', '副業/兼職', '其他'],
+        投資流出: ['台股加碼', '中信基金加碼', '美股/ETF', '其他投資'],
+        固定支出: ['房貸', '車貸', '房租支出', '水電瓦斯/管理費', '電信費', '其他'],
+      },
+      isSubmitting: false,
+    };
+
+    function formatMoney(num) {
+      return Number(num || 0).toLocaleString('zh-TW', { maximumFractionDigits: 0 });
+    }
+
+    function showToast(message, variant) {
+      const toast = document.getElementById('toast');
+      toast.textContent = message;
+      toast.className = 'toast show' + (variant ? ' ' + variant : '');
+      clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(() => {
+        toast.classList.remove('show');
+      }, 3200);
+    }
+
+    function renderCategories() {
+      const container = document.getElementById('categoryChips');
+      container.innerHTML = '';
+      const list = state.categories[state.selectedType] || ['其他'];
+      if (!list.includes(state.selectedCategory)) {
+        state.selectedCategory = list[0];
+      }
+
+      list.forEach((cat) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'chip' + (cat === state.selectedCategory ? ' active' : '');
+        btn.textContent = cat;
+        btn.addEventListener('click', () => {
+          state.selectedCategory = cat;
+          renderCategories();
+        });
+        container.appendChild(btn);
+      });
+    }
+
+    function updateFxPreview() {
+      const preview = document.getElementById('fxPreview');
+      const val = parseFloat(document.getElementById('amountInput').value);
+      if (state.selectedCurrency === 'USD' && !isNaN(val) && val > 0) {
+        const twd = Math.round(val * state.usdTwdRate);
+        preview.textContent = '≈ NT$ ' + formatMoney(twd);
+      } else {
+        preview.textContent = '';
+      }
+    }
+
+    function renderSummary(summary) {
+      if (!summary) return;
+      document.getElementById('monthBadge').textContent = summary.yearMonth;
+      const remainPrefix = summary.remainingBudget < 0 ? '-NT$ ' : 'NT$ ';
+      document.getElementById('remainingBudget').textContent =
+        remainPrefix + formatMoney(Math.abs(summary.remainingBudget));
+      document.getElementById('spentText').textContent =
+        '已消費 NT$ ' + formatMoney(summary.monthlyDailySpent);
+      document.getElementById('budgetLimitText').textContent =
+        '預算上限 NT$ ' + formatMoney(summary.monthlyDailyBudget);
+      document.getElementById('usagePctText').textContent =
+        '日常預算使用率：' + summary.budgetUsagePct.toFixed(1) + '%';
+
+      const fill = document.getElementById('budgetProgress');
+      const clamped = Math.min(100, Math.max(0, summary.budgetUsagePct));
+      fill.style.width = clamped + '%';
+      fill.className = 'progress-fill';
+      if (summary.budgetUsagePct > 100) {
+        fill.classList.add('over');
+      } else if (summary.budgetUsagePct >= 85) {
+        fill.classList.add('warn');
+      }
+    }
+
+    function renderRecent(entries) {
+      const list = document.getElementById('recentList');
+      list.innerHTML = '';
+      if (!entries || entries.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty-tip';
+        empty.textContent = '尚無記帳紀錄';
+        list.appendChild(empty);
+        return;
+      }
+
+      entries.forEach((item) => {
+        const row = document.createElement('div');
+        row.className = 'recent-item';
+
+        const left = document.createElement('div');
+        left.className = 'recent-left';
+
+        const nameEl = document.createElement('div');
+        nameEl.className = 'recent-name';
+        nameEl.textContent = item.itemName || item.category;
+
+        const metaEl = document.createElement('div');
+        metaEl.className = 'recent-meta';
+        metaEl.textContent = `${item.date} · ${item.type} · ${item.category}`;
+
+        left.appendChild(nameEl);
+        left.appendChild(metaEl);
+
+        const amtEl = document.createElement('div');
+        amtEl.className = 'recent-amt';
+        const isIncome = item.type.includes('收入');
+        const isInvest = item.type === '投資流出';
+        if (isIncome) amtEl.classList.add('income');
+        if (isInvest) amtEl.classList.add('invest');
+
+        const sign = isIncome ? '+' : '-';
+        const origHint = item.currency === 'USD' ? ` (US$${item.amount})` : '';
+        amtEl.textContent = `${sign}NT$ ${formatMoney(item.twdAmount)}${origHint}`;
+
+        row.appendChild(left);
+        row.appendChild(amtEl);
+        list.appendChild(row);
+      });
+    }
+
+    function setSubmitting(loading) {
+      state.isSubmitting = loading;
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = loading;
+      btn.textContent = loading ? '寫入 Google Sheets 中...' : '送出寫入流水帳';
+    }
+
+    const RECURRING_ELIGIBLE_TYPES = ['其他收入', '投資流出', '固定支出'];
+
+    function updateRecurringToggleVisibility() {
+      const box = document.getElementById('recurringToggleBox');
+      const cb = document.getElementById('makeRecurringCheckbox');
+      if (RECURRING_ELIGIBLE_TYPES.includes(state.selectedType)) {
+        box.style.display = 'flex';
+      } else {
+        box.style.display = 'none';
+        cb.checked = false;
+      }
+    }
+
+    // 綁定互動事件
+    document.querySelectorAll('.type-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.type-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.selectedType = btn.dataset.type;
+        renderCategories();
+        updateRecurringToggleVisibility();
+      });
+    });
+
+    document.querySelectorAll('.curr-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.curr-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.selectedCurrency = btn.dataset.curr;
+        updateFxPreview();
+      });
+    });
+
+    document.querySelectorAll('.quick-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const input = document.getElementById('amountInput');
+        const current = parseFloat(input.value) || 0;
+        const add = parseFloat(btn.dataset.add) || 0;
+        input.value = String(current + add);
+        updateFxPreview();
+      });
+    });
+
+    document.getElementById('amountInput').addEventListener('input', updateFxPreview);
+
+    document.getElementById('expenseForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (state.isSubmitting) return;
+
+      const amount = parseFloat(document.getElementById('amountInput').value);
+      const date = document.getElementById('dateInput').value;
+      const itemName = document.getElementById('itemNameInput').value.trim();
+      const note = document.getElementById('noteInput').value.trim();
+
+      if (!date) {
+        showToast('請選擇日期', 'error');
+        return;
+      }
+      if (isNaN(amount) || amount <= 0) {
+        showToast('請輸入大於 0 的金額', 'error');
+        return;
+      }
+
+      const makeRecurring = document.getElementById('makeRecurringCheckbox').checked;
+
+      const payload = {
+        date,
+        type: state.selectedType,
+        category: state.selectedCategory,
+        itemName: itemName || state.selectedCategory,
+        amount,
+        currency: state.selectedCurrency,
+        note,
+        makeRecurring,
+      };
+
+      setSubmitting(true);
+
+      if (typeof google !== 'undefined' && google.script && google.script.run) {
+        google.script.run
+          .withSuccessHandler((res) => {
+            setSubmitting(false);
+            showToast(res.message || '記帳成功！', 'success');
+            document.getElementById('amountInput').value = '';
+            document.getElementById('itemNameInput').value = '';
+            document.getElementById('noteInput').value = '';
+            document.getElementById('makeRecurringCheckbox').checked = false;
+            updateFxPreview();
+            renderSummary(res.summary);
+            renderRecent(res.recentEntries);
+          })
+          .withFailureHandler((err) => {
+            setSubmitting(false);
+            showToast(err && err.message ? err.message : '寫入失敗，請稍後再試', 'error');
+          })
+          .submitExpense(payload);
+      } else {
+        setSubmitting(false);
+        showToast('本地預覽模式：請部署至 GAS Web App 後使用', 'error');
+      }
+    });
+
+    // 初始化載入
+    (function init() {
+      const todayLocal = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      document.getElementById('dateInput').value =
+        `${todayLocal.getFullYear()}-${pad(todayLocal.getMonth() + 1)}-${pad(todayLocal.getDate())}`;
+      renderCategories();
+
+      if (typeof google !== 'undefined' && google.script && google.script.run) {
+        google.script.run
+          .withSuccessHandler((data) => {
+            if (!data) return;
+            state.usdTwdRate = data.usdTwdRate || 32.5;
+            if (data.categories) state.categories = data.categories;
+            if (data.todayYmd) document.getElementById('dateInput').value = data.todayYmd;
+            document.getElementById('fxRateText').textContent =
+              'USD/TWD：' + Number(state.usdTwdRate).toFixed(2);
+            renderCategories();
+            renderSummary(data.summary);
+            renderRecent(data.recentEntries);
+          })
+          .withFailureHandler((err) => {
+            showToast(err && err.message ? err.message : '無法讀取試算表資料', 'error');
+          })
+          .getWebAppInitData();
+      } else {
+        document.getElementById('monthBadge').textContent = '本地預覽';
+        document.getElementById('fxRateText').textContent = 'USD/TWD：32.50';
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Compiled GAS artifacts
+dist/
+
+# Clasp local binding (contains your private scriptId)
+.clasp.json
+.clasprc.json
+
+# Environment & secrets
+.env
+.env.local
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

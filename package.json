@@ -1,0 +1,22 @@
+{
+  "name": "personal-finance-gas",
+  "version": "1.0.0",
+  "description": "個人現金流與資產負債管理系統 (Google Sheets + Google Apps Script + clasp)",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "login": "clasp login",
+    "push": "npm run build && clasp push",
+    "push:force": "npm run build && clasp push --force",
+    "pull": "clasp pull",
+    "deploy": "npm run build && clasp push && clasp deploy",
+    "open": "clasp open"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.0.6",
+    "@types/google-apps-script": "^1.0.95",
+    "typescript": "^5.8.2"
+  }
+}
