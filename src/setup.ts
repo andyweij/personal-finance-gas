@@ -19,6 +19,8 @@ function onOpen(): void {
     .addSeparator()
     .addItem('5. 安裝 / 重設每月排程觸發器', 'installTriggers')
     .addItem('6. 檢視目前排程觸發器狀態', 'listInstalledTriggers')
+    .addSeparator()
+    .addItem('7. 清除 / 重設 Web App PIN 鎖', 'resetAppPinMenu')
     .addToUi();
 }
 
@@ -41,6 +43,21 @@ function setupSpreadsheetWithConfirm(): void {
 }
 
 /**
+ * 完整重置單一分頁：清除內容、格式、舊資料驗證、舊合併儲存格、條件式格式與圖表
+ * （GAS 的 sheet.clear() 不會清除 DataValidation 與合併格，必須明確清除以避免跨版本重建報錯）
+ */
+function resetSheetCompletely(sheet: GoogleAppsScript.Spreadsheet.Sheet): void {
+  const maxRows = Math.max(sheet.getMaxRows(), 1);
+  const maxCols = Math.max(sheet.getMaxColumns(), 1);
+  const fullRange = sheet.getRange(1, 1, maxRows, maxCols);
+  fullRange.breakApart();
+  fullRange.clearDataValidations();
+  sheet.clear();
+  sheet.clearConditionalFormatRules();
+  sheet.getCharts().forEach((chart) => sheet.removeChart(chart));
+}
+
+/**
  * 安全重建 Dashboard（保留其他 5 個分頁所有帳目、設定與歷史紀錄）
  */
 function rebuildDashboardOnly(): void {
@@ -53,9 +70,7 @@ function rebuildDashboardOnly(): void {
   if (dash) {
     savedBudget = toSafeNumber(dash.getRange('B3').getValue(), DEFAULT_MONTHLY_DAILY_BUDGET) || DEFAULT_MONTHLY_DAILY_BUDGET;
     savedEmergencyMonths = toSafeNumber(dash.getRange('F3').getValue(), DEFAULT_EMERGENCY_MONTHS) || DEFAULT_EMERGENCY_MONTHS;
-    dash.clear();
-    dash.clearConditionalFormatRules();
-    dash.getCharts().forEach((chart) => dash!.removeChart(chart));
+    resetSheetCompletely(dash);
   } else {
     dash = ss.insertSheet(SHEET_NAMES.DASHBOARD, 0);
   }
@@ -91,9 +106,7 @@ function setupSpreadsheet(seedSampleData = true): void {
     if (!sheet) {
       sheet = ss.insertSheet(name);
     } else {
-      sheet.clear();
-      sheet.clearConditionalFormatRules();
-      sheet.getCharts().forEach((chart) => sheet!.removeChart(chart));
+      resetSheetCompletely(sheet);
     }
     sheets[name] = sheet;
   }

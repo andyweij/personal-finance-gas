@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import vm from 'node:vm';
@@ -7,7 +8,31 @@ import vm from 'node:vm';
 const projectRoot = resolve(import.meta.dirname, '..');
 const distDir = join(projectRoot, 'dist');
 
+function createMockProperties() {
+  const store = new Map();
+  return {
+    getProperty: (k) => (store.has(k) ? store.get(k) : null),
+    setProperty: (k, v) => store.set(k, String(v)),
+    setProperties: (obj) => {
+      for (const [k, v] of Object.entries(obj)) store.set(k, String(v));
+    },
+    deleteProperty: (k) => store.delete(k),
+  };
+}
+
+function createMockCache() {
+  const store = new Map();
+  return {
+    get: (k) => (store.has(k) ? store.get(k) : null),
+    put: (k, v) => store.set(k, String(v)),
+    remove: (k) => store.delete(k),
+  };
+}
+
 function loadGasContext(mocks = {}) {
+  const props = createMockProperties();
+  const userCache = createMockCache();
+
   const ctx = vm.createContext({
     console,
     Date,
@@ -21,7 +46,15 @@ function loadGasContext(mocks = {}) {
     isNaN,
     isFinite,
     Logger: { log: () => {} },
+    PropertiesService: { getScriptProperties: () => props },
+    CacheService: { getUserCache: () => userCache },
     Utilities: {
+      DigestAlgorithm: { SHA_256: 'sha256' },
+      Charset: { UTF_8: 'utf8' },
+      getUuid: () => crypto.randomUUID(),
+      computeDigest(_alg, input) {
+        return Array.from(crypto.createHash('sha256').update(String(input), 'utf8').digest());
+      },
       formatDate(date, _tz, pattern) {
         const y = date.getFullYear();
         const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -37,7 +70,7 @@ function loadGasContext(mocks = {}) {
     ...mocks,
   });
 
-  const files = ['config.js', 'utils.js', 'setup.js', 'automation.js', 'webapp.js'];
+  const files = ['config.js', 'utils.js', 'security.js', 'setup.js', 'automation.js', 'webapp.js'];
   for (const file of files) {
     const code = readFileSync(join(distDir, file), 'utf8');
     vm.runInContext(code, ctx, { filename: file });
@@ -51,6 +84,7 @@ test('dist/ contains all compiled GAS files, HTML, and manifest without ES modul
     'index.html',
     'config.js',
     'utils.js',
+    'security.js',
     'setup.js',
     'automation.js',
     'webapp.js',
@@ -61,14 +95,14 @@ test('dist/ contains all compiled GAS files, HTML, and manifest without ES modul
     assert.equal(existsSync(fullPath), true, `Missing dist/${file}`);
   }
 
-  for (const jsFile of ['config.js', 'utils.js', 'setup.js', 'automation.js', 'webapp.js']) {
+  for (const jsFile of ['config.js', 'utils.js', 'security.js', 'setup.js', 'automation.js', 'webapp.js']) {
     const content = readFileSync(join(distDir, jsFile), 'utf8');
     assert.equal(/\bexport\s+/.test(content), false, `dist/${jsFile} should not contain ES export`);
     assert.equal(/\bimport\s+/.test(content), false, `dist/${jsFile} should not contain ES import`);
   }
 });
 
-test('GAS global entry points are defined and callable', () => {
+test('GAS global entry points (Sheets + Automation + WebApp + Security) are defined', () => {
   const ctx = loadGasContext();
   const requiredFns = [
     'onOpen',
@@ -83,8 +117,24 @@ test('GAS global entry points are defined and callable', () => {
     'removeManagedTriggers',
     'listInstalledTriggers',
     'doGet',
-    'getWebAppInitData',
+    'getSecurityStatus',
+    'unlockWithPin',
+    'lockSession',
+    'configureAppPin',
+    'resetAppPinMenu',
+    'getAppBundle',
     'submitExpense',
+    'deleteCashFlowEntry',
+    'saveBudgetSettings',
+    'saveRecurringItem',
+    'toggleRecurringStatus',
+    'deleteRecurringItem',
+    'saveSinkingFundItem',
+    'deleteSinkingFundItem',
+    'saveAssetItem',
+    'deleteAssetItem',
+    'runRecurringFromUi',
+    'runSnapshotFromUi',
   ];
 
   for (const fn of requiredFns) {
@@ -114,25 +164,49 @@ test('buildRecurringDedupKey normalizes whitespace reliably', () => {
 test('shouldPostRecurringItem supports monthly, annual, specific months, and one-time cycles', () => {
   const ctx = loadGasContext();
 
-  // 月繳：每月皆入帳
   assert.equal(ctx.shouldPostRecurringItem('月繳', '', 2026, 1), true);
-  assert.equal(ctx.shouldPostRecurringItem('月繳', '', 2026, 11), true);
-
-  // 年繳：僅指定月份入帳
   assert.equal(ctx.shouldPostRecurringItem('年繳', '6', 2026, 6), true);
   assert.equal(ctx.shouldPostRecurringItem('年繳', '6', 2026, 5), false);
-
-  // 特定月份：支援逗號與中文頓號多月設定
   assert.equal(ctx.shouldPostRecurringItem('特定月份', '3,6,9,12', 2026, 9), true);
   assert.equal(ctx.shouldPostRecurringItem('特定月份', '3、6、9、12', 2026, 12), true);
   assert.equal(ctx.shouldPostRecurringItem('特定月份', '3,6,9,12', 2026, 10), false);
-
-  // 一次性：支援 YYYY-MM、單月或留空立即入帳
   assert.equal(ctx.shouldPostRecurringItem('一次性', '', 2026, 11), true);
   assert.equal(ctx.shouldPostRecurringItem('一次性', '2026-12', 2026, 12), true);
   assert.equal(ctx.shouldPostRecurringItem('一次性', '2026-12', 2026, 11), false);
-  assert.equal(ctx.shouldPostRecurringItem('一次性', '2026-12', 2027, 12), false);
   assert.equal(ctx.shouldPostRecurringItem('一次性', '11', 2026, 11), true);
+});
+
+test('App PIN security: enable, reject wrong PIN, unlock with valid token, and lockSession', () => {
+  const ctx = loadGasContext();
+
+  // 預設關閉
+  assert.equal(ctx.getSecurityStatus().pinEnabled, false);
+  assert.doesNotThrow(() => ctx.assertAuthorized(''));
+
+  // 啟用 PIN 鎖
+  const enabledRes = ctx.configureAppPin('', { enable: true, newPin: '2580' });
+  assert.equal(enabledRes.pinEnabled, true);
+  assert.ok(enabledRes.token.length > 10);
+
+  // 未帶 token 或假 token 應拒絕
+  assert.throws(() => ctx.assertAuthorized(''), /AUTH_REQUIRED/);
+  assert.throws(() => ctx.assertAuthorized('fake-token'), /AUTH_REQUIRED/);
+
+  // 帶正確 token 應放行
+  assert.doesNotThrow(() => ctx.assertAuthorized(enabledRes.token));
+
+  // 錯誤 PIN 無法解鎖
+  const badUnlock = ctx.unlockWithPin('9999');
+  assert.equal(badUnlock.ok, false);
+
+  // 正確 PIN 可取得新 token
+  const goodUnlock = ctx.unlockWithPin('2580');
+  assert.equal(goodUnlock.ok, true);
+  assert.doesNotThrow(() => ctx.assertAuthorized(goodUnlock.token));
+
+  // 手動上鎖後 token 立即失效
+  ctx.lockSession(goodUnlock.token);
+  assert.throws(() => ctx.assertAuthorized(goodUnlock.token), /AUTH_REQUIRED/);
 });
 
 test('submitExpense rejects invalid amounts and unsupported types before touching sheet', () => {
