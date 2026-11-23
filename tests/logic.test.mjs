@@ -248,3 +248,35 @@ test('submitExpense rejects invalid amounts and unsupported types before touchin
     /不支援的幣別/
   );
 });
+
+test('getSecurityStatus reports 60-minute server session TTL for configurable client idle lock', () => {
+  const ctx = loadGasContext();
+  const status = ctx.getSecurityStatus();
+  assert.equal(status.sessionTtlMinutes, 60);
+});
+
+test('dist/index.html inline script parses cleanly and includes Apple UI features', () => {
+  const html = readFileSync(join(distDir, 'index.html'), 'utf8');
+  const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+  assert.ok(scriptMatch && scriptMatch[1], 'Expected inline <script> block in dist/index.html');
+
+  // Verify inline JS syntax parses with zero errors
+  assert.doesNotThrow(() => new vm.Script(scriptMatch[1], { filename: 'index.html' }));
+
+  // Verify key elements and handlers exist
+  for (const marker of [
+    'logSubtabBar',
+    'ledgerModeToggle',
+    'calendarGrid',
+    'paginationBar',
+    'allocModeToggle',
+    'isDesktopDevice',
+    'checkIdleTimeout',
+    'triggerPinKey',
+    '#4E8FE6',
+    '[0, 5, 15, 30, 60]',
+  ]) {
+    assert.equal(html.includes(marker), true, `Expected dist/index.html to include ${marker}`);
+  }
+});
+

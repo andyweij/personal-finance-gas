@@ -139,9 +139,11 @@ interface AppBundleDto {
       cashUsdValue: number;
       fundStructuredValue: number;
       insuranceValue: number;
+      otherAssetsValue: number;
     };
     monthlyTrend: MonthlyTrendPointDto[];
   };
+  monthlyLogs: CashFlowLogDto[];
   recentLogs: CashFlowLogDto[];
   recurringItems: RecurringItemDto[];
   sinkingItems: SinkingFundItemDto[];
@@ -155,7 +157,7 @@ interface AppBundleDto {
 function doGet(): GoogleAppsScript.HTML.HtmlOutput {
   return HtmlService.createTemplateFromFile('index')
     .evaluate()
-    .setTitle('個人財務管家 | 現金流與資產')
+    .setTitle('財務管家')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
@@ -300,6 +302,10 @@ function buildAppBundleInternal(
     }
   }
 
+  const otherAssetsValue = Math.max(
+    0,
+    Math.round(totalAssets - stockValue - cashUsdValue - fundStructuredValue - insuranceValue)
+  );
   const netWorth = Math.round(totalAssets - totalLiabilities);
   const debtRatio = totalAssets > 0 ? Math.round((totalLiabilities / totalAssets) * 1000) / 10 : 0;
   const remainingBudget = Math.round(monthlyDailyBudget - monthly.dailyExpense);
@@ -307,8 +313,11 @@ function buildAppBundleInternal(
   const emergencyMonths =
     monthly.totalConsumption > 0 ? Math.round((highLiquidityAssets / monthly.totalConsumption) * 10) / 10 : 0;
 
-  // 最近 15 筆（最新在前）
-  const recentLogs = allLogs.slice(-15).reverse();
+  // 當月完整流水帳（依日期新→舊，同日依列號新→舊）供 10 筆分頁列表與日曆模式使用
+  const sortLogsDesc = (a: CashFlowLogDto, b: CashFlowLogDto): number =>
+    b.date.localeCompare(a.date) || b.rowIndex - a.rowIndex;
+  const sortedMonthlyLogs = monthlyLogs.slice().sort(sortLogsDesc);
+  const recentLogs = allLogs.slice().sort(sortLogsDesc).slice(0, 100);
   const availableYears = Array.from(yearSet).sort((a, b) => b - a);
 
   return {
@@ -342,9 +351,11 @@ function buildAppBundleInternal(
         cashUsdValue: Math.round(cashUsdValue),
         fundStructuredValue: Math.round(fundStructuredValue),
         insuranceValue: Math.round(insuranceValue),
+        otherAssetsValue,
       },
       monthlyTrend,
     },
+    monthlyLogs: sortedMonthlyLogs,
     recentLogs,
     recurringItems,
     sinkingItems,

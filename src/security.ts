@@ -2,7 +2,7 @@
  * Web App 安全保護模組 (security.ts)
  * - 提供可選 4~6 位數 App PIN 鎖（預設關閉，可於 Web App UI 內隨時開啟/修改/關閉）
  * - PIN 以隨機 Salt + SHA-256 雜湊存於 ScriptProperties（絕不明文儲存）
- * - 解鎖後透過 CacheService.getUserCache() 核發 15 分鐘滑動效期 Session Token
+ * - 解鎖後透過 CacheService.getUserCache() 核發 60 分鐘滑動效期 Session Token（前端可自訂 15/30/60 分鐘閒置自動上鎖）
  * - 若忘記 PIN，可直接從 Google Sheets 自訂選單一鍵重設
  */
 
@@ -13,7 +13,7 @@ const SECURITY_PROP_KEYS = {
 } as const;
 
 const SESSION_TOKEN_PREFIX = 'FINANCE_APP_SESSION_';
-const SESSION_TTL_SECONDS = 900; // 15 分鐘閒置自動鎖定
+const SESSION_TTL_SECONDS = 3600; // 60 分鐘伺服器端滑動效期（配合前端 15/30/60 分鐘閒置鎖定）
 
 /**
  * 計算 SHA-256 十六進位摘要
@@ -181,7 +181,7 @@ function configureAppPin(
     ok: true,
     pinEnabled: true,
     token: nextToken,
-    message: currentlyEnabled ? 'PIN 碼已更新！' : '已啟用 App PIN 鎖（閒置 15 分鐘自動鎖定）。',
+    message: currentlyEnabled ? 'PIN 碼已更新！' : '已啟用 App PIN 鎖。',
   };
 }
 
