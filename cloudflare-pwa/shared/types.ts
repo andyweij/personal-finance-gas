@@ -75,6 +75,10 @@ export interface AssetItem {
   balanceAnchorDate?: string | null;
   balanceAnchorAt?: string | null;
   isDefaultSavings?: boolean;
+  isAmortizingLoan?: boolean;
+  loanAnnualRate?: number | null;
+  loanMonthlyPayment?: number | null;
+  loanBillingDay?: number | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -158,6 +162,30 @@ export interface StockPortfolioSummary {
   totalReturnPnlTwd: number;
   totalReturnRoiPct: number;
   hasAnyCostBasis: boolean;
+}
+
+export interface LoanScheduleEntry {
+  periodIndex: number;
+  paymentDate: string;
+  payment: number;
+  interest: number;
+  principal: number;
+  remainingBalance: number;
+}
+
+export interface LoanAmortizationSummary {
+  baseBalance: number;
+  currentBalance: number;
+  currentBalanceTwd: number;
+  elapsedPeriods: number;
+  totalPaidInterest: number;
+  totalPaidPrincipal: number;
+  nextPaymentDate: string | null;
+  nextInterest: number;
+  nextPrincipal: number;
+  remainingPeriods: number | null;
+  estimatedPayoffYm: string | null;
+  isInterestOnly: boolean;
 }
 
 export interface SavingsAdjustment {

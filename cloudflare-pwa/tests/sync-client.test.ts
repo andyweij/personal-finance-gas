@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LocalFinanceDB } from '../web/src/db/localDb';
 import { SyncEngine } from '../web/src/sync/syncEngine';
 import { CASHFLOW_TYPES } from '../shared/constants';
-import { computeAllSavingsSummary } from '../shared/calculations';
+import { computeAllSavingsSummary, computeLoanAmortizationSummary } from '../shared/calculations';
 import type { SyncResponse } from '../shared/types';
 
 describe('Offline-First IndexedDB & SyncEngine', () => {
@@ -315,5 +315,50 @@ describe('Offline-First IndexedDB & SyncEngine', () => {
       'savings_adjustment',
       'cashflow',
     ]);
+  });
+
+  it('tracks offline auto-amortizing loan and supports snapshot calibration & switching back to manual mode', async () => {
+    const engine = new SyncEngine(db, {
+      fetchImpl: vi.fn(),
+      isOnline: () => false,
+    });
+    await engine.init();
+
+    const loan = await engine.saveAsset({
+      updateMode: '手動快照',
+      majorType: '負債',
+      subCategory: '房貸餘額',
+      liquidity: '負債',
+      itemName: '自住房貸',
+      quantityOrAmount: 3760328,
+      currency: 'TWD',
+      isAmortizingLoan: true,
+      balanceAnchorDate: '2025-05-25',
+      loanAnnualRate: 2.37,
+      loanMonthlyPayment: 30765,
+      loanBillingDay: 12,
+    });
+
+    const summary = computeLoanAmortizationSummary(loan, 32.5, '2026-11-24');
+    expect(summary.elapsedPeriods).toBe(18);
+    expect(summary.currentBalance).toBeLessThan(3340000);
+
+    // Snapshot calibration with fresh bank statement & new rate
+    const calibrated = await engine.reconcileLoanBalance(loan.id, 3320000, '2026-11-24', {
+      annualRate: 2.45,
+      monthlyPayment: 30900,
+    });
+    expect(calibrated.quantityOrAmount).toBe(3320000);
+    expect(calibrated.balanceAnchorDate).toBe('2026-11-24');
+    expect(calibrated.loanAnnualRate).toBe(2.45);
+    expect(calibrated.isAmortizingLoan).toBe(true);
+
+    // Switch back to pure manual snapshot mode
+    const manual = await engine.reconcileLoanBalance(loan.id, 3300000, '2026-12-01', {
+      disableAutoAmortize: true,
+    });
+    expect(manual.isAmortizingLoan).toBe(false);
+    expect(manual.quantityOrAmount).toBe(3300000);
+    expect((await db.getOutbox()).every((m) => m.entity === 'asset')).toBe(true);
   });
 });

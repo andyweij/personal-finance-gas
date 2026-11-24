@@ -209,6 +209,10 @@ export interface AssetInputPayload {
   balanceAnchorDate?: string | null;
   balanceAnchorAt?: string | null;
   isDefaultSavings?: boolean;
+  isAmortizingLoan?: boolean;
+  loanAnnualRate?: number | string | null;
+  loanMonthlyPayment?: number | string | null;
+  loanBillingDay?: number | string | null;
 }
 
 export function validateAssetInput(payload: AssetInputPayload) {
@@ -245,6 +249,47 @@ export function validateAssetInput(payload: AssetInputPayload) {
   const balanceAnchorAt = payload.balanceAnchorAt ? String(payload.balanceAnchorAt).trim() : null;
   const isDefaultSavings = isLinkedSavings && Boolean(payload.isDefaultSavings);
 
+  const isAmortizingLoan = !isLinkedSavings && majorType === '負債' && Boolean(payload.isAmortizingLoan);
+  let loanAnnualRate: number | null = null;
+  let loanMonthlyPayment: number | null = null;
+  let loanBillingDay: number | null = null;
+
+  if (isAmortizingLoan) {
+    const rateNum = Number(payload.loanAnnualRate ?? 0);
+    const payNum = Number(payload.loanMonthlyPayment);
+    const dayNum = Math.round(Number(payload.loanBillingDay ?? 1));
+    if (Number.isNaN(rateNum) || !Number.isFinite(rateNum) || rateNum < 0 || rateNum > 50) {
+      throw new Error('貸款年利率需介於 0% ～ 50%。');
+    }
+    if (Number.isNaN(payNum) || !Number.isFinite(payNum) || payNum <= 0) {
+      throw new Error('啟用自動還本推算時，請輸入大於 0 的每月月付金。');
+    }
+    if (Number.isNaN(dayNum) || dayNum < 1 || dayNum > 31) {
+      throw new Error('每月扣款日需介於 1 ～ 31 號。');
+    }
+    loanAnnualRate = Math.round(rateNum * 1000) / 1000;
+    loanMonthlyPayment = Math.round(payNum * 100) / 100;
+    loanBillingDay = dayNum;
+  } else if (majorType === '負債') {
+    // Preserve optional numeric fields if provided on a paused/manual loan for easy re-enabling
+    if (payload.loanAnnualRate !== undefined && payload.loanAnnualRate !== null && payload.loanAnnualRate !== '') {
+      const r = Number(payload.loanAnnualRate);
+      if (Number.isFinite(r) && r >= 0 && r <= 50) loanAnnualRate = Math.round(r * 1000) / 1000;
+    }
+    if (
+      payload.loanMonthlyPayment !== undefined &&
+      payload.loanMonthlyPayment !== null &&
+      payload.loanMonthlyPayment !== ''
+    ) {
+      const p = Number(payload.loanMonthlyPayment);
+      if (Number.isFinite(p) && p > 0) loanMonthlyPayment = Math.round(p * 100) / 100;
+    }
+    if (payload.loanBillingDay !== undefined && payload.loanBillingDay !== null && payload.loanBillingDay !== '') {
+      const d = Math.round(Number(payload.loanBillingDay));
+      if (Number.isFinite(d) && d >= 1 && d <= 31) loanBillingDay = d;
+    }
+  }
+
   if (!itemName) throw new Error('請輸入項目名稱。');
   if (!ASSET_UPDATE_MODES.includes(updateMode)) throw new Error('更新方式無效。');
   if (!ASSET_MAJOR_TYPES.includes(majorType)) throw new Error('大類需為資產或負債。');
@@ -272,6 +317,10 @@ export function validateAssetInput(payload: AssetInputPayload) {
     balanceAnchorDate,
     balanceAnchorAt,
     isDefaultSavings,
+    isAmortizingLoan,
+    loanAnnualRate,
+    loanMonthlyPayment,
+    loanBillingDay,
   };
 }
 

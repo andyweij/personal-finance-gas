@@ -150,6 +150,15 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
     balanceAnchorDate: r.balance_anchor_date ? String(r.balance_anchor_date) : null,
     balanceAnchorAt: r.balance_anchor_at ? String(r.balance_anchor_at) : null,
     isDefaultSavings: Number(r.is_default_savings || 0) === 1,
+    isAmortizingLoan: Number(r.is_amortizing_loan || 0) === 1,
+    loanAnnualRate:
+      r.loan_annual_rate !== null && r.loan_annual_rate !== undefined ? Number(r.loan_annual_rate) : null,
+    loanMonthlyPayment:
+      r.loan_monthly_payment !== null && r.loan_monthly_payment !== undefined
+        ? Number(r.loan_monthly_payment)
+        : null,
+    loanBillingDay:
+      r.loan_billing_day !== null && r.loan_billing_day !== undefined ? Number(r.loan_billing_day) : null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -520,6 +529,15 @@ async function applySingleMutation(
       balanceAnchorDate: p.balanceAnchorDate ? String(p.balanceAnchorDate) : null,
       balanceAnchorAt: p.balanceAnchorAt ? String(p.balanceAnchorAt) : null,
       isDefaultSavings: Boolean(p.isDefaultSavings),
+      isAmortizingLoan: Boolean(p.isAmortizingLoan),
+      loanAnnualRate:
+        p.loanAnnualRate !== undefined && p.loanAnnualRate !== null ? Number(p.loanAnnualRate) : null,
+      loanMonthlyPayment:
+        p.loanMonthlyPayment !== undefined && p.loanMonthlyPayment !== null
+          ? Number(p.loanMonthlyPayment)
+          : null,
+      loanBillingDay:
+        p.loanBillingDay !== undefined && p.loanBillingDay !== null ? Number(p.loanBillingDay) : null,
     });
 
     if (v.isDefaultSavings) {
@@ -532,8 +550,8 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(id) DO UPDATE SET
            update_mode = excluded.update_mode,
            major_type = excluded.major_type,
@@ -550,6 +568,10 @@ async function applySingleMutation(
            balance_anchor_date = excluded.balance_anchor_date,
            balance_anchor_at = excluded.balance_anchor_at,
            is_default_savings = excluded.is_default_savings,
+           is_amortizing_loan = excluded.is_amortizing_loan,
+           loan_annual_rate = excluded.loan_annual_rate,
+           loan_monthly_payment = excluded.loan_monthly_payment,
+           loan_billing_day = excluded.loan_billing_day,
            updated_at = excluded.updated_at,
            deleted_at = NULL`
       )
@@ -570,6 +592,10 @@ async function applySingleMutation(
         v.balanceAnchorDate,
         v.balanceAnchorAt,
         v.isDefaultSavings ? 1 : 0,
+        v.isAmortizingLoan ? 1 : 0,
+        v.loanAnnualRate,
+        v.loanMonthlyPayment,
+        v.loanBillingDay,
         String(p.createdAt || ts),
         ts
       )
@@ -1032,8 +1058,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
       )
       .bind(
         a.id || crypto.randomUUID(),
@@ -1052,6 +1078,10 @@ export async function importFullSnapshot(
         v.balanceAnchorDate,
         v.balanceAnchorAt,
         v.isDefaultSavings ? 1 : 0,
+        v.isAmortizingLoan ? 1 : 0,
+        v.loanAnnualRate,
+        v.loanMonthlyPayment,
+        v.loanBillingDay,
         a.createdAt || nowIso,
         nowIso
       )

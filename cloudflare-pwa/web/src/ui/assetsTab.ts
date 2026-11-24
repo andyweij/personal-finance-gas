@@ -2,10 +2,13 @@ import { ASSET_SUB_CATEGORIES } from '../../../shared/constants';
 import {
   computeAllSavingsSummary,
   computeAssetEffectiveTwdValue,
+  computeLoanAmortizationSchedule,
+  computeLoanAmortizationSummary,
   computeNetWorthSummary,
   computeSavingsAccountSummary,
   computeStockPositionSummary,
   isStockAsset,
+  solveImpliedLoanAnnualRate,
 } from '../../../shared/calculations';
 import type { AssetItem } from '../../../shared/types';
 import {
@@ -237,11 +240,91 @@ export function renderAssetsTab(ctx: UiContext): void {
 
   let autoCount = 0;
   let manualCount = 0;
+  const todayYmd = todayYmdLocal();
   for (const item of activeAssets) {
     if (item.isLinkedSavings) continue;
+    if (item.majorType === '負債' && item.isAmortizingLoan) {
+      const loan = computeLoanAmortizationSummary(item, rate, todayYmd);
+      const row = document.createElement('div');
+      row.className = 'savings-acc-row';
+
+      const top = document.createElement('div');
+      top.className = 'savings-acc-top';
+
+      const main = document.createElement('div');
+      main.className = 'item-main';
+      const title = document.createElement('div');
+      title.className = 'item-title';
+      title.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap';
+      title.appendChild(document.createTextNode(item.itemName));
+
+      const catBadge = document.createElement('span');
+      catBadge.className = 'badge red';
+      catBadge.style.marginRight = '0';
+      catBadge.textContent = item.subCategory;
+      title.appendChild(catBadge);
+
+      const autoBadge = document.createElement('span');
+      autoBadge.className = 'badge';
+      autoBadge.style.marginRight = '0';
+      autoBadge.textContent = '自動還本';
+      title.appendChild(autoBadge);
+
+      const sub = document.createElement('div');
+      sub.className = 'item-sub tnum';
+      if (loan.currentBalance <= 0) {
+        sub.textContent = `已推算清償（基準 ${fmtMoney(loan.baseBalance, ctx.state.masked)} @ ${item.balanceAnchorDate || '-'}）`;
+      } else if (loan.isInterestOnly) {
+        sub.textContent = `寬限期/只繳息 · 年利 ${item.loanAnnualRate ?? 0}% · 月息 ~${fmtMoney(loan.nextInterest, ctx.state.masked)} · 基準 ${item.balanceAnchorDate || '-'}`;
+      } else {
+        const payoffTxt = loan.estimatedPayoffYm ? ` · 預計 ${loan.estimatedPayoffYm} 清償` : '';
+        sub.textContent = `年利 ${item.loanAnnualRate ?? 0}% · 已推算 ${loan.elapsedPeriods} 期 · 下期還本 ~${fmtMoney(loan.nextPrincipal, ctx.state.masked)} / 息 ~${fmtMoney(loan.nextInterest, ctx.state.masked)}${payoffTxt}`;
+      }
+      main.appendChild(title);
+      main.appendChild(sub);
+
+      const bal = document.createElement('div');
+      bal.className = 'savings-acc-bal neg tnum';
+      bal.textContent = '-' + fmtMoney(loan.currentBalanceTwd, ctx.state.masked);
+
+      top.appendChild(main);
+      top.appendChild(bal);
+
+      const actions = document.createElement('div');
+      actions.className = 'savings-acc-actions';
+
+      const recBtn = document.createElement('button');
+      recBtn.type = 'button';
+      recBtn.className = 'btn btn-tinted btn-sm';
+      recBtn.textContent = '快照校準';
+      recBtn.addEventListener('click', () => openLoanReconcileModal(ctx, item));
+
+      const schBtn = document.createElement('button');
+      schBtn.type = 'button';
+      schBtn.className = 'btn btn-outline btn-sm';
+      schBtn.textContent = '攤還試算';
+      schBtn.addEventListener('click', () => openLoanScheduleModal(ctx, item));
+
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'btn btn-outline btn-sm';
+      editBtn.textContent = '編輯';
+      editBtn.addEventListener('click', () => openAssetModal(ctx, item));
+
+      actions.appendChild(recBtn);
+      actions.appendChild(schBtn);
+      actions.appendChild(editBtn);
+
+      row.appendChild(top);
+      row.appendChild(actions);
+      manualList.appendChild(row);
+      manualCount++;
+      continue;
+    }
+
     const isStock = isStockAsset(item);
     const stockPos = isStock ? computeStockPositionSummary(item, stockTxs, rate) : null;
-    const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs);
+    const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs, todayYmd);
     const row = document.createElement('div');
     row.className = 'list-row';
 
@@ -685,9 +768,202 @@ export function openReconcileModal(ctx: UiContext, account: AssetItem): void {
   body.appendChild(form);
 }
 
+export function openLoanReconcileModal(ctx: UiContext, item: AssetItem): void {
+  const snap = ctx.engine.getSnapshot();
+  const rate = snap.settings.usdTwdRate || 32.5;
+  const today = todayYmdLocal();
+  const loan = computeLoanAmortizationSummary(item, rate, today);
+
+  const body = openModal(`快照校準 · ${item.itemName}`);
+  const info = document.createElement('div');
+  info.style.cssText =
+    'padding:11px 13px;border-radius:12px;background:var(--surface-alt);margin-bottom:14px;font-size:13px;line-height:1.55;color:var(--text-secondary)';
+  info.innerHTML = `目前推估剩餘本金：<strong class="tnum" style="color:var(--danger)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong><br/>拿到最新銀行對帳單或遇到調息時，直接填入最新本金與基準日覆蓋，後續會從新基準繼續自動還本推算；若想改回純手動快照也可於下方勾選。`;
+  body.appendChild(info);
+
+  const form = document.createElement('form');
+  const r1 = document.createElement('div');
+  r1.className = 'row-2';
+  r1.appendChild(
+    makeInputField(`最新實際剩餘本金 (${item.currency})`, 'lnRecBal', 'number', loan.currentBalance, '0', true)
+  );
+  r1.appendChild(makeInputField('單據基準日', 'lnRecDate', 'date', today, '', true));
+  form.appendChild(r1);
+
+  const r2 = document.createElement('div');
+  r2.className = 'row-2';
+  r2.appendChild(
+    makeInputField('年利率 (%)', 'lnRecRate', 'number', item.loanAnnualRate ?? 0, '2.37', true)
+  );
+  r2.appendChild(
+    makeInputField('每月月付金', 'lnRecPay', 'number', item.loanMonthlyPayment ?? '', '30765', true)
+  );
+  form.appendChild(r2);
+
+  const disableLbl = document.createElement('label');
+  disableLbl.style.cssText =
+    'display:flex;align-items:center;gap:10px;padding:10px 12px;margin-bottom:14px;border-radius:10px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;';
+  const disableCb = document.createElement('input');
+  disableCb.id = 'lnRecDisable';
+  disableCb.type = 'checkbox';
+  disableCb.style.cssText = 'width:18px;height:18px;accent-color:var(--primary)';
+  const disableTxt = document.createElement('span');
+  disableTxt.innerHTML =
+    '<strong>切回純手動快照模式</strong><small style="display:block;color:var(--text-secondary);font-size:11px">勾選後將停止按月自動推算，改為固定顯示您填寫的快照餘額</small>';
+  disableLbl.appendChild(disableCb);
+  disableLbl.appendChild(disableTxt);
+  form.appendChild(disableLbl);
+
+  const btns = document.createElement('div');
+  btns.style.cssText = 'display:grid;grid-template-columns:1fr 2fr;gap:8px';
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'btn btn-outline';
+  cancel.textContent = '取消';
+  cancel.addEventListener('click', closeModal);
+  const save = document.createElement('button');
+  save.type = 'submit';
+  save.className = 'btn btn-primary';
+  save.textContent = '確認更新快照';
+  btns.appendChild(cancel);
+  btns.appendChild(save);
+  form.appendChild(btns);
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const actualBal = parseFloat(el<HTMLInputElement>('lnRecBal').value);
+    const anchorDate = el<HTMLInputElement>('lnRecDate').value || today;
+    const annualRate = parseFloat(el<HTMLInputElement>('lnRecRate').value);
+    const monthlyPayment = parseFloat(el<HTMLInputElement>('lnRecPay').value);
+    const disableAutoAmortize = el<HTMLInputElement>('lnRecDisable').checked;
+    if (Number.isNaN(actualBal) || actualBal < 0) {
+      showToast('請輸入大於等於 0 的剩餘本金', 'error');
+      return;
+    }
+    try {
+      await ctx.engine.reconcileLoanBalance(item.id, actualBal, anchorDate, {
+        annualRate: Number.isNaN(annualRate) ? undefined : annualRate,
+        monthlyPayment: Number.isNaN(monthlyPayment) ? undefined : monthlyPayment,
+        disableAutoAmortize,
+      });
+      closeModal();
+      showToast(
+        disableAutoAmortize
+          ? `已將「${item.itemName}」更新為手動快照`
+          : `已校準「${item.itemName}」餘額與基準日`,
+        'success'
+      );
+      ctx.scheduleSync();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '校準失敗', 'error');
+    }
+  });
+
+  body.appendChild(form);
+}
+
+export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
+  const snap = ctx.engine.getSnapshot();
+  const rate = snap.settings.usdTwdRate || 32.5;
+  const today = todayYmdLocal();
+  const loan = computeLoanAmortizationSummary(item, rate, today);
+
+  const body = openModal(`攤還試算表 · ${item.itemName}`);
+
+  const banner = document.createElement('div');
+  banner.style.cssText =
+    'padding:11px 13px;border-radius:12px;background:var(--surface-alt);margin-bottom:12px;font-size:12.5px;line-height:1.6;color:var(--text-secondary)';
+  const remainText =
+    loan.remainingPeriods === null
+      ? '寬限期／只繳息'
+      : `剩餘約 ${loan.remainingPeriods} 期${loan.estimatedPayoffYm ? `（預計 ${loan.estimatedPayoffYm} 清償）` : ''}`;
+  banner.innerHTML =
+    `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span>截至今日預估餘額</span><strong class="tnum" style="font-size:17px;color:var(--danger)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong></div>` +
+    `<div class="tnum">年利率 ${item.loanAnnualRate ?? 0}% · 月付 ${fmtRaw(item.loanMonthlyPayment || 0, item.currency, ctx.state.masked)} · 每月 ${item.loanBillingDay || 1} 號扣款<br/>基準單據 ${fmtRaw(loan.baseBalance, item.currency, ctx.state.masked)} (${item.balanceAnchorDate || '-'}) · 已推算 ${loan.elapsedPeriods} 期 · ${remainText}</div>`;
+  body.appendChild(banner);
+
+  let showAll = false;
+  const toggleBar = document.createElement('div');
+  toggleBar.className = 'seg-bar';
+  toggleBar.style.marginBottom = '10px';
+  const btn12 = document.createElement('button');
+  btn12.type = 'button';
+  btn12.className = 'seg-btn active';
+  btn12.textContent = '未來 12 期';
+  const btnAll = document.createElement('button');
+  btnAll.type = 'button';
+  btnAll.className = 'seg-btn';
+  btnAll.textContent = '全部剩餘期數';
+  toggleBar.appendChild(btn12);
+  toggleBar.appendChild(btnAll);
+  body.appendChild(toggleBar);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'loan-schedule-wrap';
+  body.appendChild(wrap);
+
+  const renderTable = () => {
+    btn12.classList.toggle('active', !showAll);
+    btnAll.classList.toggle('active', showAll);
+    const entries = computeLoanAmortizationSchedule(item, today, showAll ? 600 : 12);
+    wrap.innerHTML = '';
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'list-empty';
+      empty.textContent = loan.currentBalance <= 0 ? '此筆貸款已推算清償完畢。' : '目前設定為寬限期／只繳息，暫無還本試算表。';
+      wrap.appendChild(empty);
+      return;
+    }
+
+    const table = document.createElement('table');
+    table.className = 'loan-schedule-table tnum';
+    table.innerHTML =
+      '<thead><tr><th>扣款日</th><th>實還本金</th><th>利息</th><th>剩餘本金</th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    for (const row of entries) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${row.paymentDate}</td>` +
+        `<td style="color:var(--success);font-weight:600">${ctx.state.masked ? '•••' : fmtNum(row.principal)}</td>` +
+        `<td style="color:var(--text-secondary)">${ctx.state.masked ? '•••' : fmtNum(row.interest)}</td>` +
+        `<td style="font-weight:600">${ctx.state.masked ? '•••••' : fmtNum(row.remainingBalance)}</td>`;
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  };
+
+  btn12.addEventListener('click', () => {
+    showAll = false;
+    renderTable();
+  });
+  btnAll.addEventListener('click', () => {
+    showAll = true;
+    renderTable();
+  });
+  renderTable();
+
+  const footer = document.createElement('div');
+  footer.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px';
+  const recBtn = document.createElement('button');
+  recBtn.type = 'button';
+  recBtn.className = 'btn btn-tinted';
+  recBtn.textContent = '快照校準餘額';
+  recBtn.addEventListener('click', () => openLoanReconcileModal(ctx, item));
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'btn btn-outline';
+  closeBtn.textContent = '關閉';
+  closeBtn.addEventListener('click', closeModal);
+  footer.appendChild(recBtn);
+  footer.appendChild(closeBtn);
+  body.appendChild(footer);
+}
+
 export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void {
   const body = openModal(existing ? '更新資產 / 負債餘額' : '新增資產 / 負債');
   const form = document.createElement('form');
+  const today = todayYmdLocal();
   form.appendChild(makeInputField('項目名稱', 'asName', 'text', existing?.itemName || '', '如：0050、台幣定存、房貸餘額', true));
 
   const r1 = document.createElement('div');
@@ -704,7 +980,7 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
 
   const r3 = document.createElement('div');
   r3.className = 'row-2';
-  r3.appendChild(makeInputField('持有股數 / 原幣餘額', 'asQty', 'number', existing?.quantityOrAmount ?? '', '0', true));
+  r3.appendChild(makeInputField('持有股數 / 原幣餘額（基準餘額）', 'asQty', 'number', existing?.quantityOrAmount ?? '', '0', true));
   r3.appendChild(makeSelectField('幣別', 'asCurr', ['TWD', 'USD'], existing?.currency || 'TWD'));
   form.appendChild(r3);
 
@@ -713,6 +989,105 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
   r4.appendChild(makeInputField('股票代碼（選填，如 TPE:0050）', 'asTicker', 'text', existing?.ticker || '', 'TPE:0050'));
   r4.appendChild(makeInputField('目前單價（非股票填 1）', 'asPrice', 'number', existing?.unitPrice ?? 1, '1', true));
   form.appendChild(r4);
+
+  // Optional auto-amortizing loan section (shown only when majorType === '負債')
+  const loanBox = document.createElement('div');
+  loanBox.id = 'loanAutoBox';
+  loanBox.className = 'loan-config-box';
+
+  const loanToggleLbl = document.createElement('label');
+  loanToggleLbl.style.cssText = 'display:flex;align-items:center;gap:10px;font-size:13px;cursor:pointer;';
+  const loanCb = document.createElement('input');
+  loanCb.id = 'asLoanAuto';
+  loanCb.type = 'checkbox';
+  loanCb.checked = Boolean(existing?.isAmortizingLoan);
+  loanCb.style.cssText = 'width:18px;height:18px;accent-color:var(--primary)';
+  const loanToggleTxt = document.createElement('span');
+  loanToggleTxt.innerHTML =
+    '<strong>啟用本息均攤自動還本推算</strong><small style="display:block;color:var(--text-secondary);font-size:11px">未勾選維持純手動快照；勾選後依基準日與扣款日自動算到今日，仍可隨時快照校準</small>';
+  loanToggleLbl.appendChild(loanCb);
+  loanToggleLbl.appendChild(loanToggleTxt);
+  loanBox.appendChild(loanToggleLbl);
+
+  const loanFields = document.createElement('div');
+  loanFields.id = 'loanFieldsBox';
+  loanFields.style.marginTop = '12px';
+
+  const lr1 = document.createElement('div');
+  lr1.className = 'row-2';
+  lr1.appendChild(
+    makeInputField('單據基準日', 'asLoanAnchor', 'date', existing?.balanceAnchorDate || today)
+  );
+  lr1.appendChild(
+    makeInputField('每月扣款日 (1~31)', 'asLoanDay', 'number', existing?.loanBillingDay ?? 12, '12')
+  );
+  loanFields.appendChild(lr1);
+
+  const lr2 = document.createElement('div');
+  lr2.className = 'row-2';
+  lr2.appendChild(
+    makeInputField('每月月付金', 'asLoanPay', 'number', existing?.loanMonthlyPayment ?? '', '30765')
+  );
+  lr2.appendChild(
+    makeInputField('年利率 (%)', 'asLoanRate', 'number', existing?.loanAnnualRate ?? '', '2.37')
+  );
+  loanFields.appendChild(lr2);
+
+  // Built-in implied annual interest rate reverse solver
+  const solver = document.createElement('details');
+  solver.className = 'loan-solver-box';
+  const solverSum = document.createElement('summary');
+  solverSum.textContent = '不知道確切年利率？依申貸日＋年限一鍵反推';
+  solver.appendChild(solverSum);
+
+  const solverBody = document.createElement('div');
+  solverBody.className = 'loan-solver-body';
+  const sr1 = document.createElement('div');
+  sr1.className = 'row-2';
+  sr1.appendChild(makeInputField('原始申貸日', 'asSolveStart', 'date', ''));
+  sr1.appendChild(makeInputField('貸款年限 (年)', 'asSolveYears', 'number', 20, '20'));
+  solverBody.appendChild(sr1);
+
+  const solveBtn = document.createElement('button');
+  solveBtn.type = 'button';
+  solveBtn.className = 'btn btn-tinted btn-sm';
+  solveBtn.textContent = '反推年利率並帶入';
+  solveBtn.addEventListener('click', () => {
+    try {
+      const baseBalance = parseFloat(el<HTMLInputElement>('asQty').value);
+      const anchorDate = el<HTMLInputElement>('asLoanAnchor').value || today;
+      const loanStartDate = el<HTMLInputElement>('asSolveStart').value;
+      const loanTermYears = parseFloat(el<HTMLInputElement>('asSolveYears').value);
+      const monthlyPayment = parseFloat(el<HTMLInputElement>('asLoanPay').value);
+      const billingDayInput = parseInt(el<HTMLInputElement>('asLoanDay').value, 10);
+      const startDay = loanStartDate ? Number(loanStartDate.slice(8, 10)) : undefined;
+      const billingDay =
+        !Number.isNaN(billingDayInput) && billingDayInput >= 1 && billingDayInput <= 31
+          ? billingDayInput
+          : startDay;
+
+      const solved = solveImpliedLoanAnnualRate({
+        baseBalance,
+        anchorDate,
+        loanStartDate,
+        loanTermYears,
+        monthlyPayment,
+        billingDay,
+      });
+      el<HTMLInputElement>('asLoanRate').value = String(solved.annualRate);
+      if (billingDay && (!el<HTMLInputElement>('asLoanDay').value || Number.isNaN(billingDayInput))) {
+        el<HTMLInputElement>('asLoanDay').value = String(billingDay);
+      }
+      showToast(`推算年利率約 ${solved.annualRate}%（基準日起剩餘 ${solved.remainingPeriods} 期）`, 'success');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '請先填妥基準餘額、月付金、申貸日與年限', 'error');
+    }
+  });
+  solverBody.appendChild(solveBtn);
+  solver.appendChild(solverBody);
+  loanFields.appendChild(solver);
+  loanBox.appendChild(loanFields);
+  form.appendChild(loanBox);
 
   form.appendChild(makeInputField('備註（選填）', 'asNote', 'text', existing?.note || ''));
 
@@ -747,13 +1122,26 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
   btns.appendChild(save);
   form.appendChild(btns);
 
+  const syncLoanVisibility = () => {
+    const isLiab = el<HTMLSelectElement>('asMajor').value === '負債';
+    loanBox.style.display = isLiab ? 'block' : 'none';
+    loanFields.style.display = isLiab && loanCb.checked ? 'block' : 'none';
+  };
+
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
+      const majorType = el<HTMLSelectElement>('asMajor').value;
+      const isAmortizingLoan = majorType === '負債' && loanCb.checked;
+      const anchorVal = el<HTMLInputElement>('asLoanAnchor').value.trim();
+      const rateVal = el<HTMLInputElement>('asLoanRate').value.trim();
+      const payVal = el<HTMLInputElement>('asLoanPay').value.trim();
+      const dayVal = el<HTMLInputElement>('asLoanDay').value.trim();
+
       await ctx.engine.saveAsset({
         id: existing?.id,
         itemName: el<HTMLInputElement>('asName').value.trim(),
-        majorType: el<HTMLSelectElement>('asMajor').value,
+        majorType,
         updateMode: el<HTMLSelectElement>('asMode').value,
         subCategory: el<HTMLSelectElement>('asSub').value,
         liquidity: el<HTMLSelectElement>('asLiq').value,
@@ -762,6 +1150,11 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
         ticker: el<HTMLInputElement>('asTicker').value.trim(),
         unitPrice: parseFloat(el<HTMLInputElement>('asPrice').value) || 1,
         note: el<HTMLInputElement>('asNote').value.trim(),
+        isAmortizingLoan,
+        balanceAnchorDate: isAmortizingLoan ? anchorVal || today : anchorVal || null,
+        loanAnnualRate: rateVal !== '' ? parseFloat(rateVal) : null,
+        loanMonthlyPayment: payVal !== '' ? parseFloat(payVal) : null,
+        loanBillingDay: dayVal !== '' ? parseInt(dayVal, 10) : null,
       });
       closeModal();
       showToast('已更新資產負債項目', 'success');
@@ -772,4 +1165,7 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
   });
 
   body.appendChild(form);
+  el('asMajor').addEventListener('change', syncLoanVisibility);
+  loanCb.addEventListener('change', syncLoanVisibility);
+  syncLoanVisibility();
 }

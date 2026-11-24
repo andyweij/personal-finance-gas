@@ -688,4 +688,57 @@ describe('Cloudflare Worker API + D1 Integration', () => {
       .first<{ linked_account_id: string | null }>();
     expect(posted?.linked_account_id).toBe('sav-acc-1');
   });
+
+  it('syncs auto-amortizing loan fields to D1 and captures derived remaining principal in month-end snapshot', async () => {
+    const cookie = await setupAndGetCookie();
+
+    const syncRes = await app.request(
+      'https://finance.example.com/api/sync',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({
+          mutations: [
+            {
+              mutationId: 'm-loan-1',
+              entity: 'asset',
+              op: 'upsert',
+              recordId: 'loan-d1-1',
+              clientTimestamp: '2026-11-24T06:00:00.000Z',
+              payload: {
+                updateMode: '手動快照',
+                majorType: '負債',
+                subCategory: '房貸餘額',
+                liquidity: '負債',
+                itemName: '自住房貸',
+                quantityOrAmount: 3760328,
+                currency: 'TWD',
+                unitPrice: 1,
+                isAmortizingLoan: true,
+                balanceAnchorDate: '2025-05-25',
+                loanAnnualRate: 2.37,
+                loanMonthlyPayment: 30765,
+                loanBillingDay: 12,
+              },
+            },
+          ],
+        }),
+      },
+      env
+    );
+    expect(syncRes.status).toBe(200);
+    const syncJson = (await syncRes.json()) as {
+      ackedMutationIds: string[];
+      delta: { assetItems: Array<{ id: string; isAmortizingLoan?: boolean; loanAnnualRate?: number | null }> };
+    };
+    expect(syncJson.ackedMutationIds).toEqual(['m-loan-1']);
+    const syncedLoan = syncJson.delta.assetItems.find((a) => a.id === 'loan-d1-1');
+    expect(syncedLoan?.isAmortizingLoan).toBe(true);
+    expect(syncedLoan?.loanAnnualRate).toBe(2.37);
+
+    // Month-end snapshot on 2026-11-30 captures 18 elapsed cycles (~3.33M, not raw 3.76M)
+    const snap = await runMonthEndSnapshotD1(db, new Date('2026-11-30T15:00:00.000Z'));
+    expect(snap.totalLiabilities).toBeGreaterThan(3330000);
+    expect(snap.totalLiabilities).toBeLessThan(3336000);
+  });
 });

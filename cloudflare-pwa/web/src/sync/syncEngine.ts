@@ -395,9 +395,10 @@ export class SyncEngine {
       ? v.isDefaultSavings || otherSavings.length === 0
       : false;
 
-    const balanceAnchorDate = v.isLinkedSavings
-      ? v.balanceAnchorDate ?? existing?.balanceAnchorDate ?? todayYmd
-      : null;
+    const balanceAnchorDate =
+      v.isLinkedSavings || v.isAmortizingLoan
+        ? v.balanceAnchorDate ?? existing?.balanceAnchorDate ?? todayYmd
+        : v.balanceAnchorDate ?? null;
     const balanceAnchorAt = v.isLinkedSavings
       ? v.balanceAnchorAt ?? existing?.balanceAnchorAt ?? nowIso
       : null;
@@ -437,6 +438,36 @@ export class SyncEngine {
       },
     ]);
     return item;
+  }
+
+  async reconcileLoanBalance(
+    assetId: string,
+    actualBalance: number,
+    anchorDate?: string,
+    opts?: {
+      annualRate?: number;
+      monthlyPayment?: number;
+      billingDay?: number;
+      disableAutoAmortize?: boolean;
+    }
+  ): Promise<AssetItem> {
+    const existing = this.snapshot.assetItems.find((a) => a.id === assetId && !a.deletedAt);
+    if (!existing) throw new Error('找不到指定的負債項目。');
+    const ymd =
+      anchorDate ||
+      `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+    const keepAuto = opts?.disableAutoAmortize ? false : Boolean(existing.isAmortizingLoan);
+    return this.saveAsset({
+      ...existing,
+      id: existing.id,
+      quantityOrAmount: actualBalance,
+      balanceAnchorDate: ymd,
+      isAmortizingLoan: keepAuto,
+      loanAnnualRate: opts?.annualRate !== undefined ? opts.annualRate : existing.loanAnnualRate,
+      loanMonthlyPayment:
+        opts?.monthlyPayment !== undefined ? opts.monthlyPayment : existing.loanMonthlyPayment,
+      loanBillingDay: opts?.billingDay !== undefined ? opts.billingDay : existing.loanBillingDay,
+    });
   }
 
   async reconcileSavingsAccount(accountId: string, actualBalance: number, anchorDate?: string): Promise<AssetItem> {

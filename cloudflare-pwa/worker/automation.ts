@@ -173,7 +173,8 @@ export async function runMonthEndSnapshotD1(
       full.settings.usdTwdRate,
       full.cashflowLogs,
       full.savingsAdjustments,
-      full.stockTransactions
+      full.stockTransactions,
+      parts.ymd
     );
     if (twdValue === 0) continue;
     if (item.majorType === '資產') {
