@@ -8,6 +8,7 @@ import { renderOverviewTab, renderTrendChart } from './ui/overviewTab';
 import { openRecurringModal, openSinkingModal, renderConfigTab } from './ui/configTab';
 import { openAssetModal, renderAssetsTab } from './ui/assetsTab';
 import {
+  closeLockScreen,
   openAuthScreen,
   openLockScreen,
   openSecurityModal,
@@ -151,11 +152,21 @@ async function bootstrap(): Promise<void> {
         state.pinHash = auth.pinHash || null;
         await engine.updateLocalPinCache(state.pinEnabled, state.pinSalt, state.pinHash);
         updateSecurityButtons(ctx);
+        if (!state.pinEnabled) {
+          closeLockScreen(ctx);
+        }
         void engine.syncNow();
       } else if (!auth.initialized) {
+        state.pinEnabled = false;
+        state.pinSalt = null;
+        state.pinHash = null;
+        await engine.updateLocalPinCache(false, null, null);
+        updateSecurityButtons(ctx);
+        closeLockScreen(ctx);
         openAuthScreen(ctx, 'setup', '', () => void engine.syncNow(true));
       } else if (!meta.lastSyncedAt) {
         // 首次使用無本機快取時要求登入
+        closeLockScreen(ctx);
         openAuthScreen(ctx, 'login', '', () => void engine.syncNow(true));
       }
     } catch {
