@@ -103,6 +103,13 @@ export function initBottomNavScrub(opts: BottomNavScrubOptions): { syncPill: (in
       isScrubbing = true;
       navEl.classList.add('scrubbing');
       pillEl.classList.add('scrubbing');
+      if (activePointerId !== null && typeof navEl.setPointerCapture === 'function') {
+        try {
+          navEl.setPointerCapture(activePointerId);
+        } catch {
+          // Ignore if capture is unsupported
+        }
+      }
     }
     if (!isScrubbing) return;
 
@@ -118,6 +125,21 @@ export function initBottomNavScrub(opts: BottomNavScrubOptions): { syncPill: (in
     pillEl.style.transform = `translate3d(${padLeft + offsetPx + 3}px, 0, 0)`;
     const idx = computeTabIndexFromX(clientX, innerLeft, innerWidth, tabCount);
     setHoveredTarget(idx);
+  };
+
+  const releaseCaptureIfHeld = (pointerId: number) => {
+    if (
+      typeof navEl.hasPointerCapture === 'function' &&
+      typeof navEl.releasePointerCapture === 'function'
+    ) {
+      try {
+        if (navEl.hasPointerCapture(pointerId)) {
+          navEl.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // Ignore if already released
+      }
+    }
   };
 
   const endTouch = (cancelled = false) => {
@@ -142,34 +164,33 @@ export function initBottomNavScrub(opts: BottomNavScrubOptions): { syncPill: (in
     }
   };
 
-  // Prefer Pointer Events (unified across iOS 13+ Safari, Android Chrome, and Desktop)
+  // Prefer Pointer Events (unified across iOS 13+ Safari, Android Chrome, and Desktop).
+  // IMPORTANT: Do NOT call setPointerCapture on pointerdown — capturing on pointerdown
+  // retargets desktop click events from child <button class="nav-btn"> to navEl, breaking normal clicks.
   navEl.addEventListener('pointerdown', (e) => {
     if (e.button !== 0 && e.pointerType === 'mouse') return;
     activePointerId = e.pointerId;
-    if (typeof navEl.setPointerCapture === 'function') {
-      try {
-        navEl.setPointerCapture(e.pointerId);
-      } catch {
-        // Ignore if capture is unsupported
-      }
-    }
     beginTouch(e.clientX);
   });
 
-  navEl.addEventListener('pointermove', (e) => {
+  window.addEventListener('pointermove', (e) => {
     if (activePointerId !== e.pointerId) return;
     moveTouch(e.clientX, e.clientY);
   });
 
-  navEl.addEventListener('pointerup', (e) => {
+  window.addEventListener('pointerup', (e) => {
     if (activePointerId !== e.pointerId) return;
+    const pid = activePointerId;
     activePointerId = null;
+    releaseCaptureIfHeld(pid);
     endTouch(false);
   });
 
-  navEl.addEventListener('pointercancel', (e) => {
+  window.addEventListener('pointercancel', (e) => {
     if (activePointerId !== e.pointerId) return;
+    const pid = activePointerId;
     activePointerId = null;
+    releaseCaptureIfHeld(pid);
     endTouch(true);
   });
 
