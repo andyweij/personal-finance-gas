@@ -3,6 +3,7 @@ import {
   DEFAULT_MONTHLY_DAILY_BUDGET,
   DEFAULT_USD_TWD_RATE,
 } from '../../../shared/constants';
+import { DEFAULT_UTILITY_RENTS } from '../../../shared/rentUtility';
 import type { CachedPasskeyDto, FinanceSnapshot, SyncMutation } from '../../../shared/types';
 
 const DB_VERSION = 1;
@@ -23,6 +24,8 @@ export function createEmptySnapshot(): FinanceSnapshot {
     sinkingItems: [],
     assetItems: [],
     netWorthHistory: [],
+    rentUtilityRecords: [],
+    rentUtilityRents: { ...DEFAULT_UTILITY_RENTS },
   };
 }
 
@@ -69,7 +72,26 @@ export class LocalFinanceDB {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readonly');
       const req = tx.objectStore(STORE_KV).get('snapshot');
-      req.onsuccess = () => resolve((req.result as FinanceSnapshot) || createEmptySnapshot());
+      req.onsuccess = () => {
+        const raw = req.result as Partial<FinanceSnapshot> | undefined;
+        if (!raw) {
+          resolve(createEmptySnapshot());
+          return;
+        }
+        const empty = createEmptySnapshot();
+        resolve({
+          ...empty,
+          ...raw,
+          settings: raw.settings || empty.settings,
+          cashflowLogs: Array.isArray(raw.cashflowLogs) ? raw.cashflowLogs : [],
+          recurringItems: Array.isArray(raw.recurringItems) ? raw.recurringItems : [],
+          sinkingItems: Array.isArray(raw.sinkingItems) ? raw.sinkingItems : [],
+          assetItems: Array.isArray(raw.assetItems) ? raw.assetItems : [],
+          netWorthHistory: Array.isArray(raw.netWorthHistory) ? raw.netWorthHistory : [],
+          rentUtilityRecords: Array.isArray(raw.rentUtilityRecords) ? raw.rentUtilityRecords : [],
+          rentUtilityRents: raw.rentUtilityRents || empty.rentUtilityRents,
+        });
+      };
       req.onerror = () => reject(req.error);
     });
   }

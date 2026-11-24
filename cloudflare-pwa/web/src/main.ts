@@ -7,6 +7,7 @@ import { getTodayYmd, renderLogCategories, renderLogTab, updateFxPreview } from 
 import { renderOverviewTab, renderTrendChart } from './ui/overviewTab';
 import { openRecurringModal, openSinkingModal, renderConfigTab } from './ui/configTab';
 import { openAssetModal, renderAssetsTab } from './ui/assetsTab';
+import { bindUtilityTabEvents, renderUtilityTab } from './ui/utilityTab';
 import {
   closeLockScreen,
   isAnyLockEnabled,
@@ -100,6 +101,7 @@ async function bootstrap(): Promise<void> {
       renderOverviewTab(ctx);
       renderConfigTab(ctx);
       renderAssetsTab(ctx);
+      renderUtilityTab(ctx);
     },
     scheduleSync: () => {
       window.clearTimeout(syncDebounce);
@@ -191,7 +193,7 @@ async function bootstrap(): Promise<void> {
 function bindEvents(ctx: UiContext): void {
   // Bottom Nav (支援點擊切換 ＋ 按住左右滑動高亮膠囊、放開切換分頁)
   const navButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('#bottomNav .nav-btn'));
-  const tabOrder: Array<AppUiState['activeTab']> = ['log', 'overview', 'config', 'assets'];
+  const tabOrder: Array<AppUiState['activeTab']> = ['log', 'overview', 'config', 'assets', 'utility'];
 
   const activateTabByIndex = (idx: number) => {
     const safeIdx = Math.max(0, Math.min(navButtons.length - 1, idx));
@@ -532,6 +534,9 @@ function bindEvents(ctx: UiContext): void {
       setLoading(false);
     }
   });
+
+  // Tab 5 Rent & Utility Calculator events
+  bindUtilityTabEvents(ctx);
 
   // iOS PWA Auto-Sync on reconnect / return to foreground + Idle Auto-Lock
   const checkIdle = () => {

@@ -512,4 +512,72 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     const recRows = await db.prepare('SELECT COUNT(*) as cnt FROM recurring_items').first<{ cnt: number }>();
     expect(recRows?.cnt).toBe(2);
   });
+
+  it('syncs 5F & 6F rent utility records and rents via /api/sync and includes them in JSON export', async () => {
+    const cookie = await setupAndGetCookie();
+
+    const syncRes = await app.request(
+      'https://finance.example.com/api/sync',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({
+          mutations: [
+            {
+              mutationId: 'ut-mut-1',
+              entity: 'utility_record',
+              op: 'upsert',
+              recordId: '11511',
+              clientTimestamp: '2026-11-24T06:00:00.000Z',
+              payload: {
+                period: '11511',
+                isBaseline: false,
+                curTotal: 62500,
+                cur6F: 8100,
+                totalElec: 4200,
+                totalWater: 550,
+                f6People: 2,
+                f5People: 3,
+                curA: 260,
+                curB: 5950,
+                curC: 6460,
+              },
+            },
+            {
+              mutationId: 'ut-mut-2',
+              entity: 'utility_rents',
+              op: 'upsert',
+              recordId: '1',
+              clientTimestamp: '2026-11-24T06:00:00.000Z',
+              payload: { rent6F: 18500, rentA: 9500, rentB: 9000, rentC: 8800 },
+            },
+          ],
+        }),
+      },
+      env
+    );
+    expect(syncRes.status).toBe(200);
+    const syncJson = (await syncRes.json()) as {
+      ackedMutationIds: string[];
+      delta: {
+        rentUtilityRecords: Array<{ period: string }>;
+        rentUtilityRents: { rent6F: number } | null;
+      };
+    };
+    expect(syncJson.ackedMutationIds).toEqual(['ut-mut-1', 'ut-mut-2']);
+    expect(syncJson.delta.rentUtilityRecords.some((r) => r.period === '11511')).toBe(true);
+    expect(syncJson.delta.rentUtilityRents?.rent6F).toBe(18500);
+
+    const exportRes = await app.request(
+      'https://finance.example.com/api/export/json',
+      { headers: { cookie } },
+      env
+    );
+    expect(exportRes.status).toBe(200);
+    const exported = (await exportRes.json()) as {
+      data: { rentUtilityRecords: Array<{ period: string }>; rentUtilityRents: { rentA: number } };
+    };
+    expect(exported.data.rentUtilityRecords.length).toBeGreaterThanOrEqual(8);
+    expect(exported.data.rentUtilityRents.rentA).toBe(9500);
+  });
 });

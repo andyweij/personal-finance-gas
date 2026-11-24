@@ -358,8 +358,8 @@ body {
 .bottom-nav {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
   background: var(--glass); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px);
-  border-top: 0.5px solid var(--sep); display: grid; grid-template-columns: repeat(4, 1fr);
-  padding: 6px 8px calc(7px + env(safe-area-inset-bottom, 0px));
+  border-top: 0.5px solid var(--sep); display: grid; grid-template-columns: repeat(5, 1fr);
+  padding: 6px 4px calc(7px + env(safe-area-inset-bottom, 0px));
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
@@ -400,8 +400,8 @@ body {
   justify-content: center;
   gap: 2px;
   height: 44px;
-  padding: 4px;
-  font-size: 11px;
+  padding: 4px 2px;
+  font-size: 10.5px;
   font-weight: 500;
   cursor: pointer;
   transition: color 0.15s ease, transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
@@ -413,6 +413,38 @@ body {
   font-weight: 700;
   transform: translateY(-2px) scale(1.07);
 }
+
+/* Rent & Utility Calculator (Tab 5) */
+.ut-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.ut-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.ut-subcard { background: var(--surface-alt); border: 0.5px solid var(--sep); border-radius: 14px; padding: 12px; }
+.ut-subcard h4 { margin: 0 0 10px; font-size: 13px; font-weight: 700; color: var(--text); }
+.ut-prev-hint { font-size: 10.5px; font-weight: 600; color: var(--text-muted); background: var(--fill); padding: 1px 6px; border-radius: 6px; margin-left: 4px; }
+.ut-alert { padding: 10px 12px; border-radius: 12px; font-size: 12.5px; line-height: 1.5; display: none; margin-bottom: 10px; }
+.ut-alert.show { display: block; }
+.ut-alert.info { background: var(--primary-soft); color: var(--primary); }
+.ut-alert.warn { background: var(--danger-soft); color: var(--danger); }
+.ut-summary-strip { display: flex; flex-wrap: wrap; gap: 6px 14px; background: var(--surface-alt); border-radius: 12px; padding: 10px 12px; font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; }
+.ut-res-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 420px) { .ut-res-grid { grid-template-columns: 1fr; } }
+.ut-res-card { border-radius: 14px; padding: 13px; border: 1px solid var(--sep); background: var(--surface-alt); }
+.ut-res-card.f6 { border-color: rgba(52, 199, 89, 0.45); background: var(--success-soft); }
+.ut-res-card.f5 { border-color: rgba(0, 122, 255, 0.35); background: var(--primary-soft); }
+.ut-res-who { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 700; }
+.ut-res-amt { font-size: 24px; font-weight: 800; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
+.ut-res-card.f6 .ut-res-amt { color: var(--success); }
+.ut-res-card.f5 .ut-res-amt { color: var(--primary); }
+.ut-res-exact { font-size: 11px; color: var(--text-muted); margin-bottom: 8px; }
+.ut-res-ul { list-style: none; margin: 6px 0 0; padding: 6px 0 0; border-top: 0.5px dashed var(--sep); font-size: 12px; }
+.ut-res-ul li { display: flex; justify-content: space-between; margin-bottom: 2px; }
+.ut-rent-total { margin-top: 6px; padding-top: 6px; border-top: 0.5px solid var(--sep); font-size: 12.5px; font-weight: 700; display: flex; justify-content: space-between; }
+.ut-line-box { background: var(--surface-alt); border: 0.5px solid var(--sep); border-radius: 12px; padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; color: var(--text); margin-bottom: 10px; }
+.ut-table-wrap { overflow-x: auto; }
+.ut-table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+.ut-table th, .ut-table td { padding: 8px 6px; border-bottom: 0.5px solid var(--sep); text-align: right; font-variant-numeric: tabular-nums; }
+.ut-table th { color: var(--text-muted); font-weight: 600; font-size: 11px; }
+.ut-table th:first-child, .ut-table td:first-child { text-align: center; }
+.ut-details summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--text-secondary); user-select: none; padding: 4px 0; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,0.38); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); display: none; align-items: flex-end; justify-content: center; }
 .modal-backdrop.open { display: flex; }

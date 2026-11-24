@@ -3,7 +3,7 @@ import type { SyncEngine } from '../sync/syncEngine';
 
 export interface AppUiState {
   masked: boolean;
-  activeTab: 'log' | 'overview' | 'config' | 'assets';
+  activeTab: 'log' | 'overview' | 'config' | 'assets' | 'utility';
   logSubtab: 'entry' | 'ledger';
   ledgerMode: 'list' | 'calendar';
   ledgerPage: number;

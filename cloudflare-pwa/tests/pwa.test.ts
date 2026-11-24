@@ -48,7 +48,7 @@ describe('PWA assets & D1 migration integrity', () => {
     expect(code).toContain('caches.open');
   });
 
-  it('initializes all 12 D1 tables cleanly from 0001_initial.sql', async () => {
+  it('initializes all 14 D1 tables cleanly from migrations (including rent_utility)', async () => {
     const db = createTestD1();
     const res = await db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
@@ -66,8 +66,22 @@ describe('PWA assets & D1 migration integrity', () => {
       'cashflow_logs',
       'networth_history',
       'recurring_items',
+      'rent_utility_records',
+      'rent_utility_settings',
       'sinking_fund_items',
       'sync_idempotency',
     ]);
+
+    // Verify seeded confirmed history (11409 baseline + 11411~11509)
+    const countRow = await db
+      .prepare('SELECT COUNT(*) as cnt FROM rent_utility_records')
+      .first<{ cnt: number }>();
+    expect(countRow?.cnt).toBe(7);
+  });
+
+  it('includes 5th rent-utility tab in index.html', () => {
+    const html = readFileSync(resolve(rootDir, 'web/index.html'), 'utf8');
+    expect(html).toContain('id="tab-utility"');
+    expect(html).toContain('data-tab="utility"');
   });
 });

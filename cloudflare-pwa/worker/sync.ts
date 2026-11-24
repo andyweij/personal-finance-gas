@@ -10,12 +10,19 @@ import type {
   FinanceSnapshot,
   NetWorthHistory,
   RecurringItem,
+  RentUtilityRecord,
+  RentUtilityRents,
   SinkingFundItem,
   SyncDelta,
   SyncMutation,
   SyncRequest,
   SyncResponse,
 } from '../shared/types';
+import {
+  DEFAULT_UTILITY_RENTS,
+  validateUtilityRecordInput,
+  validateUtilityRentsInput,
+} from '../shared/rentUtility';
 import {
   toSafeNumber,
   validateAssetInput,
@@ -153,6 +160,58 @@ function mapNetWorthRow(r: Record<string, unknown>): NetWorthHistory {
     savingsRate: Number(r.savings_rate),
     note: String(r.note || ''),
     updatedAt: String(r.updated_at),
+  };
+}
+
+export async function ensureRentUtilitySettings(db: D1Database): Promise<RentUtilityRents> {
+  const row = await db
+    .prepare('SELECT * FROM rent_utility_settings WHERE id = 1')
+    .first<{
+      rent_6f: number;
+      rent_a: number;
+      rent_b: number;
+      rent_c: number;
+      updated_at: string;
+    }>();
+
+  if (row) {
+    return {
+      rent6F: Number(row.rent_6f || 0),
+      rentA: Number(row.rent_a || 0),
+      rentB: Number(row.rent_b || 0),
+      rentC: Number(row.rent_c || 0),
+      updatedAt: String(row.updated_at || ''),
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO rent_utility_settings (id, rent_6f, rent_a, rent_b, rent_c, updated_at)
+       VALUES (1, 0, 0, 0, 0, ?)`
+    )
+    .bind(nowIso)
+    .run();
+
+  return { ...DEFAULT_UTILITY_RENTS, updatedAt: nowIso };
+}
+
+function mapUtilityRecordRow(r: Record<string, unknown>): RentUtilityRecord {
+  return {
+    period: String(r.period),
+    isBaseline: Number(r.is_baseline) === 1,
+    curTotal: Number(r.cur_total),
+    cur6F: Number(r.cur_6f),
+    totalElec: Number(r.total_elec),
+    totalWater: Number(r.total_water),
+    f6People: Number(r.f6_people),
+    f5People: Number(r.f5_people),
+    curA: Number(r.cur_a),
+    curB: Number(r.cur_b),
+    curC: Number(r.cur_c),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
   };
 }
 
@@ -445,19 +504,114 @@ async function applySingleMutation(
         ts
       )
       .run();
+    return;
+  }
+
+  if (mutation.entity === 'utility_rents') {
+    const existing = await ensureRentUtilitySettings(db);
+    if (!isNewerOrEqual(ts, existing.updatedAt)) return;
+    const v = validateUtilityRentsInput((mutation.payload || {}) as Partial<RentUtilityRents>);
+    await db
+      .prepare(
+        `INSERT INTO rent_utility_settings (id, rent_6f, rent_a, rent_b, rent_c, updated_at)
+         VALUES (1, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           rent_6f = excluded.rent_6f,
+           rent_a = excluded.rent_a,
+           rent_b = excluded.rent_b,
+           rent_c = excluded.rent_c,
+           updated_at = excluded.updated_at`
+      )
+      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, ts)
+      .run();
+    return;
+  }
+
+  if (mutation.entity === 'utility_record') {
+    const existing = await db
+      .prepare('SELECT updated_at, is_baseline FROM rent_utility_records WHERE period = ?')
+      .bind(mutation.recordId)
+      .first<{ updated_at: string; is_baseline: number }>();
+    if (!isNewerOrEqual(ts, existing?.updated_at)) return;
+
+    if (mutation.op === 'delete') {
+      if (existing && Number(existing.is_baseline) === 1) {
+        throw new Error('不可刪除起始表底紀錄。');
+      }
+      await db
+        .prepare('UPDATE rent_utility_records SET deleted_at = ?, updated_at = ? WHERE period = ?')
+        .bind(ts, ts, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateUtilityRecordInput({
+      period: String(p.period || mutation.recordId),
+      isBaseline: Boolean(p.isBaseline),
+      curTotal: Number(p.curTotal),
+      cur6F: Number(p.cur6F),
+      totalElec: Number(p.totalElec ?? 0),
+      totalWater: Number(p.totalWater ?? 0),
+      f6People: Number(p.f6People ?? 2),
+      f5People: Number(p.f5People ?? 3),
+      curA: Number(p.curA),
+      curB: Number(p.curB),
+      curC: Number(p.curC),
+    });
+
+    await db
+      .prepare(
+        `INSERT INTO rent_utility_records
+          (period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(period) DO UPDATE SET
+           is_baseline = excluded.is_baseline,
+           cur_total = excluded.cur_total,
+           cur_6f = excluded.cur_6f,
+           total_elec = excluded.total_elec,
+           total_water = excluded.total_water,
+           f6_people = excluded.f6_people,
+           f5_people = excluded.f5_people,
+           cur_a = excluded.cur_a,
+           cur_b = excluded.cur_b,
+           cur_c = excluded.cur_c,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL`
+      )
+      .bind(
+        v.period,
+        v.isBaseline ? 1 : 0,
+        v.curTotal,
+        v.cur6F,
+        v.totalElec,
+        v.totalWater,
+        v.f6People,
+        v.f5People,
+        v.curA,
+        v.curB,
+        v.curC,
+        String(p.createdAt || ts),
+        ts
+      )
+      .run();
   }
 }
 
 export async function querySyncDelta(db: D1Database, since?: string | null): Promise<SyncDelta> {
-  const settings = await ensureAppSettings(db);
+  const [settings, utilityRents] = await Promise.all([
+    ensureAppSettings(db),
+    ensureRentUtilitySettings(db),
+  ]);
 
   if (since) {
-    const [logs, rec, sink, assets, hist] = await Promise.all([
+    const [logs, rec, sink, assets, hist, utilRecs] = await Promise.all([
       db.prepare('SELECT * FROM cashflow_logs WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
       db.prepare('SELECT * FROM recurring_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM sinking_fund_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM asset_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM networth_history WHERE updated_at > ? ORDER BY year_month DESC').bind(since).all(),
+      db.prepare('SELECT * FROM rent_utility_records WHERE updated_at > ?').bind(since).all(),
     ]);
 
     return {
@@ -467,15 +621,18 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
       sinkingItems: sink.results.map(mapSinkingRow),
       assetItems: assets.results.map(mapAssetRow),
       netWorthHistory: hist.results.map(mapNetWorthRow),
+      rentUtilityRecords: utilRecs.results.map(mapUtilityRecordRow),
+      rentUtilityRents: utilityRents.updatedAt > since ? utilityRents : null,
     };
   }
 
-  const [logs, rec, sink, assets, hist] = await Promise.all([
+  const [logs, rec, sink, assets, hist, utilRecs] = await Promise.all([
     db.prepare('SELECT * FROM cashflow_logs WHERE deleted_at IS NULL ORDER BY date DESC').all(),
     db.prepare('SELECT * FROM recurring_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM sinking_fund_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM asset_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM networth_history ORDER BY year_month DESC').all(),
+    db.prepare('SELECT * FROM rent_utility_records WHERE deleted_at IS NULL').all(),
   ]);
 
   return {
@@ -485,6 +642,8 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
     sinkingItems: sink.results.map(mapSinkingRow),
     assetItems: assets.results.map(mapAssetRow),
     netWorthHistory: hist.results.map(mapNetWorthRow),
+    rentUtilityRecords: utilRecs.results.map(mapUtilityRecordRow),
+    rentUtilityRents: utilityRents,
   };
 }
 
@@ -545,6 +704,8 @@ export async function exportFullSnapshot(db: D1Database): Promise<FinanceSnapsho
     sinkingItems: delta.sinkingItems,
     assetItems: delta.assetItems,
     netWorthHistory: delta.netWorthHistory,
+    rentUtilityRecords: delta.rentUtilityRecords,
+    rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db)),
   };
 }
 
@@ -561,6 +722,9 @@ export async function importFullSnapshot(
     await db.prepare('DELETE FROM sinking_fund_items').run();
     await db.prepare('DELETE FROM asset_items').run();
     await db.prepare('DELETE FROM networth_history').run();
+    if (Array.isArray(data.rentUtilityRecords) && data.rentUtilityRecords.length > 0) {
+      await db.prepare('DELETE FROM rent_utility_records').run();
+    }
   }
 
   const currentSettings = await ensureAppSettings(db);
@@ -709,6 +873,43 @@ export async function importFullSnapshot(
         Math.round(h.monthlyConsumption),
         h.savingsRate,
         h.note || '',
+        nowIso
+      )
+      .run();
+  }
+
+  if (data.rentUtilityRents) {
+    const v = validateUtilityRentsInput(data.rentUtilityRents);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO rent_utility_settings (id, rent_6f, rent_a, rent_b, rent_c, updated_at)
+         VALUES (1, ?, ?, ?, ?, ?)`
+      )
+      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, nowIso)
+      .run();
+  }
+
+  for (const u of data.rentUtilityRecords || []) {
+    const v = validateUtilityRecordInput(u);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO rent_utility_records
+          (period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        v.period,
+        v.isBaseline ? 1 : 0,
+        v.curTotal,
+        v.cur6F,
+        v.totalElec,
+        v.totalWater,
+        v.f6People,
+        v.f5People,
+        v.curA,
+        v.curB,
+        v.curC,
+        u.createdAt || nowIso,
         nowIso
       )
       .run();

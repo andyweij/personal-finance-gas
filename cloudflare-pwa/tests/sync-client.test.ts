@@ -118,6 +118,8 @@ describe('Offline-First IndexedDB & SyncEngine', () => {
           sinkingItems: [],
           assetItems: [],
           netWorthHistory: [],
+          rentUtilityRecords: [],
+          rentUtilityRents: null,
         },
       };
 
@@ -216,5 +218,49 @@ describe('Offline-First IndexedDB & SyncEngine', () => {
       op: 'delete',
       recordId: log.id,
     });
+  });
+
+  it('saves, deletes, and syncs 5F & 6F rent utility records and fixed rents offline-first', async () => {
+    const engine = new SyncEngine(db, {
+      fetchImpl: vi.fn(),
+      isOnline: () => false,
+    });
+    await engine.init();
+
+    await engine.saveUtilityRecord({
+      period: '11409',
+      isBaseline: true,
+      curTotal: 52803,
+      cur6F: 4486,
+      curA: 8989,
+      curB: 5251,
+      curC: 6026,
+    });
+    await engine.saveUtilityRecord({
+      period: '11511',
+      curTotal: 62500,
+      cur6F: 8100,
+      totalElec: 4200,
+      totalWater: 550,
+      f6People: 2,
+      f5People: 3,
+      curA: 260,
+      curB: 5950,
+      curC: 6460,
+    });
+    await engine.saveUtilityRents({ rent6F: 18000, rentA: 9500, rentB: 9000, rentC: 8500 });
+
+    const snap = engine.getSnapshot();
+    expect(snap.rentUtilityRecords).toHaveLength(2);
+    expect(snap.rentUtilityRents.rent6F).toBe(18000);
+
+    // Baseline deletion must be rejected
+    await expect(engine.deleteUtilityRecord('11409')).rejects.toThrow(/起始表底/);
+
+    await engine.deleteUtilityRecord('11511');
+    expect(engine.getSnapshot().rentUtilityRecords).toHaveLength(1);
+    const outbox = await db.getOutbox();
+    expect(outbox.some((m) => m.entity === 'utility_record' && m.op === 'delete' && m.recordId === '11511')).toBe(true);
+    expect(outbox.some((m) => m.entity === 'utility_rents' && m.op === 'upsert')).toBe(true);
   });
 });

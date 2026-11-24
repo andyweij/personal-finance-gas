@@ -89,6 +89,31 @@ export interface NetWorthHistory {
   updatedAt: string;
 }
 
+export interface RentUtilityRecord {
+  period: string;
+  isBaseline: boolean;
+  curTotal: number;
+  cur6F: number;
+  totalElec: number;
+  totalWater: number;
+  f6People: number;
+  f5People: number;
+  curA: number;
+  curB: number;
+  curC: number;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+}
+
+export interface RentUtilityRents {
+  rent6F: number;
+  rentA: number;
+  rentB: number;
+  rentC: number;
+  updatedAt: string;
+}
+
 export interface FinanceSnapshot {
   settings: AppSettings;
   cashflowLogs: CashFlowLog[];
@@ -96,9 +121,18 @@ export interface FinanceSnapshot {
   sinkingItems: SinkingFundItem[];
   assetItems: AssetItem[];
   netWorthHistory: NetWorthHistory[];
+  rentUtilityRecords: RentUtilityRecord[];
+  rentUtilityRents: RentUtilityRents;
 }
 
-export type SyncEntity = 'cashflow' | 'recurring' | 'sinking' | 'asset' | 'settings';
+export type SyncEntity =
+  | 'cashflow'
+  | 'recurring'
+  | 'sinking'
+  | 'asset'
+  | 'settings'
+  | 'utility_record'
+  | 'utility_rents';
 export type SyncOp = 'upsert' | 'delete';
 
 export interface SyncMutation {
@@ -124,6 +158,8 @@ export interface SyncDelta {
   sinkingItems: SinkingFundItem[];
   assetItems: AssetItem[];
   netWorthHistory: NetWorthHistory[];
+  rentUtilityRecords: RentUtilityRecord[];
+  rentUtilityRents: RentUtilityRents | null;
 }
 
 export interface SyncResponse {

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -84,9 +84,14 @@ class MockD1PreparedStatement {
 
 export function createTestD1(): D1Database {
   const sqlite = new DatabaseSync(':memory:');
-  const migrationPath = resolve(currentDir, '../../migrations/0001_initial.sql');
-  const migrationSql = readFileSync(migrationPath, 'utf8');
-  sqlite.exec(migrationSql);
+  const migrationsDir = resolve(currentDir, '../../migrations');
+  const sqlFiles = readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+  for (const file of sqlFiles) {
+    const migrationSql = readFileSync(resolve(migrationsDir, file), 'utf8');
+    sqlite.exec(migrationSql);
+  }
 
   const mockDb = {
     prepare(query: string) {

@@ -1,4 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import {
+  buildUtilityCsv,
+  buildUtilityLineMessages,
+  chainUtilityRecords,
+  computeUtilityBill,
+  nextUtilityPeriodCode,
+} from '../shared/rentUtility';
 import { CASHFLOW_TYPES } from '../shared/constants';
 import {
   parseLocalDate,
@@ -455,5 +462,62 @@ describe('shared/csv', () => {
     const hist = parseNetWorthHistoryCsv(historyCsv);
     expect(hist).toHaveLength(1);
     expect(hist[0]).toMatchObject({ yearMonth: '2026-10', totalAssets: 3040000, netWorth: -3550000, savingsRate: 0.363 });
+  });
+
+  it('computes 5F & 6F rent utility split with 10,000 meter rollover, auto-chaining, LINE text, and CSV', () => {
+    expect(nextUtilityPeriodCode('11509')).toBe('11511');
+    expect(nextUtilityPeriodCode('11511')).toBe('11601');
+
+    const chained = chainUtilityRecords([
+      {
+        period: '11509',
+        isBaseline: false,
+        curTotal: 61261,
+        cur6F: 7762,
+        totalElec: 8214,
+        totalWater: 494,
+        f6People: 2,
+        f5People: 3,
+        curA: 105,
+        curB: 5852,
+        curC: 6374,
+        createdAt: '',
+        updatedAt: '',
+      },
+      {
+        period: '11507',
+        isBaseline: true,
+        curTotal: 59341,
+        cur6F: 6607,
+        totalElec: 0,
+        totalWater: 0,
+        f6People: 2,
+        f5People: 3,
+        curA: 9826,
+        curB: 5732,
+        curC: 6295,
+        createdAt: '',
+        updatedAt: '',
+      },
+    ]);
+
+    expect(chained[1].prevA).toBe(9826);
+    const r = computeUtilityBill(chained[1]);
+    expect(r.totalKwh).toBe(1920);
+    expect(r.f6Kwh).toBe(1155);
+    expect(r.f5Kwh).toBe(765);
+    expect(r.aKwh).toBe(279);
+    expect(r.pubKwh).toBe(287);
+    expect(r.f6Elec + r.f5Elec).toBe(8214);
+    expect(r.f6Water + r.f5Water).toBe(494);
+    expect(r.checkDiff).toBe(0);
+
+    const msgs = buildUtilityLineMessages('11509', chained[1], r, { rent6F: 18000, rentA: 9000, rentB: 0, rentC: 0 });
+    expect(msgs.line6F).toContain('【11509期 6F水電費明細】');
+    expect(msgs.line6F).toContain('含房租 $18,000');
+    expect(msgs.line5F).toContain('A房（9826→105，279度）');
+
+    const csv = buildUtilityCsv(chained);
+    expect(csv).toContain('11509,59341,61261,1920');
   });
 });

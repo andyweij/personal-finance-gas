@@ -1,9 +1,17 @@
 import { RECURRING_CASHFLOW_TYPES } from '../../../shared/constants';
+import {
+  sortUtilityRecords,
+  validateUtilityRecordInput,
+  validateUtilityRentsInput,
+  type UtilityRecordInputPayload,
+} from '../../../shared/rentUtility';
 import type {
   AssetItem,
   CashFlowLog,
   FinanceSnapshot,
   RecurringItem,
+  RentUtilityRecord,
+  RentUtilityRents,
   SinkingFundItem,
   SyncDelta,
   SyncMutation,
@@ -57,6 +65,27 @@ function mergeById<T extends { id: string; deletedAt?: string | null; updatedAt:
     }
   }
   return Array.from(map.values());
+}
+
+function mergeUtilityRecords(
+  current: RentUtilityRecord[],
+  incoming: RentUtilityRecord[]
+): RentUtilityRecord[] {
+  const map = new Map<string, RentUtilityRecord>();
+  for (const item of current) {
+    map.set(item.period, item);
+  }
+  for (const item of incoming) {
+    if (item.deletedAt) {
+      map.delete(item.period);
+    } else {
+      const existing = map.get(item.period);
+      if (!existing || item.updatedAt >= existing.updatedAt) {
+        map.set(item.period, item);
+      }
+    }
+  }
+  return sortUtilityRecords(Array.from(map.values()));
 }
 
 export class SyncEngine {
@@ -392,6 +421,111 @@ export class SyncEngine {
     ]);
   }
 
+  async saveUtilityRecord(payload: UtilityRecordInputPayload): Promise<RentUtilityRecord> {
+    const v = validateUtilityRecordInput(payload);
+    const nowIso = new Date().toISOString();
+    const existing = this.snapshot.rentUtilityRecords.find((r) => r.period === v.period);
+    const record: RentUtilityRecord = {
+      ...v,
+      createdAt: existing?.createdAt || nowIso,
+      updatedAt: nowIso,
+      deletedAt: null,
+    };
+
+    const updates: RentUtilityRecord[] = [record];
+    const mutations: SyncMutation[] = [];
+
+    // 若更新的是第一期非起點紀錄，且使用者有微調上期度數，同步更新起點表底
+    const sorted = sortUtilityRecords(this.snapshot.rentUtilityRecords);
+    const baseline = sorted.find((r) => r.isBaseline);
+    const firstNonBase = sorted.find((r) => !r.isBaseline);
+    if (
+      baseline &&
+      (!firstNonBase || firstNonBase.period === v.period) &&
+      payload.prevTotal !== undefined &&
+      Number.isFinite(Number(payload.prevTotal))
+    ) {
+      const updatedBaseline: RentUtilityRecord = {
+        ...baseline,
+        curTotal: Math.round(Number(payload.prevTotal)),
+        cur6F: Math.round(Number(payload.prev6F ?? baseline.cur6F)),
+        curA: Math.round(Number(payload.prevA ?? baseline.curA)),
+        curB: Math.round(Number(payload.prevB ?? baseline.curB)),
+        curC: Math.round(Number(payload.prevC ?? baseline.curC)),
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      updates.push(updatedBaseline);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'utility_record',
+        op: 'upsert',
+        recordId: updatedBaseline.period,
+        clientTimestamp: nowIso,
+        payload: { ...updatedBaseline },
+      });
+    }
+
+    mutations.push({
+      mutationId: crypto.randomUUID(),
+      entity: 'utility_record',
+      op: 'upsert',
+      recordId: record.period,
+      clientTimestamp: nowIso,
+      payload: { ...record },
+    });
+
+    this.snapshot = {
+      ...this.snapshot,
+      rentUtilityRecords: mergeUtilityRecords(this.snapshot.rentUtilityRecords, updates),
+    };
+    await this.commitAndMaybeSync(mutations);
+    return record;
+  }
+
+  async deleteUtilityRecord(period: string): Promise<void> {
+    const clean = String(period || '').trim();
+    const target = this.snapshot.rentUtilityRecords.find((r) => r.period === clean);
+    if (!target || target.isBaseline) {
+      throw new Error('無法刪除起始表底或不存在的期別。');
+    }
+    const nowIso = new Date().toISOString();
+    this.snapshot = {
+      ...this.snapshot,
+      rentUtilityRecords: this.snapshot.rentUtilityRecords.filter((r) => r.period !== clean),
+    };
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'utility_record',
+        op: 'delete',
+        recordId: clean,
+        clientTimestamp: nowIso,
+      },
+    ]);
+  }
+
+  async saveUtilityRents(rents: Partial<RentUtilityRents>): Promise<RentUtilityRents> {
+    const v = validateUtilityRentsInput(rents);
+    const nowIso = new Date().toISOString();
+    const nextRents: RentUtilityRents = { ...v, updatedAt: nowIso };
+    this.snapshot = {
+      ...this.snapshot,
+      rentUtilityRents: nextRents,
+    };
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'utility_rents',
+        op: 'upsert',
+        recordId: '1',
+        clientTimestamp: nowIso,
+        payload: { ...nextRents },
+      },
+    ]);
+    return nextRents;
+  }
+
   private async commitAndMaybeSync(mutations: SyncMutation[]): Promise<void> {
     await this.db.commitLocalMutation(this.snapshot, mutations);
     const outbox = await this.db.getOutbox();
@@ -492,6 +626,9 @@ export class SyncEngine {
   }
 
   private mergeDelta(current: FinanceSnapshot, delta: SyncDelta, isFull: boolean): FinanceSnapshot {
+    const incomingUtilityRecords = Array.isArray(delta.rentUtilityRecords) ? delta.rentUtilityRecords : [];
+    const incomingUtilityRents = delta.rentUtilityRents || current.rentUtilityRents;
+
     if (isFull) {
       return {
         settings: delta.settings || current.settings,
@@ -502,6 +639,8 @@ export class SyncEngine {
         netWorthHistory: delta.netWorthHistory
           .slice()
           .sort((a, b) => b.yearMonth.localeCompare(a.yearMonth)),
+        rentUtilityRecords: sortUtilityRecords(incomingUtilityRecords),
+        rentUtilityRents: incomingUtilityRents,
       };
     }
 
@@ -519,6 +658,8 @@ export class SyncEngine {
       netWorthHistory: Array.from(historyMap.values()).sort((a, b) =>
         b.yearMonth.localeCompare(a.yearMonth)
       ),
+      rentUtilityRecords: mergeUtilityRecords(current.rentUtilityRecords || [], incomingUtilityRecords),
+      rentUtilityRents: incomingUtilityRents,
     };
   }
 }
