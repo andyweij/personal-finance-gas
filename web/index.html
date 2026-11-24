@@ -664,8 +664,8 @@
       -webkit-backdrop-filter: saturate(180%) blur(20px);
       border-top: 0.5px solid var(--sep);
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      padding: 6px 8px calc(7px + env(safe-area-inset-bottom, 0px));
+      grid-template-columns: repeat(5, 1fr);
+      padding: 6px 4px calc(7px + env(safe-area-inset-bottom, 0px));
     }
     .nav-btn {
       border: none;
@@ -675,13 +675,94 @@
       flex-direction: column;
       align-items: center;
       gap: 3px;
-      padding: 4px;
-      font-size: 11px;
+      padding: 4px 2px;
+      font-size: 10.5px;
       font-weight: 500;
       cursor: pointer;
       transition: color 0.15s ease;
     }
     .nav-btn.active { color: var(--primary); font-weight: 600; }
+
+    /* Rent & Utility Calculator (Tab 5) */
+    .ut-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .ut-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .ut-subcard {
+      background: var(--surface-alt);
+      border: 0.5px solid var(--sep);
+      border-radius: 14px;
+      padding: 12px;
+    }
+    .ut-subcard h4 { margin: 0 0 10px; font-size: 13px; font-weight: 700; color: var(--text); }
+    .ut-prev-hint {
+      font-size: 10.5px;
+      font-weight: 600;
+      color: var(--text-muted);
+      background: var(--fill);
+      padding: 1px 6px;
+      border-radius: 6px;
+      margin-left: 4px;
+    }
+    .ut-alert {
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-size: 12.5px;
+      line-height: 1.5;
+      display: none;
+      margin-bottom: 10px;
+    }
+    .ut-alert.show { display: block; }
+    .ut-alert.info { background: var(--primary-soft); color: var(--primary); }
+    .ut-alert.warn { background: var(--danger-soft); color: var(--danger); }
+    .ut-summary-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 14px;
+      background: var(--surface-alt);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-bottom: 12px;
+    }
+    .ut-summary-strip strong { color: var(--text); }
+    .ut-res-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    @media (max-width: 420px) { .ut-res-grid { grid-template-columns: 1fr; } }
+    .ut-res-card {
+      border-radius: 14px;
+      padding: 13px;
+      border: 1px solid var(--sep);
+      background: var(--surface-alt);
+    }
+    .ut-res-card.f6 { border-color: rgba(52, 199, 89, 0.45); background: var(--success-soft); }
+    .ut-res-card.f5 { border-color: rgba(0, 122, 255, 0.35); background: var(--primary-soft); }
+    .ut-res-who { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 700; }
+    .ut-res-amt { font-size: 24px; font-weight: 800; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
+    .ut-res-card.f6 .ut-res-amt { color: var(--success); }
+    .ut-res-card.f5 .ut-res-amt { color: var(--primary); }
+    .ut-res-exact { font-size: 11px; color: var(--text-muted); margin-bottom: 8px; }
+    .ut-res-ul { list-style: none; margin: 6px 0 0; padding: 6px 0 0; border-top: 0.5px dashed var(--sep); font-size: 12px; }
+    .ut-res-ul li { display: flex; justify-content: space-between; margin-bottom: 2px; }
+    .ut-rent-total {
+      margin-top: 6px; padding-top: 6px; border-top: 0.5px solid var(--sep);
+      font-size: 12.5px; font-weight: 700; display: flex; justify-content: space-between;
+    }
+    .ut-line-box {
+      background: var(--surface-alt);
+      border: 0.5px solid var(--sep);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      color: var(--text);
+      margin-bottom: 10px;
+    }
+    .ut-table-wrap { overflow-x: auto; }
+    .ut-table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+    .ut-table th, .ut-table td { padding: 8px 6px; border-bottom: 0.5px solid var(--sep); text-align: right; font-variant-numeric: tabular-nums; }
+    .ut-table th { color: var(--text-muted); font-weight: 600; font-size: 11px; }
+    .ut-table th:first-child, .ut-table td:first-child { text-align: center; }
+    .ut-details summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--text-secondary); user-select: none; padding: 4px 0; }
 
     /* Device-Aware Modal (Mobile Bottom Sheet vs Desktop Centered Dialog) */
     .modal-backdrop {
@@ -1219,25 +1300,211 @@
         <div class="list-group" id="historyList"></div>
       </div>
     </section>
+
+    <!-- ==================== TAB 5: 5F & 6F 房租水電分攤 ==================== -->
+    <section class="tab-view" id="tab-utility">
+      <div class="card">
+        <div class="card-header" style="margin-bottom:8px">
+          <div>
+            <div class="card-title">🏠 5F &amp; 6F 水電費自動分攤</div>
+            <div class="muted" id="utSyncStatus">尚未載入，點擊切換分頁將自動同步 Rent_Utility</div>
+          </div>
+          <span class="badge" id="utModeBadge">待載入</span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button type="button" class="btn btn-primary btn-sm" id="utNewPeriodBtn">➕ 開新的一期</button>
+          <button type="button" class="btn btn-outline btn-sm" id="utReloadBtn">🔄 重新讀取</button>
+          <button type="button" class="btn btn-outline btn-sm" id="utExportCsvBtn">⬇️ 匯出 CSV</button>
+        </div>
+      </div>
+
+      <!-- 步驟一：輸入度數與帳單 -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">✏️ 1. 填入本期度數與帳單金額</span>
+        </div>
+
+        <div class="ut-subcard" style="margin-bottom:10px">
+          <h4>📅 期別、帳單金額與分攤人數</h4>
+          <div class="ut-grid-2">
+            <div class="field" style="margin-bottom:8px">
+              <label class="section-label" for="utPeriod">期別（如 11511）</label>
+              <input id="utPeriod" type="text" placeholder="11511" />
+            </div>
+            <div class="field" style="margin-bottom:8px">
+              <label class="section-label" for="utTotalElec">台電總電費 (元)</label>
+              <input id="utTotalElec" type="number" inputmode="numeric" min="0" placeholder="台電帳單金額" />
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label class="section-label" for="utTotalWater">自來水總水費 (元)</label>
+              <input id="utTotalWater" type="number" inputmode="numeric" min="0" placeholder="水費帳單金額" />
+            </div>
+            <div class="ut-grid-2" style="gap:6px">
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utF6People">6F 人數</label>
+                <input id="utF6People" type="number" inputmode="numeric" min="0" value="2" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utF5People">5F 人數</label>
+                <input id="utF5People" type="number" inputmode="numeric" min="1" value="3" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ut-subcard" style="margin-bottom:10px">
+          <h4>⚡ 整棟總表 &amp; 6F 電表</h4>
+          <div class="ut-grid-2">
+            <div class="field" style="margin-bottom:0">
+              <label class="section-label" for="utCurTotal">總表本期 <span class="ut-prev-hint" id="utHintPrevTotal">上期：-</span></label>
+              <input id="utCurTotal" type="number" inputmode="numeric" placeholder="本期總表度數" />
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label class="section-label" for="utCur6F">6F 本期 <span class="ut-prev-hint" id="utHintPrev6F">上期：-</span></label>
+              <input id="utCur6F" type="number" inputmode="numeric" placeholder="6F 真實度數" />
+            </div>
+          </div>
+          <details class="ut-details" style="margin-top:8px">
+            <summary>🔧 手動微調總表 / 6F 上期度數（平常免改）</summary>
+            <div class="ut-grid-2" style="margin-top:8px">
+              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevTotal">總表上期</label><input id="utPrevTotal" type="number" inputmode="numeric" /></div>
+              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrev6F">6F 上期</label><input id="utPrev6F" type="number" inputmode="numeric" /></div>
+            </div>
+          </details>
+        </div>
+
+        <div class="ut-subcard" style="margin-bottom:10px">
+          <h4>🚪 5F 各房電表（滿 10,000 自動歸零）</h4>
+          <div class="ut-grid-3">
+            <div class="field" style="margin-bottom:0">
+              <label class="section-label" for="utCurA">A 房 <span class="ut-prev-hint" id="utHintPrevA">-</span></label>
+              <input id="utCurA" type="number" inputmode="numeric" placeholder="A度數" />
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label class="section-label" for="utCurB">B 房 <span class="ut-prev-hint" id="utHintPrevB">-</span></label>
+              <input id="utCurB" type="number" inputmode="numeric" placeholder="B度數" />
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label class="section-label" for="utCurC">C 房 <span class="ut-prev-hint" id="utHintPrevC">-</span></label>
+              <input id="utCurC" type="number" inputmode="numeric" placeholder="C度數" />
+            </div>
+          </div>
+          <details class="ut-details" style="margin-top:8px">
+            <summary>🔧 手動微調 5F A/B/C 上期度數（平常免改）</summary>
+            <div class="ut-grid-3" style="margin-top:8px">
+              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevA">A 上期</label><input id="utPrevA" type="number" inputmode="numeric" /></div>
+              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevB">B 上期</label><input id="utPrevB" type="number" inputmode="numeric" /></div>
+              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevC">C 上期</label><input id="utPrevC" type="number" inputmode="numeric" /></div>
+            </div>
+          </details>
+        </div>
+
+        <details class="ut-details" style="margin-bottom:12px">
+          <summary>💰 選填：固定月租金設定（同步存於 Rent_Utility，算「房租＋水電」總匯款）</summary>
+          <div class="ut-grid-2" style="margin-top:8px">
+            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRent6F">6F 月租金</label><input id="utRent6F" type="number" inputmode="numeric" min="0" value="0" /></div>
+            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentA">5F A 房月租金</label><input id="utRentA" type="number" inputmode="numeric" min="0" value="0" /></div>
+            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentB">5F B 房月租金</label><input id="utRentB" type="number" inputmode="numeric" min="0" value="0" /></div>
+            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentC">5F C 房月租金</label><input id="utRentC" type="number" inputmode="numeric" min="0" value="0" /></div>
+          </div>
+          <button type="button" class="btn btn-outline btn-sm" id="utSaveRentsBtn" style="margin-top:4px">💾 單獨儲存月租金</button>
+        </details>
+
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:8px">
+          <button type="button" class="btn btn-primary" id="utSaveBtn">💾 儲存本期並同步試算表</button>
+          <button type="button" class="btn btn-outline" id="utClearBtn">清空</button>
+        </div>
+      </div>
+
+      <!-- 步驟二：自動分攤結果與 LINE 明細 -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">📊 2. 自動計算與對帳結果</span>
+          <span class="badge" id="utCheckStatus">等待輸入...</span>
+        </div>
+        <div class="ut-alert info" id="utInfoBox"></div>
+        <div class="ut-alert warn" id="utWarnBox"></div>
+        <div class="ut-summary-strip" id="utSummaryStrip">請填入本期度數與帳單金額，分攤結果將即時計算。</div>
+        <div class="ut-res-grid" id="utResultCards"></div>
+
+        <div id="utLineSection" style="display:none;margin-top:14px">
+          <div class="section-heading" style="margin-bottom:8px">
+            <span>💬 一鍵複製 LINE 對帳明細</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <strong style="font-size:12.5px;color:var(--success)">傳給 6F</strong>
+            <button type="button" class="btn btn-outline btn-sm" id="utCopy6FBtn">📋 複製 6F 明細</button>
+          </div>
+          <div class="ut-line-box" id="utLine6F"></div>
+
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <strong style="font-size:12.5px;color:var(--primary)">傳給 5F 群組（A / B / C）</strong>
+            <button type="button" class="btn btn-outline btn-sm" id="utCopy5FBtn">📋 複製 5F 明細</button>
+          </div>
+          <div class="ut-line-box" id="utLine5F"></div>
+
+          <div class="section-heading" style="margin:12px 0 8px">
+            <span>🔗 選用連動：一鍵寫入個人現金流</span>
+          </div>
+          <div class="ut-grid-2">
+            <button type="button" class="btn btn-outline btn-sm" id="utPostExpenseBtn">💸 記為水電帳單支出</button>
+            <button type="button" class="btn btn-outline btn-sm" id="utPostIncomeBtn">💰 記為代收水電收入</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 步驟三：歷史抄表紀錄 -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">📚 雲端歷史抄表紀錄</span>
+          <span class="muted">點編輯自動連動下期</span>
+        </div>
+        <div class="ut-table-wrap">
+          <table class="ut-table">
+            <thead>
+              <tr>
+                <th>期別</th>
+                <th>總表</th>
+                <th>6F</th>
+                <th>總電</th>
+                <th>總水</th>
+                <th>6F應繳</th>
+                <th>A房</th>
+                <th>B房</th>
+                <th>C房</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="utHistoryBody">
+              <tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:16px">切換至此分頁時自動載入...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </main>
 
-  <!-- 底部毛玻璃 4 分頁導覽列 -->
+  <!-- 底部毛玻璃 5 分頁導覽列 -->
   <nav class="bottom-nav">
     <button type="button" class="nav-btn active" data-tab="log">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
       <span>記帳</span>
     </button>
     <button type="button" class="nav-btn" data-tab="overview">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7" rx="1"/><rect x="12" y="6" width="3" height="11" rx="1"/><rect x="17" y="13" width="3" height="4" rx="1"/></svg>
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7" rx="1"/><rect x="12" y="6" width="3" height="11" rx="1"/><rect x="17" y="13" width="3" height="4" rx="1"/></svg>
       <span>總覽</span>
     </button>
     <button type="button" class="nav-btn" data-tab="config">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
       <span>固定/分攤</span>
     </button>
     <button type="button" class="nav-btn" data-tab="assets">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
       <span>資產負債</span>
+    </button>
+    <button type="button" class="nav-btn" data-tab="utility">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20h14V9.5"/><path d="M13 11l-3 5h3l-1 4 4-6h-3l0-3z"/></svg>
+      <span>水電分攤</span>
     </button>
   </nav>
 
@@ -1288,6 +1555,10 @@
       idleLocked: false,
       pendingIdleRefresh: false,
       bundle: null,
+      utilityLoaded: false,
+      utilityRecords: [],
+      utilityLastBillTotal: 0,
+      utilityLastTenantTotal: 0,
       busy: false,
     };
 
@@ -1360,6 +1631,8 @@
     /* ================= IDLE AUTO-PROTECTION & REFRESH ================= */
     function scrubSensitiveDom() {
       app.bundle = null;
+      app.utilityLoaded = false;
+      app.utilityRecords = [];
       const placeholders = [
         ['remainingBudget', 'NT$ --'],
         ['spentText', '已花費 NT$ --'],
@@ -1371,12 +1644,14 @@
         ['totalLiabText', 'NT$ --'],
         ['debtRatioBadge', '負債比 --%'],
         ['sinkingMonthlyTotal', 'NT$ --'],
+        ['utLine6F', ''],
+        ['utLine5F', ''],
       ];
       placeholders.forEach(([id, txt]) => {
         const el = document.getElementById(id);
         if (el) el.textContent = txt;
       });
-      ['recentList', 'calDayList', 'overviewKpis', 'majorStatsBody', 'recurringList', 'sinkingList', 'autoAssetsList', 'manualAssetsList', 'historyList', 'allocBar', 'allocLegend'].forEach((id) => {
+      ['recentList', 'calDayList', 'overviewKpis', 'majorStatsBody', 'recurringList', 'sinkingList', 'autoAssetsList', 'manualAssetsList', 'historyList', 'allocBar', 'allocLegend', 'utResultCards', 'utHistoryBody'].forEach((id) => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = '';
       });
@@ -2756,6 +3031,9 @@
         app.activeTab = tab;
         document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b === btn));
         document.querySelectorAll('.tab-view').forEach((v) => v.classList.toggle('active', v.id === 'tab-' + tab));
+        if (tab === 'utility' && !app.utilityLoaded) {
+          utLoadFromSheet(true);
+        }
         window.scrollTo({ top: 0, behavior: 'smooth' });
       });
     });
@@ -2771,6 +3049,10 @@
         renderConfigTab();
         renderAssetsTab();
       }
+      if (app.utilityLoaded) {
+        utRecalculate();
+        utRenderHistory();
+      }
       showToast(app.masked ? '已開啟金額隱私遮罩' : '已顯示實際金額');
     });
 
@@ -2785,7 +3067,13 @@
         openLockScreen('已手動上鎖');
       });
     });
-    document.getElementById('refreshBtn').addEventListener('click', () => loadBundle(app.selectedYear, app.selectedMonth, true));
+    document.getElementById('refreshBtn').addEventListener('click', () => {
+      if (app.activeTab === 'utility') {
+        utLoadFromSheet(false);
+      } else {
+        loadBundle(app.selectedYear, app.selectedMonth, true);
+      }
+    });
 
     // Tab 1: Sub-tab switching (快速記帳 / 流水帳明細)
     function switchLogSubtab(sub) {
@@ -2971,6 +3259,517 @@
     document.getElementById('runSnapshotBtn').addEventListener('click', () => {
       if (!confirm('確定要立即將目前資產負債總計寫入 NetWorth_History 快照？')) return;
       runServer('runSnapshotFromUi', [app.token, app.selectedYear, app.selectedMonth], (res) => {
+        applyBundle(res.bundle);
+        showToast(res.message, 'success');
+      });
+    });
+
+    /* ================= TAB 5: 5F & 6F 房租水電分攤 ================= */
+    const UT_SUB_MOD = 10000;
+    const UT_MAIN_MOD = 100000;
+
+    function utNum(id) {
+      const v = document.getElementById(id).value;
+      if (v === '' || v === null || v === undefined) return NaN;
+      return Number(v);
+    }
+
+    function utFmt(n, digits = 0) {
+      if (!isFinite(n)) return '-';
+      return n.toLocaleString('zh-TW', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    }
+
+    function utFmtDollar(n, digits = 0) {
+      if (app.masked) return '$••••';
+      return '$' + utFmt(n, digits);
+    }
+
+    function utMeterDiff(cur, prev, mod) {
+      return (((cur - prev) % mod) + mod) % mod;
+    }
+
+    function utDidRollover(cur, prev, mod) {
+      return (((cur % mod) + mod) % mod) < (((prev % mod) + mod) % mod);
+    }
+
+    function utNextPeriod(code) {
+      if (!/^\d{5}$/.test(code)) return '';
+      let y = parseInt(code.slice(0, 3), 10);
+      let m = parseInt(code.slice(3, 5), 10);
+      m += 2;
+      if (m > 12) { m -= 12; y += 1; }
+      return String(y) + String(m).padStart(2, '0');
+    }
+
+    function utCompute(d) {
+      const totalKwh = utMeterDiff(d.curTotal, d.prevTotal, UT_MAIN_MOD);
+      const f6Kwh = utMeterDiff(d.cur6F, d.prev6F, UT_SUB_MOD);
+      const f5Kwh = totalKwh - f6Kwh;
+      const avgRate = totalKwh > 0 ? d.totalElec / totalKwh : NaN;
+
+      const f5Elec = totalKwh > 0 ? Math.round((d.totalElec * f5Kwh) / totalKwh) : NaN;
+      const f6Elec = totalKwh > 0 ? d.totalElec - f5Elec : NaN;
+
+      const totalPpl = d.f6People + d.f5People;
+      let f5Water = 0;
+      let f6Water = 0;
+      if (d.f6People === 0) {
+        f5Water = d.totalWater;
+        f6Water = 0;
+      } else if (totalPpl > 0) {
+        const perPerson = Math.floor(d.totalWater / totalPpl);
+        f5Water = perPerson * d.f5People;
+        f6Water = d.totalWater - f5Water;
+      }
+
+      const f6Total = f6Elec + f6Water;
+      const f5Total = f5Elec + f5Water;
+
+      const aKwh = utMeterDiff(d.curA, d.prevA, UT_SUB_MOD);
+      const bKwh = utMeterDiff(d.curB, d.prevB, UT_SUB_MOD);
+      const cKwh = utMeterDiff(d.curC, d.prevC, UT_SUB_MOD);
+      const pubKwh = f5Kwh - (aKwh + bKwh + cKwh);
+
+      const f5Rate = f5Kwh > 0 ? f5Elec / f5Kwh : NaN;
+      const pubEachKwh = d.f5People > 0 ? pubKwh / d.f5People : NaN;
+      const pubEachElec = pubEachKwh * f5Rate;
+      const waterEach = d.f5People > 0 ? f5Water / d.f5People : NaN;
+
+      const aPriv = aKwh * f5Rate;
+      const bPriv = bKwh * f5Rate;
+      const cPriv = cKwh * f5Rate;
+
+      const aTotal = aPriv + pubEachElec + waterEach;
+      const bTotal = bPriv + pubEachElec + waterEach;
+      const cTotal = cPriv + pubEachElec + waterEach;
+      const checkDiff = Math.round(((f6Total + aTotal + bTotal + cTotal) - (d.totalElec + d.totalWater)) * 100) / 100;
+
+      return {
+        totalKwh, f6Kwh, f5Kwh, avgRate,
+        f6Elec, f6Water, f6Total,
+        f5Elec, f5Water, f5Total, f5Rate,
+        aKwh, bKwh, cKwh, pubKwh, pubEachKwh,
+        aPriv, bPriv, cPriv, pubEachElec, waterEach,
+        aTotal, bTotal, cTotal, checkDiff,
+      };
+    }
+
+    function utGetRents() {
+      return {
+        rent6F: utNum('utRent6F') || 0,
+        rentA: utNum('utRentA') || 0,
+        rentB: utNum('utRentB') || 0,
+        rentC: utNum('utRentC') || 0,
+      };
+    }
+
+    function utUpdatePrevHints() {
+      const pairs = [
+        ['utPrevTotal', 'utHintPrevTotal', '上期：'],
+        ['utPrev6F', 'utHintPrev6F', '上期：'],
+        ['utPrevA', 'utHintPrevA', ''],
+        ['utPrevB', 'utHintPrevB', ''],
+        ['utPrevC', 'utHintPrevC', ''],
+      ];
+      pairs.forEach(([inId, hintId, prefix]) => {
+        const v = document.getElementById(inId).value;
+        document.getElementById(hintId).textContent = prefix + (v !== '' ? Number(v).toLocaleString('zh-TW') : '-');
+      });
+    }
+
+    function utFillNextFromLatest() {
+      if (!app.utilityRecords.length) return;
+      const latest = app.utilityRecords[app.utilityRecords.length - 1];
+      document.getElementById('utPeriod').value = utNextPeriod(latest.period);
+      document.getElementById('utPrevTotal').value = latest.curTotal ?? '';
+      document.getElementById('utPrev6F').value = latest.cur6F ?? '';
+      document.getElementById('utPrevA').value = latest.curA ?? '';
+      document.getElementById('utPrevB').value = latest.curB ?? '';
+      document.getElementById('utPrevC').value = latest.curC ?? '';
+      ['utCurTotal', 'utCur6F', 'utTotalElec', 'utTotalWater', 'utCurA', 'utCurB', 'utCurC'].forEach((id) => {
+        document.getElementById(id).value = '';
+      });
+      document.getElementById('utF6People').value = latest.f6People ?? 2;
+      document.getElementById('utF5People').value = latest.f5People ?? 3;
+      document.getElementById('utModeBadge').textContent = `新增下一期（帶入 ${latest.period}）`;
+      utUpdatePrevHints();
+      utRecalculate();
+    }
+
+    function utLoadRecordToForm(idx) {
+      const rec = app.utilityRecords[idx];
+      if (!rec || rec.isBaseline) return;
+      document.getElementById('utPeriod').value = rec.period;
+      document.getElementById('utPrevTotal').value = rec.prevTotal;
+      document.getElementById('utCurTotal').value = rec.curTotal;
+      document.getElementById('utPrev6F').value = rec.prev6F;
+      document.getElementById('utCur6F').value = rec.cur6F;
+      document.getElementById('utTotalElec').value = rec.totalElec;
+      document.getElementById('utTotalWater').value = rec.totalWater;
+      document.getElementById('utF6People').value = rec.f6People;
+      document.getElementById('utF5People').value = rec.f5People;
+      document.getElementById('utPrevA').value = rec.prevA;
+      document.getElementById('utCurA').value = rec.curA;
+      document.getElementById('utPrevB').value = rec.prevB;
+      document.getElementById('utCurB').value = rec.curB;
+      document.getElementById('utPrevC').value = rec.prevC;
+      document.getElementById('utCurC').value = rec.curC;
+      document.getElementById('utModeBadge').textContent = `編輯 ${rec.period} 期`;
+      utUpdatePrevHints();
+      utRecalculate();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function utRecalculate() {
+      utUpdatePrevHints();
+      const period = document.getElementById('utPeriod').value.trim() || '本期';
+      const d = {
+        prevTotal: utNum('utPrevTotal'), curTotal: utNum('utCurTotal'),
+        prev6F: utNum('utPrev6F'), cur6F: utNum('utCur6F'),
+        totalElec: utNum('utTotalElec'), totalWater: utNum('utTotalWater'),
+        f6People: utNum('utF6People'), f5People: utNum('utF5People'),
+        prevA: utNum('utPrevA'), curA: utNum('utCurA'),
+        prevB: utNum('utPrevB'), curB: utNum('utCurB'),
+        prevC: utNum('utPrevC'), curC: utNum('utCurC'),
+      };
+      const rents = utGetRents();
+      const infoBox = document.getElementById('utInfoBox');
+      const warnBox = document.getElementById('utWarnBox');
+      const checkStatus = document.getElementById('utCheckStatus');
+      const summaryStrip = document.getElementById('utSummaryStrip');
+      const resultCards = document.getElementById('utResultCards');
+      const lineSection = document.getElementById('utLineSection');
+
+      const requiredFilled = [d.prevTotal, d.curTotal, d.prev6F, d.cur6F, d.totalElec, d.totalWater, d.f6People, d.f5People].every((v) => isFinite(v));
+      const f5Filled = [d.prevA, d.curA, d.prevB, d.curB, d.prevC, d.curC].every((v) => isFinite(v));
+
+      if (!requiredFilled) {
+        infoBox.classList.remove('show');
+        warnBox.classList.remove('show');
+        checkStatus.textContent = '等待輸入...';
+        summaryStrip.textContent = '請在上方填入總表度數、6F 度數、總電費、總水費與 5F A/B/C 度數，計算結果會即時顯示。';
+        resultCards.innerHTML = '';
+        lineSection.style.display = 'none';
+        return;
+      }
+
+      const r = utCompute(d);
+      const infos = [];
+      const warnings = [];
+      if (utDidRollover(d.curTotal, d.prevTotal, UT_MAIN_MOD)) infos.push(`🔄 總表滿 100,000 度歸零（${d.prevTotal} → ${d.curTotal}），自動換算為 ${utFmt(r.totalKwh)} 度。`);
+      if (utDidRollover(d.cur6F, d.prev6F, UT_SUB_MOD)) infos.push(`🔄 6F 分表滿 10,000 度歸零（${d.prev6F} → ${d.cur6F}），自動換算為 ${utFmt(r.f6Kwh)} 度。`);
+      if (f5Filled) {
+        if (utDidRollover(d.curA, d.prevA, UT_SUB_MOD)) infos.push(`🔄 5F-A 房滿 10,000 度歸零（${d.prevA} → ${d.curA}），自動換算為 ${utFmt(r.aKwh)} 度。`);
+        if (utDidRollover(d.curB, d.prevB, UT_SUB_MOD)) infos.push(`🔄 5F-B 房滿 10,000 度歸零（${d.prevB} → ${d.curB}），自動換算為 ${utFmt(r.bKwh)} 度。`);
+        if (utDidRollover(d.curC, d.prevC, UT_SUB_MOD)) infos.push(`🔄 5F-C 房滿 10,000 度歸零（${d.prevC} → ${d.curC}），自動換算為 ${utFmt(r.cKwh)} 度。`);
+      }
+
+      if (d.curTotal < 0 || d.cur6F < 0 || (f5Filled && (d.curA < 0 || d.curB < 0 || d.curC < 0))) warnings.push('⚠️ 電表度數不能為負數，請檢查輸入！');
+      if (r.totalKwh <= 0) warnings.push('⚠️ 總表本期用量為 0，請確認總表度數！');
+      if (r.f5Kwh <= 0) warnings.push('⚠️ 計算出的 5F 用量 ≤ 0，請確認 6F 或總表度數！');
+      if (f5Filled && r.pubKwh < 0) warnings.push('⚠️ 5F 三房加總超過 5F 總用電（公用度數為負），請檢查是否少打位數！');
+
+      infoBox.textContent = infos.join('\n');
+      infoBox.style.whiteSpace = 'pre-line';
+      infoBox.classList.toggle('show', infos.length > 0);
+      warnBox.textContent = warnings.join('\n');
+      warnBox.style.whiteSpace = 'pre-line';
+      warnBox.classList.toggle('show', warnings.length > 0);
+
+      const totalBill = d.totalElec + d.totalWater;
+      app.utilityLastBillTotal = totalBill;
+      summaryStrip.innerHTML = '';
+      const stripItems = [
+        `總用電：${utFmt(r.totalKwh)} 度（6F ${utFmt(r.f6Kwh)} / 5F ${utFmt(r.f5Kwh)}）`,
+        `平均電價：${utFmt(r.avgRate, 2)} 元/度`,
+        `整棟總計：${utFmtDollar(totalBill)}`,
+      ];
+      if (f5Filled) stripItems.push(`5F 公用電：${utFmt(r.pubKwh)} 度（每房 ${utFmtDollar(r.pubEachElec, 1)}）`);
+      stripItems.forEach((txt) => {
+        const sp = document.createElement('span');
+        sp.textContent = txt;
+        summaryStrip.appendChild(sp);
+      });
+
+      resultCards.innerHTML = '';
+
+      // 6F 卡片
+      const f6Card = document.createElement('div');
+      f6Card.className = 'ut-res-card f6';
+      f6Card.innerHTML = `
+        <div class="ut-res-who"><span>🏢 6F 應繳水電</span><span class="badge green">${d.f6People} 人</span></div>
+        <div class="ut-res-amt">${utFmtDollar(r.f6Total)}</div>
+        <div class="ut-res-exact">整數收費，無小數差額</div>
+        <ul class="ut-res-ul">
+          <li><span>用電度數</span><strong>${utFmt(r.f6Kwh)} 度</strong></li>
+          <li><span>6F 電費</span><strong>${utFmtDollar(r.f6Elec)}</strong></li>
+          <li><span>6F 水費</span><strong>${utFmtDollar(r.f6Water)}</strong></li>
+        </ul>
+        ${rents.rent6F > 0 ? `<div class="ut-rent-total"><span>含房租 (${utFmtDollar(rents.rent6F)})</span><span>${utFmtDollar(r.f6Total + rents.rent6F)}</span></div>` : ''}
+      `;
+      resultCards.appendChild(f6Card);
+
+      if (f5Filled) {
+        const rooms = [
+          { name: '5F - A 房', kwh: r.aKwh, priv: r.aPriv, total: r.aTotal, rent: rents.rentA },
+          { name: '5F - B 房', kwh: r.bKwh, priv: r.bPriv, total: r.bTotal, rent: rents.rentB },
+          { name: '5F - C 房', kwh: r.cKwh, priv: r.cPriv, total: r.cTotal, rent: rents.rentC },
+        ];
+        rooms.forEach((rm) => {
+          const rounded = Math.round(rm.total);
+          const card = document.createElement('div');
+          card.className = 'ut-res-card f5';
+          card.innerHTML = `
+            <div class="ut-res-who"><span>🚪 ${rm.name}</span><span class="badge">${utFmt(rm.kwh)} 度</span></div>
+            <div class="ut-res-amt">${utFmtDollar(rounded)}</div>
+            <div class="ut-res-exact">精確：${utFmtDollar(rm.total, 2)}（四捨五入）</div>
+            <ul class="ut-res-ul">
+              <li><span>私人電費</span><strong>${utFmtDollar(rm.priv, 1)}</strong></li>
+              <li><span>公用電費</span><strong>${utFmtDollar(r.pubEachElec, 1)}</strong></li>
+              <li><span>分攤水費</span><strong>${utFmtDollar(r.waterEach, 0)}</strong></li>
+            </ul>
+            ${rm.rent > 0 ? `<div class="ut-rent-total"><span>含房租 (${utFmtDollar(rm.rent)})</span><span>${utFmtDollar(rounded + rm.rent)}</span></div>` : ''}
+          `;
+          resultCards.appendChild(card);
+        });
+
+        const sumRounded = r.f6Total + Math.round(r.aTotal) + Math.round(r.bTotal) + Math.round(r.cTotal);
+        app.utilityLastTenantTotal = sumRounded;
+        const roundDiff = sumRounded - totalBill;
+        checkStatus.textContent = Math.abs(r.checkDiff) < 0.05
+          ? `✅ 驗算無誤（差額 ${roundDiff >= 0 ? '+' : ''}${roundDiff} 元）`
+          : `⚠️ 驗算差額 $${r.checkDiff}`;
+
+        const line6 = [
+          `【${period}期 6F水電費明細】`,
+          `電表：${d.prev6F} → ${d.cur6F}（用電 ${r.f6Kwh} 度，平均 ${utFmt(r.avgRate, 2)} 元/度）`,
+          `電費：$${utFmt(r.f6Elec)} ＋ 水費：$${utFmt(r.f6Water)} ＝ 應繳 $${utFmt(r.f6Total)}` +
+            (rents.rent6F > 0 ? `\n（含房租 $${utFmt(rents.rent6F)}，共應匯款 $${utFmt(r.f6Total + rents.rent6F)}）` : ''),
+        ].join('\n');
+
+        const line5 = [
+          `【${period}期 5F水電費明細】`,
+          `5F總用電 ${r.f5Kwh} 度（電費 $${utFmt(r.f5Elec)}，平均 ${utFmt(r.f5Rate, 2)} 元/度）`,
+          `公用電 ${r.pubKwh} 度（每房 $${utFmt(r.pubEachElec, 0)}），水費每房 $${utFmt(r.waterEach, 0)}`,
+          `• A房（${d.prevA}→${d.curA}，${r.aKwh}度）：$${utFmt(Math.round(r.aTotal))}` + (rents.rentA > 0 ? `（含房租共 $${utFmt(Math.round(r.aTotal) + rents.rentA)}）` : ''),
+          `• B房（${d.prevB}→${d.curB}，${r.bKwh}度）：$${utFmt(Math.round(r.bTotal))}` + (rents.rentB > 0 ? `（含房租共 $${utFmt(Math.round(r.bTotal) + rents.rentB)}）` : ''),
+          `• C房（${d.prevC}→${d.curC}，${r.cKwh}度）：$${utFmt(Math.round(r.cTotal))}` + (rents.rentC > 0 ? `（含房租共 $${utFmt(Math.round(r.cTotal) + rents.rentC)}）` : ''),
+        ].join('\n');
+
+        document.getElementById('utLine6F').textContent = line6;
+        document.getElementById('utLine5F').textContent = line5;
+        lineSection.style.display = 'block';
+      } else {
+        const f5Card = document.createElement('div');
+        f5Card.className = 'ut-res-card';
+        f5Card.style.display = 'flex';
+        f5Card.style.alignItems = 'center';
+        f5Card.style.fontSize = '12.5px';
+        f5Card.style.color = 'var(--text-muted)';
+        f5Card.textContent = `5F 整層合計 ${utFmtDollar(r.f5Total)}（電 ${utFmtDollar(r.f5Elec)} ＋ 水 ${utFmtDollar(r.f5Water)}）— 繼續填 A/B/C 度數即算各房分攤`;
+        resultCards.appendChild(f5Card);
+        checkStatus.textContent = '待填 5F 各房度數';
+        lineSection.style.display = 'none';
+      }
+    }
+
+    function utRenderHistory() {
+      const tbody = document.getElementById('utHistoryBody');
+      tbody.innerHTML = '';
+      const nonBase = app.utilityRecords
+        .map((rec, idx) => ({ rec, idx }))
+        .filter((x) => !x.rec.isBaseline)
+        .reverse();
+
+      if (!nonBase.length) {
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:16px">尚無抄表紀錄</td></tr>';
+        return;
+      }
+
+      nonBase.forEach(({ rec, idx }) => {
+        const r = utCompute(rec);
+        const tr = document.createElement('tr');
+
+        const cells = [
+          rec.period,
+          `${utFmt(rec.curTotal)} (+${utFmt(r.totalKwh)})`,
+          `${utFmt(rec.cur6F)} (+${utFmt(r.f6Kwh)})`,
+          utFmtDollar(rec.totalElec),
+          utFmtDollar(rec.totalWater),
+          utFmtDollar(r.f6Total),
+          utFmtDollar(Math.round(r.aTotal)),
+          utFmtDollar(Math.round(r.bTotal)),
+          utFmtDollar(Math.round(r.cTotal)),
+        ];
+        cells.forEach((val, ci) => {
+          const td = document.createElement('td');
+          td.textContent = val;
+          if (ci === 0) td.style.fontWeight = '700';
+          if (ci === 5) { td.style.color = 'var(--success)'; td.style.fontWeight = '700'; }
+          if (ci >= 6 && ci <= 8) { td.style.color = 'var(--primary)'; td.style.fontWeight = '700'; }
+          tr.appendChild(td);
+        });
+
+        const opTd = document.createElement('td');
+        opTd.style.display = 'flex';
+        opTd.style.gap = '4px';
+        opTd.style.justifyContent = 'flex-end';
+
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'btn btn-outline btn-sm';
+        editBtn.textContent = '編';
+        editBtn.addEventListener('click', () => utLoadRecordToForm(idx));
+
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'btn btn-danger btn-sm';
+        delBtn.textContent = '刪';
+        delBtn.addEventListener('click', () => {
+          if (!confirm(`確定刪除 ${rec.period} 期的抄表紀錄？（刪除後會自動重接下期上期度數）`)) return;
+          runServer('deleteRentUtilityRecord', [app.token, rec.period], (data) => {
+            utApplyServerData(data, true);
+            showToast(`已刪除 ${rec.period} 期並自動重新接續`, 'success');
+          });
+        });
+
+        opTd.appendChild(editBtn);
+        opTd.appendChild(delBtn);
+        tr.appendChild(opTd);
+        tbody.appendChild(tr);
+      });
+    }
+
+    function utApplyServerData(data, refillNext) {
+      app.utilityLoaded = true;
+      if (data && Array.isArray(data.records)) {
+        app.utilityRecords = data.records;
+        utRenderHistory();
+      }
+      if (data && data.rents) {
+        if (data.rents.rent6F != null) document.getElementById('utRent6F').value = data.rents.rent6F;
+        if (data.rents.rentA != null) document.getElementById('utRentA').value = data.rents.rentA;
+        if (data.rents.rentB != null) document.getElementById('utRentB').value = data.rents.rentB;
+        if (data.rents.rentC != null) document.getElementById('utRentC').value = data.rents.rentC;
+      }
+      const count = app.utilityRecords.filter((x) => !x.isBaseline).length;
+      const now = new Date();
+      const hm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      document.getElementById('utSyncStatus').textContent = `🟢 已同步 Rent_Utility（${hm} · 共 ${count} 期）`;
+      if (refillNext) utFillNextFromLatest();
+      else utRecalculate();
+    }
+
+    function utLoadFromSheet(isInit) {
+      document.getElementById('utSyncStatus').textContent = '⏳ 正在讀取 Rent_Utility...';
+      runServer('getRentUtilityData', [app.token], (data) => {
+        utApplyServerData(data, true);
+        if (!isInit) showToast('已重新讀取 5F&6F 水電紀錄', 'success');
+      });
+    }
+
+    function utCopyText(elId) {
+      const txt = document.getElementById(elId).textContent;
+      const fallback = () => {
+        const ta = document.createElement('textarea');
+        ta.value = txt;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('已複製，可直接貼到 LINE！', 'success');
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(() => showToast('已複製，可直接貼到 LINE！', 'success')).catch(fallback);
+      } else {
+        fallback();
+      }
+    }
+
+    function utExportCSV() {
+      const headers = ['期別','總表上期','總表本期','總表用量','6F上期','6F本期','6F用量','5F用量','總電費','總水費','6F人數','5F人數','6F電費','6F水費','6F應繳','5F電費','5F水費','A上期','A本期','A用量','B上期','B本期','B用量','C上期','C本期','C用量','5F公用度數','A應繳','B應繳','C應繳'];
+      const lines = [headers.join(',')];
+      app.utilityRecords.filter((x) => !x.isBaseline).forEach((rec) => {
+        const r = utCompute(rec);
+        lines.push([
+          rec.period, rec.prevTotal, rec.curTotal, r.totalKwh,
+          rec.prev6F, rec.cur6F, r.f6Kwh, r.f5Kwh,
+          rec.totalElec, rec.totalWater, rec.f6People, rec.f5People,
+          r.f6Elec, r.f6Water, r.f6Total, r.f5Elec, r.f5Water,
+          rec.prevA, rec.curA, r.aKwh, rec.prevB, rec.curB, r.bKwh, rec.prevC, rec.curC, r.cKwh,
+          r.pubKwh, r.aTotal.toFixed(2), r.bTotal.toFixed(2), r.cTotal.toFixed(2),
+        ].join(','));
+      });
+      const blob = new Blob(['\uFEFF' + lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = '5F6F水電費分攤紀錄.csv';
+      a.click();
+    }
+
+    // Bind Tab 5 events
+    ['utPeriod','utTotalElec','utTotalWater','utF6People','utF5People','utCurTotal','utCur6F','utPrevTotal','utPrev6F','utCurA','utCurB','utCurC','utPrevA','utPrevB','utPrevC','utRent6F','utRentA','utRentB','utRentC'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('input', utRecalculate);
+    });
+    document.getElementById('utNewPeriodBtn').addEventListener('click', utFillNextFromLatest);
+    document.getElementById('utReloadBtn').addEventListener('click', () => utLoadFromSheet(false));
+    document.getElementById('utExportCsvBtn').addEventListener('click', utExportCSV);
+    document.getElementById('utClearBtn').addEventListener('click', () => {
+      ['utCurTotal', 'utCur6F', 'utTotalElec', 'utTotalWater', 'utCurA', 'utCurB', 'utCurC'].forEach((id) => {
+        document.getElementById(id).value = '';
+      });
+      utRecalculate();
+    });
+    document.getElementById('utSaveRentsBtn').addEventListener('click', () => {
+      runServer('saveRentUtilityRents', [app.token, utGetRents()], (data) => {
+        utApplyServerData(data, false);
+        showToast('固定月租金已同步儲存至試算表', 'success');
+      });
+    });
+    document.getElementById('utSaveBtn').addEventListener('click', () => {
+      const period = document.getElementById('utPeriod').value.trim();
+      if (!period) { showToast('請先填寫期別（例如 11511）', 'error'); return; }
+      const rec = {
+        period,
+        prevTotal: utNum('utPrevTotal'), curTotal: utNum('utCurTotal'),
+        prev6F: utNum('utPrev6F'), cur6F: utNum('utCur6F'),
+        totalElec: utNum('utTotalElec'), totalWater: utNum('utTotalWater'),
+        f6People: utNum('utF6People'), f5People: utNum('utF5People'),
+        prevA: utNum('utPrevA'), curA: utNum('utCurA'),
+        prevB: utNum('utPrevB'), curB: utNum('utCurB'),
+        prevC: utNum('utPrevC'), curC: utNum('utCurC'),
+      };
+      if (Object.entries(rec).some(([k, v]) => k !== 'period' && !isFinite(v))) {
+        showToast('請先把本期所有度數與帳單金額填完整再儲存', 'error');
+        return;
+      }
+      runServer('saveRentUtilityRecord', [app.token, rec, utGetRents()], (data) => {
+        utApplyServerData(data, false);
+        showToast(`${period} 期已成功寫入 Rent_Utility！`, 'success');
+      });
+    });
+    document.getElementById('utCopy6FBtn').addEventListener('click', () => utCopyText('utLine6F'));
+    document.getElementById('utCopy5FBtn').addEventListener('click', () => utCopyText('utLine5F'));
+    document.getElementById('utPostExpenseBtn').addEventListener('click', () => {
+      const period = document.getElementById('utPeriod').value.trim() || '本期';
+      const amt = Math.round(app.utilityLastBillTotal || 0);
+      if (amt <= 0) { showToast('請先算出本期水電帳單總額', 'error'); return; }
+      if (!confirm(`要將「${period}期 5F&6F 台電與水費帳單」NT$ ${utFmt(amt)} 寫入個人現金流支出嗎？`)) return;
+      runServer('postUtilityToCashFlow', [app.token, { mode: 'bill_expense', period, amount: amt }, app.selectedYear, app.selectedMonth], (res) => {
+        applyBundle(res.bundle);
+        showToast(res.message, 'success');
+      });
+    });
+    document.getElementById('utPostIncomeBtn').addEventListener('click', () => {
+      const period = document.getElementById('utPeriod').value.trim() || '本期';
+      const amt = Math.round(app.utilityLastTenantTotal || 0);
+      if (amt <= 0) { showToast('請先算出本期各房應繳總額', 'error'); return; }
+      if (!confirm(`要將「${period}期 房客代收水電費」NT$ ${utFmt(amt)} 寫入個人現金流其他收入嗎？`)) return;
+      runServer('postUtilityToCashFlow', [app.token, { mode: 'tenant_income', period, amount: amt }, app.selectedYear, app.selectedMonth], (res) => {
         applyBundle(res.bundle);
         showToast(res.message, 'success');
       });

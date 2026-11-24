@@ -13,14 +13,15 @@ function onOpen(): void {
   ui.createMenu('💰 個人財務系統')
     .addItem('1. 一鍵初始化所有分頁與公式（含範例資料）', 'setupSpreadsheetWithConfirm')
     .addItem('2. 僅更新 Dashboard 儀表板（保留所有帳目資料）', 'rebuildDashboardOnly')
+    .addItem('3. 僅建立/重置「5F&6F水電費」分頁（保留其他帳目）', 'initRentUtilitySheetOnly')
     .addSeparator()
-    .addItem('3. 手動執行本月常態收支入帳', 'runMonthlyRecurringMenu')
-    .addItem('4. 立即記錄本月淨資產快照', 'runMonthEndSnapshotMenu')
+    .addItem('4. 手動執行本月常態收支入帳', 'runMonthlyRecurringMenu')
+    .addItem('5. 立即記錄本月淨資產快照', 'runMonthEndSnapshotMenu')
     .addSeparator()
-    .addItem('5. 安裝 / 重設每月排程觸發器', 'installTriggers')
-    .addItem('6. 檢視目前排程觸發器狀態', 'listInstalledTriggers')
+    .addItem('6. 安裝 / 重設每月排程觸發器', 'installTriggers')
+    .addItem('7. 檢視目前排程觸發器狀態', 'listInstalledTriggers')
     .addSeparator()
-    .addItem('7. 清除 / 重設 Web App PIN 鎖', 'resetAppPinMenu')
+    .addItem('8. 清除 / 重設 Web App PIN 鎖', 'resetAppPinMenu')
     .addToUi();
 }
 
@@ -97,6 +98,7 @@ function setupSpreadsheet(seedSampleData = true): void {
     SHEET_NAMES.SINKING_FUND,
     SHEET_NAMES.ASSETS_LIABILITIES,
     SHEET_NAMES.NETWORTH_HISTORY,
+    SHEET_NAMES.RENT_UTILITY,
   ];
 
   // 先確保所有目標分頁皆已存在，避免跨頁公式暫時出現 #REF!
@@ -117,6 +119,7 @@ function setupSpreadsheet(seedSampleData = true): void {
   buildSinkingFundSheet(sheets[SHEET_NAMES.SINKING_FUND], seedSampleData);
   buildAssetsLiabilitiesSheet(sheets[SHEET_NAMES.ASSETS_LIABILITIES], seedSampleData);
   buildNetWorthHistorySheet(sheets[SHEET_NAMES.NETWORTH_HISTORY], seedSampleData);
+  buildRentUtilitySheet(sheets[SHEET_NAMES.RENT_UTILITY], seedSampleData);
   buildDashboardSheet(sheets[SHEET_NAMES.DASHBOARD]);
 
   // 排列分頁順序

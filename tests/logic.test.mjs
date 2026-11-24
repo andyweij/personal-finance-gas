@@ -70,7 +70,7 @@ function loadGasContext(mocks = {}) {
     ...mocks,
   });
 
-  const files = ['config.js', 'utils.js', 'security.js', 'setup.js', 'automation.js', 'webapp.js'];
+  const files = ['config.js', 'utils.js', 'security.js', 'rentUtility.js', 'setup.js', 'automation.js', 'webapp.js'];
   for (const file of files) {
     const code = readFileSync(join(distDir, file), 'utf8');
     vm.runInContext(code, ctx, { filename: file });
@@ -85,6 +85,7 @@ test('dist/ contains all compiled GAS files, HTML, and manifest without ES modul
     'config.js',
     'utils.js',
     'security.js',
+    'rentUtility.js',
     'setup.js',
     'automation.js',
     'webapp.js',
@@ -95,7 +96,7 @@ test('dist/ contains all compiled GAS files, HTML, and manifest without ES modul
     assert.equal(existsSync(fullPath), true, `Missing dist/${file}`);
   }
 
-  for (const jsFile of ['config.js', 'utils.js', 'security.js', 'setup.js', 'automation.js', 'webapp.js']) {
+  for (const jsFile of ['config.js', 'utils.js', 'security.js', 'rentUtility.js', 'setup.js', 'automation.js', 'webapp.js']) {
     const content = readFileSync(join(distDir, jsFile), 'utf8');
     assert.equal(/\bexport\s+/.test(content), false, `dist/${jsFile} should not contain ES export`);
     assert.equal(/\bimport\s+/.test(content), false, `dist/${jsFile} should not contain ES import`);
@@ -135,6 +136,15 @@ test('GAS global entry points (Sheets + Automation + WebApp + Security) are defi
     'deleteAssetItem',
     'runRecurringFromUi',
     'runSnapshotFromUi',
+    'initRentUtilitySheetOnly',
+    'computeUtilityBill',
+    'meterDiffUtility',
+    'nextUtilityPeriodCode',
+    'getRentUtilityData',
+    'saveRentUtilityRecord',
+    'deleteRentUtilityRecord',
+    'saveRentUtilityRents',
+    'postUtilityToCashFlow',
   ];
 
   for (const fn of requiredFns) {
@@ -247,6 +257,53 @@ test('submitExpense rejects invalid amounts and unsupported types before touchin
       }),
     /不支援的幣別/
   );
+});
+
+test('rentUtility math: 10,000 rollover (11509 A-room), zero 6F headcount (11411), and period rollover', () => {
+  const ctx = loadGasContext();
+
+  // 期別推進：11509 -> 11511 -> 11601
+  assert.equal(ctx.nextUtilityPeriodCode('11509'), '11511');
+  assert.equal(ctx.nextUtilityPeriodCode('11511'), '11601');
+
+  // 11509 實際歷史資料（A 房電表滿 10,000 歸零：9826 -> 105 = 279 度）
+  const r11509 = ctx.computeUtilityBill({
+    prevTotal: 59341, curTotal: 61261,
+    prev6F: 6607, cur6F: 7762,
+    totalElec: 8214, totalWater: 494,
+    f6People: 2, f5People: 3,
+    prevA: 9826, curA: 105,
+    prevB: 5732, curB: 5852,
+    prevC: 6295, curC: 6374,
+  });
+  assert.equal(r11509.totalKwh, 1920);
+  assert.equal(r11509.f6Kwh, 1155);
+  assert.equal(r11509.f5Kwh, 765);
+  assert.equal(r11509.aKwh, 279);
+  assert.equal(r11509.bKwh, 120);
+  assert.equal(r11509.cKwh, 79);
+  assert.equal(r11509.pubKwh, 287);
+  assert.equal(r11509.f6Elec + r11509.f5Elec, 8214);
+  assert.equal(r11509.f6Water + r11509.f5Water, 494);
+  assert.equal(r11509.checkDiff, 0);
+
+  // 11411：6F 人數為 0 時，5F 承擔全額水費
+  const r11411 = ctx.computeUtilityBill({
+    prevTotal: 52803, curTotal: 54090,
+    prev6F: 4486, cur6F: 4778,
+    totalElec: 3828, totalWater: 570,
+    f6People: 0, f5People: 3,
+    prevA: 8989, curA: 9235,
+    prevB: 5251, curB: 5454,
+    prevC: 6026, curC: 6140,
+  });
+  assert.equal(r11411.f6Water, 0);
+  assert.equal(r11411.f5Water, 570);
+  assert.equal(r11411.checkDiff, 0);
+
+  // PIN 啟用時 getRentUtilityData 應要求驗證
+  ctx.configureAppPin('', { enable: true, newPin: '2580' });
+  assert.throws(() => ctx.getRentUtilityData(''), /AUTH_REQUIRED/);
 });
 
 test('getSecurityStatus reports 60-minute server session TTL for configurable client idle lock', () => {

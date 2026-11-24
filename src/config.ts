@@ -15,6 +15,7 @@ const SHEET_NAMES = {
   SINKING_FUND: 'Annual_Sinking_Fund',
   ASSETS_LIABILITIES: 'Assets_Liabilities',
   NETWORTH_HISTORY: 'NetWorth_History',
+  RENT_UTILITY: 'Rent_Utility',
 } as const;
 
 const CASHFLOW_TYPES = {
