@@ -485,4 +485,29 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     expect(exported.data.settings.monthlyDailyBudget).toBe(52000);
     expect(exported.data.cashflowLogs.some((l) => l.id === 'imp-1')).toBe(true);
   });
+
+  it('auto-detects and imports Recurring_Config and Assets_Liabilities CSVs via /api/import/csv', async () => {
+    const cookie = await setupAndGetCookie();
+
+    const recurringCsv = [
+      '項目名稱,分類,收支類型,金額,幣別,入帳/扣款週期,生效月份,狀態,月均換算(TWD),備註',
+      '本業月薪,薪資,固定收入,"95,000",TWD,月繳,,啟用,"95,000",自動入帳',
+      'Claude Pro,AI訂閱,訂閱扣款,20,USD,月繳,,啟用,650,訂閱',
+    ].join('\n');
+
+    const recRes = await app.request(
+      'https://finance.example.com/api/import/csv',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ csvText: recurringCsv }),
+      },
+      env
+    );
+    expect(recRes.status).toBe(200);
+    expect(await recRes.json()).toMatchObject({ ok: true, kind: 'recurring', importedCount: 2 });
+
+    const recRows = await db.prepare('SELECT COUNT(*) as cnt FROM recurring_items').first<{ cnt: number }>();
+    expect(recRows?.cnt).toBe(2);
+  });
 });

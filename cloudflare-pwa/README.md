@@ -73,10 +73,15 @@ npm run deploy
 
 ---
 
-## 從原本 Google Sheets 遷移資料
+## 從原本 Google Sheets 遷移資料（支援全部 5 大分頁自動辨識）
 
-1. 在原本的 Google Sheet 開啟 `CashFlow_Log` 分頁 → **檔案 > 下載 > 逗號分隔值 (.csv)**。
-2. 打開新的 PWA → 點右上角 **安全 / 資料中心** 圖示 → **匯入原 Google Sheets CSV**，選擇剛下載的檔案即可批次寫入並同步至 D1。
+1. 在原本的 Google Sheet 依序切換以下分頁 → **檔案 > 下載 > 逗號分隔值 (.csv)**：
+   - `CashFlow_Log`（收支流水帳）
+   - `Recurring_Config`（薪資 / 房貸 / 投資 / 訂閱固定扣款）
+   - `Annual_Sinking_Fund`（不定期稅金與大額攤提）
+   - `Assets_Liabilities`（資產負債表）
+   - `NetWorth_History`（每月淨資產歷史快照）
+2. 打開新的 PWA → 點右上角 **安全 / 資料中心** 盾牌圖示 → **匯入原 Google Sheets CSV（可多選 5 分頁）**，一次多選剛下載的 `.csv` 檔即可自動辨識並完整匯入至 D1。
 
 ---
 

@@ -20,7 +20,15 @@ import {
   computeRecurringMonthlyTwd,
   computeSinkingMonthlyReserve,
 } from '../shared/calculations';
-import { exportCashFlowCsv, parseCashFlowCsv } from '../shared/csv';
+import {
+  detectGoogleSheetCsvKind,
+  exportCashFlowCsv,
+  parseAssetsCsv,
+  parseCashFlowCsv,
+  parseNetWorthHistoryCsv,
+  parseRecurringCsv,
+  parseSinkingFundCsv,
+} from '../shared/csv';
 import type { AssetItem, CashFlowLog, RecurringItem, SinkingFundItem } from '../shared/types';
 
 describe('shared/validation', () => {
@@ -404,5 +412,48 @@ describe('shared/csv', () => {
       source: '手機記帳',
       note: '使用 "Apple Pay"',
     });
+  });
+
+  it('auto-detects and parses Recurring_Config, Annual_Sinking_Fund, Assets_Liabilities, and NetWorth_History CSVs', () => {
+    const recurringCsv = [
+      '項目名稱,分類,收支類型,金額,幣別,入帳/扣款週期,生效月份(月繳留空/特定月填3,6,9,12/一次填YYYY-MM),狀態,月均換算(TWD),備註',
+      '本業月薪,薪資,固定收入,"95,000.00",TWD,月繳,,啟用,"95,000",每月 1 號入帳',
+      'Claude Pro,AI訂閱,訂閱扣款,20.00,USD,月繳,,啟用,650,USD 訂閱',
+      '季配息,股息/配息,其他收入,"12,000",TWD,特定月份,"3,6,9,12",停用,0,範例',
+    ].join('\n');
+    expect(detectGoogleSheetCsvKind(recurringCsv)).toBe('recurring');
+    const rec = parseRecurringCsv(recurringCsv);
+    expect(rec).toHaveLength(3);
+    expect(rec[0]).toMatchObject({ itemName: '本業月薪', amount: 95000, cycle: '月繳', status: '啟用' });
+    expect(rec[2]).toMatchObject({ itemName: '季配息', cycle: '特定月份', billingSpec: '3,6,9,12', status: '停用' });
+
+    const sinkingCsv = [
+      '項目名稱,分類,預估總金額(TWD),分攤月數,預計繳款月份,每月應提撥(TWD),狀態,本年度已實支(TWD),年度剩餘預算(TWD),備註',
+      '綜合所得稅,所得稅,"60,000",12 個月,5月,"5,000",啟用,0,"60,000",每年五月',
+    ].join('\n');
+    expect(detectGoogleSheetCsvKind(sinkingCsv)).toBe('sinking');
+    const sf = parseSinkingFundCsv(sinkingCsv);
+    expect(sf).toHaveLength(1);
+    expect(sf[0]).toMatchObject({ itemName: '綜合所得稅', totalAmount: 60000, months: 12, status: '啟用' });
+
+    const assetsCsv = [
+      '更新方式,大類,細分類別,流動性,項目名稱,股票代碼(台股填TPE:xxxx),持有股數 / 原幣金額,幣別,最新單價(原幣),折合台幣市值(TWD),最後更新日 / 備註',
+      '自動更新,資產,台股,中流動,元大台灣50 (0050),TPE:0050,"3,000.00",TWD,195.50,"586,500",自動更新',
+      '手動快照,負債,房貸餘額,負債,房屋貸款剩餘本金,,"6,200,000.00",TWD,1.00,"6,200,000",房貸',
+    ].join('\n');
+    expect(detectGoogleSheetCsvKind(assetsCsv)).toBe('asset');
+    const assets = parseAssetsCsv(assetsCsv);
+    expect(assets).toHaveLength(2);
+    expect(assets[0]).toMatchObject({ itemName: '元大台灣50 (0050)', ticker: 'TPE:0050', quantityOrAmount: 3000, unitPrice: 195.5 });
+    expect(assets[1]).toMatchObject({ majorType: '負債', liquidity: '負債', quantityOrAmount: 6200000 });
+
+    const historyCsv = [
+      '快照日期,年月,總資產(TWD),總負債(TWD),淨資產(TWD),高流動資產(TWD),投資資產(TWD),保單資產(TWD),當月總收入(TWD),當月消費總支出(TWD),當月儲蓄率,備註',
+      '2026-10-31,2026-10,"3,040,000","6,590,000","-3,550,000","940,000","1,680,000","420,000","113,000","72,000",36.3%,歷史快照',
+    ].join('\n');
+    expect(detectGoogleSheetCsvKind(historyCsv)).toBe('networth');
+    const hist = parseNetWorthHistoryCsv(historyCsv);
+    expect(hist).toHaveLength(1);
+    expect(hist[0]).toMatchObject({ yearMonth: '2026-10', totalAssets: 3040000, netWorth: -3550000, savingsRate: 0.363 });
   });
 });

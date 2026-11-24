@@ -35,7 +35,15 @@ import {
   runMonthlyRecurringD1,
 } from './automation';
 import { refreshMarketData } from './market';
-import { parseCashFlowCsv } from '../shared/csv';
+import {
+  detectGoogleSheetCsvKind,
+  parseAssetsCsv,
+  parseCashFlowCsv,
+  parseNetWorthHistoryCsv,
+  parseRecurringCsv,
+  parseSinkingFundCsv,
+  type GoogleSheetCsvKind,
+} from '../shared/csv';
 import type { SyncRequest } from '../shared/types';
 import type { WorkerEnv } from './types';
 
@@ -282,36 +290,168 @@ export function createApp() {
 
   app.post('/api/import/csv', requireAuth, async (c) => {
     try {
-      const body = (await c.req.json()) as { csvText?: string };
-      const settings = await ensureAppSettings(c.env.DB);
-      const rows = parseCashFlowCsv(String(body.csvText || ''), settings.usdTwdRate);
+      const body = (await c.req.json()) as { csvText?: string; kind?: GoogleSheetCsvKind };
+      const csvText = String(body.csvText || '');
+      const kind = body.kind || detectGoogleSheetCsvKind(csvText);
+      if (!kind) {
+        return c.json(
+          {
+            error:
+              '無法辨識此 CSV 分頁格式。請直接由 Google Sheets 的 CashFlow_Log、Recurring_Config、Annual_Sinking_Fund、Assets_Liabilities 或 NetWorth_History 分頁匯出 CSV。',
+          },
+          400
+        );
+      }
+
       const nowIso = new Date().toISOString();
-      for (const v of rows) {
+      const labels: Record<GoogleSheetCsvKind, string> = {
+        cashflow: '收支流水帳 (CashFlow_Log)',
+        recurring: '固定收支與訂閱 (Recurring_Config)',
+        sinking: '不定期稅金分攤 (Annual_Sinking_Fund)',
+        asset: '資產負債明細 (Assets_Liabilities)',
+        networth: '淨資產歷史快照 (NetWorth_History)',
+      };
+
+      if (kind === 'cashflow') {
+        const settings = await ensureAppSettings(c.env.DB);
+        const rows = parseCashFlowCsv(csvText, settings.usdTwdRate);
+        for (const v of rows) {
+          await c.env.DB
+            .prepare(
+              `INSERT INTO cashflow_logs
+                (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+            )
+            .bind(
+              crypto.randomUUID(),
+              v.date,
+              v.yearMonth,
+              v.type,
+              v.category,
+              v.itemName,
+              v.amount,
+              v.currency,
+              v.fxRate,
+              v.twdAmount,
+              v.source,
+              v.note,
+              nowIso,
+              nowIso
+            )
+            .run();
+        }
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+      }
+
+      if (kind === 'recurring') {
+        const rows = parseRecurringCsv(csvText);
+        for (const v of rows) {
+          await c.env.DB
+            .prepare(
+              `INSERT INTO recurring_items
+                (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+            )
+            .bind(
+              crypto.randomUUID(),
+              v.itemName,
+              v.category,
+              v.type,
+              v.amount,
+              v.currency,
+              v.cycle,
+              v.billingSpec,
+              v.status,
+              v.note,
+              nowIso,
+              nowIso
+            )
+            .run();
+        }
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+      }
+
+      if (kind === 'sinking') {
+        const rows = parseSinkingFundCsv(csvText);
+        for (const v of rows) {
+          await c.env.DB
+            .prepare(
+              `INSERT INTO sinking_fund_items
+                (id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+            )
+            .bind(
+              crypto.randomUUID(),
+              v.itemName,
+              v.category,
+              v.totalAmount,
+              v.months,
+              v.dueNote,
+              v.status,
+              v.note,
+              nowIso,
+              nowIso
+            )
+            .run();
+        }
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+      }
+
+      if (kind === 'asset') {
+        const rows = parseAssetsCsv(csvText);
+        for (const v of rows) {
+          await c.env.DB
+            .prepare(
+              `INSERT INTO asset_items
+                (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+            )
+            .bind(
+              crypto.randomUUID(),
+              v.updateMode,
+              v.majorType,
+              v.subCategory,
+              v.liquidity,
+              v.itemName,
+              v.ticker,
+              v.quantityOrAmount,
+              v.currency,
+              v.unitPrice,
+              v.note,
+              nowIso,
+              nowIso
+            )
+            .run();
+        }
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+      }
+
+      const rows = parseNetWorthHistoryCsv(csvText);
+      for (const h of rows) {
         await c.env.DB
           .prepare(
-            `INSERT INTO cashflow_logs
-              (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+            `INSERT OR REPLACE INTO networth_history
+              (year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .bind(
-            crypto.randomUUID(),
-            v.date,
-            v.yearMonth,
-            v.type,
-            v.category,
-            v.itemName,
-            v.amount,
-            v.currency,
-            v.fxRate,
-            v.twdAmount,
-            v.source,
-            v.note,
-            nowIso,
+            h.yearMonth,
+            h.snapshotDate,
+            h.totalAssets,
+            h.totalLiabilities,
+            h.netWorth,
+            h.highLiquidityAssets,
+            h.investmentAssets,
+            h.insuranceAssets,
+            h.monthlyIncome,
+            h.monthlyConsumption,
+            h.savingsRate,
+            h.note,
             nowIso
           )
           .run();
       }
-      return c.json({ ok: true, importedCount: rows.length });
+      return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : 'CSV 解析或匯入失敗' }, 400);
     }

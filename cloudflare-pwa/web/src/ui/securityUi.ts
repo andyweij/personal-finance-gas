@@ -352,41 +352,97 @@ export function openSecurityModal(ctx: UiContext): void {
   exportRow.appendChild(expCsvBtn);
   dataBox.appendChild(exportRow);
 
-  // CSV Import (GAS CashFlow_Log)
+  // Multi-file CSV Import (自動辨識全部 5 個原 Google Sheets 分頁)
   const fileInput = document.createElement('input');
   fileInput.type = 'file';
   fileInput.accept = '.csv,text/csv';
+  fileInput.multiple = true;
   fileInput.style.display = 'none';
   fileInput.addEventListener('change', async () => {
-    const file = fileInput.files?.[0];
-    if (!file) return;
+    const files = Array.from(fileInput.files || []);
+    if (!files.length) return;
     setLoading(true);
     try {
-      const csvText = await file.text();
-      const res = await fetch('/api/import/csv', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ csvText }),
-      });
-      const json = (await res.json()) as { ok?: boolean; importedCount?: number; error?: string };
-      if (!res.ok) throw new Error(json.error || 'CSV 匯入失敗');
+      const summaries: string[] = [];
+      for (const file of files) {
+        const csvText = await file.text();
+        const res = await fetch('/api/import/csv', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ csvText }),
+        });
+        const json = (await res.json()) as {
+          ok?: boolean;
+          label?: string;
+          importedCount?: number;
+          error?: string;
+        };
+        if (!res.ok) throw new Error(`${file.name}：${json.error || 'CSV 匯入失敗'}`);
+        summaries.push(`${json.label || file.name} ${json.importedCount || 0} 筆`);
+      }
       await ctx.engine.syncNow(true);
       closeModal();
-      showToast(`已成功匯入 ${json.importedCount || 0} 筆流水帳！`, 'success');
+      showToast(`匯入完成：${summaries.join('、')}`, 'success');
     } catch (err) {
       showToast(err instanceof Error ? err.message : '匯入失敗', 'error');
     } finally {
+      fileInput.value = '';
       setLoading(false);
     }
   });
   const impCsvBtn = document.createElement('button');
   impCsvBtn.type = 'button';
   impCsvBtn.className = 'btn btn-tinted btn-sm';
-  impCsvBtn.textContent = '匯入原 Google Sheets (CashFlow_Log CSV)';
+  impCsvBtn.textContent = '匯入原 Google Sheets CSV（可多選 5 分頁）';
   impCsvBtn.addEventListener('click', () => fileInput.click());
+
+  const csvHint = document.createElement('div');
+  csvHint.className = 'muted';
+  csvHint.style.fontSize = '11px';
+  csvHint.textContent =
+    '自動辨識：CashFlow_Log、Recurring_Config（固定/訂閱）、Annual_Sinking_Fund（攤提）、Assets_Liabilities（資產負債）、NetWorth_History';
+
+  // JSON Backup Restore
+  const jsonInput = document.createElement('input');
+  jsonInput.type = 'file';
+  jsonInput.accept = '.json,application/json';
+  jsonInput.style.display = 'none';
+  jsonInput.addEventListener('change', async () => {
+    const file = jsonInput.files?.[0];
+    if (!file) return;
+    setLoading(true);
+    try {
+      const parsed = JSON.parse(await file.text());
+      const res = await fetch('/api/import/json', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'merge', data: parsed.data || parsed }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok) throw new Error(json.error || 'JSON 還原失敗');
+      await ctx.engine.syncNow(true);
+      closeModal();
+      showToast('完整 JSON 備份還原完成！', 'success');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'JSON 還原失敗', 'error');
+    } finally {
+      jsonInput.value = '';
+      setLoading(false);
+    }
+  });
+  const impJsonBtn = document.createElement('button');
+  impJsonBtn.type = 'button';
+  impJsonBtn.className = 'btn btn-outline btn-sm';
+  impJsonBtn.textContent = '從 JSON 備份檔還原';
+  impJsonBtn.addEventListener('click', () => jsonInput.click());
+
   dataBox.appendChild(fileInput);
   dataBox.appendChild(impCsvBtn);
+  dataBox.appendChild(csvHint);
+  dataBox.appendChild(jsonInput);
+  dataBox.appendChild(impJsonBtn);
 
   // Logout
   const logoutBtn = document.createElement('button');
