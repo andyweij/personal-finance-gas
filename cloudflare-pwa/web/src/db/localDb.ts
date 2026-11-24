@@ -3,7 +3,7 @@ import {
   DEFAULT_MONTHLY_DAILY_BUDGET,
   DEFAULT_USD_TWD_RATE,
 } from '../../../shared/constants';
-import type { FinanceSnapshot, SyncMutation } from '../../../shared/types';
+import type { CachedPasskeyDto, FinanceSnapshot, SyncMutation } from '../../../shared/types';
 
 const DB_VERSION = 1;
 const STORE_KV = 'kv';
@@ -31,6 +31,8 @@ export interface LocalMeta {
   pinEnabled: boolean;
   pinSalt: string | null;
   pinHash: string | null;
+  biometricLockEnabled?: boolean;
+  passkeys?: CachedPasskeyDto[];
 }
 
 export class LocalFinanceDB {

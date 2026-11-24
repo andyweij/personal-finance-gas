@@ -80,9 +80,9 @@ export function createApp() {
   app.get('/api/auth/status', async (c) => {
     const owner = await getAuthOwner(c.env.DB);
     const session = await verifySessionCookie(c.env.DB, c.req.header('cookie'));
-    const passkeyRow = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM auth_passkeys').first<{
-      cnt: number;
-    }>();
+    const passkeyRows = await c.env.DB.prepare(
+      'SELECT credential_id, public_key, transports FROM auth_passkeys'
+    ).all<{ credential_id: string; public_key: string; transports: string }>();
 
     return c.json({
       initialized: Boolean(owner),
@@ -90,7 +90,16 @@ export function createApp() {
       pinEnabled: Boolean(owner && owner.pin_enabled === 1 && owner.pin_hash),
       pinSalt: session.valid && owner?.pin_enabled === 1 ? owner.pin_salt : null,
       pinHash: session.valid && owner?.pin_enabled === 1 ? owner.pin_hash : null,
-      passkeyCount: Number(passkeyRow?.cnt || 0),
+      passkeyCount: passkeyRows.results.length,
+      ...(session.valid
+        ? {
+            passkeys: passkeyRows.results.map((p) => ({
+              id: p.credential_id,
+              publicKey: p.public_key,
+              transports: JSON.parse(p.transports || '[]'),
+            })),
+          }
+        : {}),
     });
   });
 

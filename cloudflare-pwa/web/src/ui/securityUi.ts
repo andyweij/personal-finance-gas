@@ -1,5 +1,6 @@
 import { exportCashFlowCsv } from '../../../shared/csv';
 import {
+  fetchAuthStatus,
   loginWithPasskey,
   loginWithPassword,
   logoutSession,
@@ -8,6 +9,7 @@ import {
   setupMasterPassword,
   verifyOfflinePin,
 } from '../auth/authClient';
+import { triggerOfflineFaceIdUnlock } from '../auth/offlineWebAuthn';
 import {
   closeModal,
   downloadTextFile,
@@ -23,9 +25,17 @@ import type { UiContext } from './state';
 
 let pinInput = '';
 
+export function isAnyLockEnabled(ctx: UiContext): boolean {
+  return Boolean(
+    (ctx.state.pinEnabled && ctx.state.pinHash) ||
+      (ctx.state.biometricLockEnabled && ctx.state.passkeys.length > 0)
+  );
+}
+
 export function updateSecurityButtons(ctx: UiContext): void {
-  el('lockNowBtn').style.display = ctx.state.pinEnabled ? 'inline-flex' : 'none';
-  el('securityBtn').classList.toggle('active', ctx.state.pinEnabled || ctx.state.idleMinutes > 0);
+  const lockedCapable = isAnyLockEnabled(ctx);
+  el('lockNowBtn').style.display = lockedCapable ? 'inline-flex' : 'none';
+  el('securityBtn').classList.toggle('active', lockedCapable || ctx.state.idleMinutes > 0);
   el('maskEyeSvg').innerHTML = ctx.state.masked ? EYE_OFF_SVG : EYE_OPEN_SVG;
   el('maskBtn').classList.toggle('active', ctx.state.masked);
 }
@@ -126,7 +136,7 @@ export function openAuthScreen(
   el('authScreen').classList.add('open');
 }
 
-/* ==================== Offline PIN Lock Screen ==================== */
+/* ==================== Offline Face ID + PIN Lock Screen ==================== */
 
 function renderPinDots(): void {
   const box = el('pinDots');
@@ -139,10 +149,27 @@ function renderPinDots(): void {
   }
 }
 
-export function openLockScreen(errMsg = ''): void {
+export function openLockScreen(ctx: UiContext, errMsg = ''): void {
   pinInput = '';
+  const hasFaceId = ctx.state.passkeys.length > 0;
+  const hasPin = Boolean(ctx.state.pinEnabled && ctx.state.pinHash);
+
   el('pinError').textContent = errMsg;
-  renderPinDots();
+  el('lockFaceIdBtn').style.display = hasFaceId ? 'inline-flex' : 'none';
+  el('pinDots').style.display = hasPin ? 'flex' : 'none';
+  el('pinPad').style.display = hasPin ? 'grid' : 'none';
+  el('lockUsePasswordBtn').style.display = !hasPin ? 'inline-flex' : 'none';
+
+  el('lockSub').textContent =
+    hasFaceId && hasPin
+      ? '點擊刷 Face ID 解鎖，或輸入 4～6 位數 PIN（離線皆可用）'
+      : hasFaceId
+        ? '點擊下方按鈕刷 Face ID 解鎖（支援離線驗證）'
+        : '離線亦可解鎖使用（4～6 位數 PIN）';
+
+  if (hasPin) {
+    renderPinDots();
+  }
   el('lockScreen').classList.add('open');
 }
 
@@ -152,7 +179,59 @@ export function closeLockScreen(ctx: UiContext): void {
   el('lockScreen').classList.remove('open');
 }
 
+export async function unlockLockScreenWithFaceId(ctx: UiContext): Promise<void> {
+  el('pinError').textContent = '';
+  const btn = el<HTMLButtonElement>('lockFaceIdBtn');
+  btn.disabled = true;
+  setLoading(true);
+
+  try {
+    let verified = false;
+    // 有網路時優先走線上 Passkey 驗證（順便續期伺服器 Session）；斷網或逾時自動切換純離線 Web Crypto 驗證
+    if (navigator.onLine) {
+      try {
+        await loginWithPasskey();
+        ctx.state.authenticated = true;
+        verified = true;
+      } catch (err) {
+        // 若是使用者主動取消 Face ID（NotAllowedError），直接中止不重複彈窗
+        if (err instanceof Error && err.name === 'NotAllowedError') {
+          throw new Error('已取消 Face ID 驗證');
+        }
+        // 網路錯誤才退回純離線驗證
+        if (!navigator.onLine || (err instanceof TypeError && err.message.includes('fetch'))) {
+          verified = await triggerOfflineFaceIdUnlock(ctx.state.passkeys);
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      verified = await triggerOfflineFaceIdUnlock(ctx.state.passkeys);
+    }
+
+    if (verified) {
+      closeLockScreen(ctx);
+      showToast('Face ID 解鎖成功', 'success');
+      ctx.scheduleSync();
+    } else {
+      el('pinError').textContent = 'Face ID 驗證未通過，請重試或使用備用方式解鎖';
+    }
+  } catch (err) {
+    const msg =
+      err instanceof Error && err.name === 'NotAllowedError'
+        ? '已取消 Face ID 驗證，可再次點擊或改用備用解鎖'
+        : err instanceof Error
+          ? err.message
+          : 'Face ID 驗證失敗';
+    el('pinError').textContent = msg;
+  } finally {
+    btn.disabled = false;
+    setLoading(false);
+  }
+}
+
 export async function triggerPinKey(ctx: UiContext, k: string): Promise<void> {
+  if (!ctx.state.pinEnabled) return;
   el('pinError').textContent = '';
   const keyEl = document.querySelector<HTMLElement>(`#pinPad [data-k="${k}"]`);
   if (keyEl) {
@@ -188,11 +267,12 @@ export async function triggerPinKey(ctx: UiContext, k: string): Promise<void> {
 export function openSecurityModal(ctx: UiContext): void {
   const body = openModal('安全、Passkey 與資料備份');
 
-  // 1. Passkey (Face ID / Touch ID)
+  // 1. Passkey (Face ID / Touch ID) + 啟動/閒置 Face ID 鎖定開關
   const pkCard = document.createElement('div');
   pkCard.style.cssText = 'padding:12px 13px;border-radius:12px;background:var(--surface-alt);margin-bottom:14px';
   pkCard.innerHTML = `<div style="font-size:13px;font-weight:700;margin-bottom:4px">Face ID / Touch ID (Passkey)</div>
-    <div class="muted" style="margin-bottom:10px">目前已綁定 ${ctx.state.passkeyCount} 組 Passkey。綁定後在 iPhone / Mac 登入免輸入主密碼。</div>`;
+    <div class="muted" style="margin-bottom:10px">目前已綁定 ${ctx.state.passkeyCount} 組 Passkey（本機快取 ${ctx.state.passkeys.length} 組，離線可用）。</div>`;
+
   const pkBtn = document.createElement('button');
   pkBtn.type = 'button';
   pkBtn.className = 'btn btn-tinted btn-sm';
@@ -201,8 +281,13 @@ export function openSecurityModal(ctx: UiContext): void {
     setLoading(true);
     try {
       await registerPasskey(navigator.platform || '我的裝置');
-      ctx.state.passkeyCount += 1;
-      showToast('Passkey 綁定成功！下次可直接刷 Face ID / Touch ID 登入', 'success');
+      const status = await fetchAuthStatus();
+      ctx.state.passkeyCount = status.passkeyCount;
+      ctx.state.passkeys = status.passkeys || [];
+      ctx.state.biometricLockEnabled = true;
+      await ctx.engine.updateLocalBiometricCache(true, ctx.state.passkeys);
+      updateSecurityButtons(ctx);
+      showToast('Face ID 綁定成功！已自動開啟啟動／閒置 Face ID 解鎖', 'success');
       openSecurityModal(ctx);
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Passkey 綁定失敗', 'error');
@@ -211,6 +296,30 @@ export function openSecurityModal(ctx: UiContext): void {
     }
   });
   pkCard.appendChild(pkBtn);
+
+  if (ctx.state.passkeys.length > 0) {
+    const bioRow = document.createElement('div');
+    bioRow.style.cssText =
+      'display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px;padding-top:10px;border-top:0.5px solid var(--sep)';
+    bioRow.innerHTML = `<div><div style="font-size:13px;font-weight:600">啟動與閒置時用 Face ID 解鎖</div><div class="muted" style="font-size:11px">支援飛航模式離線刷臉解鎖</div></div>`;
+    const sw = document.createElement('label');
+    sw.className = 'switch';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = ctx.state.biometricLockEnabled;
+    cb.addEventListener('change', async () => {
+      ctx.state.biometricLockEnabled = cb.checked;
+      await ctx.engine.updateLocalBiometricCache(cb.checked);
+      updateSecurityButtons(ctx);
+      showToast(cb.checked ? '已開啟 Face ID 鎖定保護' : '已關閉 Face ID 鎖定保護', 'success');
+    });
+    const sl = document.createElement('span');
+    sl.className = 'slider';
+    sw.appendChild(cb);
+    sw.appendChild(sl);
+    bioRow.appendChild(sw);
+    pkCard.appendChild(bioRow);
+  }
   body.appendChild(pkCard);
 
   // 2. Idle Auto-Lock

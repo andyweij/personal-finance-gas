@@ -182,6 +182,12 @@ export interface NetWorthSummary {
   otherAssetsValue: number;
 }
 
+export interface CachedPasskeyDto {
+  id: string;
+  publicKey: string;
+  transports: string[];
+}
+
 export interface AuthStatusResponse {
   initialized: boolean;
   authenticated: boolean;
@@ -189,4 +195,5 @@ export interface AuthStatusResponse {
   pinSalt?: string | null;
   pinHash?: string | null;
   passkeyCount: number;
+  passkeys?: CachedPasskeyDto[];
 }

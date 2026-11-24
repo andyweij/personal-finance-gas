@@ -117,6 +117,18 @@ export class SyncEngine {
     await this.db.saveMeta(this.meta);
   }
 
+  async updateLocalBiometricCache(
+    biometricLockEnabled: boolean,
+    passkeys?: LocalMeta['passkeys']
+  ): Promise<void> {
+    this.meta = {
+      ...this.meta,
+      biometricLockEnabled,
+      ...(passkeys !== undefined ? { passkeys } : {}),
+    };
+    await this.db.saveMeta(this.meta);
+  }
+
   private updateStatus(next: SyncStatus): void {
     this.status = next;
     this.opts.onStatusChange?.(next);

@@ -47,7 +47,9 @@ describe('Cloudflare Worker API + D1 Integration', () => {
 
   it('protects first-time setup with SETUP_SECRET and forbids re-initialization', async () => {
     const status0 = await app.request('https://finance.example.com/api/auth/status', {}, env);
-    expect(await status0.json()).toMatchObject({ initialized: false, authenticated: false });
+    const status0Json = (await status0.json()) as Record<string, unknown>;
+    expect(status0Json).toMatchObject({ initialized: false, authenticated: false });
+    expect(status0Json.passkeys).toBeUndefined();
 
     // Wrong setup secret rejected
     const badSetup = await app.request(

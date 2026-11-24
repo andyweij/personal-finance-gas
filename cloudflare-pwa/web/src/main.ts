@@ -9,10 +9,12 @@ import { openRecurringModal, openSinkingModal, renderConfigTab } from './ui/conf
 import { openAssetModal, renderAssetsTab } from './ui/assetsTab';
 import {
   closeLockScreen,
+  isAnyLockEnabled,
   openAuthScreen,
   openLockScreen,
   openSecurityModal,
   triggerPinKey,
+  unlockLockScreenWithFaceId,
   updateSecurityButtons,
 } from './ui/securityUi';
 import type { AppUiState, UiContext } from './ui/state';
@@ -77,6 +79,8 @@ async function bootstrap(): Promise<void> {
     pinEnabled: false,
     pinSalt: null,
     pinHash: null,
+    biometricLockEnabled: false,
+    passkeys: [],
     passkeyCount: 0,
     authenticated: false,
     initialized: true,
@@ -122,14 +126,17 @@ async function bootstrap(): Promise<void> {
   state.pinEnabled = meta.pinEnabled;
   state.pinSalt = meta.pinSalt;
   state.pinHash = meta.pinHash;
+  state.passkeys = meta.passkeys || [];
+  state.passkeyCount = state.passkeys.length;
+  state.biometricLockEnabled = Boolean(meta.biometricLockEnabled);
 
   el<HTMLInputElement>('dateInput').value = getTodayYmd();
   renderLogCategories(ctx);
   updateSecurityButtons(ctx);
   ctx.renderAll();
 
-  if (state.pinEnabled && state.pinHash) {
-    openLockScreen('');
+  if (isAnyLockEnabled(ctx)) {
+    openLockScreen(ctx, '');
   }
 
   // 申請瀏覽器持久化儲存（降低 iOS 清理機率）
@@ -150,9 +157,11 @@ async function bootstrap(): Promise<void> {
         state.pinEnabled = auth.pinEnabled;
         state.pinSalt = auth.pinSalt || null;
         state.pinHash = auth.pinHash || null;
+        state.passkeys = auth.passkeys || [];
         await engine.updateLocalPinCache(state.pinEnabled, state.pinSalt, state.pinHash);
+        await engine.updateLocalBiometricCache(state.biometricLockEnabled, state.passkeys);
         updateSecurityButtons(ctx);
-        if (!state.pinEnabled) {
+        if (!isAnyLockEnabled(ctx)) {
           closeLockScreen(ctx);
         }
         void engine.syncNow();
@@ -160,7 +169,10 @@ async function bootstrap(): Promise<void> {
         state.pinEnabled = false;
         state.pinSalt = null;
         state.pinHash = null;
+        state.biometricLockEnabled = false;
+        state.passkeys = [];
         await engine.updateLocalPinCache(false, null, null);
+        await engine.updateLocalBiometricCache(false, []);
         updateSecurityButtons(ctx);
         closeLockScreen(ctx);
         openAuthScreen(ctx, 'setup', '', () => void engine.syncNow(true));
@@ -215,7 +227,14 @@ function bindEvents(ctx: UiContext): void {
   });
 
   el('securityBtn').addEventListener('click', () => openSecurityModal(ctx));
-  el('lockNowBtn').addEventListener('click', () => openLockScreen('已手動上鎖'));
+  el('lockNowBtn').addEventListener('click', () => openLockScreen(ctx, '已手動上鎖'));
+  el('lockFaceIdBtn').addEventListener('click', () => void unlockLockScreenWithFaceId(ctx));
+  el('lockUsePasswordBtn').addEventListener('click', () => {
+    closeLockScreen(ctx);
+    openAuthScreen(ctx, 'login', '請輸入主密碼驗證解鎖', () => {
+      void ctx.engine.syncNow();
+    });
+  });
 
   // Modal backdrop close (mobile closes on tap; desktop shakes to prevent accidental data loss)
   el('closeModalBtn').addEventListener('click', closeModal);
@@ -502,8 +521,8 @@ function bindEvents(ctx: UiContext): void {
     if (Date.now() - ctx.state.lastActivityAt < ctx.state.idleMinutes * 60 * 1000) return;
 
     closeModal();
-    if (ctx.state.pinEnabled && ctx.state.pinHash) {
-      openLockScreen(`閒置超過 ${ctx.state.idleMinutes} 分鐘，已自動鎖定`);
+    if (isAnyLockEnabled(ctx)) {
+      openLockScreen(ctx, `閒置超過 ${ctx.state.idleMinutes} 分鐘，已自動鎖定`);
     } else if (!ctx.state.masked) {
       ctx.state.masked = true;
       updateSecurityButtons(ctx);

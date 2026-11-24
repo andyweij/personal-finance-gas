@@ -17,7 +17,25 @@ describe('PWA assets & D1 migration integrity', () => {
     expect(manifest.start_url).toBe('/');
     expect(manifest.name).toBeTruthy();
     expect(Array.isArray(manifest.icons)).toBe(true);
-    expect(manifest.icons.length).toBeGreaterThanOrEqual(1);
+    expect(manifest.icons.length).toBeGreaterThanOrEqual(2);
+    expect(manifest.icons.some((i: { src: string; type: string }) => i.src.endsWith('.png') && i.type === 'image/png')).toBe(true);
+  });
+
+  it('ships real PNG icons for iOS apple-touch-icon (avoiding Safari SVG letter fallback)', () => {
+    for (const file of ['apple-touch-icon.png', 'icon-192.png', 'icon-512.png']) {
+      const iconPath = resolve(rootDir, 'web/public/icons', file);
+      expect(existsSync(iconPath)).toBe(true);
+      const buf = readFileSync(iconPath);
+      // PNG magic bytes: 89 50 4E 47
+      expect(buf[0]).toBe(0x89);
+      expect(buf[1]).toBe(0x50);
+      expect(buf[2]).toBe(0x4e);
+      expect(buf[3]).toBe(0x47);
+    }
+
+    const html = readFileSync(resolve(rootDir, 'web/index.html'), 'utf8');
+    expect(html).toContain('rel="apple-touch-icon"');
+    expect(html).toContain('/icons/apple-touch-icon.png');
   });
 
   it('provides a syntactically valid Service Worker that caches app shell and bypasses /api/', () => {

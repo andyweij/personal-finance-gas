@@ -1,3 +1,4 @@
+import type { CachedPasskeyDto } from '../../../shared/types';
 import type { SyncEngine } from '../sync/syncEngine';
 
 export interface AppUiState {
@@ -24,6 +25,8 @@ export interface AppUiState {
   pinEnabled: boolean;
   pinSalt: string | null;
   pinHash: string | null;
+  biometricLockEnabled: boolean;
+  passkeys: CachedPasskeyDto[];
   passkeyCount: number;
   authenticated: boolean;
   initialized: boolean;

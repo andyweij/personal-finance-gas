@@ -1,5 +1,12 @@
-const CACHE_VERSION = 'finance-pwa-v2';
-const APP_SHELL_URLS = ['/', '/index.html', '/manifest.webmanifest', '/icons/icon.svg'];
+const CACHE_VERSION = 'finance-pwa-v3';
+const APP_SHELL_URLS = [
+  '/',
+  '/index.html',
+  '/manifest.webmanifest',
+  '/icons/apple-touch-icon.png',
+  '/icons/icon-192.png',
+  '/icons/icon.svg',
+];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
