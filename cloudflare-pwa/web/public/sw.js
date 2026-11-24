@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'finance-pwa-v1';
+const CACHE_VERSION = 'finance-pwa-v2';
 const APP_SHELL_URLS = ['/', '/index.html', '/manifest.webmanifest', '/icons/icon.svg'];
 
 self.addEventListener('install', (event) => {

@@ -220,12 +220,35 @@ body {
 }
 
 .quick-row { display: flex; align-items: center; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
-.row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
-.field { margin-bottom: 12px; }
+.row-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-bottom: 12px; align-items: end; }
+.row-2 > * { min-width: 0; }
+.field { margin-bottom: 12px; min-width: 0; }
 .field input, .field select {
-  width: 100%; padding: 10px 13px; border-radius: 12px;
-  border: 1px solid transparent; background: var(--fill); color: var(--text);
-  font-size: 14px; outline: none;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 42px;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: var(--fill);
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+}
+.field input {
+  -webkit-appearance: none;
+  appearance: none;
+  line-height: 40px;
+}
+.field input[type="date"] {
+  padding: 0 10px;
+  font-size: 13.5px;
+  overflow: hidden;
+}
+.field input[type="date"]::-webkit-date-and-time-value {
+  text-align: left;
 }
 .field input:focus, .field select:focus { border-color: var(--primary); background: var(--surface); }
 
