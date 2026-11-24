@@ -1,0 +1,31 @@
+{
+  "name": "personal-finance-cloudflare-pwa",
+  "version": "1.0.0",
+  "description": "個人現金流與資產負債管理系統 (Offline-First PWA + Cloudflare Workers + D1)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:web": "vite",
+    "dev:worker": "wrangler dev",
+    "build:web": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate:local": "wrangler d1 migrations apply finance-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply finance-db --remote",
+    "deploy": "npm run build:web && wrangler deploy"
+  },
+  "dependencies": {
+    "@simplewebauthn/browser": "^13.1.0",
+    "@simplewebauthn/server": "^13.1.1",
+    "hono": "^4.7.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.0.0",
+    "fake-indexeddb": "^6.0.0",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.5",
+    "vitest": "^3.1.1",
+    "wrangler": "^4.10.0"
+  }
+}

@@ -1,0 +1,241 @@
+import {
+  ALL_CASHFLOW_TYPES,
+  ASSET_MAJOR_TYPES,
+  ASSET_UPDATE_MODES,
+  BILLING_CYCLES,
+  CURRENCIES,
+  LIQUIDITY_LEVELS,
+  RECURRING_CASHFLOW_TYPES,
+  SOURCE_OPTIONS,
+  STATUS_OPTIONS,
+} from './constants';
+
+export interface ParsedLocalDate {
+  year: number;
+  month: number;
+  day: number;
+  yearMonth: string;
+}
+
+export function toSafeNumber(value: unknown, fallback = 0): number {
+  const num = Number(value);
+  return Number.isNaN(num) || !Number.isFinite(num) ? fallback : num;
+}
+
+export function parseLocalDate(ymd: string): ParsedLocalDate {
+  const trimmed = String(ymd || '').trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) {
+    throw new Error(`日期格式錯誤：${ymd}（應為 YYYY-MM-DD）`);
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const probe = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+  if (
+    probe.getUTCFullYear() !== year ||
+    probe.getUTCMonth() !== month - 1 ||
+    probe.getUTCDate() !== day
+  ) {
+    throw new Error(`無效的日期：${ymd}`);
+  }
+  return {
+    year,
+    month,
+    day,
+    yearMonth: `${year}-${String(month).padStart(2, '0')}`,
+  };
+}
+
+export interface CashFlowInputPayload {
+  date: string;
+  type: string;
+  category?: string;
+  itemName?: string;
+  amount: number | string;
+  currency?: string;
+  fxRate?: number;
+  source?: string;
+  note?: string;
+  makeRecurring?: boolean;
+}
+
+export interface ValidatedCashFlowInput {
+  date: string;
+  yearMonth: string;
+  type: string;
+  category: string;
+  itemName: string;
+  amount: number;
+  currency: string;
+  fxRate: number;
+  twdAmount: number;
+  source: string;
+  note: string;
+}
+
+export function validateCashFlowInput(
+  payload: CashFlowInputPayload,
+  defaultUsdTwdRate = 32.5
+): ValidatedCashFlowInput {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('請求格式無效。');
+  }
+  const parsedDate = parseLocalDate(String(payload.date || ''));
+  const type = String(payload.type || '').trim();
+  const category = String(payload.category || '').trim().slice(0, 40) || '其他';
+  const itemName = (String(payload.itemName || '').trim() || category).slice(0, 80);
+  const amount = Number(payload.amount);
+  const currency = String(payload.currency || 'TWD').trim().toUpperCase();
+  const sourceRaw = String(payload.source || '手機記帳').trim();
+  const source = SOURCE_OPTIONS.includes(sourceRaw) ? sourceRaw : '手機記帳';
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  if (!ALL_CASHFLOW_TYPES.includes(type)) {
+    throw new Error(`不支援的收支類型：${type}`);
+  }
+  if (Number.isNaN(amount) || !Number.isFinite(amount) || amount <= 0) {
+    throw new Error('請輸入大於 0 的有效金額。');
+  }
+  if (!CURRENCIES.includes(currency)) {
+    throw new Error(`不支援的幣別：${currency}`);
+  }
+
+  const fxRate =
+    currency === 'USD'
+      ? toSafeNumber(payload.fxRate, defaultUsdTwdRate) > 0
+        ? toSafeNumber(payload.fxRate, defaultUsdTwdRate)
+        : defaultUsdTwdRate
+      : 1;
+  const twdAmount = Math.round(amount * fxRate);
+
+  return {
+    date: String(payload.date).trim(),
+    yearMonth: parsedDate.yearMonth,
+    type,
+    category,
+    itemName,
+    amount,
+    currency,
+    fxRate,
+    twdAmount,
+    source,
+    note,
+  };
+}
+
+export interface RecurringInputPayload {
+  itemName: string;
+  category?: string;
+  type: string;
+  amount: number | string;
+  currency?: string;
+  cycle?: string;
+  billingSpec?: string;
+  status?: string;
+  note?: string;
+}
+
+export function validateRecurringInput(payload: RecurringInputPayload) {
+  const itemName = String(payload.itemName || '').trim().slice(0, 80);
+  const category = String(payload.category || '').trim().slice(0, 40) || '其他';
+  const type = String(payload.type || '').trim();
+  const amount = Number(payload.amount);
+  const currency = String(payload.currency || 'TWD').trim().toUpperCase();
+  const cycle = String(payload.cycle || '月繳').trim();
+  const billingSpec = String(payload.billingSpec || '').trim().slice(0, 40);
+  const status = String(payload.status || '啟用').trim();
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  if (!itemName) throw new Error('請輸入項目名稱。');
+  if (!RECURRING_CASHFLOW_TYPES.includes(type)) throw new Error(`不支援的收支類型：${type}`);
+  if (Number.isNaN(amount) || !Number.isFinite(amount) || amount <= 0) throw new Error('請輸入大於 0 的金額。');
+  if (!CURRENCIES.includes(currency)) throw new Error(`不支援的幣別：${currency}`);
+  if (!BILLING_CYCLES.includes(cycle)) throw new Error(`不支援的週期：${cycle}`);
+  if (!STATUS_OPTIONS.includes(status)) throw new Error(`不支援的狀態：${status}`);
+
+  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note };
+}
+
+export interface SinkingInputPayload {
+  itemName: string;
+  category?: string;
+  totalAmount: number | string;
+  months: number | string;
+  dueNote?: string;
+  status?: string;
+  note?: string;
+}
+
+export function validateSinkingInput(payload: SinkingInputPayload) {
+  const itemName = String(payload.itemName || '').trim().slice(0, 80);
+  const category = String(payload.category || '').trim().slice(0, 40) || '其他';
+  const totalAmount = Math.round(Number(payload.totalAmount));
+  const months = Math.round(Number(payload.months));
+  const dueNote = String(payload.dueNote || '').trim().slice(0, 40);
+  const status = String(payload.status || '啟用').trim();
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  if (!itemName) throw new Error('請輸入項目名稱。');
+  if (Number.isNaN(totalAmount) || totalAmount <= 0) throw new Error('請輸入大於 0 的預估總金額。');
+  if (Number.isNaN(months) || months < 1 || months > 120) throw new Error('分攤月數需介於 1～120 個月。');
+  if (!STATUS_OPTIONS.includes(status)) throw new Error('狀態無效。');
+
+  return { itemName, category, totalAmount, months, dueNote, status, note };
+}
+
+export interface AssetInputPayload {
+  updateMode?: string;
+  majorType?: string;
+  subCategory?: string;
+  liquidity?: string;
+  itemName: string;
+  ticker?: string;
+  quantityOrAmount: number | string;
+  currency?: string;
+  unitPrice?: number | string;
+  note?: string;
+}
+
+export function validateAssetInput(payload: AssetInputPayload) {
+  const updateMode = String(payload.updateMode || '手動快照').trim();
+  const majorType = String(payload.majorType || '資產').trim();
+  const subCategory = String(payload.subCategory || '其他資產').trim().slice(0, 40);
+  const rawLiquidity = String(payload.liquidity || '中流動').trim();
+  const liquidity =
+    majorType === '負債'
+      ? '負債'
+      : LIQUIDITY_LEVELS.includes(rawLiquidity)
+        ? rawLiquidity
+        : '中流動';
+  const itemName = String(payload.itemName || '').trim().slice(0, 80);
+  const ticker = String(payload.ticker || '').trim().toUpperCase().slice(0, 30);
+  const quantityOrAmount = Number(payload.quantityOrAmount);
+  const currency = String(payload.currency || 'TWD').trim().toUpperCase();
+  const unitPrice = payload.unitPrice !== undefined ? Number(payload.unitPrice) : 1;
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  if (!itemName) throw new Error('請輸入項目名稱。');
+  if (!ASSET_UPDATE_MODES.includes(updateMode)) throw new Error('更新方式無效。');
+  if (!ASSET_MAJOR_TYPES.includes(majorType)) throw new Error('大類需為資產或負債。');
+  if (Number.isNaN(quantityOrAmount) || !Number.isFinite(quantityOrAmount) || quantityOrAmount < 0) {
+    throw new Error('請輸入大於等於 0 的有效數值。');
+  }
+  if (!CURRENCIES.includes(currency)) throw new Error('幣別僅支援 TWD / USD。');
+  if (Number.isNaN(unitPrice) || !Number.isFinite(unitPrice) || unitPrice < 0) {
+    throw new Error('單價需大於等於 0。');
+  }
+
+  return {
+    updateMode,
+    majorType,
+    subCategory,
+    liquidity,
+    itemName,
+    ticker,
+    quantityOrAmount,
+    currency,
+    unitPrice,
+    note,
+  };
+}

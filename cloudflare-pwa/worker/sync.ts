@@ -1,0 +1,718 @@
+import {
+  DEFAULT_EMERGENCY_MONTHS,
+  DEFAULT_MONTHLY_DAILY_BUDGET,
+  DEFAULT_USD_TWD_RATE,
+} from '../shared/constants';
+import type {
+  AppSettings,
+  AssetItem,
+  CashFlowLog,
+  FinanceSnapshot,
+  NetWorthHistory,
+  RecurringItem,
+  SinkingFundItem,
+  SyncDelta,
+  SyncMutation,
+  SyncRequest,
+  SyncResponse,
+} from '../shared/types';
+import {
+  toSafeNumber,
+  validateAssetInput,
+  validateCashFlowInput,
+  validateRecurringInput,
+  validateSinkingInput,
+} from '../shared/validation';
+
+export async function ensureAppSettings(db: D1Database): Promise<AppSettings> {
+  const row = await db
+    .prepare('SELECT * FROM app_settings WHERE id = 1')
+    .first<{
+      monthly_daily_budget: number;
+      emergency_target_months: number;
+      usd_twd_rate: number;
+      fx_updated_at: string | null;
+      updated_at: string;
+    }>();
+
+  if (row) {
+    return {
+      monthlyDailyBudget: row.monthly_daily_budget,
+      emergencyTargetMonths: row.emergency_target_months,
+      usdTwdRate: row.usd_twd_rate,
+      fxUpdatedAt: row.fx_updated_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO app_settings (id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
+       VALUES (1, ?, ?, ?, ?)`
+    )
+    .bind(DEFAULT_MONTHLY_DAILY_BUDGET, DEFAULT_EMERGENCY_MONTHS, DEFAULT_USD_TWD_RATE, nowIso)
+    .run();
+
+  return {
+    monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
+    emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
+    usdTwdRate: DEFAULT_USD_TWD_RATE,
+    fxUpdatedAt: null,
+    updatedAt: nowIso,
+  };
+}
+
+function mapCashFlowRow(r: Record<string, unknown>): CashFlowLog {
+  return {
+    id: String(r.id),
+    date: String(r.date),
+    yearMonth: String(r.year_month),
+    type: String(r.type),
+    category: String(r.category),
+    itemName: String(r.item_name),
+    amount: Number(r.amount),
+    currency: String(r.currency),
+    fxRate: Number(r.fx_rate),
+    twdAmount: Number(r.twd_amount),
+    source: String(r.source),
+    note: String(r.note || ''),
+    recurringDedupKey: r.recurring_dedup_key ? String(r.recurring_dedup_key) : null,
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+  };
+}
+
+function mapRecurringRow(r: Record<string, unknown>): RecurringItem {
+  return {
+    id: String(r.id),
+    itemName: String(r.item_name),
+    category: String(r.category),
+    type: String(r.type),
+    amount: Number(r.amount),
+    currency: String(r.currency),
+    cycle: String(r.cycle),
+    billingSpec: String(r.billing_spec || ''),
+    status: String(r.status),
+    note: String(r.note || ''),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+  };
+}
+
+function mapSinkingRow(r: Record<string, unknown>): SinkingFundItem {
+  return {
+    id: String(r.id),
+    itemName: String(r.item_name),
+    category: String(r.category),
+    totalAmount: Number(r.total_amount),
+    months: Number(r.months),
+    dueNote: String(r.due_note || ''),
+    status: String(r.status),
+    note: String(r.note || ''),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+  };
+}
+
+function mapAssetRow(r: Record<string, unknown>): AssetItem {
+  return {
+    id: String(r.id),
+    updateMode: String(r.update_mode),
+    majorType: String(r.major_type),
+    subCategory: String(r.sub_category),
+    liquidity: String(r.liquidity),
+    itemName: String(r.item_name),
+    ticker: String(r.ticker || ''),
+    quantityOrAmount: Number(r.quantity_or_amount),
+    currency: String(r.currency),
+    unitPrice: Number(r.unit_price),
+    priceUpdatedAt: r.price_updated_at ? String(r.price_updated_at) : null,
+    note: String(r.note || ''),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+  };
+}
+
+function mapNetWorthRow(r: Record<string, unknown>): NetWorthHistory {
+  return {
+    yearMonth: String(r.year_month),
+    snapshotDate: String(r.snapshot_date),
+    totalAssets: Number(r.total_assets),
+    totalLiabilities: Number(r.total_liabilities),
+    netWorth: Number(r.net_worth),
+    highLiquidityAssets: Number(r.high_liquidity_assets),
+    investmentAssets: Number(r.investment_assets),
+    insuranceAssets: Number(r.insurance_assets),
+    monthlyIncome: Number(r.monthly_income),
+    monthlyConsumption: Number(r.monthly_consumption),
+    savingsRate: Number(r.savings_rate),
+    note: String(r.note || ''),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function isNewerOrEqual(incomingTs: string, existingTs: string | null | undefined): boolean {
+  if (!existingTs) return true;
+  return incomingTs >= existingTs;
+}
+
+async function applySingleMutation(
+  db: D1Database,
+  mutation: SyncMutation,
+  defaultFxRate: number,
+  serverTime: string
+): Promise<void> {
+  const ts = mutation.clientTimestamp || serverTime;
+
+  if (mutation.entity === 'settings') {
+    const p = mutation.payload || {};
+    const existing = await ensureAppSettings(db);
+    if (!isNewerOrEqual(ts, existing.updatedAt)) return;
+    const budget = Math.max(0, Math.round(toSafeNumber(p.monthlyDailyBudget, existing.monthlyDailyBudget)));
+    const months = Math.min(60, Math.max(1, Math.round(toSafeNumber(p.emergencyTargetMonths, existing.emergencyTargetMonths))));
+    const fx = toSafeNumber(p.usdTwdRate, existing.usdTwdRate);
+    const validFx = fx > 10 && fx < 100 ? fx : existing.usdTwdRate;
+    await db
+      .prepare(
+        `UPDATE app_settings
+         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, updated_at = ?
+         WHERE id = 1`
+      )
+      .bind(budget, months, validFx, ts)
+      .run();
+    return;
+  }
+
+  if (mutation.entity === 'cashflow') {
+    const existing = await db
+      .prepare('SELECT updated_at FROM cashflow_logs WHERE id = ?')
+      .bind(mutation.recordId)
+      .first<{ updated_at: string }>();
+    if (!isNewerOrEqual(ts, existing?.updated_at)) return;
+
+    if (mutation.op === 'delete') {
+      await db
+        .prepare('UPDATE cashflow_logs SET deleted_at = ?, updated_at = ? WHERE id = ?')
+        .bind(ts, ts, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateCashFlowInput(
+      {
+        date: String(p.date || ''),
+        type: String(p.type || ''),
+        category: String(p.category || ''),
+        itemName: String(p.itemName || ''),
+        amount: Number(p.amount),
+        currency: String(p.currency || 'TWD'),
+        fxRate: p.fxRate !== undefined ? Number(p.fxRate) : undefined,
+        source: String(p.source || '手機記帳'),
+        note: String(p.note || ''),
+      },
+      defaultFxRate
+    );
+
+    await db
+      .prepare(
+        `INSERT INTO cashflow_logs
+          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           date = excluded.date,
+           year_month = excluded.year_month,
+           type = excluded.type,
+           category = excluded.category,
+           item_name = excluded.item_name,
+           amount = excluded.amount,
+           currency = excluded.currency,
+           fx_rate = excluded.fx_rate,
+           twd_amount = excluded.twd_amount,
+           source = excluded.source,
+           note = excluded.note,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL`
+      )
+      .bind(
+        mutation.recordId,
+        v.date,
+        v.yearMonth,
+        v.type,
+        v.category,
+        v.itemName,
+        v.amount,
+        v.currency,
+        v.fxRate,
+        v.twdAmount,
+        v.source,
+        v.note,
+        String(p.createdAt || ts),
+        ts
+      )
+      .run();
+    return;
+  }
+
+  if (mutation.entity === 'recurring') {
+    const existing = await db
+      .prepare('SELECT updated_at FROM recurring_items WHERE id = ?')
+      .bind(mutation.recordId)
+      .first<{ updated_at: string }>();
+    if (!isNewerOrEqual(ts, existing?.updated_at)) return;
+
+    if (mutation.op === 'delete') {
+      await db
+        .prepare('UPDATE recurring_items SET deleted_at = ?, updated_at = ? WHERE id = ?')
+        .bind(ts, ts, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateRecurringInput({
+      itemName: String(p.itemName || ''),
+      category: String(p.category || ''),
+      type: String(p.type || ''),
+      amount: Number(p.amount),
+      currency: String(p.currency || 'TWD'),
+      cycle: String(p.cycle || '月繳'),
+      billingSpec: String(p.billingSpec || ''),
+      status: String(p.status || '啟用'),
+      note: String(p.note || ''),
+    });
+
+    await db
+      .prepare(
+        `INSERT INTO recurring_items
+          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           item_name = excluded.item_name,
+           category = excluded.category,
+           type = excluded.type,
+           amount = excluded.amount,
+           currency = excluded.currency,
+           cycle = excluded.cycle,
+           billing_spec = excluded.billing_spec,
+           status = excluded.status,
+           note = excluded.note,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL`
+      )
+      .bind(
+        mutation.recordId,
+        v.itemName,
+        v.category,
+        v.type,
+        v.amount,
+        v.currency,
+        v.cycle,
+        v.billingSpec,
+        v.status,
+        v.note,
+        String(p.createdAt || ts),
+        ts
+      )
+      .run();
+    return;
+  }
+
+  if (mutation.entity === 'sinking') {
+    const existing = await db
+      .prepare('SELECT updated_at FROM sinking_fund_items WHERE id = ?')
+      .bind(mutation.recordId)
+      .first<{ updated_at: string }>();
+    if (!isNewerOrEqual(ts, existing?.updated_at)) return;
+
+    if (mutation.op === 'delete') {
+      await db
+        .prepare('UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ? WHERE id = ?')
+        .bind(ts, ts, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateSinkingInput({
+      itemName: String(p.itemName || ''),
+      category: String(p.category || ''),
+      totalAmount: Number(p.totalAmount),
+      months: Number(p.months),
+      dueNote: String(p.dueNote || ''),
+      status: String(p.status || '啟用'),
+      note: String(p.note || ''),
+    });
+
+    await db
+      .prepare(
+        `INSERT INTO sinking_fund_items
+          (id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           item_name = excluded.item_name,
+           category = excluded.category,
+           total_amount = excluded.total_amount,
+           months = excluded.months,
+           due_note = excluded.due_note,
+           status = excluded.status,
+           note = excluded.note,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL`
+      )
+      .bind(
+        mutation.recordId,
+        v.itemName,
+        v.category,
+        v.totalAmount,
+        v.months,
+        v.dueNote,
+        v.status,
+        v.note,
+        String(p.createdAt || ts),
+        ts
+      )
+      .run();
+    return;
+  }
+
+  if (mutation.entity === 'asset') {
+    const existing = await db
+      .prepare('SELECT updated_at, unit_price FROM asset_items WHERE id = ?')
+      .bind(mutation.recordId)
+      .first<{ updated_at: string; unit_price: number }>();
+    if (!isNewerOrEqual(ts, existing?.updated_at)) return;
+
+    if (mutation.op === 'delete') {
+      await db
+        .prepare('UPDATE asset_items SET deleted_at = ?, updated_at = ? WHERE id = ?')
+        .bind(ts, ts, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateAssetInput({
+      updateMode: String(p.updateMode || '手動快照'),
+      majorType: String(p.majorType || '資產'),
+      subCategory: String(p.subCategory || '其他資產'),
+      liquidity: String(p.liquidity || '中流動'),
+      itemName: String(p.itemName || ''),
+      ticker: String(p.ticker || ''),
+      quantityOrAmount: Number(p.quantityOrAmount),
+      currency: String(p.currency || 'TWD'),
+      unitPrice: p.unitPrice !== undefined ? Number(p.unitPrice) : existing?.unit_price ?? 1,
+      note: String(p.note || ''),
+    });
+
+    await db
+      .prepare(
+        `INSERT INTO asset_items
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           update_mode = excluded.update_mode,
+           major_type = excluded.major_type,
+           sub_category = excluded.sub_category,
+           liquidity = excluded.liquidity,
+           item_name = excluded.item_name,
+           ticker = excluded.ticker,
+           quantity_or_amount = excluded.quantity_or_amount,
+           currency = excluded.currency,
+           unit_price = excluded.unit_price,
+           note = excluded.note,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL`
+      )
+      .bind(
+        mutation.recordId,
+        v.updateMode,
+        v.majorType,
+        v.subCategory,
+        v.liquidity,
+        v.itemName,
+        v.ticker,
+        v.quantityOrAmount,
+        v.currency,
+        v.unitPrice,
+        v.note,
+        String(p.createdAt || ts),
+        ts
+      )
+      .run();
+  }
+}
+
+export async function querySyncDelta(db: D1Database, since?: string | null): Promise<SyncDelta> {
+  const settings = await ensureAppSettings(db);
+
+  if (since) {
+    const [logs, rec, sink, assets, hist] = await Promise.all([
+      db.prepare('SELECT * FROM cashflow_logs WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
+      db.prepare('SELECT * FROM recurring_items WHERE updated_at > ?').bind(since).all(),
+      db.prepare('SELECT * FROM sinking_fund_items WHERE updated_at > ?').bind(since).all(),
+      db.prepare('SELECT * FROM asset_items WHERE updated_at > ?').bind(since).all(),
+      db.prepare('SELECT * FROM networth_history WHERE updated_at > ? ORDER BY year_month DESC').bind(since).all(),
+    ]);
+
+    return {
+      settings: settings.updatedAt > since ? settings : null,
+      cashflowLogs: logs.results.map(mapCashFlowRow),
+      recurringItems: rec.results.map(mapRecurringRow),
+      sinkingItems: sink.results.map(mapSinkingRow),
+      assetItems: assets.results.map(mapAssetRow),
+      netWorthHistory: hist.results.map(mapNetWorthRow),
+    };
+  }
+
+  const [logs, rec, sink, assets, hist] = await Promise.all([
+    db.prepare('SELECT * FROM cashflow_logs WHERE deleted_at IS NULL ORDER BY date DESC').all(),
+    db.prepare('SELECT * FROM recurring_items WHERE deleted_at IS NULL').all(),
+    db.prepare('SELECT * FROM sinking_fund_items WHERE deleted_at IS NULL').all(),
+    db.prepare('SELECT * FROM asset_items WHERE deleted_at IS NULL').all(),
+    db.prepare('SELECT * FROM networth_history ORDER BY year_month DESC').all(),
+  ]);
+
+  return {
+    settings,
+    cashflowLogs: logs.results.map(mapCashFlowRow),
+    recurringItems: rec.results.map(mapRecurringRow),
+    sinkingItems: sink.results.map(mapSinkingRow),
+    assetItems: assets.results.map(mapAssetRow),
+    netWorthHistory: hist.results.map(mapNetWorthRow),
+  };
+}
+
+export async function processSyncRequest(db: D1Database, req: SyncRequest): Promise<SyncResponse> {
+  const serverTime = new Date().toISOString();
+  const settings = await ensureAppSettings(db);
+  const mutations = Array.isArray(req.mutations) ? req.mutations : [];
+  const ackedMutationIds: string[] = [];
+  const rejected: Array<{ mutationId: string; reason: string }> = [];
+
+  for (const mut of mutations) {
+    if (!mut || !mut.mutationId || !mut.entity || !mut.recordId) {
+      rejected.push({ mutationId: mut?.mutationId || 'unknown', reason: 'Invalid mutation format' });
+      continue;
+    }
+
+    const already = await db
+      .prepare('SELECT mutation_id FROM sync_idempotency WHERE mutation_id = ?')
+      .bind(mut.mutationId)
+      .first();
+
+    if (already) {
+      ackedMutationIds.push(mut.mutationId);
+      continue;
+    }
+
+    try {
+      await applySingleMutation(db, mut, settings.usdTwdRate, serverTime);
+      await db
+        .prepare('INSERT INTO sync_idempotency (mutation_id, applied_at) VALUES (?, ?)')
+        .bind(mut.mutationId, serverTime)
+        .run();
+      ackedMutationIds.push(mut.mutationId);
+    } catch (err) {
+      rejected.push({
+        mutationId: mut.mutationId,
+        reason: err instanceof Error ? err.message : 'Failed to apply mutation',
+      });
+    }
+  }
+
+  const delta = await querySyncDelta(db, req.since);
+  return {
+    ok: true,
+    serverTime,
+    ackedMutationIds,
+    rejected,
+    delta,
+  };
+}
+
+export async function exportFullSnapshot(db: D1Database): Promise<FinanceSnapshot> {
+  const delta = await querySyncDelta(db, null);
+  return {
+    settings: delta.settings || (await ensureAppSettings(db)),
+    cashflowLogs: delta.cashflowLogs,
+    recurringItems: delta.recurringItems,
+    sinkingItems: delta.sinkingItems,
+    assetItems: delta.assetItems,
+    netWorthHistory: delta.netWorthHistory,
+  };
+}
+
+export async function importFullSnapshot(
+  db: D1Database,
+  data: Partial<FinanceSnapshot>,
+  mode: 'merge' | 'replace' = 'merge'
+): Promise<{ importedLogs: number; importedRecurring: number; importedSinking: number; importedAssets: number }> {
+  const nowIso = new Date().toISOString();
+
+  if (mode === 'replace') {
+    await db.prepare('DELETE FROM cashflow_logs').run();
+    await db.prepare('DELETE FROM recurring_items').run();
+    await db.prepare('DELETE FROM sinking_fund_items').run();
+    await db.prepare('DELETE FROM asset_items').run();
+    await db.prepare('DELETE FROM networth_history').run();
+  }
+
+  const currentSettings = await ensureAppSettings(db);
+  if (data.settings) {
+    await db
+      .prepare(
+        `UPDATE app_settings
+         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, updated_at = ?
+         WHERE id = 1`
+      )
+      .bind(
+        Math.max(0, Math.round(toSafeNumber(data.settings.monthlyDailyBudget, currentSettings.monthlyDailyBudget))),
+        Math.min(60, Math.max(1, Math.round(toSafeNumber(data.settings.emergencyTargetMonths, currentSettings.emergencyTargetMonths)))),
+        toSafeNumber(data.settings.usdTwdRate, currentSettings.usdTwdRate),
+        nowIso
+      )
+      .run();
+  }
+
+  let importedLogs = 0;
+  for (const log of data.cashflowLogs || []) {
+    const v = validateCashFlowInput(log, currentSettings.usdTwdRate);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO cashflow_logs
+          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        log.id || crypto.randomUUID(),
+        v.date,
+        v.yearMonth,
+        v.type,
+        v.category,
+        v.itemName,
+        v.amount,
+        v.currency,
+        v.fxRate,
+        v.twdAmount,
+        v.source,
+        v.note,
+        log.createdAt || nowIso,
+        nowIso
+      )
+      .run();
+    importedLogs++;
+  }
+
+  let importedRecurring = 0;
+  for (const r of data.recurringItems || []) {
+    const v = validateRecurringInput(r);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO recurring_items
+          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        r.id || crypto.randomUUID(),
+        v.itemName,
+        v.category,
+        v.type,
+        v.amount,
+        v.currency,
+        v.cycle,
+        v.billingSpec,
+        v.status,
+        v.note,
+        r.createdAt || nowIso,
+        nowIso
+      )
+      .run();
+    importedRecurring++;
+  }
+
+  let importedSinking = 0;
+  for (const s of data.sinkingItems || []) {
+    const v = validateSinkingInput(s);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO sinking_fund_items
+          (id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        s.id || crypto.randomUUID(),
+        v.itemName,
+        v.category,
+        v.totalAmount,
+        v.months,
+        v.dueNote,
+        v.status,
+        v.note,
+        s.createdAt || nowIso,
+        nowIso
+      )
+      .run();
+    importedSinking++;
+  }
+
+  let importedAssets = 0;
+  for (const a of data.assetItems || []) {
+    const v = validateAssetInput(a);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO asset_items
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        a.id || crypto.randomUUID(),
+        v.updateMode,
+        v.majorType,
+        v.subCategory,
+        v.liquidity,
+        v.itemName,
+        v.ticker,
+        v.quantityOrAmount,
+        v.currency,
+        v.unitPrice,
+        v.note,
+        a.createdAt || nowIso,
+        nowIso
+      )
+      .run();
+    importedAssets++;
+  }
+
+  for (const h of data.netWorthHistory || []) {
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO networth_history
+          (year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        h.yearMonth,
+        h.snapshotDate,
+        Math.round(h.totalAssets),
+        Math.round(h.totalLiabilities),
+        Math.round(h.netWorth),
+        Math.round(h.highLiquidityAssets),
+        Math.round(h.investmentAssets),
+        Math.round(h.insuranceAssets),
+        Math.round(h.monthlyIncome),
+        Math.round(h.monthlyConsumption),
+        h.savingsRate,
+        h.note || '',
+        nowIso
+      )
+      .run();
+  }
+
+  return { importedLogs, importedRecurring, importedSinking, importedAssets };
+}

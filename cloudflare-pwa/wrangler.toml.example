@@ -1,0 +1,27 @@
+name = "personal-finance-pwa"
+main = "worker/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist/web"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+# 執行 `npx wrangler d1 create finance-db` 後，複製此檔為 wrangler.toml 並填入 database_id
+[[d1_databases]]
+binding = "DB"
+database_name = "finance-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Cloudflare Cron Triggers (UTC 時區)
+# 1. 0 0 1 * *  => 台灣時間每月 1 號 08:00：常態收支自動入帳
+# 2. 0 15 * * * => 台灣時間每日 23:00：更新匯率/台股報價，並於月底自動建立淨資產快照
+[triggers]
+crons = ["0 0 1 * *", "0 15 * * *"]
+
+[vars]
+APP_TIMEZONE = "Asia/Taipei"
+# 部署前請使用 `npx wrangler secret put SETUP_SECRET` 設定首次初始化密鑰

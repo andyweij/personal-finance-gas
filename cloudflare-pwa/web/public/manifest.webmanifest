@@ -1,0 +1,19 @@
+{
+  "name": "財務管家 | 個人現金流與資產",
+  "short_name": "財務管家",
+  "description": "離線優先個人現金流、訂閱與資產負債管理 PWA",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F2F2F7",
+  "theme_color": "#4E8FE6",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
