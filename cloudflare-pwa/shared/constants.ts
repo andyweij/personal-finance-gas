@@ -43,6 +43,7 @@ export const ASSET_MAJOR_TYPES: string[] = ['資產', '負債'];
 export const ASSET_SUB_CATEGORIES: string[] = [
   '活存',
   '台股',
+  '美股/ETF',
   '美金',
   '定存/現金',
   '中信基金',
@@ -54,6 +55,20 @@ export const ASSET_SUB_CATEGORIES: string[] = [
   '其他負債',
 ];
 export const LIQUIDITY_LEVELS: string[] = ['高流動', '中流動', '低流動', '負債'];
+
+export const STOCK_TX_TYPES = {
+  BUY: 'buy',
+  SELL: 'sell',
+  CASH_DIVIDEND: 'cash_dividend',
+  STOCK_DIVIDEND: 'stock_dividend',
+} as const;
+
+export const ALL_STOCK_TX_TYPES: string[] = [
+  STOCK_TX_TYPES.BUY,
+  STOCK_TX_TYPES.SELL,
+  STOCK_TX_TYPES.CASH_DIVIDEND,
+  STOCK_TX_TYPES.STOCK_DIVIDEND,
+];
 
 export const SINKING_FUND_CATEGORIES: string[] = [
   '所得稅',

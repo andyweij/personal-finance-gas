@@ -1,4 +1,4 @@
-import { CASHFLOW_TYPES } from './constants';
+import { CASHFLOW_TYPES, STOCK_TX_TYPES } from './constants';
 import type {
   AllSavingsSummary,
   AssetItem,
@@ -10,6 +10,9 @@ import type {
   SavingsAccountSummary,
   SavingsAdjustment,
   SinkingFundItem,
+  StockPortfolioSummary,
+  StockPositionSummary,
+  StockTransaction,
 } from './types';
 
 export function isCashFlowIncome(type: string): boolean {
@@ -94,14 +97,251 @@ export function computeAllSavingsSummary(
   };
 }
 
+export function isStockAsset(item: AssetItem): boolean {
+  if (item.deletedAt || item.isLinkedSavings || item.majorType !== '資產') return false;
+  return (
+    item.subCategory === '台股' ||
+    item.subCategory === '美股/ETF' ||
+    Boolean(item.ticker && item.ticker.trim())
+  );
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
+}
+
+function round4(n: number): number {
+  return Math.round(n * 10000) / 10000;
+}
+
+export function computeStockPositionSummary(
+  asset: AssetItem,
+  stockTransactions: StockTransaction[],
+  usdTwdRate: number
+): StockPositionSummary {
+  const fxRate = asset.currency === 'USD' ? usdTwdRate : 1;
+  const baselineShares = Math.max(0, Number(asset.quantityOrAmount || 0));
+  const baselineHasCost = asset.costBasis !== null && asset.costBasis !== undefined;
+  const baselineCostBasis = baselineHasCost ? Math.max(0, Number(asset.costBasis)) : 0;
+
+  const txs = (stockTransactions || [])
+    .filter((tx) => !tx.deletedAt && tx.assetId === asset.id)
+    .slice()
+    .sort(
+      (a, b) =>
+        a.date.localeCompare(b.date) ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id)
+    );
+
+  const hasBuyTx = txs.some((tx) => tx.txType === STOCK_TX_TYPES.BUY);
+  const hasCostBasis = baselineHasCost || (baselineShares === 0 && hasBuyTx);
+
+  let shares = baselineShares;
+  let costBasis = baselineCostBasis;
+  let totalInvestedAllTime = baselineCostBasis;
+  let cumulativeCashDividends = 0;
+  let cumulativeStockDividendShares = 0;
+  let realizedPnl = 0;
+
+  for (const tx of txs) {
+    if (tx.txType === STOCK_TX_TYPES.BUY) {
+      shares += tx.shares;
+      if (hasCostBasis) {
+        costBasis += tx.totalAmount;
+        totalInvestedAllTime += tx.totalAmount;
+      }
+    } else if (tx.txType === STOCK_TX_TYPES.STOCK_DIVIDEND) {
+      shares += tx.shares;
+      cumulativeStockDividendShares += tx.shares;
+    } else if (tx.txType === STOCK_TX_TYPES.SELL) {
+      const sold = Math.min(tx.shares, shares);
+      const avgBefore = shares > 0 ? costBasis / shares : 0;
+      const removedCost = hasCostBasis ? avgBefore * sold : 0;
+      shares = Math.max(0, shares - sold);
+      if (hasCostBasis) {
+        costBasis = shares > 0 ? Math.max(0, costBasis - removedCost) : 0;
+        realizedPnl += tx.totalAmount - removedCost;
+      }
+    } else if (tx.txType === STOCK_TX_TYPES.CASH_DIVIDEND) {
+      cumulativeCashDividends += tx.totalAmount;
+    }
+  }
+
+  const currentShares = round4(shares);
+  const marketPrice = Number(asset.unitPrice || 0);
+  const marketValue = round2(currentShares * marketPrice);
+  const marketValueTwd = Math.round(marketValue * fxRate);
+
+  const activeCostBasis = hasCostBasis ? round2(costBasis) : 0;
+  const costBasisTwd = Math.round(activeCostBasis * fxRate);
+  const avgCostPerShare = hasCostBasis && currentShares > 0 ? round4(activeCostBasis / currentShares) : 0;
+
+  const unrealizedPnl = hasCostBasis ? round2(marketValue - activeCostBasis) : 0;
+  const unrealizedPnlTwd = Math.round(unrealizedPnl * fxRate);
+  const unrealizedRoiPct =
+    hasCostBasis && activeCostBasis > 0 ? round1((unrealizedPnl / activeCostBasis) * 100) : 0;
+
+  const cashDivRounded = round2(cumulativeCashDividends);
+  const cashDivTwd = Math.round(cashDivRounded * fxRate);
+  const realizedRounded = hasCostBasis ? round2(realizedPnl) : 0;
+  const realizedTwd = Math.round(realizedRounded * fxRate);
+
+  const unrecoveredCost = hasCostBasis ? round2(Math.max(0, activeCostBasis - cashDivRounded)) : 0;
+  const unrecoveredCostTwd = Math.round(unrecoveredCost * fxRate);
+  const unrecoveredCostPerShare =
+    hasCostBasis && currentShares > 0 ? round4(unrecoveredCost / currentShares) : 0;
+  const excessRecoveredCash = hasCostBasis
+    ? round2(Math.max(0, cashDivRounded - activeCostBasis))
+    : 0;
+  const excessRecoveredCashTwd = Math.round(excessRecoveredCash * fxRate);
+
+  const costRecoveryPct = !hasCostBasis
+    ? 0
+    : activeCostBasis > 0
+      ? Math.min(100, round1((cashDivRounded / activeCostBasis) * 100))
+      : cashDivRounded > 0
+        ? 100
+        : 0;
+  const isCostRecovered =
+    hasCostBasis &&
+    ((activeCostBasis > 0 && cashDivRounded >= activeCostBasis) ||
+      (activeCostBasis === 0 && cashDivRounded > 0));
+
+  const totalReturnPnl = hasCostBasis
+    ? round2(unrealizedPnl + cashDivRounded + realizedRounded)
+    : 0;
+  const totalReturnPnlTwd = Math.round(totalReturnPnl * fxRate);
+  const roiDenominator = totalInvestedAllTime > 0 ? totalInvestedAllTime : activeCostBasis;
+  const totalReturnRoiPct =
+    hasCostBasis && roiDenominator > 0 ? round1((totalReturnPnl / roiDenominator) * 100) : 0;
+
+  return {
+    asset,
+    fxRate,
+    hasCostBasis,
+    baselineShares,
+    baselineCostBasis,
+    currentShares,
+    marketPrice,
+    marketValue,
+    marketValueTwd,
+    costBasis: activeCostBasis,
+    costBasisTwd,
+    avgCostPerShare,
+    unrealizedPnl,
+    unrealizedPnlTwd,
+    unrealizedRoiPct,
+    cumulativeCashDividends: cashDivRounded,
+    cumulativeCashDividendsTwd: cashDivTwd,
+    cumulativeStockDividendShares: round4(cumulativeStockDividendShares),
+    realizedPnl: realizedRounded,
+    realizedPnlTwd: realizedTwd,
+    unrecoveredCost,
+    unrecoveredCostTwd,
+    unrecoveredCostPerShare,
+    excessRecoveredCash,
+    excessRecoveredCashTwd,
+    costRecoveryPct,
+    isCostRecovered,
+    totalReturnPnl,
+    totalReturnPnlTwd,
+    totalReturnRoiPct,
+    totalInvestedAllTime: round2(totalInvestedAllTime),
+    transactionCount: txs.length,
+  };
+}
+
+export function computeStockPortfolioSummary(
+  assets: AssetItem[],
+  stockTransactions: StockTransaction[],
+  usdTwdRate: number
+): StockPortfolioSummary {
+  const stockAssets = (assets || []).filter((a) => isStockAsset(a));
+  const positions = stockAssets.map((a) =>
+    computeStockPositionSummary(a, stockTransactions || [], usdTwdRate)
+  );
+
+  let totalMarketValueTwd = 0;
+  let totalCostBasisTwd = 0;
+  let totalUnrealizedPnlTwd = 0;
+  let totalCashDividendsTwd = 0;
+  let totalRealizedPnlTwd = 0;
+  let totalUnrecoveredCostTwd = 0;
+  let totalExcessRecoveredCashTwd = 0;
+  let totalReturnPnlTwd = 0;
+  let totalInvestedAllTimeTwd = 0;
+  let hasAnyCostBasis = false;
+
+  for (const p of positions) {
+    totalMarketValueTwd += p.marketValueTwd;
+    totalCashDividendsTwd += p.cumulativeCashDividendsTwd;
+    if (p.hasCostBasis) {
+      hasAnyCostBasis = true;
+      totalCostBasisTwd += p.costBasisTwd;
+      totalUnrealizedPnlTwd += p.unrealizedPnlTwd;
+      totalRealizedPnlTwd += p.realizedPnlTwd;
+      totalUnrecoveredCostTwd += p.unrecoveredCostTwd;
+      totalExcessRecoveredCashTwd += p.excessRecoveredCashTwd;
+      totalReturnPnlTwd += p.totalReturnPnlTwd;
+      totalInvestedAllTimeTwd += Math.round(p.totalInvestedAllTime * p.fxRate);
+    }
+  }
+
+  const totalUnrealizedRoiPct =
+    totalCostBasisTwd > 0 ? round1((totalUnrealizedPnlTwd / totalCostBasisTwd) * 100) : 0;
+  const overallCostRecoveryPct =
+    totalCostBasisTwd > 0
+      ? Math.min(100, round1((totalCashDividendsTwd / totalCostBasisTwd) * 100))
+      : hasAnyCostBasis && totalCashDividendsTwd > 0
+        ? 100
+        : 0;
+  const roiDenom = totalInvestedAllTimeTwd > 0 ? totalInvestedAllTimeTwd : totalCostBasisTwd;
+  const totalReturnRoiPct = roiDenom > 0 ? round1((totalReturnPnlTwd / roiDenom) * 100) : 0;
+
+  return {
+    positions,
+    totalMarketValueTwd: Math.round(totalMarketValueTwd),
+    totalCostBasisTwd: Math.round(totalCostBasisTwd),
+    totalUnrealizedPnlTwd: Math.round(totalUnrealizedPnlTwd),
+    totalUnrealizedRoiPct,
+    totalCashDividendsTwd: Math.round(totalCashDividendsTwd),
+    totalRealizedPnlTwd: Math.round(totalRealizedPnlTwd),
+    totalUnrecoveredCostTwd: Math.round(totalUnrecoveredCostTwd),
+    totalExcessRecoveredCashTwd: Math.round(totalExcessRecoveredCashTwd),
+    overallCostRecoveryPct,
+    totalReturnPnlTwd: Math.round(totalReturnPnlTwd),
+    totalReturnRoiPct,
+    hasAnyCostBasis,
+  };
+}
+
+export function computeAssetEffectiveShares(
+  item: AssetItem,
+  stockTransactions: StockTransaction[] = []
+): number {
+  if (!stockTransactions.length || !isStockAsset(item)) {
+    return item.quantityOrAmount;
+  }
+  return computeStockPositionSummary(item, stockTransactions, 1).currentShares;
+}
+
 export function computeAssetEffectiveTwdValue(
   item: AssetItem,
   usdTwdRate: number,
   logs: CashFlowLog[] = [],
-  adjustments: SavingsAdjustment[] = []
+  adjustments: SavingsAdjustment[] = [],
+  stockTransactions: StockTransaction[] = []
 ): number {
   if (item.isLinkedSavings) {
     return computeSavingsAccountSummary(item, logs, adjustments, usdTwdRate).currentBalanceTwd;
+  }
+  if (stockTransactions.length > 0 && isStockAsset(item)) {
+    return computeStockPositionSummary(item, stockTransactions, usdTwdRate).marketValueTwd;
   }
   return computeAssetTwdValue(item, usdTwdRate);
 }
@@ -264,7 +504,8 @@ export function computeNetWorthSummary(
   usdTwdRate: number,
   monthlyTotalConsumption: number,
   logs: CashFlowLog[] = [],
-  adjustments: SavingsAdjustment[] = []
+  adjustments: SavingsAdjustment[] = [],
+  stockTransactions: StockTransaction[] = []
 ): NetWorthSummary {
   let totalAssets = 0;
   let totalLiabilities = 0;
@@ -276,11 +517,11 @@ export function computeNetWorthSummary(
 
   for (const a of assets) {
     if (a.deletedAt) continue;
-    const twdValue = computeAssetEffectiveTwdValue(a, usdTwdRate, logs, adjustments);
+    const twdValue = computeAssetEffectiveTwdValue(a, usdTwdRate, logs, adjustments, stockTransactions);
     if (a.majorType === '資產') {
       totalAssets += twdValue;
       if (a.liquidity === '高流動' || a.isLinkedSavings) highLiquidityAssets += twdValue;
-      if (a.subCategory === '台股') stockValue += twdValue;
+      if (a.subCategory === '台股' || a.subCategory === '美股/ETF') stockValue += twdValue;
       else if (a.subCategory === '活存' || a.subCategory === '美金' || a.subCategory === '定存/現金' || a.isLinkedSavings) {
         cashUsdValue += twdValue;
       } else if (a.subCategory === '中信基金' || a.subCategory === '結構性商品') {

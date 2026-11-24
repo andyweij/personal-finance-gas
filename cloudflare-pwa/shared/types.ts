@@ -68,6 +68,7 @@ export interface AssetItem {
   quantityOrAmount: number;
   currency: string;
   unitPrice: number;
+  costBasis?: number | null;
   priceUpdatedAt?: string | null;
   note: string;
   isLinkedSavings?: boolean;
@@ -77,6 +78,86 @@ export interface AssetItem {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+}
+
+export type StockTransactionType = 'buy' | 'sell' | 'cash_dividend' | 'stock_dividend';
+
+export interface StockTransaction {
+  id: string;
+  assetId: string;
+  date: string; // YYYY-MM-DD
+  txType: StockTransactionType;
+  shares: number; // > 0 for buy, sell, stock_dividend; 0 for cash_dividend
+  totalAmount: number; // asset currency: buy total cost (incl. fee), sell net proceeds, cash_dividend net received
+  fee: number; // optional fee / tax / health insurance metadata
+  linkedCashflowId?: string | null;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+}
+
+export interface StockPositionSummary {
+  asset: AssetItem;
+  fxRate: number;
+  hasCostBasis: boolean;
+  baselineShares: number;
+  baselineCostBasis: number;
+  currentShares: number;
+  marketPrice: number;
+  marketValue: number; // asset currency
+  marketValueTwd: number;
+  /** 原始持有總成本（不含息，原幣） */
+  costBasis: number;
+  costBasisTwd: number;
+  /** 原始每股平均成本（不含息，原幣） */
+  avgCostPerShare: number;
+  /** 帳面價差未實現損益（不含息，原幣 / TWD） */
+  unrealizedPnl: number;
+  unrealizedPnlTwd: number;
+  unrealizedRoiPct: number;
+  /** 累計現金配息（原幣 / TWD） */
+  cumulativeCashDividends: number;
+  cumulativeCashDividendsTwd: number;
+  /** 累計股票配股股數 */
+  cumulativeStockDividendShares: number;
+  /** 已實現賣出損益（移動平均法，原幣 / TWD） */
+  realizedPnl: number;
+  realizedPnlTwd: number;
+  /** 扣除配息後尚未回本成本（下限鎖 0，原幣 / TWD） */
+  unrecoveredCost: number;
+  unrecoveredCostTwd: number;
+  /** 扣除配息後每股剩餘未回本成本（下限鎖 0，原幣） */
+  unrecoveredCostPerShare: number;
+  /** 成本歸零後超額回收現金（原幣 / TWD） */
+  excessRecoveredCash: number;
+  excessRecoveredCashTwd: number;
+  /** 配息回本進度 0..100 */
+  costRecoveryPct: number;
+  isCostRecovered: boolean;
+  /** 含息總淨利 = 未實現價差 + 累計配息 + 已實現損益（原幣 / TWD） */
+  totalReturnPnl: number;
+  totalReturnPnlTwd: number;
+  /** 含息總報酬率 %（分母使用累計總投入成本，永不除以 0） */
+  totalReturnRoiPct: number;
+  totalInvestedAllTime: number;
+  transactionCount: number;
+}
+
+export interface StockPortfolioSummary {
+  positions: StockPositionSummary[];
+  totalMarketValueTwd: number;
+  totalCostBasisTwd: number;
+  totalUnrealizedPnlTwd: number;
+  totalUnrealizedRoiPct: number;
+  totalCashDividendsTwd: number;
+  totalRealizedPnlTwd: number;
+  totalUnrecoveredCostTwd: number;
+  totalExcessRecoveredCashTwd: number;
+  overallCostRecoveryPct: number;
+  totalReturnPnlTwd: number;
+  totalReturnRoiPct: number;
+  hasAnyCostBasis: boolean;
 }
 
 export interface SavingsAdjustment {
@@ -155,6 +236,7 @@ export interface FinanceSnapshot {
   sinkingItems: SinkingFundItem[];
   assetItems: AssetItem[];
   savingsAdjustments: SavingsAdjustment[];
+  stockTransactions: StockTransaction[];
   netWorthHistory: NetWorthHistory[];
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents;
@@ -166,6 +248,7 @@ export type SyncEntity =
   | 'sinking'
   | 'asset'
   | 'savings_adjustment'
+  | 'stock_tx'
   | 'settings'
   | 'utility_record'
   | 'utility_rents';
@@ -194,6 +277,7 @@ export interface SyncDelta {
   sinkingItems: SinkingFundItem[];
   assetItems: AssetItem[];
   savingsAdjustments?: SavingsAdjustment[];
+  stockTransactions?: StockTransaction[];
   netWorthHistory: NetWorthHistory[];
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents | null;

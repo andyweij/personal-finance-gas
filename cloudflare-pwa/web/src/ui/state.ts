@@ -3,7 +3,7 @@ import type { SyncEngine } from '../sync/syncEngine';
 
 export interface AppUiState {
   masked: boolean;
-  activeTab: 'log' | 'overview' | 'config' | 'assets' | 'utility';
+  activeTab: 'log' | 'overview' | 'assets' | 'stocks' | 'tools';
   logSubtab: 'entry' | 'ledger';
   ledgerMode: 'list' | 'calendar';
   ledgerPage: number;
@@ -11,10 +11,11 @@ export interface AppUiState {
   selectedCalendarDay: string;
   overviewPeriod: 'monthly' | 'yearly';
   chartMetric: 'netCashFlow' | 'investment' | 'totalSavings' | 'daily' | 'income';
-  configSubtab: 'recurring' | 'sinking';
+  toolsSubtab: 'recurring' | 'sinking' | 'utility';
   recurringFilter: 'all' | 'income' | 'invest' | 'fixed' | 'sub';
   allocMode: 'both' | 'pct' | 'amt';
   allocHighlight: string | null;
+  stockPriceViewMode: 'unit' | 'total';
   selectedYear: number;
   selectedMonth: number;
   logType: string;

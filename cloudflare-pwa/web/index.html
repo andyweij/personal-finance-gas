@@ -321,49 +321,7 @@
       </form>
     </section>
 
-    <!-- ==================== TAB 3: 固定收支與不定期分攤 ==================== -->
-    <section class="tab-view" id="tab-config">
-      <div class="seg-bar">
-        <button type="button" class="seg-btn active" data-subtab="recurring">固定收支與訂閱</button>
-        <button type="button" class="seg-btn" data-subtab="sinking">不定期稅金分攤</button>
-      </div>
-
-      <div id="subtab-recurring" style="display:flex;flex-direction:column;gap:12px">
-        <div class="card compact">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-            <div>
-              <div style="font-size:14px;font-weight:700">薪資 / 房貸 / 投資 / 訂閱</div>
-              <div class="muted">開關停用不影響歷史帳目，點編輯修改細項</div>
-            </div>
-            <div style="display:flex;gap:6px">
-              <button type="button" class="btn btn-outline btn-sm" id="runRecurringBtn">立即入帳本月</button>
-              <button type="button" class="btn btn-tinted btn-sm" id="addRecurringBtn">+ 新增</button>
-            </div>
-          </div>
-          <div class="quick-row" id="recurringFilterPills" style="margin:10px 0 0">
-            <button type="button" class="chip-btn sm active" data-filter="all">全部</button>
-            <button type="button" class="chip-btn sm" data-filter="income">收入</button>
-            <button type="button" class="chip-btn sm" data-filter="invest">投資</button>
-            <button type="button" class="chip-btn sm" data-filter="fixed">固定支出</button>
-            <button type="button" class="chip-btn sm" data-filter="sub">訂閱</button>
-          </div>
-        </div>
-        <div class="list-group" id="recurringList"></div>
-      </div>
-
-      <div id="subtab-sinking" style="display:none;flex-direction:column;gap:12px">
-        <div class="card compact" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
-          <div>
-            <div class="muted" style="font-weight:600">每月合計應提撥預備金</div>
-            <div class="tnum" style="font-size:24px;font-weight:700;color:var(--primary);margin-top:2px" id="sinkingMonthlyTotal">NT$ --</div>
-          </div>
-          <button type="button" class="btn btn-tinted btn-sm" id="addSinkingBtn">+ 新增攤提</button>
-        </div>
-        <div class="list-group" id="sinkingList"></div>
-      </div>
-    </section>
-
-    <!-- ==================== TAB 4: 資產負債 ==================== -->
+    <!-- ==================== TAB 3: 資產負債 ==================== -->
     <section class="tab-view" id="tab-assets">
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center">
@@ -414,7 +372,7 @@
 
       <div>
         <div class="section-heading">
-          <span>自動更新區（台股 / 美金）</span>
+          <span>自動更新區（股票 / 美金）</span>
           <span>每日自動更新行情</span>
         </div>
         <div class="list-group" id="autoAssetsList"></div>
@@ -437,178 +395,265 @@
       </div>
     </section>
 
-    <!-- ==================== TAB 5: 5F & 6F 房租水電分攤 ==================== -->
-    <section class="tab-view" id="tab-utility">
+    <!-- ==================== TAB 4: 持股與損益 ==================== -->
+    <section class="tab-view" id="tab-stocks">
       <div class="card">
-        <div class="card-header" style="margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:6px">
+            <span style="font-size:13px;font-weight:600;color:var(--text-secondary)">持股總市值 (TWD)</span>
+            <span class="fx-pill" id="stocksCountBadge">0 檔</span>
+          </div>
+          <div class="mini-seg" id="stockViewModeToggle">
+            <button type="button" class="mini-seg-btn active" data-stock-view="unit">單價 (39)</button>
+            <button type="button" class="mini-seg-btn" data-stock-view="total">總額 (39,000)</button>
+          </div>
+        </div>
+        <div class="big-num" style="margin:6px 0 4px" id="stocksMarketValueHero">NT$ --</div>
+
+        <div class="sub-tile-grid">
+          <div class="sub-tile">
+            <div class="sub-tile-label">帳面價差淨利（不含息）</div>
+            <div class="sub-tile-val tnum" id="stocksPricePnlText">--</div>
+            <div class="stock-tile-sub tnum" id="stocksPricePnlSub">--</div>
+          </div>
+          <div class="sub-tile">
+            <div class="sub-tile-label">含息總淨利（扣配息後）</div>
+            <div class="sub-tile-val tnum" id="stocksDivPnlText">--</div>
+            <div class="stock-tile-sub tnum" id="stocksDivPnlSub">--</div>
+          </div>
+        </div>
+
+        <div class="progress-track" style="margin-top:12px">
+          <div class="progress-fill" id="stocksRecoveryFill" style="width:0%"></div>
+        </div>
+        <div class="hero-footer tnum">
+          <span id="stocksRecoveryPctText">整體配息回本：0.0%</span>
+          <span id="stocksUnrecoveredText">--</span>
+        </div>
+      </div>
+
+      <div class="stock-top-actions">
+        <button type="button" class="btn btn-primary btn-sm" id="addStockBtn">+ 新增持股</button>
+        <button type="button" class="btn btn-outline btn-sm" id="stocksRefreshMarketBtn">更新股價匯率</button>
+      </div>
+
+      <div class="stocks-list" id="stocksPortfolioList"></div>
+    </section>
+
+    <!-- ==================== TAB 5: 工具（固定收支 / 稅金分攤 / 水電分攤） ==================== -->
+    <section class="tab-view" id="tab-tools">
+      <div class="seg-bar cols-3" id="toolsSubtabBar">
+        <button type="button" class="seg-btn active" data-tools-sub="recurring">固定收支</button>
+        <button type="button" class="seg-btn" data-tools-sub="sinking">稅金分攤</button>
+        <button type="button" class="seg-btn" data-tools-sub="utility">水電分攤</button>
+      </div>
+
+      <div id="subtab-recurring" style="display:flex;flex-direction:column;gap:12px">
+        <div class="card compact">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+            <div>
+              <div style="font-size:14px;font-weight:700">薪資 / 房貸 / 投資 / 訂閱</div>
+              <div class="muted">開關停用不影響歷史帳目，點編輯修改細項</div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button type="button" class="btn btn-outline btn-sm" id="runRecurringBtn">立即入帳本月</button>
+              <button type="button" class="btn btn-tinted btn-sm" id="addRecurringBtn">+ 新增</button>
+            </div>
+          </div>
+          <div class="quick-row" id="recurringFilterPills" style="margin:10px 0 0">
+            <button type="button" class="chip-btn sm active" data-filter="all">全部</button>
+            <button type="button" class="chip-btn sm" data-filter="income">收入</button>
+            <button type="button" class="chip-btn sm" data-filter="invest">投資</button>
+            <button type="button" class="chip-btn sm" data-filter="fixed">固定支出</button>
+            <button type="button" class="chip-btn sm" data-filter="sub">訂閱</button>
+          </div>
+        </div>
+        <div class="list-group" id="recurringList"></div>
+      </div>
+
+      <div id="subtab-sinking" style="display:none;flex-direction:column;gap:12px">
+        <div class="card compact" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
           <div>
-            <div class="card-title">🏠 5F &amp; 6F 水電費自動分攤</div>
-            <div class="muted" id="utSyncStatus">支援 0ms 離線抄表與自動雲端同步</div>
+            <div class="muted" style="font-weight:600">每月合計應提撥預備金</div>
+            <div class="tnum" style="font-size:24px;font-weight:700;color:var(--primary);margin-top:2px" id="sinkingMonthlyTotal">NT$ --</div>
           </div>
-          <span class="badge" id="utModeBadge">待載入</span>
+          <button type="button" class="btn btn-tinted btn-sm" id="addSinkingBtn">+ 新增攤提</button>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button type="button" class="btn btn-primary btn-sm" id="utNewPeriodBtn">➕ 開新的一期</button>
-          <button type="button" class="btn btn-outline btn-sm" id="utExportCsvBtn">⬇️ 匯出 CSV</button>
-        </div>
+        <div class="list-group" id="sinkingList"></div>
       </div>
 
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">✏️ 1. 填入本期度數與帳單金額</span>
-        </div>
-
-        <div class="ut-subcard" style="margin-bottom:10px">
-          <h4>📅 期別、帳單金額與分攤人數</h4>
-          <div class="ut-grid-2">
-            <div class="field" style="margin-bottom:8px">
-              <label class="section-label" for="utPeriod">期別（如 11511）</label>
-              <input id="utPeriod" type="text" placeholder="11511" />
+      <div id="subtab-utility" style="display:none;flex-direction:column;gap:12px">
+        <div class="card">
+          <div class="card-header" style="margin-bottom:8px">
+            <div>
+              <div class="card-title">🏠 5F &amp; 6F 水電費自動分攤</div>
+              <div class="muted" id="utSyncStatus">支援 0ms 離線抄表與自動雲端同步</div>
             </div>
-            <div class="field" style="margin-bottom:8px">
-              <label class="section-label" for="utTotalElec">台電總電費 (元)</label>
-              <input id="utTotalElec" class="tnum" type="number" inputmode="numeric" min="0" placeholder="台電帳單金額" />
-            </div>
-            <div class="field" style="margin-bottom:0">
-              <label class="section-label" for="utTotalWater">自來水總水費 (元)</label>
-              <input id="utTotalWater" class="tnum" type="number" inputmode="numeric" min="0" placeholder="水費帳單金額" />
-            </div>
-            <div class="ut-grid-2" style="gap:6px">
-              <div class="field" style="margin-bottom:0">
-                <label class="section-label" for="utF6People">6F 人數</label>
-                <input id="utF6People" class="tnum" type="number" inputmode="numeric" min="0" value="2" />
-              </div>
-              <div class="field" style="margin-bottom:0">
-                <label class="section-label" for="utF5People">5F 人數</label>
-                <input id="utF5People" class="tnum" type="number" inputmode="numeric" min="1" value="3" />
-              </div>
-            </div>
+            <span class="badge" id="utModeBadge">待載入</span>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn btn-primary btn-sm" id="utNewPeriodBtn">➕ 開新的一期</button>
+            <button type="button" class="btn btn-outline btn-sm" id="utExportCsvBtn">⬇️ 匯出 CSV</button>
           </div>
         </div>
 
-        <div class="ut-subcard" style="margin-bottom:10px">
-          <h4>⚡ 整棟總表 &amp; 6F 電表</h4>
-          <div class="ut-grid-2">
-            <div class="field" style="margin-bottom:0">
-              <label class="section-label" for="utCurTotal">總表本期 <span class="ut-prev-hint" id="utHintPrevTotal">上期：-</span></label>
-              <input id="utCurTotal" class="tnum" type="number" inputmode="numeric" placeholder="本期總表度數" />
-            </div>
-            <div class="field" style="margin-bottom:0">
-              <label class="section-label" for="utCur6F">6F 本期 <span class="ut-prev-hint" id="utHintPrev6F">上期：-</span></label>
-              <input id="utCur6F" class="tnum" type="number" inputmode="numeric" placeholder="6F 真實度數" />
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">✏️ 1. 填入本期度數與帳單金額</span>
+          </div>
+
+          <div class="ut-subcard" style="margin-bottom:10px">
+            <h4>📅 期別、帳單金額與分攤人數</h4>
+            <div class="ut-grid-2">
+              <div class="field" style="margin-bottom:8px">
+                <label class="section-label" for="utPeriod">期別（如 11511）</label>
+                <input id="utPeriod" type="text" placeholder="11511" />
+              </div>
+              <div class="field" style="margin-bottom:8px">
+                <label class="section-label" for="utTotalElec">台電總電費 (元)</label>
+                <input id="utTotalElec" class="tnum" type="number" inputmode="numeric" min="0" placeholder="台電帳單金額" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utTotalWater">自來水總水費 (元)</label>
+                <input id="utTotalWater" class="tnum" type="number" inputmode="numeric" min="0" placeholder="水費帳單金額" />
+              </div>
+              <div class="ut-grid-2" style="gap:6px">
+                <div class="field" style="margin-bottom:0">
+                  <label class="section-label" for="utF6People">6F 人數</label>
+                  <input id="utF6People" class="tnum" type="number" inputmode="numeric" min="0" value="2" />
+                </div>
+                <div class="field" style="margin-bottom:0">
+                  <label class="section-label" for="utF5People">5F 人數</label>
+                  <input id="utF5People" class="tnum" type="number" inputmode="numeric" min="1" value="3" />
+                </div>
+              </div>
             </div>
           </div>
-          <details class="ut-details" style="margin-top:8px">
-            <summary>🔧 手動微調總表 / 6F 上期度數（平常免改）</summary>
+
+          <div class="ut-subcard" style="margin-bottom:10px">
+            <h4>⚡ 整棟總表 &amp; 6F 電表</h4>
+            <div class="ut-grid-2">
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utCurTotal">總表本期 <span class="ut-prev-hint" id="utHintPrevTotal">上期：-</span></label>
+                <input id="utCurTotal" class="tnum" type="number" inputmode="numeric" placeholder="本期總表度數" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utCur6F">6F 本期 <span class="ut-prev-hint" id="utHintPrev6F">上期：-</span></label>
+                <input id="utCur6F" class="tnum" type="number" inputmode="numeric" placeholder="6F 真實度數" />
+              </div>
+            </div>
+            <details class="ut-details" style="margin-top:8px">
+              <summary>🔧 手動微調總表 / 6F 上期度數（平常免改）</summary>
+              <div class="ut-grid-2" style="margin-top:8px">
+                <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevTotal">總表上期</label><input id="utPrevTotal" class="tnum" type="number" inputmode="numeric" /></div>
+                <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrev6F">6F 上期</label><input id="utPrev6F" class="tnum" type="number" inputmode="numeric" /></div>
+              </div>
+            </details>
+          </div>
+
+          <div class="ut-subcard" style="margin-bottom:10px">
+            <h4>🚪 5F 各房電表（滿 10,000 自動歸零）</h4>
+            <div class="ut-grid-3">
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utCurA">A 房 <span class="ut-prev-hint" id="utHintPrevA">-</span></label>
+                <input id="utCurA" class="tnum" type="number" inputmode="numeric" placeholder="A度數" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utCurB">B 房 <span class="ut-prev-hint" id="utHintPrevB">-</span></label>
+                <input id="utCurB" class="tnum" type="number" inputmode="numeric" placeholder="B度數" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="utCurC">C 房 <span class="ut-prev-hint" id="utHintPrevC">-</span></label>
+                <input id="utCurC" class="tnum" type="number" inputmode="numeric" placeholder="C度數" />
+              </div>
+            </div>
+            <details class="ut-details" style="margin-top:8px">
+              <summary>🔧 手動微調 5F A/B/C 上期度數（平常免改）</summary>
+              <div class="ut-grid-3" style="margin-top:8px">
+                <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevA">A 上期</label><input id="utPrevA" class="tnum" type="number" inputmode="numeric" /></div>
+                <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevB">B 上期</label><input id="utPrevB" class="tnum" type="number" inputmode="numeric" /></div>
+                <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevC">C 上期</label><input id="utPrevC" class="tnum" type="number" inputmode="numeric" /></div>
+              </div>
+            </details>
+          </div>
+
+          <details class="ut-details" style="margin-bottom:12px">
+            <summary>💰 選填：固定月租金設定（同步存於 D1，算「房租＋水電」總匯款）</summary>
             <div class="ut-grid-2" style="margin-top:8px">
-              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevTotal">總表上期</label><input id="utPrevTotal" class="tnum" type="number" inputmode="numeric" /></div>
-              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrev6F">6F 上期</label><input id="utPrev6F" class="tnum" type="number" inputmode="numeric" /></div>
+              <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRent6F">6F 月租金</label><input id="utRent6F" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
+              <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentA">5F A 房月租金</label><input id="utRentA" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
+              <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentB">5F B 房月租金</label><input id="utRentB" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
+              <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentC">5F C 房月租金</label><input id="utRentC" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
             </div>
+            <button type="button" class="btn btn-outline btn-sm" id="utSaveRentsBtn" style="margin-top:4px">💾 單獨儲存月租金</button>
           </details>
+
+          <div style="display:grid;grid-template-columns:2fr 1fr;gap:8px">
+            <button type="button" class="btn btn-primary" id="utSaveBtn">💾 儲存本期並同步</button>
+            <button type="button" class="btn btn-outline" id="utClearBtn">清空</button>
+          </div>
         </div>
 
-        <div class="ut-subcard" style="margin-bottom:10px">
-          <h4>🚪 5F 各房電表（滿 10,000 自動歸零）</h4>
-          <div class="ut-grid-3">
-            <div class="field" style="margin-bottom:0">
-              <label class="section-label" for="utCurA">A 房 <span class="ut-prev-hint" id="utHintPrevA">-</span></label>
-              <input id="utCurA" class="tnum" type="number" inputmode="numeric" placeholder="A度數" />
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">📊 2. 自動計算與對帳結果</span>
+            <span class="badge" id="utCheckStatus">等待輸入...</span>
+          </div>
+          <div class="ut-alert info" id="utInfoBox"></div>
+          <div class="ut-alert warn" id="utWarnBox"></div>
+          <div class="ut-summary-strip" id="utSummaryStrip">請填入本期度數與帳單金額，分攤結果將即時計算。</div>
+          <div class="ut-res-grid" id="utResultCards"></div>
+
+          <div id="utLineSection" style="display:none;margin-top:14px">
+            <div class="section-heading" style="margin-bottom:8px">
+              <span>💬 一鍵複製 LINE 對帳明細</span>
             </div>
-            <div class="field" style="margin-bottom:0">
-              <label class="section-label" for="utCurB">B 房 <span class="ut-prev-hint" id="utHintPrevB">-</span></label>
-              <input id="utCurB" class="tnum" type="number" inputmode="numeric" placeholder="B度數" />
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+              <strong style="font-size:12.5px;color:var(--success)">傳給 6F</strong>
+              <button type="button" class="btn btn-outline btn-sm" id="utCopy6FBtn">📋 複製 6F 明細</button>
             </div>
-            <div class="field" style="margin-bottom:0">
-              <label class="section-label" for="utCurC">C 房 <span class="ut-prev-hint" id="utHintPrevC">-</span></label>
-              <input id="utCurC" class="tnum" type="number" inputmode="numeric" placeholder="C度數" />
+            <div class="ut-line-box" id="utLine6F"></div>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+              <strong style="font-size:12.5px;color:var(--primary)">傳給 5F 群組（A / B / C）</strong>
+              <button type="button" class="btn btn-outline btn-sm" id="utCopy5FBtn">📋 複製 5F 明細</button>
+            </div>
+            <div class="ut-line-box" id="utLine5F"></div>
+
+            <div class="section-heading" style="margin:12px 0 8px">
+              <span>🔗 離線即時連動：一鍵寫入個人現金流</span>
+            </div>
+            <div class="ut-grid-2">
+              <button type="button" class="btn btn-outline btn-sm" id="utPostExpenseBtn">💸 記為水電帳單支出</button>
+              <button type="button" class="btn btn-outline btn-sm" id="utPostIncomeBtn">💰 記為代收水電收入</button>
             </div>
           </div>
-          <details class="ut-details" style="margin-top:8px">
-            <summary>🔧 手動微調 5F A/B/C 上期度數（平常免改）</summary>
-            <div class="ut-grid-3" style="margin-top:8px">
-              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevA">A 上期</label><input id="utPrevA" class="tnum" type="number" inputmode="numeric" /></div>
-              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevB">B 上期</label><input id="utPrevB" class="tnum" type="number" inputmode="numeric" /></div>
-              <div class="field" style="margin-bottom:0"><label class="section-label" for="utPrevC">C 上期</label><input id="utPrevC" class="tnum" type="number" inputmode="numeric" /></div>
-            </div>
-          </details>
         </div>
 
-        <details class="ut-details" style="margin-bottom:12px">
-          <summary>💰 選填：固定月租金設定（同步存於 D1，算「房租＋水電」總匯款）</summary>
-          <div class="ut-grid-2" style="margin-top:8px">
-            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRent6F">6F 月租金</label><input id="utRent6F" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
-            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentA">5F A 房月租金</label><input id="utRentA" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
-            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentB">5F B 房月租金</label><input id="utRentB" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
-            <div class="field" style="margin-bottom:6px"><label class="section-label" for="utRentC">5F C 房月租金</label><input id="utRentC" class="tnum" type="number" inputmode="numeric" min="0" value="0" /></div>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">📚 歷史抄表紀錄</span>
+            <span class="muted">點編輯自動連動下期</span>
           </div>
-          <button type="button" class="btn btn-outline btn-sm" id="utSaveRentsBtn" style="margin-top:4px">💾 單獨儲存月租金</button>
-        </details>
-
-        <div style="display:grid;grid-template-columns:2fr 1fr;gap:8px">
-          <button type="button" class="btn btn-primary" id="utSaveBtn">💾 儲存本期並同步</button>
-          <button type="button" class="btn btn-outline" id="utClearBtn">清空</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">📊 2. 自動計算與對帳結果</span>
-          <span class="badge" id="utCheckStatus">等待輸入...</span>
-        </div>
-        <div class="ut-alert info" id="utInfoBox"></div>
-        <div class="ut-alert warn" id="utWarnBox"></div>
-        <div class="ut-summary-strip" id="utSummaryStrip">請填入本期度數與帳單金額，分攤結果將即時計算。</div>
-        <div class="ut-res-grid" id="utResultCards"></div>
-
-        <div id="utLineSection" style="display:none;margin-top:14px">
-          <div class="section-heading" style="margin-bottom:8px">
-            <span>💬 一鍵複製 LINE 對帳明細</span>
+          <div class="ut-table-wrap">
+            <table class="ut-table">
+              <thead>
+                <tr>
+                  <th>期別</th>
+                  <th>總表</th>
+                  <th>6F</th>
+                  <th>總電</th>
+                  <th>總水</th>
+                  <th>6F應繳</th>
+                  <th>A房</th>
+                  <th>B房</th>
+                  <th>C房</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="utHistoryBody"></tbody>
+            </table>
           </div>
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-            <strong style="font-size:12.5px;color:var(--success)">傳給 6F</strong>
-            <button type="button" class="btn btn-outline btn-sm" id="utCopy6FBtn">📋 複製 6F 明細</button>
-          </div>
-          <div class="ut-line-box" id="utLine6F"></div>
-
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-            <strong style="font-size:12.5px;color:var(--primary)">傳給 5F 群組（A / B / C）</strong>
-            <button type="button" class="btn btn-outline btn-sm" id="utCopy5FBtn">📋 複製 5F 明細</button>
-          </div>
-          <div class="ut-line-box" id="utLine5F"></div>
-
-          <div class="section-heading" style="margin:12px 0 8px">
-            <span>🔗 離線即時連動：一鍵寫入個人現金流</span>
-          </div>
-          <div class="ut-grid-2">
-            <button type="button" class="btn btn-outline btn-sm" id="utPostExpenseBtn">💸 記為水電帳單支出</button>
-            <button type="button" class="btn btn-outline btn-sm" id="utPostIncomeBtn">💰 記為代收水電收入</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">📚 歷史抄表紀錄</span>
-          <span class="muted">點編輯自動連動下期</span>
-        </div>
-        <div class="ut-table-wrap">
-          <table class="ut-table">
-            <thead>
-              <tr>
-                <th>期別</th>
-                <th>總表</th>
-                <th>6F</th>
-                <th>總電</th>
-                <th>總水</th>
-                <th>6F應繳</th>
-                <th>A房</th>
-                <th>B房</th>
-                <th>C房</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody id="utHistoryBody"></tbody>
-          </table>
         </div>
       </div>
     </section>
@@ -625,17 +670,17 @@
       <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7" rx="1"/><rect x="12" y="6" width="3" height="11" rx="1"/><rect x="17" y="13" width="3" height="4" rx="1"/></svg>
       <span>總覽</span>
     </button>
-    <button type="button" class="nav-btn" data-tab="config">
-      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-      <span>固定/分攤</span>
-    </button>
     <button type="button" class="nav-btn" data-tab="assets">
       <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
-      <span>資產負債</span>
+      <span>資產</span>
     </button>
-    <button type="button" class="nav-btn" data-tab="utility">
-      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20h14V9.5"/><path d="M13 11l-3 5h3l-1 4 4-6h-3l0-3z"/></svg>
-      <span>水電分攤</span>
+    <button type="button" class="nav-btn" data-tab="stocks">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
+      <span>持股</span>
+    </button>
+    <button type="button" class="nav-btn" data-tab="tools">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/></svg>
+      <span>工具</span>
     </button>
   </nav>
 

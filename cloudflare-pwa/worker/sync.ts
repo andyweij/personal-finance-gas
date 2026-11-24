@@ -14,6 +14,7 @@ import type {
   RentUtilityRents,
   SavingsAdjustment,
   SinkingFundItem,
+  StockTransaction,
   SyncDelta,
   SyncMutation,
   SyncRequest,
@@ -31,6 +32,7 @@ import {
   validateRecurringInput,
   validateSavingsAdjustmentInput,
   validateSinkingInput,
+  validateStockTransactionInput,
 } from '../shared/validation';
 
 export async function ensureAppSettings(db: D1Database): Promise<AppSettings> {
@@ -141,6 +143,7 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
     quantityOrAmount: Number(r.quantity_or_amount),
     currency: String(r.currency),
     unitPrice: Number(r.unit_price),
+    costBasis: r.cost_basis !== null && r.cost_basis !== undefined ? Number(r.cost_basis) : null,
     priceUpdatedAt: r.price_updated_at ? String(r.price_updated_at) : null,
     note: String(r.note || ''),
     isLinkedSavings: Number(r.is_linked_savings || 0) === 1,
@@ -160,6 +163,23 @@ function mapSavingsAdjustmentRow(r: Record<string, unknown>): SavingsAdjustment 
     date: String(r.date),
     amount: Number(r.amount),
     twdAmount: Number(r.twd_amount),
+    note: String(r.note || ''),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+  };
+}
+
+function mapStockTransactionRow(r: Record<string, unknown>): StockTransaction {
+  return {
+    id: String(r.id),
+    assetId: String(r.asset_id),
+    date: String(r.date),
+    txType: String(r.tx_type) as StockTransaction['txType'],
+    shares: Number(r.shares || 0),
+    totalAmount: Number(r.total_amount || 0),
+    fee: Number(r.fee || 0),
+    linkedCashflowId: r.linked_cashflow_id ? String(r.linked_cashflow_id) : null,
     note: String(r.note || ''),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
@@ -470,9 +490,9 @@ async function applySingleMutation(
 
   if (mutation.entity === 'asset') {
     const existing = await db
-      .prepare('SELECT updated_at, unit_price FROM asset_items WHERE id = ?')
+      .prepare('SELECT updated_at, unit_price, cost_basis FROM asset_items WHERE id = ?')
       .bind(mutation.recordId)
-      .first<{ updated_at: string; unit_price: number }>();
+      .first<{ updated_at: string; unit_price: number; cost_basis: number | null }>();
     if (!isNewerOrEqual(ts, existing?.updated_at)) return;
 
     if (mutation.op === 'delete') {
@@ -494,6 +514,7 @@ async function applySingleMutation(
       quantityOrAmount: Number(p.quantityOrAmount),
       currency: String(p.currency || 'TWD'),
       unitPrice: p.unitPrice !== undefined ? Number(p.unitPrice) : existing?.unit_price ?? 1,
+      costBasis: p.costBasis !== undefined ? (p.costBasis as number | null) : existing?.cost_basis ?? null,
       note: String(p.note || ''),
       isLinkedSavings: Boolean(p.isLinkedSavings),
       balanceAnchorDate: p.balanceAnchorDate ? String(p.balanceAnchorDate) : null,
@@ -511,8 +532,8 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(id) DO UPDATE SET
            update_mode = excluded.update_mode,
            major_type = excluded.major_type,
@@ -523,6 +544,7 @@ async function applySingleMutation(
            quantity_or_amount = excluded.quantity_or_amount,
            currency = excluded.currency,
            unit_price = excluded.unit_price,
+           cost_basis = excluded.cost_basis,
            note = excluded.note,
            is_linked_savings = excluded.is_linked_savings,
            balance_anchor_date = excluded.balance_anchor_date,
@@ -542,6 +564,7 @@ async function applySingleMutation(
         v.quantityOrAmount,
         v.currency,
         v.unitPrice,
+        v.costBasis,
         v.note,
         v.isLinkedSavings ? 1 : 0,
         v.balanceAnchorDate,
@@ -602,6 +625,67 @@ async function applySingleMutation(
         v.date,
         v.amount,
         twdAmount,
+        v.note,
+        String(p.createdAt || ts),
+        ts
+      )
+      .run();
+    return;
+  }
+
+  if (mutation.entity === 'stock_tx') {
+    const existing = await db
+      .prepare('SELECT updated_at FROM stock_transactions WHERE id = ?')
+      .bind(mutation.recordId)
+      .first<{ updated_at: string }>();
+    if (!isNewerOrEqual(ts, existing?.updated_at)) return;
+
+    if (mutation.op === 'delete') {
+      await db
+        .prepare('UPDATE stock_transactions SET deleted_at = ?, updated_at = ? WHERE id = ?')
+        .bind(ts, ts, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateStockTransactionInput({
+      assetId: String(p.assetId || ''),
+      date: String(p.date || ''),
+      txType: String(p.txType || ''),
+      shares: p.shares !== undefined ? Number(p.shares) : 0,
+      totalAmount: p.totalAmount !== undefined ? Number(p.totalAmount) : 0,
+      fee: p.fee !== undefined ? Number(p.fee) : 0,
+      linkedCashflowId: p.linkedCashflowId ? String(p.linkedCashflowId) : null,
+      note: String(p.note || ''),
+    });
+
+    await db
+      .prepare(
+        `INSERT INTO stock_transactions
+          (id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           asset_id = excluded.asset_id,
+           date = excluded.date,
+           tx_type = excluded.tx_type,
+           shares = excluded.shares,
+           total_amount = excluded.total_amount,
+           fee = excluded.fee,
+           linked_cashflow_id = excluded.linked_cashflow_id,
+           note = excluded.note,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL`
+      )
+      .bind(
+        mutation.recordId,
+        v.assetId,
+        v.date,
+        v.txType,
+        v.shares,
+        v.totalAmount,
+        v.fee,
+        v.linkedCashflowId,
         v.note,
         String(p.createdAt || ts),
         ts
@@ -708,12 +792,13 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
   ]);
 
   if (since) {
-    const [logs, rec, sink, assets, adjs, hist, utilRecs] = await Promise.all([
+    const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
       db.prepare('SELECT * FROM cashflow_logs WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
       db.prepare('SELECT * FROM recurring_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM sinking_fund_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM asset_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM savings_adjustments WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
+      db.prepare('SELECT * FROM stock_transactions WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
       db.prepare('SELECT * FROM networth_history WHERE updated_at > ? ORDER BY year_month DESC').bind(since).all(),
       db.prepare('SELECT * FROM rent_utility_records WHERE updated_at > ?').bind(since).all(),
     ]);
@@ -725,18 +810,20 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
       sinkingItems: sink.results.map(mapSinkingRow),
       assetItems: assets.results.map(mapAssetRow),
       savingsAdjustments: adjs.results.map(mapSavingsAdjustmentRow),
+      stockTransactions: stockTxs.results.map(mapStockTransactionRow),
       netWorthHistory: hist.results.map(mapNetWorthRow),
       rentUtilityRecords: utilRecs.results.map(mapUtilityRecordRow),
       rentUtilityRents: utilityRents.updatedAt > since ? utilityRents : null,
     };
   }
 
-  const [logs, rec, sink, assets, adjs, hist, utilRecs] = await Promise.all([
+  const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
     db.prepare('SELECT * FROM cashflow_logs WHERE deleted_at IS NULL ORDER BY date DESC').all(),
     db.prepare('SELECT * FROM recurring_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM sinking_fund_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM asset_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM savings_adjustments WHERE deleted_at IS NULL ORDER BY date DESC').all(),
+    db.prepare('SELECT * FROM stock_transactions WHERE deleted_at IS NULL ORDER BY date DESC').all(),
     db.prepare('SELECT * FROM networth_history ORDER BY year_month DESC').all(),
     db.prepare('SELECT * FROM rent_utility_records WHERE deleted_at IS NULL').all(),
   ]);
@@ -748,6 +835,7 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
     sinkingItems: sink.results.map(mapSinkingRow),
     assetItems: assets.results.map(mapAssetRow),
     savingsAdjustments: adjs.results.map(mapSavingsAdjustmentRow),
+    stockTransactions: stockTxs.results.map(mapStockTransactionRow),
     netWorthHistory: hist.results.map(mapNetWorthRow),
     rentUtilityRecords: utilRecs.results.map(mapUtilityRecordRow),
     rentUtilityRents: utilityRents,
@@ -811,6 +899,7 @@ export async function exportFullSnapshot(db: D1Database): Promise<FinanceSnapsho
     sinkingItems: delta.sinkingItems,
     assetItems: delta.assetItems,
     savingsAdjustments: delta.savingsAdjustments || [],
+    stockTransactions: delta.stockTransactions || [],
     netWorthHistory: delta.netWorthHistory,
     rentUtilityRecords: delta.rentUtilityRecords,
     rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db)),
@@ -830,6 +919,7 @@ export async function importFullSnapshot(
     await db.prepare('DELETE FROM sinking_fund_items').run();
     await db.prepare('DELETE FROM asset_items').run();
     await db.prepare('DELETE FROM savings_adjustments').run();
+    await db.prepare('DELETE FROM stock_transactions').run();
     await db.prepare('DELETE FROM networth_history').run();
     if (Array.isArray(data.rentUtilityRecords) && data.rentUtilityRecords.length > 0) {
       await db.prepare('DELETE FROM rent_utility_records').run();
@@ -942,8 +1032,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
       )
       .bind(
         a.id || crypto.randomUUID(),
@@ -956,6 +1046,7 @@ export async function importFullSnapshot(
         v.quantityOrAmount,
         v.currency,
         v.unitPrice,
+        v.costBasis,
         v.note,
         v.isLinkedSavings ? 1 : 0,
         v.balanceAnchorDate,
@@ -984,6 +1075,30 @@ export async function importFullSnapshot(
         adj.twdAmount !== undefined ? Math.round(adj.twdAmount) : v.twdAmount,
         v.note,
         adj.createdAt || nowIso,
+        nowIso
+      )
+      .run();
+  }
+
+  for (const tx of data.stockTransactions || []) {
+    const v = validateStockTransactionInput(tx);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO stock_transactions
+          (id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        tx.id || crypto.randomUUID(),
+        v.assetId,
+        v.date,
+        v.txType,
+        v.shares,
+        v.totalAmount,
+        v.fee,
+        v.linkedCashflowId,
+        v.note,
+        tx.createdAt || nowIso,
         nowIso
       )
       .run();

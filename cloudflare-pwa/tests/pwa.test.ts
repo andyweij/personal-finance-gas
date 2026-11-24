@@ -48,7 +48,7 @@ describe('PWA assets & D1 migration integrity', () => {
     expect(code).toContain('caches.open');
   });
 
-  it('initializes all 15 D1 tables cleanly from migrations (including rent_utility and savings_adjustments)', async () => {
+  it('initializes all 16 D1 tables cleanly from migrations (including rent_utility, savings_adjustments, and stock_transactions)', async () => {
     const db = createTestD1();
     const res = await db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
@@ -70,6 +70,7 @@ describe('PWA assets & D1 migration integrity', () => {
       'rent_utility_settings',
       'savings_adjustments',
       'sinking_fund_items',
+      'stock_transactions',
       'sync_idempotency',
     ]);
 
@@ -80,9 +81,13 @@ describe('PWA assets & D1 migration integrity', () => {
     expect(countRow?.cnt).toBe(7);
   });
 
-  it('includes 5th rent-utility tab in index.html', () => {
+  it('includes Scheme B 5-tab layout (log, overview, assets, stocks, tools with utility subtab) in index.html', () => {
     const html = readFileSync(resolve(rootDir, 'web/index.html'), 'utf8');
-    expect(html).toContain('id="tab-utility"');
-    expect(html).toContain('data-tab="utility"');
+    expect(html).toContain('id="tab-stocks"');
+    expect(html).toContain('data-tab="stocks"');
+    expect(html).toContain('id="tab-tools"');
+    expect(html).toContain('data-tab="tools"');
+    expect(html).toContain('id="subtab-utility"');
+    expect(html).toContain('data-tools-sub="utility"');
   });
 });

@@ -31,7 +31,8 @@ export function renderOverviewTab(ctx: UiContext): void {
     snap.settings.usdTwdRate,
     monthly.totalConsumption,
     snap.cashflowLogs,
-    snap.savingsAdjustments || []
+    snap.savingsAdjustments || [],
+    snap.stockTransactions || []
   );
 
   const m = ctx.state.overviewPeriod === 'monthly' ? monthly : yearly;

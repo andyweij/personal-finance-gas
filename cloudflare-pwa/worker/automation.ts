@@ -172,13 +172,19 @@ export async function runMonthEndSnapshotD1(
       item,
       full.settings.usdTwdRate,
       full.cashflowLogs,
-      full.savingsAdjustments
+      full.savingsAdjustments,
+      full.stockTransactions
     );
     if (twdValue === 0) continue;
     if (item.majorType === '資產') {
       totalAssets += twdValue;
       if (item.liquidity === '高流動' || item.isLinkedSavings) highLiquidityAssets += twdValue;
-      if (item.subCategory === '台股' || item.subCategory === '中信基金' || item.subCategory === '結構性商品') {
+      if (
+        item.subCategory === '台股' ||
+        item.subCategory === '美股/ETF' ||
+        item.subCategory === '中信基金' ||
+        item.subCategory === '結構性商品'
+      ) {
         investmentAssets += twdValue;
       }
       if (item.subCategory === '保單(保價金)') insuranceAssets += twdValue;

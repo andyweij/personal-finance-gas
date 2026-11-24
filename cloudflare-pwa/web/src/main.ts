@@ -14,6 +14,7 @@ import {
 import { renderOverviewTab, renderTrendChart } from './ui/overviewTab';
 import { openRecurringModal, openSinkingModal, renderConfigTab } from './ui/configTab';
 import { openAssetModal, openSavingsAccountModal, renderAssetsTab } from './ui/assetsTab';
+import { openStockBaselineModal, renderStocksTab } from './ui/stocksTab';
 import { bindUtilityTabEvents, renderUtilityTab } from './ui/utilityTab';
 import {
   closeLockScreen,
@@ -62,6 +63,7 @@ async function bootstrap(): Promise<void> {
   const storedIdle = localStorage.getItem('finance_idle_minutes');
   const parsedIdle = storedIdle !== null && !Number.isNaN(Number(storedIdle)) ? Number(storedIdle) : 5;
   const storedAlloc = localStorage.getItem('finance_alloc_mode');
+  const storedStockView = localStorage.getItem('finance_stock_view_mode');
   const now = new Date();
 
   const state: AppUiState = {
@@ -74,10 +76,11 @@ async function bootstrap(): Promise<void> {
     selectedCalendarDay: getTodayYmd(),
     overviewPeriod: 'monthly',
     chartMetric: 'netCashFlow',
-    configSubtab: 'recurring',
+    toolsSubtab: 'recurring',
     recurringFilter: 'all',
     allocMode: storedAlloc === 'pct' || storedAlloc === 'amt' ? storedAlloc : 'both',
     allocHighlight: null,
+    stockPriceViewMode: storedStockView === 'total' ? 'total' : 'unit',
     selectedYear: now.getFullYear(),
     selectedMonth: now.getMonth() + 1,
     logType: '日常花費',
@@ -109,8 +112,9 @@ async function bootstrap(): Promise<void> {
       el('fxTopPill').textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}`;
       renderLogTab(ctx);
       renderOverviewTab(ctx);
-      renderConfigTab(ctx);
       renderAssetsTab(ctx);
+      renderStocksTab(ctx);
+      renderConfigTab(ctx);
       renderUtilityTab(ctx);
     },
     scheduleSync: () => {
@@ -204,7 +208,7 @@ async function bootstrap(): Promise<void> {
 function bindEvents(ctx: UiContext): void {
   // Bottom Nav (支援點擊切換 ＋ 按住左右滑動高亮膠囊、放開切換分頁)
   const navButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('#bottomNav .nav-btn'));
-  const tabOrder: Array<AppUiState['activeTab']> = ['log', 'overview', 'config', 'assets', 'utility'];
+  const tabOrder: Array<AppUiState['activeTab']> = ['log', 'overview', 'assets', 'stocks', 'tools'];
 
   const activateTabByIndex = (idx: number) => {
     const safeIdx = Math.max(0, Math.min(navButtons.length - 1, idx));
@@ -486,14 +490,15 @@ function bindEvents(ctx: UiContext): void {
     }
   });
 
-  // Tab 3 Config events
-  document.querySelectorAll<HTMLButtonElement>('[data-subtab]').forEach((btn) => {
+  // Tab 5 Tools 3-way subtab events (固定收支 / 稅金分攤 / 水電分攤)
+  document.querySelectorAll<HTMLButtonElement>('#toolsSubtabBar [data-tools-sub]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('[data-subtab]').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      ctx.state.configSubtab = btn.dataset.subtab as 'recurring' | 'sinking';
-      el('subtab-recurring').style.display = ctx.state.configSubtab === 'recurring' ? 'flex' : 'none';
-      el('subtab-sinking').style.display = ctx.state.configSubtab === 'sinking' ? 'flex' : 'none';
+      const sub = btn.dataset.toolsSub as AppUiState['toolsSubtab'];
+      ctx.state.toolsSubtab = sub;
+      document.querySelectorAll('#toolsSubtabBar [data-tools-sub]').forEach((b) => b.classList.toggle('active', b === btn));
+      el('subtab-recurring').style.display = sub === 'recurring' ? 'flex' : 'none';
+      el('subtab-sinking').style.display = sub === 'sinking' ? 'flex' : 'none';
+      el('subtab-utility').style.display = sub === 'utility' ? 'flex' : 'none';
     });
   });
 
@@ -532,19 +537,7 @@ function bindEvents(ctx: UiContext): void {
     }
   });
 
-  // Tab 4 Assets events
-  document.querySelectorAll<HTMLButtonElement>('#allocModeToggle .mini-seg-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      ctx.state.allocMode = btn.dataset.allocMode as 'both' | 'pct' | 'amt';
-      localStorage.setItem('finance_alloc_mode', ctx.state.allocMode);
-      renderAssetsTab(ctx);
-    });
-  });
-
-  el('addSavingsBtn').addEventListener('click', () => openSavingsAccountModal(ctx, null));
-  el('addAssetBtn').addEventListener('click', () => openAssetModal(ctx, null));
-
-  el('refreshMarketBtn').addEventListener('click', async () => {
+  const refreshMarketAction = async () => {
     setLoading(true);
     try {
       const res = await fetch('/api/market/refresh', { method: 'POST', credentials: 'same-origin' });
@@ -561,7 +554,20 @@ function bindEvents(ctx: UiContext): void {
     } finally {
       setLoading(false);
     }
+  };
+
+  // Tab 3 Assets events
+  document.querySelectorAll<HTMLButtonElement>('#allocModeToggle .mini-seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      ctx.state.allocMode = btn.dataset.allocMode as 'both' | 'pct' | 'amt';
+      localStorage.setItem('finance_alloc_mode', ctx.state.allocMode);
+      renderAssetsTab(ctx);
+    });
   });
+
+  el('addSavingsBtn').addEventListener('click', () => openSavingsAccountModal(ctx, null));
+  el('addAssetBtn').addEventListener('click', () => openAssetModal(ctx, null));
+  el('refreshMarketBtn').addEventListener('click', () => void refreshMarketAction());
 
   el('runSnapshotBtn').addEventListener('click', async () => {
     if (!confirm('確定立即將目前資產負債總計寫入本月歷史快照？')) return;
@@ -580,7 +586,18 @@ function bindEvents(ctx: UiContext): void {
     }
   });
 
-  // Tab 5 Rent & Utility Calculator events
+  // Tab 4 Stocks events
+  document.querySelectorAll<HTMLButtonElement>('#stockViewModeToggle .mini-seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      ctx.state.stockPriceViewMode = btn.dataset.stockView === 'total' ? 'total' : 'unit';
+      localStorage.setItem('finance_stock_view_mode', ctx.state.stockPriceViewMode);
+      renderStocksTab(ctx);
+    });
+  });
+  el('addStockBtn').addEventListener('click', () => openStockBaselineModal(ctx, null));
+  el('stocksRefreshMarketBtn').addEventListener('click', () => void refreshMarketAction());
+
+  // Tab 5 Utility subtab events
   bindUtilityTabEvents(ctx);
 
   // iOS PWA Auto-Sync on reconnect / return to foreground + Idle Auto-Lock

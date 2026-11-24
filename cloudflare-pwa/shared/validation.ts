@@ -1,5 +1,6 @@
 import {
   ALL_CASHFLOW_TYPES,
+  ALL_STOCK_TX_TYPES,
   ASSET_MAJOR_TYPES,
   ASSET_UPDATE_MODES,
   BILLING_CYCLES,
@@ -8,7 +9,9 @@ import {
   RECURRING_CASHFLOW_TYPES,
   SOURCE_OPTIONS,
   STATUS_OPTIONS,
+  STOCK_TX_TYPES,
 } from './constants';
+import type { StockTransactionType } from './types';
 
 export interface ParsedLocalDate {
   year: number;
@@ -200,6 +203,7 @@ export interface AssetInputPayload {
   quantityOrAmount: number | string;
   currency?: string;
   unitPrice?: number | string;
+  costBasis?: number | string | null;
   note?: string;
   isLinkedSavings?: boolean;
   balanceAnchorDate?: string | null;
@@ -226,6 +230,14 @@ export function validateAssetInput(payload: AssetInputPayload) {
   const quantityOrAmount = Number(payload.quantityOrAmount);
   const currency = String(payload.currency || 'TWD').trim().toUpperCase();
   const unitPrice = isLinkedSavings ? 1 : payload.unitPrice !== undefined ? Number(payload.unitPrice) : 1;
+  let costBasis: number | null = null;
+  if (!isLinkedSavings && payload.costBasis !== undefined && payload.costBasis !== null && String(payload.costBasis).trim() !== '') {
+    const parsedCost = Number(payload.costBasis);
+    if (Number.isNaN(parsedCost) || !Number.isFinite(parsedCost) || parsedCost < 0) {
+      throw new Error('期初成本需大於等於 0。');
+    }
+    costBasis = Math.round(parsedCost * 100) / 100;
+  }
   const note = String(payload.note || '').trim().slice(0, 200);
   const balanceAnchorDate = payload.balanceAnchorDate
     ? (parseLocalDate(String(payload.balanceAnchorDate)), String(payload.balanceAnchorDate).trim())
@@ -254,6 +266,7 @@ export function validateAssetInput(payload: AssetInputPayload) {
     quantityOrAmount,
     currency,
     unitPrice,
+    costBasis,
     note,
     isLinkedSavings,
     balanceAnchorDate,
@@ -291,6 +304,73 @@ export function validateSavingsAdjustmentInput(
     date: String(payload.date).trim(),
     amount,
     twdAmount,
+    note,
+  };
+}
+
+export interface StockTransactionInputPayload {
+  assetId: string;
+  date: string;
+  txType: StockTransactionType | string;
+  shares?: number | string;
+  totalAmount?: number | string;
+  fee?: number | string;
+  linkedCashflowId?: string | null;
+  note?: string;
+}
+
+export function validateStockTransactionInput(payload: StockTransactionInputPayload) {
+  const assetId = String(payload.assetId || '').trim();
+  if (!assetId) throw new Error('請選擇對應的持股標的。');
+  parseLocalDate(String(payload.date || ''));
+
+  const txTypeRaw = String(payload.txType || '').trim();
+  if (!ALL_STOCK_TX_TYPES.includes(txTypeRaw)) {
+    throw new Error(`不支援的持股異動類型：${txTypeRaw}`);
+  }
+  const txType = txTypeRaw as StockTransactionType;
+
+  const sharesRaw = payload.shares !== undefined && payload.shares !== '' ? Number(payload.shares) : 0;
+  const totalAmountRaw =
+    payload.totalAmount !== undefined && payload.totalAmount !== '' ? Number(payload.totalAmount) : 0;
+  const feeRaw = payload.fee !== undefined && payload.fee !== '' ? Number(payload.fee) : 0;
+
+  if (Number.isNaN(sharesRaw) || !Number.isFinite(sharesRaw) || sharesRaw < 0) {
+    throw new Error('股數需大於等於 0。');
+  }
+  if (Number.isNaN(totalAmountRaw) || !Number.isFinite(totalAmountRaw) || totalAmountRaw < 0) {
+    throw new Error('金額需大於等於 0。');
+  }
+  if (Number.isNaN(feeRaw) || !Number.isFinite(feeRaw) || feeRaw < 0) {
+    throw new Error('手續費或扣費需大於等於 0。');
+  }
+
+  let shares = sharesRaw;
+  let totalAmount = Math.round(totalAmountRaw * 100) / 100;
+  const fee = Math.round(feeRaw * 100) / 100;
+
+  if (txType === STOCK_TX_TYPES.BUY || txType === STOCK_TX_TYPES.SELL) {
+    if (shares <= 0) throw new Error('買入或賣出股數需大於 0。');
+    if (totalAmount <= 0) throw new Error('成交總金額需大於 0。');
+  } else if (txType === STOCK_TX_TYPES.CASH_DIVIDEND) {
+    shares = 0;
+    if (totalAmount <= 0) throw new Error('現金配息金額需大於 0。');
+  } else if (txType === STOCK_TX_TYPES.STOCK_DIVIDEND) {
+    if (shares <= 0) throw new Error('股票配股股數需大於 0。');
+    totalAmount = 0;
+  }
+
+  const linkedCashflowId = payload.linkedCashflowId ? String(payload.linkedCashflowId).trim() : null;
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  return {
+    assetId,
+    date: String(payload.date).trim(),
+    txType,
+    shares,
+    totalAmount,
+    fee,
+    linkedCashflowId,
     note,
   };
 }

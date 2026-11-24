@@ -1,4 +1,4 @@
-import { RECURRING_CASHFLOW_TYPES } from '../../../shared/constants';
+import { CASHFLOW_TYPES, RECURRING_CASHFLOW_TYPES, STOCK_TX_TYPES } from '../../../shared/constants';
 import {
   sortUtilityRecords,
   validateUtilityRecordInput,
@@ -14,6 +14,7 @@ import type {
   RentUtilityRents,
   SavingsAdjustment,
   SinkingFundItem,
+  StockTransaction,
   SyncDelta,
   SyncMutation,
   SyncResponse,
@@ -24,11 +25,13 @@ import {
   validateRecurringInput,
   validateSavingsAdjustmentInput,
   validateSinkingInput,
+  validateStockTransactionInput,
   type AssetInputPayload,
   type CashFlowInputPayload,
   type RecurringInputPayload,
   type SavingsAdjustmentInputPayload,
   type SinkingInputPayload,
+  type StockTransactionInputPayload,
 } from '../../../shared/validation';
 import { createEmptySnapshot, type LocalFinanceDB, type LocalMeta } from '../db/localDb';
 
@@ -403,6 +406,7 @@ export class SyncEngine {
       id,
       ...v,
       unitPrice: payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? 1,
+      costBasis: payload.costBasis !== undefined ? v.costBasis : existing?.costBasis ?? null,
       priceUpdatedAt: existing?.priceUpdatedAt ?? null,
       balanceAnchorDate,
       balanceAnchorAt,
@@ -500,6 +504,136 @@ export class SyncEngine {
         clientTimestamp: nowIso,
       },
     ]);
+  }
+
+  async addStockTransaction(
+    payload: StockTransactionInputPayload & {
+      syncToCashflow?: boolean;
+      linkedAccountId?: string | null;
+    }
+  ): Promise<{ tx: StockTransaction; cashflow: CashFlowLog | null }> {
+    const asset = this.snapshot.assetItems.find((a) => a.id === payload.assetId && !a.deletedAt);
+    if (!asset) throw new Error('找不到對應的持股項目。');
+    const v = validateStockTransactionInput(payload);
+    const nowIso = new Date().toISOString();
+    const txId = crypto.randomUUID();
+    const mutations: SyncMutation[] = [];
+
+    let createdCashflow: CashFlowLog | null = null;
+    if (payload.syncToCashflow && v.totalAmount > 0 && v.txType !== STOCK_TX_TYPES.STOCK_DIVIDEND) {
+      const cfId = crypto.randomUUID();
+      const cfType =
+        v.txType === STOCK_TX_TYPES.BUY ? CASHFLOW_TYPES.INVESTMENT : CASHFLOW_TYPES.OTHER_INCOME;
+      const cfCategory =
+        v.txType === STOCK_TX_TYPES.BUY
+          ? asset.subCategory === '美股/ETF'
+            ? '美股/ETF'
+            : '台股投資'
+          : v.txType === STOCK_TX_TYPES.CASH_DIVIDEND
+            ? '股息/配息'
+            : '其他';
+      const cfItemName =
+        v.txType === STOCK_TX_TYPES.BUY
+          ? `${asset.itemName} 加碼 ${v.shares}股`
+          : v.txType === STOCK_TX_TYPES.CASH_DIVIDEND
+            ? `${asset.itemName} 現金配息`
+            : `${asset.itemName} 賣出 ${v.shares}股`;
+
+      const validatedCf = validateCashFlowInput(
+        {
+          date: v.date,
+          type: cfType,
+          category: cfCategory,
+          itemName: cfItemName,
+          amount: v.totalAmount,
+          currency: asset.currency,
+          source: '手機記帳',
+          note: v.note ? `[持股連動] ${v.note}` : '[持股連動]',
+          linkedAccountId: payload.linkedAccountId || null,
+        },
+        this.snapshot.settings.usdTwdRate
+      );
+
+      createdCashflow = {
+        id: cfId,
+        ...validatedCf,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'cashflow',
+        op: 'upsert',
+        recordId: cfId,
+        clientTimestamp: nowIso,
+        payload: { ...createdCashflow },
+      });
+    }
+
+    const tx: StockTransaction = {
+      id: txId,
+      ...v,
+      linkedCashflowId: createdCashflow ? createdCashflow.id : v.linkedCashflowId,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      deletedAt: null,
+    };
+
+    mutations.push({
+      mutationId: crypto.randomUUID(),
+      entity: 'stock_tx',
+      op: 'upsert',
+      recordId: txId,
+      clientTimestamp: nowIso,
+      payload: { ...tx },
+    });
+
+    this.snapshot = {
+      ...this.snapshot,
+      cashflowLogs: createdCashflow
+        ? this.sortCashFlows([createdCashflow, ...this.snapshot.cashflowLogs])
+        : this.snapshot.cashflowLogs,
+      stockTransactions: [tx, ...(this.snapshot.stockTransactions || [])].sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+    };
+
+    await this.commitAndMaybeSync(mutations);
+    return { tx, cashflow: createdCashflow };
+  }
+
+  async deleteStockTransaction(id: string, deleteLinkedCashflow = false): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const target = (this.snapshot.stockTransactions || []).find((t) => t.id === id);
+    const mutations: SyncMutation[] = [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'stock_tx',
+        op: 'delete',
+        recordId: id,
+        clientTimestamp: nowIso,
+      },
+    ];
+
+    let nextLogs = this.snapshot.cashflowLogs;
+    if (deleteLinkedCashflow && target?.linkedCashflowId) {
+      nextLogs = nextLogs.filter((l) => l.id !== target.linkedCashflowId);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'cashflow',
+        op: 'delete',
+        recordId: target.linkedCashflowId,
+        clientTimestamp: nowIso,
+      });
+    }
+
+    this.snapshot = {
+      ...this.snapshot,
+      cashflowLogs: nextLogs,
+      stockTransactions: (this.snapshot.stockTransactions || []).filter((t) => t.id !== id),
+    };
+    await this.commitAndMaybeSync(mutations);
   }
 
   async deleteAsset(id: string): Promise<void> {
@@ -726,6 +860,7 @@ export class SyncEngine {
     const incomingUtilityRecords = Array.isArray(delta.rentUtilityRecords) ? delta.rentUtilityRecords : [];
     const incomingUtilityRents = delta.rentUtilityRents || current.rentUtilityRents;
     const incomingAdjs = delta.savingsAdjustments || [];
+    const incomingStockTxs = delta.stockTransactions || [];
     if (isFull) {
       return {
         settings: delta.settings || current.settings,
@@ -735,6 +870,9 @@ export class SyncEngine {
         assetItems: delta.assetItems.filter((a) => !a.deletedAt),
         savingsAdjustments: incomingAdjs
           .filter((a) => !a.deletedAt)
+          .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+        stockTransactions: incomingStockTxs
+          .filter((t) => !t.deletedAt)
           .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
         netWorthHistory: delta.netWorthHistory
           .slice()
@@ -756,6 +894,9 @@ export class SyncEngine {
       sinkingItems: mergeById(current.sinkingItems, delta.sinkingItems),
       assetItems: mergeById(current.assetItems, delta.assetItems),
       savingsAdjustments: mergeById(current.savingsAdjustments || [], incomingAdjs).sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+      stockTransactions: mergeById(current.stockTransactions || [], incomingStockTxs).sort(
         (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
       ),
       netWorthHistory: Array.from(historyMap.values()).sort((a, b) =>

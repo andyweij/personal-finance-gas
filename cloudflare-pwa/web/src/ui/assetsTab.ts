@@ -1,9 +1,11 @@
 import { ASSET_SUB_CATEGORIES } from '../../../shared/constants';
 import {
   computeAllSavingsSummary,
-  computeAssetTwdValue,
+  computeAssetEffectiveTwdValue,
   computeNetWorthSummary,
   computeSavingsAccountSummary,
+  computeStockPositionSummary,
+  isStockAsset,
 } from '../../../shared/calculations';
 import type { AssetItem } from '../../../shared/types';
 import {
@@ -38,7 +40,8 @@ export function renderAssetsTab(ctx: UiContext): void {
   const rate = snap.settings.usdTwdRate;
   const activeAssets = snap.assetItems.filter((a) => !a.deletedAt);
   const adjustments = snap.savingsAdjustments || [];
-  const nw = computeNetWorthSummary(activeAssets, rate, 0, snap.cashflowLogs, adjustments);
+  const stockTxs = snap.stockTransactions || [];
+  const nw = computeNetWorthSummary(activeAssets, rate, 0, snap.cashflowLogs, adjustments, stockTxs);
 
   el('netWorthHero').textContent = fmtMoney(nw.netWorth, ctx.state.masked);
   el('totalAssetsText').textContent = fmtMoney(nw.totalAssets, ctx.state.masked);
@@ -50,7 +53,7 @@ export function renderAssetsTab(ctx: UiContext): void {
   });
 
   const alloc = [
-    { key: 'stock', name: '台股', val: nw.stockValue, color: '#4E8FE6' },
+    { key: 'stock', name: '股票', val: nw.stockValue, color: '#4E8FE6' },
     { key: 'cash', name: '活存 / 現金 / 美金', val: nw.cashUsdValue, color: '#34C759' },
     { key: 'fund', name: '基金 / 結構', val: nw.fundStructuredValue, color: '#FF9500' },
     { key: 'ins', name: '保單保價金', val: nw.insuranceValue, color: '#5856D6' },
@@ -236,7 +239,9 @@ export function renderAssetsTab(ctx: UiContext): void {
   let manualCount = 0;
   for (const item of activeAssets) {
     if (item.isLinkedSavings) continue;
-    const twdVal = computeAssetTwdValue(item, rate);
+    const isStock = isStockAsset(item);
+    const stockPos = isStock ? computeStockPositionSummary(item, stockTxs, rate) : null;
+    const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs);
     const row = document.createElement('div');
     row.className = 'list-row';
 
@@ -251,8 +256,13 @@ export function renderAssetsTab(ctx: UiContext): void {
     b.className = 'badge' + (item.majorType === '負債' ? ' red' : ' green');
     b.textContent = item.subCategory;
     sub.appendChild(b);
-    const detail = item.ticker
-      ? `${item.ticker} · ${fmtNum(item.quantityOrAmount)} 股 @ ${item.unitPrice}`
+    const displayQty = stockPos ? stockPos.currentShares : item.quantityOrAmount;
+    const pnlSuffix =
+      stockPos && stockPos.hasCostBasis
+        ? ` · 含息 ${fmtSignedMoney(stockPos.totalReturnPnlTwd, ctx.state.masked)}`
+        : '';
+    const detail = item.ticker || isStock
+      ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}${pnlSuffix}`
       : item.currency === 'USD'
         ? fmtRaw(item.quantityOrAmount, 'USD', ctx.state.masked)
         : item.liquidity;
@@ -270,8 +280,11 @@ export function renderAssetsTab(ctx: UiContext): void {
     const editBtn = document.createElement('button');
     editBtn.type = 'button';
     editBtn.className = 'btn btn-outline btn-sm';
-    editBtn.textContent = '更新';
-    editBtn.addEventListener('click', () => openAssetModal(ctx, item));
+    editBtn.textContent = isStock ? '持股頁' : '更新';
+    editBtn.addEventListener('click', () => {
+      if (isStock) ctx.navigateToTab('stocks');
+      else openAssetModal(ctx, item);
+    });
 
     right.appendChild(amt);
     right.appendChild(editBtn);
