@@ -17,6 +17,7 @@ import {
   unlockLockScreenWithFaceId,
   updateSecurityButtons,
 } from './ui/securityUi';
+import { initBottomNavScrub } from './ui/tabBarScrub';
 import type { AppUiState, UiContext } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
@@ -188,14 +189,32 @@ async function bootstrap(): Promise<void> {
 }
 
 function bindEvents(ctx: UiContext): void {
-  // Bottom Nav
-  document.querySelectorAll<HTMLButtonElement>('.nav-btn').forEach((btn) => {
+  // Bottom Nav (支援點擊切換 ＋ 按住左右滑動高亮膠囊、放開切換分頁)
+  const navButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('#bottomNav .nav-btn'));
+  const tabOrder: Array<AppUiState['activeTab']> = ['log', 'overview', 'config', 'assets'];
+
+  const activateTabByIndex = (idx: number) => {
+    const safeIdx = Math.max(0, Math.min(navButtons.length - 1, idx));
+    const btn = navButtons[safeIdx];
+    const tab = (btn.dataset.tab as AppUiState['activeTab']) || tabOrder[safeIdx];
+    ctx.state.activeTab = tab;
+    navButtons.forEach((b, i) => b.classList.toggle('active', i === safeIdx));
+    document.querySelectorAll('.tab-view').forEach((v) => v.classList.toggle('active', v.id === 'tab-' + tab));
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const navScrub = initBottomNavScrub({
+    navEl: el('bottomNav'),
+    buttons: navButtons,
+    pillEl: el('navPill'),
+    getActiveIndex: () => Math.max(0, tabOrder.indexOf(ctx.state.activeTab)),
+    onSelectIndex: (idx) => activateTabByIndex(idx),
+  });
+
+  navButtons.forEach((btn, idx) => {
     btn.addEventListener('click', () => {
-      const tab = btn.dataset.tab as AppUiState['activeTab'];
-      ctx.state.activeTab = tab;
-      document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b === btn));
-      document.querySelectorAll('.tab-view').forEach((v) => v.classList.toggle('active', v.id === 'tab-' + tab));
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      activateTabByIndex(idx);
+      navScrub.syncPill(false);
     });
   });
 
