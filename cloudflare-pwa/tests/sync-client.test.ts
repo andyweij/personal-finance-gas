@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LocalFinanceDB } from '../web/src/db/localDb';
 import { SyncEngine } from '../web/src/sync/syncEngine';
 import { CASHFLOW_TYPES } from '../shared/constants';
+import { computeAllSavingsSummary } from '../shared/calculations';
 import type { SyncResponse } from '../shared/types';
 
 describe('Offline-First IndexedDB & SyncEngine', () => {
@@ -262,5 +263,57 @@ describe('Offline-First IndexedDB & SyncEngine', () => {
     const outbox = await db.getOutbox();
     expect(outbox.some((m) => m.entity === 'utility_record' && m.op === 'delete' && m.recordId === '11511')).toBe(true);
     expect(outbox.some((m) => m.entity === 'utility_rents' && m.op === 'upsert')).toBe(true);
+  });
+
+  it('tracks offline savings account deposits and linked cashflow deductions immediately in IndexedDB', async () => {
+    const engine = new SyncEngine(db, {
+      fetchImpl: vi.fn(),
+      isOnline: () => false,
+    });
+    await engine.init();
+
+    const acc = await engine.saveAsset({
+      updateMode: '手動快照',
+      majorType: '資產',
+      subCategory: '活存',
+      liquidity: '高流動',
+      itemName: '中信活存',
+      quantityOrAmount: 300000,
+      currency: 'TWD',
+      isLinkedSavings: true,
+      isDefaultSavings: true,
+      balanceAnchorDate: '2026-11-24',
+    });
+
+    await engine.addSavingsAdjustment({
+      accountId: acc.id,
+      date: '2026-11-24',
+      amount: 200000,
+      note: '加碼存入活存',
+    });
+
+    await engine.addCashFlow({
+      date: '2026-11-24',
+      type: CASHFLOW_TYPES.DAILY_EXPENSE,
+      category: '其他',
+      itemName: '扣款測試',
+      amount: 100000,
+      currency: 'TWD',
+      linkedAccountId: acc.id,
+    });
+
+    const snap = engine.getSnapshot();
+    const summary = computeAllSavingsSummary(
+      snap.assetItems,
+      snap.cashflowLogs,
+      snap.savingsAdjustments,
+      snap.settings.usdTwdRate
+    );
+    expect(summary.totalSavingsTwd).toBe(400000);
+    expect((await db.getOutbox()).map((m) => m.entity)).toEqual([
+      'asset',
+      'savings_adjustment',
+      'cashflow',
+    ]);
   });
 });

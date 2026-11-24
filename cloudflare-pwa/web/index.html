@@ -108,6 +108,20 @@
         </div>
       </div>
 
+      <div class="card compact savings-strip" id="savingsLiveCard">
+        <button type="button" class="savings-strip-head" id="savingsStripToggle" aria-expanded="false">
+          <div class="savings-strip-left">
+            <span class="savings-strip-label">活存即時餘額</span>
+            <span class="fx-pill" id="savingsAccountCountPill">0 個帳戶</span>
+          </div>
+          <div class="savings-strip-right">
+            <span class="savings-strip-total tnum" id="logSavingsTotal">NT$ --</span>
+            <svg class="savings-chevron" id="savingsChevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+        </button>
+        <div class="savings-strip-body" id="savingsStripBody" style="display:none"></div>
+      </div>
+
       <div class="seg-bar" id="logSubtabBar">
         <button type="button" class="seg-btn active" data-log-sub="entry">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -164,6 +178,15 @@
         <div class="field" style="margin-top:12px">
           <label class="section-label" for="noteInput">備註（選填）</label>
           <input id="noteInput" type="text" placeholder="例如：Apple Pay、中信卡、所得稅" maxlength="200" />
+        </div>
+
+        <div class="field" id="logSavingsField">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px">
+            <label class="section-label" style="margin-bottom:0">連動活存帳戶</label>
+            <span class="muted" style="font-size:11px">收入加計 · 支出與投資扣減</span>
+          </div>
+          <div class="chip-group" id="logSavingsChips" style="margin-bottom:8px"></div>
+          <div class="savings-preview tnum" id="savingsDeltaPreview" style="display:none"></div>
         </div>
 
         <label id="recurringToggleBox" style="display:none;align-items:center;gap:10px;padding:11px 13px;margin-bottom:14px;border-radius:12px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;">
@@ -374,10 +397,19 @@
         </div>
       </div>
 
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
-        <button type="button" class="btn btn-primary btn-sm" id="addAssetBtn">+ 新增資產</button>
-        <button type="button" class="btn btn-tinted btn-sm" id="refreshMarketBtn">更新股價匯率</button>
+      <div class="asset-action-grid">
+        <button type="button" class="btn btn-primary btn-sm" id="addSavingsBtn">+ 新增活存</button>
+        <button type="button" class="btn btn-tinted btn-sm" id="addAssetBtn">+ 新增資產</button>
+        <button type="button" class="btn btn-outline btn-sm" id="refreshMarketBtn">更新股價匯率</button>
         <button type="button" class="btn btn-outline btn-sm" id="runSnapshotBtn">記錄快照</button>
+      </div>
+
+      <div>
+        <div class="section-heading">
+          <span>活存帳戶區（與流水帳即時連動）</span>
+          <span class="tnum" id="assetsSavingsTotalLabel">合計 NT$ --</span>
+        </div>
+        <div class="list-group" id="savingsAccountsList"></div>
       </div>
 
       <div>

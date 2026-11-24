@@ -26,7 +26,13 @@ export function renderOverviewTab(ctx: UiContext): void {
 
   const monthly = aggregatePeriodMetrics(monthLogs, monthlySinking, true);
   const yearly = aggregatePeriodMetrics(yearLogs, monthlySinking * 12, false);
-  const nw = computeNetWorthSummary(snap.assetItems, snap.settings.usdTwdRate, monthly.totalConsumption);
+  const nw = computeNetWorthSummary(
+    snap.assetItems,
+    snap.settings.usdTwdRate,
+    monthly.totalConsumption,
+    snap.cashflowLogs,
+    snap.savingsAdjustments || []
+  );
 
   const m = ctx.state.overviewPeriod === 'monthly' ? monthly : yearly;
   const kpiGrid = el('overviewKpis');

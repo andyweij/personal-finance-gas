@@ -1,6 +1,12 @@
 import { WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
-import { aggregatePeriodMetrics, computeSinkingMonthlyReserve } from '../../../shared/calculations';
+import {
+  aggregatePeriodMetrics,
+  computeAllSavingsSummary,
+  computeSinkingMonthlyReserve,
+  isCashFlowIncome,
+} from '../../../shared/calculations';
 import type { CashFlowLog } from '../../../shared/types';
+import { openSavingsAccountModal } from './assetsTab';
 import { el, fmtMoney, fmtNum, showToast, TRASH_SVG } from './helpers';
 import type { UiContext } from './state';
 
@@ -43,9 +49,205 @@ export function updateFxPreview(ctx: UiContext): void {
   } else {
     preview.textContent = '';
   }
+  updateSavingsPreview(ctx);
 }
 
-function createLedgerRow(ctx: UiContext, item: CashFlowLog): HTMLDivElement {
+export function updateSavingsPreview(ctx: UiContext): void {
+  const preview = el('savingsDeltaPreview');
+  const snap = ctx.engine.getSnapshot();
+  const rate = snap.settings.usdTwdRate || 32.5;
+  const savings = computeAllSavingsSummary(
+    snap.assetItems,
+    snap.cashflowLogs,
+    snap.savingsAdjustments || [],
+    rate
+  );
+  const selected = savings.accounts.find((a) => a.account.id === ctx.state.logLinkedAccountId);
+  if (!selected) {
+    preview.style.display = 'none';
+    preview.innerHTML = '';
+    return;
+  }
+
+  const rawAmt = parseFloat(el<HTMLInputElement>('amountInput').value);
+  const dateVal = el<HTMLInputElement>('dateInput').value || getTodayYmd();
+  const beforeAnchor = Boolean(
+    selected.account.balanceAnchorDate && dateVal < selected.account.balanceAnchorDate
+  );
+
+  preview.style.display = 'flex';
+  preview.innerHTML = '';
+
+  if (Number.isNaN(rawAmt) || rawAmt <= 0) {
+    const left = document.createElement('span');
+    left.textContent = `${selected.account.itemName} 目前餘額`;
+    const right = document.createElement('strong');
+    right.className = selected.currentBalanceTwd < 0 ? 'delta-neg' : 'delta-pos';
+    right.textContent = fmtMoney(selected.currentBalanceTwd, ctx.state.masked);
+    preview.appendChild(left);
+    preview.appendChild(right);
+    return;
+  }
+
+  if (beforeAnchor) {
+    const warn = document.createElement('span');
+    warn.className = 'delta-warn';
+    warn.textContent = `日期早於 ${selected.account.itemName} 基準日 (${selected.account.balanceAnchorDate})，寫入後不影響目前餘額`;
+    preview.appendChild(warn);
+    return;
+  }
+
+  const twdDeltaAbs = Math.round(ctx.state.logCurrency === 'USD' ? rawAmt * rate : rawAmt);
+  const isInc = isCashFlowIncome(ctx.state.logType);
+  const signedDelta = isInc ? twdDeltaAbs : -twdDeltaAbs;
+  const afterBal = selected.currentBalanceTwd + signedDelta;
+
+  const left = document.createElement('span');
+  left.textContent = `${selected.account.itemName}：${fmtMoney(selected.currentBalanceTwd, ctx.state.masked)} → `;
+  const afterStrong = document.createElement('strong');
+  afterStrong.className = afterBal < 0 ? 'delta-neg' : 'delta-pos';
+  afterStrong.textContent = fmtMoney(afterBal, ctx.state.masked);
+  left.appendChild(afterStrong);
+
+  const deltaSpan = document.createElement('span');
+  deltaSpan.className = isInc ? 'delta-pos' : 'delta-neg';
+  deltaSpan.textContent = ctx.state.masked
+    ? isInc
+      ? '+•••'
+      : '-•••'
+    : `${isInc ? '+' : '-'}${fmtNum(twdDeltaAbs)}`;
+
+  preview.appendChild(left);
+  preview.appendChild(deltaSpan);
+}
+
+function renderSavingsStripAndChips(ctx: UiContext): void {
+  const snap = ctx.engine.getSnapshot();
+  const rate = snap.settings.usdTwdRate || 32.5;
+  const savings = computeAllSavingsSummary(
+    snap.assetItems,
+    snap.cashflowLogs,
+    snap.savingsAdjustments || [],
+    rate
+  );
+
+  // Keep selected linked savings account in sync with available accounts
+  if (!ctx.state.logLinkedAccountTouched) {
+    ctx.state.logLinkedAccountId = savings.defaultAccountId;
+  } else if (
+    ctx.state.logLinkedAccountId &&
+    !savings.accounts.some((a) => a.account.id === ctx.state.logLinkedAccountId)
+  ) {
+    ctx.state.logLinkedAccountId = savings.defaultAccountId;
+    ctx.state.logLinkedAccountTouched = false;
+  }
+
+  // 1. Live savings balance strip
+  const countPill = el('savingsAccountCountPill');
+  const totalEl = el('logSavingsTotal');
+  const chevron = el('savingsChevron');
+  const toggleBtn = el('savingsStripToggle');
+  const bodyEl = el('savingsStripBody');
+
+  countPill.textContent = savings.accounts.length ? `${savings.accounts.length} 個帳戶` : '未建立';
+  if (!savings.accounts.length) {
+    totalEl.className = 'savings-strip-total empty';
+    totalEl.textContent = '點此建立活存';
+  } else {
+    totalEl.className = 'savings-strip-total tnum' + (savings.totalSavingsTwd < 0 ? ' neg' : '');
+    totalEl.textContent = fmtMoney(savings.totalSavingsTwd, ctx.state.masked);
+  }
+
+  toggleBtn.setAttribute('aria-expanded', String(ctx.state.savingsExpanded));
+  chevron.classList.toggle('open', ctx.state.savingsExpanded);
+  bodyEl.style.display = ctx.state.savingsExpanded ? 'flex' : 'none';
+  bodyEl.innerHTML = '';
+
+  if (ctx.state.savingsExpanded) {
+    if (!savings.accounts.length) {
+      const hint = document.createElement('div');
+      hint.className = 'muted';
+      hint.textContent = '建立活存帳戶後，記帳與投資扣款將即時加減活存餘額，並同步反映至資產負債。';
+      const createBtn = document.createElement('button');
+      createBtn.type = 'button';
+      createBtn.className = 'btn btn-tinted btn-sm';
+      createBtn.textContent = '+ 建立第一個活存帳戶';
+      createBtn.addEventListener('click', () => {
+        ctx.navigateToTab('assets');
+        openSavingsAccountModal(ctx, null);
+      });
+      bodyEl.appendChild(hint);
+      bodyEl.appendChild(createBtn);
+    } else {
+      for (const s of savings.accounts) {
+        const row = document.createElement('div');
+        row.className = 'savings-mini-row';
+        const name = document.createElement('span');
+        name.className = 'savings-mini-name';
+        name.textContent = `${s.account.isDefaultSavings ? '★ ' : ''}${s.account.itemName}`;
+        const val = document.createElement('span');
+        val.className = 'savings-mini-val tnum' + (s.currentBalanceTwd < 0 ? ' neg' : '');
+        val.textContent = fmtMoney(s.currentBalanceTwd, ctx.state.masked);
+        row.appendChild(name);
+        row.appendChild(val);
+        bodyEl.appendChild(row);
+      }
+      const manageBtn = document.createElement('button');
+      manageBtn.type = 'button';
+      manageBtn.className = 'btn btn-outline btn-sm';
+      manageBtn.style.marginTop = '2px';
+      manageBtn.textContent = '前往資產頁管理活存 / 存入款項';
+      manageBtn.addEventListener('click', () => ctx.navigateToTab('assets'));
+      bodyEl.appendChild(manageBtn);
+    }
+  }
+
+  // 2. Quick Entry linked savings account chips
+  const chipsBox = el('logSavingsChips');
+  chipsBox.innerHTML = '';
+  if (!savings.accounts.length) {
+    const setupBtn = document.createElement('button');
+    setupBtn.type = 'button';
+    setupBtn.className = 'chip-btn sm';
+    setupBtn.textContent = '+ 建立活存帳戶以即時連動';
+    setupBtn.addEventListener('click', () => {
+      ctx.navigateToTab('assets');
+      openSavingsAccountModal(ctx, null);
+    });
+    chipsBox.appendChild(setupBtn);
+  } else {
+    for (const s of savings.accounts) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chip-btn sm' + (ctx.state.logLinkedAccountId === s.account.id ? ' active' : '');
+      chip.textContent = `${s.account.isDefaultSavings ? '★ ' : ''}${s.account.itemName}`;
+      chip.addEventListener('click', () => {
+        ctx.state.logLinkedAccountId = s.account.id;
+        ctx.state.logLinkedAccountTouched = true;
+        renderSavingsStripAndChips(ctx);
+      });
+      chipsBox.appendChild(chip);
+    }
+    const noneChip = document.createElement('button');
+    noneChip.type = 'button';
+    noneChip.className = 'chip-btn sm' + (ctx.state.logLinkedAccountId === null ? ' active' : '');
+    noneChip.textContent = '不連動';
+    noneChip.addEventListener('click', () => {
+      ctx.state.logLinkedAccountId = null;
+      ctx.state.logLinkedAccountTouched = true;
+      renderSavingsStripAndChips(ctx);
+    });
+    chipsBox.appendChild(noneChip);
+  }
+
+  updateSavingsPreview(ctx);
+}
+
+function createLedgerRow(
+  ctx: UiContext,
+  item: CashFlowLog,
+  savingsNameById: Map<string, string>
+): HTMLDivElement {
   const row = document.createElement('div');
   row.className = 'list-row';
   const isInc = item.type.includes('收入');
@@ -68,7 +270,8 @@ function createLedgerRow(ctx: UiContext, item: CashFlowLog): HTMLDivElement {
   t.textContent = item.itemName || item.category;
   const sub = document.createElement('div');
   sub.className = 'item-sub tnum';
-  sub.textContent = `${item.date} · ${item.type} · ${item.category}${item.note ? ' · ' + item.note : ''}`;
+  const accName = item.linkedAccountId ? savingsNameById.get(item.linkedAccountId) : null;
+  sub.textContent = `${item.date} · ${item.type} · ${item.category}${accName ? ` · 活存:${accName}` : ''}${item.note ? ' · ' + item.note : ''}`;
   main.appendChild(t);
   main.appendChild(sub);
   leading.appendChild(dotBox);
@@ -128,11 +331,20 @@ export function renderLogTab(ctx: UiContext): void {
   bar.style.width = Math.min(100, Math.max(0, usagePct)) + '%';
   bar.className = 'progress-fill' + (usagePct >= 100 ? ' over' : usagePct >= 80 ? ' warn' : '');
 
-  renderLedgerList(ctx, monthLogs);
-  renderLedgerCalendar(ctx, monthLogs, ym);
+  renderSavingsStripAndChips(ctx);
+
+  const savingsNameById = new Map(
+    snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
+  );
+  renderLedgerList(ctx, monthLogs, savingsNameById);
+  renderLedgerCalendar(ctx, monthLogs, ym, savingsNameById);
 }
 
-function renderLedgerList(ctx: UiContext, logs: CashFlowLog[]): void {
+function renderLedgerList(
+  ctx: UiContext,
+  logs: CashFlowLog[],
+  savingsNameById: Map<string, string>
+): void {
   const total = logs.length;
   const totalPages = Math.max(1, Math.ceil(total / ctx.state.pageSize));
   if (ctx.state.ledgerPage > totalPages) ctx.state.ledgerPage = totalPages;
@@ -154,7 +366,7 @@ function renderLedgerList(ctx: UiContext, logs: CashFlowLog[]): void {
     list.appendChild(empty);
   } else {
     for (const item of slice) {
-      list.appendChild(createLedgerRow(ctx, item));
+      list.appendChild(createLedgerRow(ctx, item, savingsNameById));
     }
   }
 
@@ -188,13 +400,18 @@ function renderLedgerList(ctx: UiContext, logs: CashFlowLog[]): void {
     btn.textContent = String(pageNum);
     btn.addEventListener('click', () => {
       ctx.state.ledgerPage = pageNum;
-      renderLedgerList(ctx, logs);
+      renderLedgerList(ctx, logs, savingsNameById);
     });
     pills.appendChild(btn);
   }
 }
 
-function renderLedgerCalendar(ctx: UiContext, logs: CashFlowLog[], ym: string): void {
+function renderLedgerCalendar(
+  ctx: UiContext,
+  logs: CashFlowLog[],
+  ym: string,
+  savingsNameById: Map<string, string>
+): void {
   const year = ctx.state.selectedYear;
   const month = ctx.state.selectedMonth;
   const todayYmd = getTodayYmd();
@@ -272,7 +489,7 @@ function renderLedgerCalendar(ctx: UiContext, logs: CashFlowLog[], ym: string): 
 
     cell.addEventListener('click', () => {
       ctx.state.selectedCalendarDay = dateStr;
-      renderLedgerCalendar(ctx, logs, ym);
+      renderLedgerCalendar(ctx, logs, ym, savingsNameById);
     });
     grid.appendChild(cell);
   }
@@ -292,7 +509,7 @@ function renderLedgerCalendar(ctx: UiContext, logs: CashFlowLog[], ym: string): 
     dayList.appendChild(empty);
   } else {
     for (const item of sel.logs) {
-      dayList.appendChild(createLedgerRow(ctx, item));
+      dayList.appendChild(createLedgerRow(ctx, item, savingsNameById));
     }
   }
 }

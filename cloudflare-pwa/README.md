@@ -2,13 +2,14 @@
 
 獨立於根目錄 GAS 專案之外的次世代架構，採用 **Local-First PWA + Cloudflare Workers + D1 (SQLite) + Cron Triggers**，解決 GAS 冷啟動延遲與無法離線記帳的痛點，且完全運作於 Cloudflare 免費方案（免綁信用卡、永不休眠）。
 
-> 完整設計規格請參閱 [docs/SDD.md](./docs/SDD.md)。
+> 完整設計規格請參閱 [docs/SDD.md](./docs/SDD.md) 與 [docs/SDD_savings_linkage.md](./docs/SDD_savings_linkage.md)。
 
 ---
 
 ## 核心特色
 
 - **真正的離線記帳（0ms 回應）**：Service Worker 預快取 App Shell，沒網路（捷運、地下室、飛航模式）點開 iPhone 主畫面圖示照樣秒開、秒記帳，資料安全寫入本機 IndexedDB 佇列，恢復網路或切回 App 立即背景同步。
+- **活存帳戶與流水帳即時連動**：支援多活存帳戶加總與單帳戶 N 筆存入／轉出累加（不扭曲儲蓄率），記帳頁即時顯示活存餘額與扣減前後預覽，並內建基準生效日與對帳校準機制，避免歷史舊帳重複扣款。
 - **0ms 切換月份與報表**：所有帳目鏡像於本機 IndexedDB，切月份、看年度 12 個月趨勢與資產配置圖完全不需等待網路。
 - **高強度單人安全保護**：
   - 首次初始化受 `SETUP_SECRET` Worker Secret 保護，初始化完成後永久鎖死註冊端點。

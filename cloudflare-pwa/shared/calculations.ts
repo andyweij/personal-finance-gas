@@ -1,13 +1,110 @@
 import { CASHFLOW_TYPES } from './constants';
 import type {
+  AllSavingsSummary,
   AssetItem,
   CashFlowLog,
   MonthlyTrendPoint,
   NetWorthSummary,
   PeriodMetrics,
   RecurringItem,
+  SavingsAccountSummary,
+  SavingsAdjustment,
   SinkingFundItem,
 } from './types';
+
+export function isCashFlowIncome(type: string): boolean {
+  return type === CASHFLOW_TYPES.FIXED_INCOME || type === CASHFLOW_TYPES.OTHER_INCOME;
+}
+
+function isAfterSavingsAnchor(
+  recordDate: string,
+  recordCreatedAt: string,
+  anchorDate?: string | null,
+  anchorAt?: string | null
+): boolean {
+  if (!anchorDate) return true;
+  if (recordDate > anchorDate) return true;
+  if (recordDate < anchorDate) return false;
+  // Same date as anchor: require createdAt >= anchorAt so prior same-day logs are not double-deducted
+  if (!anchorAt) return true;
+  return recordCreatedAt >= anchorAt;
+}
+
+export function computeSavingsAccountSummary(
+  account: AssetItem,
+  logs: CashFlowLog[],
+  adjustments: SavingsAdjustment[],
+  usdTwdRate: number
+): SavingsAccountSummary {
+  const baseBalanceTwd = computeAssetTwdValue(account, usdTwdRate);
+
+  let adjustmentsTotalTwd = 0;
+  let adjustmentCount = 0;
+  for (const adj of adjustments) {
+    if (adj.deletedAt || adj.accountId !== account.id) continue;
+    if (!isAfterSavingsAnchor(adj.date, adj.createdAt, account.balanceAnchorDate, account.balanceAnchorAt)) {
+      continue;
+    }
+    const twd =
+      account.currency === 'USD' ? Math.round(adj.amount * usdTwdRate) : Math.round(adj.twdAmount);
+    adjustmentsTotalTwd += twd;
+    adjustmentCount++;
+  }
+
+  let cashflowNetTwd = 0;
+  let linkedLogCount = 0;
+  for (const log of logs) {
+    if (log.deletedAt || log.linkedAccountId !== account.id) continue;
+    if (!isAfterSavingsAnchor(log.date, log.createdAt, account.balanceAnchorDate, account.balanceAnchorAt)) {
+      continue;
+    }
+    cashflowNetTwd += isCashFlowIncome(log.type) ? log.twdAmount : -log.twdAmount;
+    linkedLogCount++;
+  }
+
+  return {
+    account,
+    baseBalanceTwd,
+    adjustmentsTotalTwd: Math.round(adjustmentsTotalTwd),
+    cashflowNetTwd: Math.round(cashflowNetTwd),
+    linkedLogCount,
+    adjustmentCount,
+    currentBalanceTwd: Math.round(baseBalanceTwd + adjustmentsTotalTwd + cashflowNetTwd),
+  };
+}
+
+export function computeAllSavingsSummary(
+  assets: AssetItem[],
+  logs: CashFlowLog[],
+  adjustments: SavingsAdjustment[],
+  usdTwdRate: number
+): AllSavingsSummary {
+  const linkedAccounts = assets.filter((a) => !a.deletedAt && a.isLinkedSavings);
+  const accounts = linkedAccounts.map((acc) =>
+    computeSavingsAccountSummary(acc, logs, adjustments, usdTwdRate)
+  );
+  const totalSavingsTwd = accounts.reduce((sum, a) => sum + a.currentBalanceTwd, 0);
+  const explicitDefault = linkedAccounts.find((a) => a.isDefaultSavings);
+  const defaultAccountId = explicitDefault?.id ?? linkedAccounts[0]?.id ?? null;
+
+  return {
+    accounts,
+    totalSavingsTwd: Math.round(totalSavingsTwd),
+    defaultAccountId,
+  };
+}
+
+export function computeAssetEffectiveTwdValue(
+  item: AssetItem,
+  usdTwdRate: number,
+  logs: CashFlowLog[] = [],
+  adjustments: SavingsAdjustment[] = []
+): number {
+  if (item.isLinkedSavings) {
+    return computeSavingsAccountSummary(item, logs, adjustments, usdTwdRate).currentBalanceTwd;
+  }
+  return computeAssetTwdValue(item, usdTwdRate);
+}
 
 export function computeRecurringMonthlyTwd(item: RecurringItem, usdTwdRate: number): number {
   if (item.status !== '啟用' || item.cycle === '一次性') return 0;
@@ -165,7 +262,9 @@ export function computeMonthlyTrend(logs: CashFlowLog[], year: number): MonthlyT
 export function computeNetWorthSummary(
   assets: AssetItem[],
   usdTwdRate: number,
-  monthlyTotalConsumption: number
+  monthlyTotalConsumption: number,
+  logs: CashFlowLog[] = [],
+  adjustments: SavingsAdjustment[] = []
 ): NetWorthSummary {
   let totalAssets = 0;
   let totalLiabilities = 0;
@@ -177,14 +276,18 @@ export function computeNetWorthSummary(
 
   for (const a of assets) {
     if (a.deletedAt) continue;
-    const twdValue = computeAssetTwdValue(a, usdTwdRate);
+    const twdValue = computeAssetEffectiveTwdValue(a, usdTwdRate, logs, adjustments);
     if (a.majorType === '資產') {
       totalAssets += twdValue;
-      if (a.liquidity === '高流動') highLiquidityAssets += twdValue;
+      if (a.liquidity === '高流動' || a.isLinkedSavings) highLiquidityAssets += twdValue;
       if (a.subCategory === '台股') stockValue += twdValue;
-      else if (a.subCategory === '美金' || a.subCategory === '定存/現金') cashUsdValue += twdValue;
-      else if (a.subCategory === '中信基金' || a.subCategory === '結構性商品') fundStructuredValue += twdValue;
-      else if (a.subCategory === '保單(保價金)') insuranceValue += twdValue;
+      else if (a.subCategory === '活存' || a.subCategory === '美金' || a.subCategory === '定存/現金' || a.isLinkedSavings) {
+        cashUsdValue += twdValue;
+      } else if (a.subCategory === '中信基金' || a.subCategory === '結構性商品') {
+        fundStructuredValue += twdValue;
+      } else if (a.subCategory === '保單(保價金)') {
+        insuranceValue += twdValue;
+      }
     } else if (a.majorType === '負債') {
       totalLiabilities += twdValue;
     }

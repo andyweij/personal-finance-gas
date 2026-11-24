@@ -20,6 +20,9 @@ export interface AppUiState {
   logType: string;
   logCurrency: string;
   logCategory: string;
+  logLinkedAccountId: string | null;
+  logLinkedAccountTouched: boolean;
+  savingsExpanded: boolean;
   idleMinutes: number;
   lastActivityAt: number;
   pinEnabled: boolean;
@@ -37,4 +40,5 @@ export interface UiContext {
   engine: SyncEngine;
   renderAll: () => void;
   scheduleSync: () => void;
+  navigateToTab: (tab: AppUiState['activeTab']) => void;
 }

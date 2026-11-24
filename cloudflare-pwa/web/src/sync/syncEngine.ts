@@ -12,6 +12,7 @@ import type {
   RecurringItem,
   RentUtilityRecord,
   RentUtilityRents,
+  SavingsAdjustment,
   SinkingFundItem,
   SyncDelta,
   SyncMutation,
@@ -21,10 +22,12 @@ import {
   validateAssetInput,
   validateCashFlowInput,
   validateRecurringInput,
+  validateSavingsAdjustmentInput,
   validateSinkingInput,
   type AssetInputPayload,
   type CashFlowInputPayload,
   type RecurringInputPayload,
+  type SavingsAdjustmentInputPayload,
   type SinkingInputPayload,
 } from '../../../shared/validation';
 import { createEmptySnapshot, type LocalFinanceDB, type LocalMeta } from '../db/localDb';
@@ -210,6 +213,7 @@ export class SyncEngine {
         billingSpec: '',
         status: '啟用',
         note: record.note ? `[手機加入每月常態] ${record.note}` : '手機記帳加入每月常態',
+        linkedAccountId: record.linkedAccountId,
         createdAt: nowIso,
         updatedAt: nowIso,
         deletedAt: null,
@@ -376,21 +380,48 @@ export class SyncEngine {
   async saveAsset(payload: AssetInputPayload & { id?: string }): Promise<AssetItem> {
     const v = validateAssetInput(payload);
     const nowIso = new Date().toISOString();
+    const todayYmd = nowIso.slice(0, 10);
     const id = payload.id || crypto.randomUUID();
     const existing = this.snapshot.assetItems.find((a) => a.id === id);
+
+    // If this is the first linked savings account, auto-promote as default
+    const otherSavings = this.snapshot.assetItems.filter(
+      (a) => !a.deletedAt && a.isLinkedSavings && a.id !== id
+    );
+    const isDefaultSavings = v.isLinkedSavings
+      ? v.isDefaultSavings || otherSavings.length === 0
+      : false;
+
+    const balanceAnchorDate = v.isLinkedSavings
+      ? v.balanceAnchorDate ?? existing?.balanceAnchorDate ?? todayYmd
+      : null;
+    const balanceAnchorAt = v.isLinkedSavings
+      ? v.balanceAnchorAt ?? existing?.balanceAnchorAt ?? nowIso
+      : null;
+
     const item: AssetItem = {
       id,
       ...v,
       unitPrice: payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? 1,
       priceUpdatedAt: existing?.priceUpdatedAt ?? null,
+      balanceAnchorDate,
+      balanceAnchorAt,
+      isDefaultSavings,
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
     };
+
+    const updatedAssets = this.snapshot.assetItems.map((a) =>
+      isDefaultSavings && a.id !== id && a.isDefaultSavings
+        ? { ...a, isDefaultSavings: false, updatedAt: nowIso }
+        : a
+    );
     this.snapshot = {
       ...this.snapshot,
-      assetItems: mergeById(this.snapshot.assetItems, [item]),
+      assetItems: mergeById(updatedAssets, [item]),
     };
+
     await this.commitAndMaybeSync([
       {
         mutationId: crypto.randomUUID(),
@@ -402,6 +433,73 @@ export class SyncEngine {
       },
     ]);
     return item;
+  }
+
+  async reconcileSavingsAccount(accountId: string, actualBalance: number, anchorDate?: string): Promise<AssetItem> {
+    const existing = this.snapshot.assetItems.find((a) => a.id === accountId && !a.deletedAt);
+    if (!existing) throw new Error('找不到指定的活存帳戶。');
+    const nowIso = new Date().toISOString();
+    const ymd = anchorDate || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+    return this.saveAsset({
+      ...existing,
+      id: existing.id,
+      quantityOrAmount: actualBalance,
+      isLinkedSavings: true,
+      balanceAnchorDate: ymd,
+      balanceAnchorAt: nowIso,
+    });
+  }
+
+  async addSavingsAdjustment(payload: SavingsAdjustmentInputPayload): Promise<SavingsAdjustment> {
+    const account = this.snapshot.assetItems.find((a) => a.id === payload.accountId && !a.deletedAt);
+    const currency = payload.currency || account?.currency || 'TWD';
+    const v = validateSavingsAdjustmentInput(
+      { ...payload, currency },
+      this.snapshot.settings.usdTwdRate
+    );
+    const nowIso = new Date().toISOString();
+    const id = crypto.randomUUID();
+    const adj: SavingsAdjustment = {
+      id,
+      ...v,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      deletedAt: null,
+    };
+    this.snapshot = {
+      ...this.snapshot,
+      savingsAdjustments: [adj, ...this.snapshot.savingsAdjustments].sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+    };
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'savings_adjustment',
+        op: 'upsert',
+        recordId: id,
+        clientTimestamp: nowIso,
+        payload: { ...adj, currency },
+      },
+    ]);
+    return adj;
+  }
+
+  async deleteSavingsAdjustment(id: string): Promise<void> {
+    const nowIso = new Date().toISOString();
+    this.snapshot = {
+      ...this.snapshot,
+      savingsAdjustments: this.snapshot.savingsAdjustments.filter((a) => a.id !== id),
+    };
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'savings_adjustment',
+        op: 'delete',
+        recordId: id,
+        clientTimestamp: nowIso,
+      },
+    ]);
   }
 
   async deleteAsset(id: string): Promise<void> {
@@ -580,7 +678,6 @@ export class SyncEngine {
       });
 
       if (res.status === 401) {
-        // Keep outbox safely in IndexedDB and notify caller to re-authenticate
         this.updateStatus({
           state: 'auth_required',
           pendingCount: outbox.length,
@@ -628,7 +725,7 @@ export class SyncEngine {
   private mergeDelta(current: FinanceSnapshot, delta: SyncDelta, isFull: boolean): FinanceSnapshot {
     const incomingUtilityRecords = Array.isArray(delta.rentUtilityRecords) ? delta.rentUtilityRecords : [];
     const incomingUtilityRents = delta.rentUtilityRents || current.rentUtilityRents;
-
+    const incomingAdjs = delta.savingsAdjustments || [];
     if (isFull) {
       return {
         settings: delta.settings || current.settings,
@@ -636,6 +733,9 @@ export class SyncEngine {
         recurringItems: delta.recurringItems.filter((r) => !r.deletedAt),
         sinkingItems: delta.sinkingItems.filter((s) => !s.deletedAt),
         assetItems: delta.assetItems.filter((a) => !a.deletedAt),
+        savingsAdjustments: incomingAdjs
+          .filter((a) => !a.deletedAt)
+          .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
         netWorthHistory: delta.netWorthHistory
           .slice()
           .sort((a, b) => b.yearMonth.localeCompare(a.yearMonth)),
@@ -655,6 +755,9 @@ export class SyncEngine {
       recurringItems: mergeById(current.recurringItems, delta.recurringItems),
       sinkingItems: mergeById(current.sinkingItems, delta.sinkingItems),
       assetItems: mergeById(current.assetItems, delta.assetItems),
+      savingsAdjustments: mergeById(current.savingsAdjustments || [], incomingAdjs).sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
       netWorthHistory: Array.from(historyMap.values()).sort((a, b) =>
         b.yearMonth.localeCompare(a.yearMonth)
       ),

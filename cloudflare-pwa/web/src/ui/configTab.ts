@@ -41,6 +41,10 @@ export function renderConfigTab(ctx: UiContext): void {
     return true;
   });
 
+  const savingsMap = new Map(
+    snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
+  );
+
   if (!filtered.length) {
     const e = document.createElement('div');
     e.className = 'list-empty';
@@ -65,9 +69,10 @@ export function renderConfigTab(ctx: UiContext): void {
       sub.appendChild(badge);
       const specText = item.billingSpec ? ` (${item.billingSpec})` : '';
       const monthlyTwd = computeRecurringMonthlyTwd(item, rate);
+      const linkedName = item.linkedAccountId ? savingsMap.get(item.linkedAccountId) : null;
       sub.appendChild(
         document.createTextNode(
-          `${item.cycle}${specText} · ${fmtRaw(item.amount, item.currency, ctx.state.masked)} · 月均 ${fmtMoney(monthlyTwd, ctx.state.masked)}`
+          `${item.cycle}${specText} · ${fmtRaw(item.amount, item.currency, ctx.state.masked)} · 月均 ${fmtMoney(monthlyTwd, ctx.state.masked)}${linkedName ? ` · 活存:${linkedName}` : ''}`
         )
       );
       main.appendChild(title);
@@ -196,6 +201,34 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
       '例如：3,6,9,12 或 2026-12'
     )
   );
+
+  // Linked savings account selector
+  const savingsAccounts = ctx.engine
+    .getSnapshot()
+    .assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings);
+  const linkWrap = document.createElement('div');
+  linkWrap.className = 'field';
+  const linkLbl = document.createElement('label');
+  linkLbl.className = 'section-label';
+  linkLbl.htmlFor = 'recLinkedAccount';
+  linkLbl.textContent = '自動入帳連動活存帳戶（選填）';
+  const linkSel = document.createElement('select');
+  linkSel.id = 'recLinkedAccount';
+  const noneOpt = document.createElement('option');
+  noneOpt.value = '';
+  noneOpt.textContent = '不連動活存';
+  linkSel.appendChild(noneOpt);
+  for (const acc of savingsAccounts) {
+    const opt = document.createElement('option');
+    opt.value = acc.id;
+    opt.textContent = `${acc.isDefaultSavings ? '★ ' : ''}${acc.itemName}`;
+    if (existing?.linkedAccountId === acc.id) opt.selected = true;
+    linkSel.appendChild(opt);
+  }
+  linkWrap.appendChild(linkLbl);
+  linkWrap.appendChild(linkSel);
+  form.appendChild(linkWrap);
+
   form.appendChild(makeInputField('備註（選填）', 'recNote', 'text', existing?.note || ''));
 
   const btns = document.createElement('div');
@@ -242,6 +275,7 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
         cycle: el<HTMLSelectElement>('recCycle').value,
         billingSpec: el<HTMLInputElement>('recSpec').value.trim(),
         status: el<HTMLSelectElement>('recStatus').value,
+        linkedAccountId: el<HTMLSelectElement>('recLinkedAccount').value || null,
         note: el<HTMLInputElement>('recNote').value.trim(),
       });
       closeModal();

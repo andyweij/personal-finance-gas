@@ -20,6 +20,7 @@ export interface CashFlowLog {
   source: string;
   note: string;
   recurringDedupKey?: string | null;
+  linkedAccountId?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -36,6 +37,7 @@ export interface RecurringItem {
   billingSpec: string;
   status: string;
   note: string;
+  linkedAccountId?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -68,9 +70,41 @@ export interface AssetItem {
   unitPrice: number;
   priceUpdatedAt?: string | null;
   note: string;
+  isLinkedSavings?: boolean;
+  balanceAnchorDate?: string | null;
+  balanceAnchorAt?: string | null;
+  isDefaultSavings?: boolean;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+}
+
+export interface SavingsAdjustment {
+  id: string;
+  accountId: string;
+  date: string; // YYYY-MM-DD
+  amount: number; // positive = deposit, negative = withdrawal/transfer out
+  twdAmount: number;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+}
+
+export interface SavingsAccountSummary {
+  account: AssetItem;
+  baseBalanceTwd: number;
+  adjustmentsTotalTwd: number;
+  cashflowNetTwd: number;
+  linkedLogCount: number;
+  adjustmentCount: number;
+  currentBalanceTwd: number;
+}
+
+export interface AllSavingsSummary {
+  accounts: SavingsAccountSummary[];
+  totalSavingsTwd: number;
+  defaultAccountId: string | null;
 }
 
 export interface NetWorthHistory {
@@ -120,6 +154,7 @@ export interface FinanceSnapshot {
   recurringItems: RecurringItem[];
   sinkingItems: SinkingFundItem[];
   assetItems: AssetItem[];
+  savingsAdjustments: SavingsAdjustment[];
   netWorthHistory: NetWorthHistory[];
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents;
@@ -130,6 +165,7 @@ export type SyncEntity =
   | 'recurring'
   | 'sinking'
   | 'asset'
+  | 'savings_adjustment'
   | 'settings'
   | 'utility_record'
   | 'utility_rents';
@@ -157,6 +193,7 @@ export interface SyncDelta {
   recurringItems: RecurringItem[];
   sinkingItems: SinkingFundItem[];
   assetItems: AssetItem[];
+  savingsAdjustments?: SavingsAdjustment[];
   netWorthHistory: NetWorthHistory[];
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents | null;

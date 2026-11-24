@@ -12,6 +12,7 @@ import type {
   RecurringItem,
   RentUtilityRecord,
   RentUtilityRents,
+  SavingsAdjustment,
   SinkingFundItem,
   SyncDelta,
   SyncMutation,
@@ -28,6 +29,7 @@ import {
   validateAssetInput,
   validateCashFlowInput,
   validateRecurringInput,
+  validateSavingsAdjustmentInput,
   validateSinkingInput,
 } from '../shared/validation';
 
@@ -85,6 +87,7 @@ function mapCashFlowRow(r: Record<string, unknown>): CashFlowLog {
     source: String(r.source),
     note: String(r.note || ''),
     recurringDedupKey: r.recurring_dedup_key ? String(r.recurring_dedup_key) : null,
+    linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -103,6 +106,7 @@ function mapRecurringRow(r: Record<string, unknown>): RecurringItem {
     billingSpec: String(r.billing_spec || ''),
     status: String(r.status),
     note: String(r.note || ''),
+    linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -138,6 +142,24 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
     currency: String(r.currency),
     unitPrice: Number(r.unit_price),
     priceUpdatedAt: r.price_updated_at ? String(r.price_updated_at) : null,
+    note: String(r.note || ''),
+    isLinkedSavings: Number(r.is_linked_savings || 0) === 1,
+    balanceAnchorDate: r.balance_anchor_date ? String(r.balance_anchor_date) : null,
+    balanceAnchorAt: r.balance_anchor_at ? String(r.balance_anchor_at) : null,
+    isDefaultSavings: Number(r.is_default_savings || 0) === 1,
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+  };
+}
+
+function mapSavingsAdjustmentRow(r: Record<string, unknown>): SavingsAdjustment {
+  return {
+    id: String(r.id),
+    accountId: String(r.account_id),
+    date: String(r.date),
+    amount: Number(r.amount),
+    twdAmount: Number(r.twd_amount),
     note: String(r.note || ''),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
@@ -274,6 +296,7 @@ async function applySingleMutation(
         fxRate: p.fxRate !== undefined ? Number(p.fxRate) : undefined,
         source: String(p.source || '手機記帳'),
         note: String(p.note || ''),
+        linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
       },
       defaultFxRate
     );
@@ -281,8 +304,8 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO cashflow_logs
-          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(id) DO UPDATE SET
            date = excluded.date,
            year_month = excluded.year_month,
@@ -295,6 +318,7 @@ async function applySingleMutation(
            twd_amount = excluded.twd_amount,
            source = excluded.source,
            note = excluded.note,
+           linked_account_id = excluded.linked_account_id,
            updated_at = excluded.updated_at,
            deleted_at = NULL`
       )
@@ -311,6 +335,7 @@ async function applySingleMutation(
         v.twdAmount,
         v.source,
         v.note,
+        v.linkedAccountId,
         String(p.createdAt || ts),
         ts
       )
@@ -344,13 +369,14 @@ async function applySingleMutation(
       billingSpec: String(p.billingSpec || ''),
       status: String(p.status || '啟用'),
       note: String(p.note || ''),
+      linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
     });
 
     await db
       .prepare(
         `INSERT INTO recurring_items
-          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(id) DO UPDATE SET
            item_name = excluded.item_name,
            category = excluded.category,
@@ -361,6 +387,7 @@ async function applySingleMutation(
            billing_spec = excluded.billing_spec,
            status = excluded.status,
            note = excluded.note,
+           linked_account_id = excluded.linked_account_id,
            updated_at = excluded.updated_at,
            deleted_at = NULL`
       )
@@ -375,6 +402,7 @@ async function applySingleMutation(
         v.billingSpec,
         v.status,
         v.note,
+        v.linkedAccountId,
         String(p.createdAt || ts),
         ts
       )
@@ -467,13 +495,24 @@ async function applySingleMutation(
       currency: String(p.currency || 'TWD'),
       unitPrice: p.unitPrice !== undefined ? Number(p.unitPrice) : existing?.unit_price ?? 1,
       note: String(p.note || ''),
+      isLinkedSavings: Boolean(p.isLinkedSavings),
+      balanceAnchorDate: p.balanceAnchorDate ? String(p.balanceAnchorDate) : null,
+      balanceAnchorAt: p.balanceAnchorAt ? String(p.balanceAnchorAt) : null,
+      isDefaultSavings: Boolean(p.isDefaultSavings),
     });
+
+    if (v.isDefaultSavings) {
+      await db
+        .prepare('UPDATE asset_items SET is_default_savings = 0, updated_at = ? WHERE is_default_savings = 1 AND id != ?')
+        .bind(ts, mutation.recordId)
+        .run();
+    }
 
     await db
       .prepare(
         `INSERT INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(id) DO UPDATE SET
            update_mode = excluded.update_mode,
            major_type = excluded.major_type,
@@ -485,6 +524,10 @@ async function applySingleMutation(
            currency = excluded.currency,
            unit_price = excluded.unit_price,
            note = excluded.note,
+           is_linked_savings = excluded.is_linked_savings,
+           balance_anchor_date = excluded.balance_anchor_date,
+           balance_anchor_at = excluded.balance_anchor_at,
+           is_default_savings = excluded.is_default_savings,
            updated_at = excluded.updated_at,
            deleted_at = NULL`
       )
@@ -499,6 +542,66 @@ async function applySingleMutation(
         v.quantityOrAmount,
         v.currency,
         v.unitPrice,
+        v.note,
+        v.isLinkedSavings ? 1 : 0,
+        v.balanceAnchorDate,
+        v.balanceAnchorAt,
+        v.isDefaultSavings ? 1 : 0,
+        String(p.createdAt || ts),
+        ts
+      )
+      .run();
+    return;
+  }
+
+  if (mutation.entity === 'savings_adjustment') {
+    const existing = await db
+      .prepare('SELECT updated_at FROM savings_adjustments WHERE id = ?')
+      .bind(mutation.recordId)
+      .first<{ updated_at: string }>();
+    if (!isNewerOrEqual(ts, existing?.updated_at)) return;
+
+    if (mutation.op === 'delete') {
+      await db
+        .prepare('UPDATE savings_adjustments SET deleted_at = ?, updated_at = ? WHERE id = ?')
+        .bind(ts, ts, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateSavingsAdjustmentInput(
+      {
+        accountId: String(p.accountId || ''),
+        date: String(p.date || ''),
+        amount: Number(p.amount),
+        currency: p.currency ? String(p.currency) : 'TWD',
+        note: String(p.note || ''),
+      },
+      defaultFxRate
+    );
+    const twdAmount = p.twdAmount !== undefined ? Math.round(Number(p.twdAmount)) : v.twdAmount;
+
+    await db
+      .prepare(
+        `INSERT INTO savings_adjustments
+          (id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           account_id = excluded.account_id,
+           date = excluded.date,
+           amount = excluded.amount,
+           twd_amount = excluded.twd_amount,
+           note = excluded.note,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL`
+      )
+      .bind(
+        mutation.recordId,
+        v.accountId,
+        v.date,
+        v.amount,
+        twdAmount,
         v.note,
         String(p.createdAt || ts),
         ts
@@ -605,11 +708,12 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
   ]);
 
   if (since) {
-    const [logs, rec, sink, assets, hist, utilRecs] = await Promise.all([
+    const [logs, rec, sink, assets, adjs, hist, utilRecs] = await Promise.all([
       db.prepare('SELECT * FROM cashflow_logs WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
       db.prepare('SELECT * FROM recurring_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM sinking_fund_items WHERE updated_at > ?').bind(since).all(),
       db.prepare('SELECT * FROM asset_items WHERE updated_at > ?').bind(since).all(),
+      db.prepare('SELECT * FROM savings_adjustments WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
       db.prepare('SELECT * FROM networth_history WHERE updated_at > ? ORDER BY year_month DESC').bind(since).all(),
       db.prepare('SELECT * FROM rent_utility_records WHERE updated_at > ?').bind(since).all(),
     ]);
@@ -620,17 +724,19 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
       recurringItems: rec.results.map(mapRecurringRow),
       sinkingItems: sink.results.map(mapSinkingRow),
       assetItems: assets.results.map(mapAssetRow),
+      savingsAdjustments: adjs.results.map(mapSavingsAdjustmentRow),
       netWorthHistory: hist.results.map(mapNetWorthRow),
       rentUtilityRecords: utilRecs.results.map(mapUtilityRecordRow),
       rentUtilityRents: utilityRents.updatedAt > since ? utilityRents : null,
     };
   }
 
-  const [logs, rec, sink, assets, hist, utilRecs] = await Promise.all([
+  const [logs, rec, sink, assets, adjs, hist, utilRecs] = await Promise.all([
     db.prepare('SELECT * FROM cashflow_logs WHERE deleted_at IS NULL ORDER BY date DESC').all(),
     db.prepare('SELECT * FROM recurring_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM sinking_fund_items WHERE deleted_at IS NULL').all(),
     db.prepare('SELECT * FROM asset_items WHERE deleted_at IS NULL').all(),
+    db.prepare('SELECT * FROM savings_adjustments WHERE deleted_at IS NULL ORDER BY date DESC').all(),
     db.prepare('SELECT * FROM networth_history ORDER BY year_month DESC').all(),
     db.prepare('SELECT * FROM rent_utility_records WHERE deleted_at IS NULL').all(),
   ]);
@@ -641,6 +747,7 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
     recurringItems: rec.results.map(mapRecurringRow),
     sinkingItems: sink.results.map(mapSinkingRow),
     assetItems: assets.results.map(mapAssetRow),
+    savingsAdjustments: adjs.results.map(mapSavingsAdjustmentRow),
     netWorthHistory: hist.results.map(mapNetWorthRow),
     rentUtilityRecords: utilRecs.results.map(mapUtilityRecordRow),
     rentUtilityRents: utilityRents,
@@ -703,6 +810,7 @@ export async function exportFullSnapshot(db: D1Database): Promise<FinanceSnapsho
     recurringItems: delta.recurringItems,
     sinkingItems: delta.sinkingItems,
     assetItems: delta.assetItems,
+    savingsAdjustments: delta.savingsAdjustments || [],
     netWorthHistory: delta.netWorthHistory,
     rentUtilityRecords: delta.rentUtilityRecords,
     rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db)),
@@ -721,6 +829,7 @@ export async function importFullSnapshot(
     await db.prepare('DELETE FROM recurring_items').run();
     await db.prepare('DELETE FROM sinking_fund_items').run();
     await db.prepare('DELETE FROM asset_items').run();
+    await db.prepare('DELETE FROM savings_adjustments').run();
     await db.prepare('DELETE FROM networth_history').run();
     if (Array.isArray(data.rentUtilityRecords) && data.rentUtilityRecords.length > 0) {
       await db.prepare('DELETE FROM rent_utility_records').run();
@@ -750,8 +859,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO cashflow_logs
-          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
       )
       .bind(
         log.id || crypto.randomUUID(),
@@ -766,6 +875,7 @@ export async function importFullSnapshot(
         v.twdAmount,
         v.source,
         v.note,
+        v.linkedAccountId,
         log.createdAt || nowIso,
         nowIso
       )
@@ -779,8 +889,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO recurring_items
-          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
       )
       .bind(
         r.id || crypto.randomUUID(),
@@ -793,6 +903,7 @@ export async function importFullSnapshot(
         v.billingSpec,
         v.status,
         v.note,
+        v.linkedAccountId,
         r.createdAt || nowIso,
         nowIso
       )
@@ -831,8 +942,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
       )
       .bind(
         a.id || crypto.randomUUID(),
@@ -846,11 +957,36 @@ export async function importFullSnapshot(
         v.currency,
         v.unitPrice,
         v.note,
+        v.isLinkedSavings ? 1 : 0,
+        v.balanceAnchorDate,
+        v.balanceAnchorAt,
+        v.isDefaultSavings ? 1 : 0,
         a.createdAt || nowIso,
         nowIso
       )
       .run();
     importedAssets++;
+  }
+
+  for (const adj of data.savingsAdjustments || []) {
+    const v = validateSavingsAdjustmentInput(adj, currentSettings.usdTwdRate);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO savings_adjustments
+          (id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        adj.id || crypto.randomUUID(),
+        v.accountId,
+        v.date,
+        v.amount,
+        adj.twdAmount !== undefined ? Math.round(adj.twdAmount) : v.twdAmount,
+        v.note,
+        adj.createdAt || nowIso,
+        nowIso
+      )
+      .run();
   }
 
   for (const h of data.netWorthHistory || []) {

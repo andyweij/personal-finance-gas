@@ -41,6 +41,7 @@ export const SOURCE_OPTIONS: string[] = ['自動入帳', '手機記帳', '手動
 export const ASSET_UPDATE_MODES: string[] = ['自動更新', '手動快照'];
 export const ASSET_MAJOR_TYPES: string[] = ['資產', '負債'];
 export const ASSET_SUB_CATEGORIES: string[] = [
+  '活存',
   '台股',
   '美金',
   '定存/現金',

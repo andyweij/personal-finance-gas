@@ -1,12 +1,19 @@
 import './styles.css';
+import { computeAllSavingsSummary } from '../../shared/calculations';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
 import { fetchAuthStatus } from './auth/authClient';
-import { closeModal, el, isDesktopDevice, setLoading, showToast } from './ui/helpers';
-import { getTodayYmd, renderLogCategories, renderLogTab, updateFxPreview } from './ui/logTab';
+import { closeModal, el, fmtMoney, isDesktopDevice, setLoading, showToast } from './ui/helpers';
+import {
+  getTodayYmd,
+  renderLogCategories,
+  renderLogTab,
+  updateFxPreview,
+  updateSavingsPreview,
+} from './ui/logTab';
 import { renderOverviewTab, renderTrendChart } from './ui/overviewTab';
 import { openRecurringModal, openSinkingModal, renderConfigTab } from './ui/configTab';
-import { openAssetModal, renderAssetsTab } from './ui/assetsTab';
+import { openAssetModal, openSavingsAccountModal, renderAssetsTab } from './ui/assetsTab';
 import { bindUtilityTabEvents, renderUtilityTab } from './ui/utilityTab';
 import {
   closeLockScreen,
@@ -76,6 +83,9 @@ async function bootstrap(): Promise<void> {
     logType: '日常花費',
     logCurrency: 'TWD',
     logCategory: '餐飲',
+    logLinkedAccountId: null,
+    logLinkedAccountTouched: false,
+    savingsExpanded: false,
     idleMinutes: [0, 5, 15, 30, 60].includes(parsedIdle) ? parsedIdle : 5,
     lastActivityAt: Date.now(),
     pinEnabled: false,
@@ -109,6 +119,7 @@ async function bootstrap(): Promise<void> {
         void ctx.engine.syncNow();
       }, 300);
     },
+    navigateToTab: () => {},
   };
 
   const engine = new SyncEngine(localDb, {
@@ -213,6 +224,12 @@ function bindEvents(ctx: UiContext): void {
     onSelectIndex: (idx) => activateTabByIndex(idx),
   });
 
+  ctx.navigateToTab = (tab) => {
+    const idx = Math.max(0, tabOrder.indexOf(tab));
+    activateTabByIndex(idx);
+    navScrub.syncPill(false);
+  };
+
   navButtons.forEach((btn, idx) => {
     btn.addEventListener('click', () => {
       activateTabByIndex(idx);
@@ -292,6 +309,12 @@ function bindEvents(ctx: UiContext): void {
     }
   });
 
+  // Tab 1 live savings strip toggle
+  el('savingsStripToggle').addEventListener('click', () => {
+    ctx.state.savingsExpanded = !ctx.state.savingsExpanded;
+    renderLogTab(ctx);
+  });
+
   // Tab 1 subtabs & ledger modes
   const switchLogSubtab = (sub: 'entry' | 'ledger') => {
     ctx.state.logSubtab = sub;
@@ -338,6 +361,7 @@ function bindEvents(ctx: UiContext): void {
   el('calQuickAddBtn').addEventListener('click', () => {
     if (ctx.state.selectedCalendarDay) {
       el<HTMLInputElement>('dateInput').value = ctx.state.selectedCalendarDay;
+      updateSavingsPreview(ctx);
     }
     switchLogSubtab('entry');
     showToast(`已帶入日期 ${ctx.state.selectedCalendarDay}`);
@@ -350,6 +374,7 @@ function bindEvents(ctx: UiContext): void {
       btn.classList.add('active');
       ctx.state.logType = btn.dataset.type || '日常花費';
       renderLogCategories(ctx);
+      updateSavingsPreview(ctx);
       const show = RECURRING_ELIGIBLE_LOG.includes(ctx.state.logType);
       el('recurringToggleBox').style.display = show ? 'flex' : 'none';
       if (!show) el<HTMLInputElement>('makeRecurringCheckbox').checked = false;
@@ -373,6 +398,7 @@ function bindEvents(ctx: UiContext): void {
     });
   });
   el('amountInput').addEventListener('input', () => updateFxPreview(ctx));
+  el('dateInput').addEventListener('change', () => updateSavingsPreview(ctx));
 
   el('expenseForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -384,6 +410,7 @@ function bindEvents(ctx: UiContext): void {
     }
     try {
       const makeRecurring = el<HTMLInputElement>('makeRecurringCheckbox').checked;
+      const linkedAccountId = ctx.state.logLinkedAccountId;
       const created = await ctx.engine.addCashFlow({
         date,
         type: ctx.state.logType,
@@ -392,6 +419,7 @@ function bindEvents(ctx: UiContext): void {
         amount,
         currency: ctx.state.logCurrency,
         note: el<HTMLInputElement>('noteInput').value.trim(),
+        linkedAccountId,
         makeRecurring,
       });
       el<HTMLInputElement>('amountInput').value = '';
@@ -399,8 +427,24 @@ function bindEvents(ctx: UiContext): void {
       el<HTMLInputElement>('noteInput').value = '';
       el<HTMLInputElement>('makeRecurringCheckbox').checked = false;
       updateFxPreview(ctx);
+
+      let savingsSuffix = '';
+      if (linkedAccountId) {
+        const snap = ctx.engine.getSnapshot();
+        const sav = computeAllSavingsSummary(
+          snap.assetItems,
+          snap.cashflowLogs,
+          snap.savingsAdjustments || [],
+          snap.settings.usdTwdRate
+        );
+        const acc = sav.accounts.find((a) => a.account.id === linkedAccountId);
+        if (acc) {
+          savingsSuffix = `｜${acc.account.itemName} 剩 ${fmtMoney(acc.currentBalanceTwd, ctx.state.masked)}`;
+        }
+      }
+
       showToast(
-        `已記帳：${created.itemName} (NT$ ${created.twdAmount.toLocaleString()})${makeRecurring ? ' + 已加入每月固定' : ''}`,
+        `已記帳：${created.itemName} (${fmtMoney(created.twdAmount, ctx.state.masked)})${savingsSuffix}${makeRecurring ? ' + 已加入每月固定' : ''}`,
         'success'
       );
       ctx.scheduleSync();
@@ -497,6 +541,7 @@ function bindEvents(ctx: UiContext): void {
     });
   });
 
+  el('addSavingsBtn').addEventListener('click', () => openSavingsAccountModal(ctx, null));
   el('addAssetBtn').addEventListener('click', () => openAssetModal(ctx, null));
 
   el('refreshMarketBtn').addEventListener('click', async () => {

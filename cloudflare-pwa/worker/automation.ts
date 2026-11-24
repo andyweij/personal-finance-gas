@@ -1,7 +1,10 @@
 import { CASHFLOW_TYPES } from '../shared/constants';
-import { computeAssetTwdValue, computeSinkingMonthlyReserve } from '../shared/calculations';
+import {
+  computeAssetEffectiveTwdValue,
+  computeSinkingMonthlyReserve,
+} from '../shared/calculations';
 import { buildMonthlyDedupKey, shouldPostRecurringItem } from '../shared/recurring';
-import { ensureAppSettings } from './sync';
+import { ensureAppSettings, exportFullSnapshot } from './sync';
 
 export function getTaiwanDateParts(date: Date): {
   year: number;
@@ -10,7 +13,6 @@ export function getTaiwanDateParts(date: Date): {
   ymd: string;
   yearMonth: string;
 } {
-  // Asia/Taipei is fixed UTC+8 (no DST)
   const tw = new Date(date.getTime() + 8 * 60 * 60 * 1000);
   const year = tw.getUTCFullYear();
   const month = tw.getUTCMonth() + 1;
@@ -45,7 +47,6 @@ export async function runMonthlyRecurringD1(
   const usdRate = settings.usdTwdRate;
   const nowIso = new Date().toISOString();
 
-  // Existing auto-posted keys for this yearMonth
   const existingRows = await db
     .prepare(
       `SELECT type, item_name, recurring_dedup_key
@@ -72,6 +73,7 @@ export async function runMonthlyRecurringD1(
       cycle: string;
       billing_spec: string;
       note: string;
+      linked_account_id: string | null;
     }>();
 
   let insertedCount = 0;
@@ -99,8 +101,8 @@ export async function runMonthlyRecurringD1(
     await db
       .prepare(
         `INSERT INTO cashflow_logs
-          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, NULL)`
+          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, NULL)`
       )
       .bind(
         crypto.randomUUID(),
@@ -115,6 +117,7 @@ export async function runMonthlyRecurringD1(
         twdAmount,
         finalNote,
         dedupKey,
+        item.linked_account_id || null,
         nowIso,
         nowIso
       )
@@ -153,28 +156,10 @@ export async function runMonthEndSnapshotD1(
   netWorth: number;
   updated: boolean;
 }> {
-  const settings = await ensureAppSettings(db);
+  const full = await exportFullSnapshot(db);
   const parts = getTaiwanDateParts(targetDate);
   const yearMonth = parts.yearMonth;
   const nowIso = new Date().toISOString();
-
-  const assetsRows = await db
-    .prepare('SELECT * FROM asset_items WHERE deleted_at IS NULL')
-    .all<{
-      id: string;
-      update_mode: string;
-      major_type: string;
-      sub_category: string;
-      liquidity: string;
-      item_name: string;
-      ticker: string;
-      quantity_or_amount: number;
-      currency: string;
-      unit_price: number;
-      note: string;
-      created_at: string;
-      updated_at: string;
-    }>();
 
   let totalAssets = 0;
   let totalLiabilities = 0;
@@ -182,78 +167,46 @@ export async function runMonthEndSnapshotD1(
   let investmentAssets = 0;
   let insuranceAssets = 0;
 
-  for (const r of assetsRows.results) {
-    const twdValue = computeAssetTwdValue(
-      {
-        id: r.id,
-        updateMode: r.update_mode,
-        majorType: r.major_type,
-        subCategory: r.sub_category,
-        liquidity: r.liquidity,
-        itemName: r.item_name,
-        ticker: r.ticker,
-        quantityOrAmount: r.quantity_or_amount,
-        currency: r.currency,
-        unitPrice: r.unit_price,
-        note: r.note,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-      },
-      settings.usdTwdRate
+  for (const item of full.assetItems) {
+    const twdValue = computeAssetEffectiveTwdValue(
+      item,
+      full.settings.usdTwdRate,
+      full.cashflowLogs,
+      full.savingsAdjustments
     );
     if (twdValue === 0) continue;
-    if (r.major_type === '資產') {
+    if (item.majorType === '資產') {
       totalAssets += twdValue;
-      if (r.liquidity === '高流動') highLiquidityAssets += twdValue;
-      if (r.sub_category === '台股' || r.sub_category === '中信基金' || r.sub_category === '結構性商品') {
+      if (item.liquidity === '高流動' || item.isLinkedSavings) highLiquidityAssets += twdValue;
+      if (item.subCategory === '台股' || item.subCategory === '中信基金' || item.subCategory === '結構性商品') {
         investmentAssets += twdValue;
       }
-      if (r.sub_category === '保單(保價金)') insuranceAssets += twdValue;
-    } else if (r.major_type === '負債') {
+      if (item.subCategory === '保單(保價金)') insuranceAssets += twdValue;
+    } else if (item.majorType === '負債') {
       totalLiabilities += twdValue;
     }
   }
 
   const netWorth = Math.round(totalAssets - totalLiabilities);
 
-  // Cash flow for snapshot month
-  const logRows = await db
-    .prepare('SELECT type, twd_amount FROM cashflow_logs WHERE year_month = ? AND deleted_at IS NULL')
-    .bind(yearMonth)
-    .all<{ type: string; twd_amount: number }>();
-
   let monthlyIncome = 0;
   let monthlyCoreExpense = 0;
-  for (const l of logRows.results) {
+  for (const l of full.cashflowLogs) {
+    if (l.yearMonth !== yearMonth) continue;
     if (l.type === CASHFLOW_TYPES.FIXED_INCOME || l.type === CASHFLOW_TYPES.OTHER_INCOME) {
-      monthlyIncome += l.twd_amount;
+      monthlyIncome += l.twdAmount;
     } else if (
       l.type === CASHFLOW_TYPES.FIXED_EXPENSE ||
       l.type === CASHFLOW_TYPES.SUBSCRIPTION ||
       l.type === CASHFLOW_TYPES.DAILY_EXPENSE
     ) {
-      monthlyCoreExpense += l.twd_amount;
+      monthlyCoreExpense += l.twdAmount;
     }
   }
 
-  const sinkingRows = await db
-    .prepare(`SELECT total_amount, months, status FROM sinking_fund_items WHERE status = '啟用' AND deleted_at IS NULL`)
-    .all<{ total_amount: number; months: number; status: string }>();
-
   let monthlySinking = 0;
-  for (const s of sinkingRows.results) {
-    monthlySinking += computeSinkingMonthlyReserve({
-      id: '',
-      itemName: '',
-      category: '',
-      totalAmount: s.total_amount,
-      months: s.months,
-      dueNote: '',
-      status: s.status,
-      note: '',
-      createdAt: '',
-      updatedAt: '',
-    });
+  for (const s of full.sinkingItems) {
+    monthlySinking += computeSinkingMonthlyReserve(s);
   }
 
   const totalConsumption = Math.round(monthlyCoreExpense + monthlySinking);

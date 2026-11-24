@@ -580,4 +580,112 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     expect(exported.data.rentUtilityRecords.length).toBeGreaterThanOrEqual(8);
     expect(exported.data.rentUtilityRents.rentA).toBe(9500);
   });
+
+  it('syncs linked savings accounts & adjustments, propagates linkedAccountId on recurring, and snapshots live balance', async () => {
+    const cookie = await setupAndGetCookie();
+
+    // Sync linked savings account (300k) + deposit adjustment (+200k) + linked expense (-100k) + recurring item linked to account
+    const syncRes = await app.request(
+      'https://finance.example.com/api/sync',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({
+          mutations: [
+            {
+              mutationId: 'm-sav-1',
+              entity: 'asset',
+              op: 'upsert',
+              recordId: 'sav-acc-1',
+              clientTimestamp: '2026-11-24T04:00:00.000Z',
+              payload: {
+                updateMode: '手動快照',
+                majorType: '資產',
+                subCategory: '活存',
+                liquidity: '高流動',
+                itemName: '中信活存',
+                quantityOrAmount: 300000,
+                currency: 'TWD',
+                unitPrice: 1,
+                isLinkedSavings: true,
+                balanceAnchorDate: '2026-11-24',
+                balanceAnchorAt: '2026-11-24T04:00:00.000Z',
+                isDefaultSavings: true,
+              },
+            },
+            {
+              mutationId: 'm-adj-1',
+              entity: 'savings_adjustment',
+              op: 'upsert',
+              recordId: 'adj-1',
+              clientTimestamp: '2026-11-24T04:10:00.000Z',
+              payload: {
+                accountId: 'sav-acc-1',
+                date: '2026-11-24',
+                amount: 200000,
+                twdAmount: 200000,
+                note: '追加存入',
+              },
+            },
+            {
+              mutationId: 'm-cf-1',
+              entity: 'cashflow',
+              op: 'upsert',
+              recordId: 'cf-sav-1',
+              clientTimestamp: '2026-11-24T05:00:00.000Z',
+              payload: {
+                date: '2026-11-24',
+                type: CASHFLOW_TYPES.DAILY_EXPENSE,
+                category: '餐飲',
+                itemName: '刷卡扣款',
+                amount: 100000,
+                currency: 'TWD',
+                fxRate: 1,
+                source: '手機記帳',
+                linkedAccountId: 'sav-acc-1',
+              },
+            },
+            {
+              mutationId: 'm-rec-1',
+              entity: 'recurring',
+              op: 'upsert',
+              recordId: 'rec-sav-1',
+              clientTimestamp: '2026-11-24T05:05:00.000Z',
+              payload: {
+                itemName: '月薪入帳',
+                category: '薪資',
+                type: CASHFLOW_TYPES.FIXED_INCOME,
+                amount: 50000,
+                currency: 'TWD',
+                cycle: '月繳',
+                status: '啟用',
+                linkedAccountId: 'sav-acc-1',
+              },
+            },
+          ],
+        }),
+      },
+      env
+    );
+    expect(syncRes.status).toBe(200);
+    const syncJson = (await syncRes.json()) as {
+      ackedMutationIds: string[];
+      delta: { savingsAdjustments: unknown[] };
+    };
+    expect(syncJson.ackedMutationIds).toHaveLength(4);
+    expect(syncJson.delta.savingsAdjustments).toHaveLength(1);
+
+    // Month-end snapshot on 2026-11-30 must capture live balance = 300k + 200k - 100k = 400k
+    const snap = await runMonthEndSnapshotD1(db, new Date('2026-11-30T15:00:00.000Z'));
+    expect(snap.totalAssets).toBe(400000);
+    expect(snap.netWorth).toBe(400000);
+
+    // Next month's recurring run propagates linked_account_id into generated cashflow_logs
+    const recRun = await runMonthlyRecurringD1(db, 2026, 12);
+    expect(recRun.insertedCount).toBe(1);
+    const posted = await db
+      .prepare(`SELECT linked_account_id FROM cashflow_logs WHERE year_month = '2026-12' AND source = '自動入帳'`)
+      .first<{ linked_account_id: string | null }>();
+    expect(posted?.linked_account_id).toBe('sav-acc-1');
+  });
 });

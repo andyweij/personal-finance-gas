@@ -58,6 +58,7 @@ export interface CashFlowInputPayload {
   source?: string;
   note?: string;
   makeRecurring?: boolean;
+  linkedAccountId?: string | null;
 }
 
 export interface ValidatedCashFlowInput {
@@ -72,6 +73,7 @@ export interface ValidatedCashFlowInput {
   twdAmount: number;
   source: string;
   note: string;
+  linkedAccountId: string | null;
 }
 
 export function validateCashFlowInput(
@@ -90,6 +92,7 @@ export function validateCashFlowInput(
   const sourceRaw = String(payload.source || '手機記帳').trim();
   const source = SOURCE_OPTIONS.includes(sourceRaw) ? sourceRaw : '手機記帳';
   const note = String(payload.note || '').trim().slice(0, 200);
+  const linkedAccountId = payload.linkedAccountId ? String(payload.linkedAccountId).trim() : null;
 
   if (!ALL_CASHFLOW_TYPES.includes(type)) {
     throw new Error(`不支援的收支類型：${type}`);
@@ -121,6 +124,7 @@ export function validateCashFlowInput(
     twdAmount,
     source,
     note,
+    linkedAccountId,
   };
 }
 
@@ -134,6 +138,7 @@ export interface RecurringInputPayload {
   billingSpec?: string;
   status?: string;
   note?: string;
+  linkedAccountId?: string | null;
 }
 
 export function validateRecurringInput(payload: RecurringInputPayload) {
@@ -146,6 +151,7 @@ export function validateRecurringInput(payload: RecurringInputPayload) {
   const billingSpec = String(payload.billingSpec || '').trim().slice(0, 40);
   const status = String(payload.status || '啟用').trim();
   const note = String(payload.note || '').trim().slice(0, 200);
+  const linkedAccountId = payload.linkedAccountId ? String(payload.linkedAccountId).trim() : null;
 
   if (!itemName) throw new Error('請輸入項目名稱。');
   if (!RECURRING_CASHFLOW_TYPES.includes(type)) throw new Error(`不支援的收支類型：${type}`);
@@ -154,7 +160,7 @@ export function validateRecurringInput(payload: RecurringInputPayload) {
   if (!BILLING_CYCLES.includes(cycle)) throw new Error(`不支援的週期：${cycle}`);
   if (!STATUS_OPTIONS.includes(status)) throw new Error(`不支援的狀態：${status}`);
 
-  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note };
+  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note, linkedAccountId };
 }
 
 export interface SinkingInputPayload {
@@ -195,13 +201,20 @@ export interface AssetInputPayload {
   currency?: string;
   unitPrice?: number | string;
   note?: string;
+  isLinkedSavings?: boolean;
+  balanceAnchorDate?: string | null;
+  balanceAnchorAt?: string | null;
+  isDefaultSavings?: boolean;
 }
 
 export function validateAssetInput(payload: AssetInputPayload) {
-  const updateMode = String(payload.updateMode || '手動快照').trim();
-  const majorType = String(payload.majorType || '資產').trim();
-  const subCategory = String(payload.subCategory || '其他資產').trim().slice(0, 40);
-  const rawLiquidity = String(payload.liquidity || '中流動').trim();
+  const isLinkedSavings = Boolean(payload.isLinkedSavings);
+  const updateMode = isLinkedSavings ? '手動快照' : String(payload.updateMode || '手動快照').trim();
+  const majorType = isLinkedSavings ? '資產' : String(payload.majorType || '資產').trim();
+  const subCategory = isLinkedSavings
+    ? '活存'
+    : String(payload.subCategory || '其他資產').trim().slice(0, 40);
+  const rawLiquidity = isLinkedSavings ? '高流動' : String(payload.liquidity || '中流動').trim();
   const liquidity =
     majorType === '負債'
       ? '負債'
@@ -209,11 +222,16 @@ export function validateAssetInput(payload: AssetInputPayload) {
         ? rawLiquidity
         : '中流動';
   const itemName = String(payload.itemName || '').trim().slice(0, 80);
-  const ticker = String(payload.ticker || '').trim().toUpperCase().slice(0, 30);
+  const ticker = isLinkedSavings ? '' : String(payload.ticker || '').trim().toUpperCase().slice(0, 30);
   const quantityOrAmount = Number(payload.quantityOrAmount);
   const currency = String(payload.currency || 'TWD').trim().toUpperCase();
-  const unitPrice = payload.unitPrice !== undefined ? Number(payload.unitPrice) : 1;
+  const unitPrice = isLinkedSavings ? 1 : payload.unitPrice !== undefined ? Number(payload.unitPrice) : 1;
   const note = String(payload.note || '').trim().slice(0, 200);
+  const balanceAnchorDate = payload.balanceAnchorDate
+    ? (parseLocalDate(String(payload.balanceAnchorDate)), String(payload.balanceAnchorDate).trim())
+    : null;
+  const balanceAnchorAt = payload.balanceAnchorAt ? String(payload.balanceAnchorAt).trim() : null;
+  const isDefaultSavings = isLinkedSavings && Boolean(payload.isDefaultSavings);
 
   if (!itemName) throw new Error('請輸入項目名稱。');
   if (!ASSET_UPDATE_MODES.includes(updateMode)) throw new Error('更新方式無效。');
@@ -236,6 +254,43 @@ export function validateAssetInput(payload: AssetInputPayload) {
     quantityOrAmount,
     currency,
     unitPrice,
+    note,
+    isLinkedSavings,
+    balanceAnchorDate,
+    balanceAnchorAt,
+    isDefaultSavings,
+  };
+}
+
+export interface SavingsAdjustmentInputPayload {
+  accountId: string;
+  date: string;
+  amount: number | string;
+  currency?: string;
+  note?: string;
+}
+
+export function validateSavingsAdjustmentInput(
+  payload: SavingsAdjustmentInputPayload,
+  usdTwdRate = 32.5
+) {
+  const accountId = String(payload.accountId || '').trim();
+  if (!accountId) throw new Error('請選擇對應的活存帳戶。');
+  parseLocalDate(String(payload.date || ''));
+  const amount = Number(payload.amount);
+  if (Number.isNaN(amount) || !Number.isFinite(amount) || amount === 0) {
+    throw new Error('存入或轉出金額不可為 0。');
+  }
+  const currency = String(payload.currency || 'TWD').trim().toUpperCase();
+  const rate = currency === 'USD' ? usdTwdRate : 1;
+  const twdAmount = Math.round(amount * rate);
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  return {
+    accountId,
+    date: String(payload.date).trim(),
+    amount,
+    twdAmount,
     note,
   };
 }
