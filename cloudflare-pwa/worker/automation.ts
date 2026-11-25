@@ -4,7 +4,7 @@ import {
   computeSinkingMonthlyReserve,
 } from '../shared/calculations';
 import { buildMonthlyDedupKey, shouldPostRecurringItem } from '../shared/recurring';
-import { ensureAppSettings, exportFullSnapshot } from './sync';
+import { assertUserId, ensureAppSettings, exportFullSnapshot } from './sync';
 
 export function getTaiwanDateParts(date: Date): {
   year: number;
@@ -29,6 +29,7 @@ export function isTaiwanMonthEnd(date: Date): boolean {
 
 export async function runMonthlyRecurringD1(
   db: D1Database,
+  userId: string,
   targetYear?: number,
   targetMonth?: number
 ): Promise<{
@@ -38,7 +39,8 @@ export async function runMonthlyRecurringD1(
   deactivatedOneTimeCount: number;
   fxRate: number;
 }> {
-  const settings = await ensureAppSettings(db);
+  const uid = assertUserId(userId);
+  const settings = await ensureAppSettings(db, uid);
   const nowParts = getTaiwanDateParts(new Date());
   const year = targetYear || nowParts.year;
   const month = targetMonth || nowParts.month;
@@ -51,9 +53,9 @@ export async function runMonthlyRecurringD1(
     .prepare(
       `SELECT type, item_name, recurring_dedup_key
        FROM cashflow_logs
-       WHERE year_month = ? AND source = '自動入帳' AND deleted_at IS NULL`
+       WHERE user_id = ? AND year_month = ? AND source = '自動入帳' AND deleted_at IS NULL`
     )
-    .bind(yearMonth)
+    .bind(uid, yearMonth)
     .all<{ type: string; item_name: string; recurring_dedup_key: string | null }>();
 
   const existingKeys = new Set<string>();
@@ -62,7 +64,8 @@ export async function runMonthlyRecurringD1(
   }
 
   const recurringRows = await db
-    .prepare(`SELECT * FROM recurring_items WHERE status = '啟用' AND deleted_at IS NULL`)
+    .prepare(`SELECT * FROM recurring_items WHERE user_id = ? AND status = '啟用' AND deleted_at IS NULL`)
+    .bind(uid)
     .all<{
       id: string;
       item_name: string;
@@ -101,10 +104,11 @@ export async function runMonthlyRecurringD1(
     await db
       .prepare(
         `INSERT INTO cashflow_logs
-          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, NULL)`
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         crypto.randomUUID(),
         entryDate,
         yearMonth,
@@ -130,8 +134,10 @@ export async function runMonthlyRecurringD1(
       const suffix = `[已一次性入帳 ${yearMonth}]`;
       const updatedNote = item.note ? `${item.note} ${suffix}` : suffix;
       await db
-        .prepare(`UPDATE recurring_items SET status = '停用', note = ?, updated_at = ? WHERE id = ?`)
-        .bind(updatedNote, nowIso, item.id)
+        .prepare(
+          `UPDATE recurring_items SET status = '停用', note = ?, updated_at = ?, version = version + 1 WHERE user_id = ? AND id = ?`
+        )
+        .bind(updatedNote, nowIso, uid, item.id)
         .run();
       deactivatedOneTimeCount++;
     }
@@ -148,6 +154,7 @@ export async function runMonthlyRecurringD1(
 
 export async function runMonthEndSnapshotD1(
   db: D1Database,
+  userId: string,
   targetDate = new Date()
 ): Promise<{
   yearMonth: string;
@@ -156,7 +163,8 @@ export async function runMonthEndSnapshotD1(
   netWorth: number;
   updated: boolean;
 }> {
-  const full = await exportFullSnapshot(db);
+  const uid = assertUserId(userId);
+  const full = await exportFullSnapshot(db, uid);
   const parts = getTaiwanDateParts(targetDate);
   const yearMonth = parts.yearMonth;
   const nowIso = new Date().toISOString();
@@ -221,18 +229,19 @@ export async function runMonthEndSnapshotD1(
     monthlyIncome > 0 ? Math.round(((monthlyIncome - totalConsumption) / monthlyIncome) * 10000) / 10000 : 0;
 
   const existing = await db
-    .prepare('SELECT year_month FROM networth_history WHERE year_month = ?')
-    .bind(yearMonth)
+    .prepare('SELECT year_month FROM networth_history WHERE user_id = ? AND year_month = ?')
+    .bind(uid, yearMonth)
     .first();
   const updated = Boolean(existing);
 
   await db
     .prepare(
       `INSERT OR REPLACE INTO networth_history
-        (year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
+      uid,
       yearMonth,
       parts.ymd,
       Math.round(totalAssets),
@@ -256,4 +265,39 @@ export async function runMonthEndSnapshotD1(
     netWorth,
     updated,
   };
+}
+
+export async function runMonthlyRecurringAllUsersD1(
+  db: D1Database,
+  targetYear?: number,
+  targetMonth?: number
+): Promise<{ userCount: number; totalInserted: number; totalSkipped: number }> {
+  const users = await db.prepare('SELECT id FROM users WHERE is_active = 1').all<{ id: string }>();
+  let totalInserted = 0;
+  let totalSkipped = 0;
+  for (const u of users.results) {
+    try {
+      const res = await runMonthlyRecurringD1(db, u.id, targetYear, targetMonth);
+      totalInserted += res.insertedCount;
+      totalSkipped += res.skippedCount;
+    } catch {
+      // Isolate per-user cron errors so other users still complete
+    }
+  }
+  return { userCount: users.results.length, totalInserted, totalSkipped };
+}
+
+export async function runMonthEndSnapshotAllUsersD1(
+  db: D1Database,
+  targetDate = new Date()
+): Promise<{ userCount: number }> {
+  const users = await db.prepare('SELECT id FROM users WHERE is_active = 1').all<{ id: string }>();
+  for (const u of users.results) {
+    try {
+      await runMonthEndSnapshotD1(db, u.id, targetDate);
+    } catch {
+      // Isolate per-user cron errors
+    }
+  }
+  return { userCount: users.results.length };
 }

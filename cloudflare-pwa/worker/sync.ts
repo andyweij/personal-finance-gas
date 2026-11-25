@@ -36,9 +36,19 @@ import {
   validateStockTransactionInput,
 } from '../shared/validation';
 
-export async function ensureAppSettings(db: D1Database): Promise<AppSettings> {
+export function assertUserId(userId: string): string {
+  const cleaned = String(userId || '').trim();
+  if (!cleaned) {
+    throw new Error('缺少租戶身分識別（userId），拒絕存取資料。');
+  }
+  return cleaned;
+}
+
+export async function ensureAppSettings(db: D1Database, userId: string): Promise<AppSettings> {
+  const uid = assertUserId(userId);
   const row = await db
-    .prepare('SELECT * FROM app_settings WHERE id = 1')
+    .prepare('SELECT * FROM app_settings WHERE user_id = ?')
+    .bind(uid)
     .first<{
       monthly_daily_budget: number;
       emergency_target_months: number;
@@ -62,10 +72,10 @@ export async function ensureAppSettings(db: D1Database): Promise<AppSettings> {
   const nowIso = new Date().toISOString();
   await db
     .prepare(
-      `INSERT OR IGNORE INTO app_settings (id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at, version)
-       VALUES (1, ?, ?, ?, ?, 1)`
+      `INSERT OR IGNORE INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at, version)
+       VALUES (?, ?, ?, ?, ?, 1)`
     )
-    .bind(DEFAULT_MONTHLY_DAILY_BUDGET, DEFAULT_EMERGENCY_MONTHS, DEFAULT_USD_TWD_RATE, nowIso)
+    .bind(uid, DEFAULT_MONTHLY_DAILY_BUDGET, DEFAULT_EMERGENCY_MONTHS, DEFAULT_USD_TWD_RATE, nowIso)
     .run();
 
   return {
@@ -224,9 +234,14 @@ function mapNetWorthRow(r: Record<string, unknown>): NetWorthHistory {
   };
 }
 
-export async function ensureRentUtilitySettings(db: D1Database): Promise<RentUtilityRents> {
+export async function ensureRentUtilitySettings(
+  db: D1Database,
+  userId: string
+): Promise<RentUtilityRents> {
+  const uid = assertUserId(userId);
   const row = await db
-    .prepare('SELECT * FROM rent_utility_settings WHERE id = 1')
+    .prepare('SELECT * FROM rent_utility_settings WHERE user_id = ?')
+    .bind(uid)
     .first<{
       rent_6f: number;
       rent_a: number;
@@ -250,10 +265,10 @@ export async function ensureRentUtilitySettings(db: D1Database): Promise<RentUti
   const nowIso = new Date().toISOString();
   await db
     .prepare(
-      `INSERT OR IGNORE INTO rent_utility_settings (id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
-       VALUES (1, 0, 0, 0, 0, ?, 1)`
+      `INSERT OR IGNORE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
+       VALUES (?, 0, 0, 0, 0, ?, 1)`
     )
-    .bind(nowIso)
+    .bind(uid, nowIso)
     .run();
 
   return { ...DEFAULT_UTILITY_RENTS, updatedAt: nowIso, version: 1 };
@@ -310,7 +325,6 @@ function checkVersionOrThrow(
 
   if (mutation.baseVersion !== undefined) {
     if (mutation.baseVersion === null) {
-      // Creating a record whose ID/period already exists and is active -> conflict!
       if (!existingDeleted && mutation.op === 'upsert') {
         throw new VersionConflictError({
           mutationId: mutation.mutationId,
@@ -352,14 +366,20 @@ function checkVersionOrThrow(
 
 async function applySingleMutation(
   db: D1Database,
+  userId: string,
   mutation: SyncMutation,
   defaultFxRate: number,
   serverTime: string
 ): Promise<void> {
+  const uid = assertUserId(userId);
+
   if (mutation.entity === 'settings') {
     const p = mutation.payload || {};
-    const existing = await ensureAppSettings(db);
-    const existingRow = await db.prepare('SELECT * FROM app_settings WHERE id = 1').first<Record<string, unknown>>();
+    const existing = await ensureAppSettings(db, uid);
+    const existingRow = await db
+      .prepare('SELECT * FROM app_settings WHERE user_id = ?')
+      .bind(uid)
+      .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
       existingRow,
@@ -375,17 +395,17 @@ async function applySingleMutation(
       .prepare(
         `UPDATE app_settings
          SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, updated_at = ?, version = ?
-         WHERE id = 1`
+         WHERE user_id = ?`
       )
-      .bind(budget, months, validFx, check.writeTs, check.nextVersion)
+      .bind(budget, months, validFx, check.writeTs, check.nextVersion, uid)
       .run();
     return;
   }
 
   if (mutation.entity === 'cashflow') {
     const existing = await db
-      .prepare('SELECT * FROM cashflow_logs WHERE id = ?')
-      .bind(mutation.recordId)
+      .prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND id = ?')
+      .bind(uid, mutation.recordId)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -398,8 +418,8 @@ async function applySingleMutation(
     if (mutation.op === 'delete') {
       if (!existing) return;
       await db
-        .prepare('UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ? WHERE id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, mutation.recordId)
+        .prepare('UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
         .run();
       return;
     }
@@ -424,9 +444,9 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO cashflow_logs
-          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(id) DO UPDATE SET
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, id) DO UPDATE SET
            date = excluded.date,
            year_month = excluded.year_month,
            type = excluded.type,
@@ -444,6 +464,7 @@ async function applySingleMutation(
            version = excluded.version`
       )
       .bind(
+        uid,
         mutation.recordId,
         v.date,
         v.yearMonth,
@@ -467,8 +488,8 @@ async function applySingleMutation(
 
   if (mutation.entity === 'recurring') {
     const existing = await db
-      .prepare('SELECT * FROM recurring_items WHERE id = ?')
-      .bind(mutation.recordId)
+      .prepare('SELECT * FROM recurring_items WHERE user_id = ? AND id = ?')
+      .bind(uid, mutation.recordId)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -481,8 +502,8 @@ async function applySingleMutation(
     if (mutation.op === 'delete') {
       if (!existing) return;
       await db
-        .prepare('UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ? WHERE id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, mutation.recordId)
+        .prepare('UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
         .run();
       return;
     }
@@ -504,9 +525,9 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO recurring_items
-          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(id) DO UPDATE SET
+          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, id) DO UPDATE SET
            item_name = excluded.item_name,
            category = excluded.category,
            type = excluded.type,
@@ -522,6 +543,7 @@ async function applySingleMutation(
            version = excluded.version`
       )
       .bind(
+        uid,
         mutation.recordId,
         v.itemName,
         v.category,
@@ -543,8 +565,8 @@ async function applySingleMutation(
 
   if (mutation.entity === 'sinking') {
     const existing = await db
-      .prepare('SELECT * FROM sinking_fund_items WHERE id = ?')
-      .bind(mutation.recordId)
+      .prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND id = ?')
+      .bind(uid, mutation.recordId)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -557,8 +579,8 @@ async function applySingleMutation(
     if (mutation.op === 'delete') {
       if (!existing) return;
       await db
-        .prepare('UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ? WHERE id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, mutation.recordId)
+        .prepare('UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
         .run();
       return;
     }
@@ -577,9 +599,9 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO sinking_fund_items
-          (id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(id) DO UPDATE SET
+          (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, id) DO UPDATE SET
            item_name = excluded.item_name,
            category = excluded.category,
            total_amount = excluded.total_amount,
@@ -592,6 +614,7 @@ async function applySingleMutation(
            version = excluded.version`
       )
       .bind(
+        uid,
         mutation.recordId,
         v.itemName,
         v.category,
@@ -610,8 +633,8 @@ async function applySingleMutation(
 
   if (mutation.entity === 'asset') {
     const existing = await db
-      .prepare('SELECT * FROM asset_items WHERE id = ?')
-      .bind(mutation.recordId)
+      .prepare('SELECT * FROM asset_items WHERE user_id = ? AND id = ?')
+      .bind(uid, mutation.recordId)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -624,8 +647,8 @@ async function applySingleMutation(
     if (mutation.op === 'delete') {
       if (!existing) return;
       await db
-        .prepare('UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ? WHERE id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, mutation.recordId)
+        .prepare('UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
         .run();
       return;
     }
@@ -671,18 +694,18 @@ async function applySingleMutation(
     if (v.isDefaultSavings) {
       await db
         .prepare(
-          'UPDATE asset_items SET is_default_savings = 0, updated_at = ?, version = version + 1 WHERE is_default_savings = 1 AND id != ?'
+          'UPDATE asset_items SET is_default_savings = 0, updated_at = ?, version = version + 1 WHERE user_id = ? AND is_default_savings = 1 AND id != ?'
         )
-        .bind(check.writeTs, mutation.recordId)
+        .bind(check.writeTs, uid, mutation.recordId)
         .run();
     }
 
     await db
       .prepare(
         `INSERT INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(id) DO UPDATE SET
+          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, id) DO UPDATE SET
            update_mode = excluded.update_mode,
            major_type = excluded.major_type,
            sub_category = excluded.sub_category,
@@ -707,6 +730,7 @@ async function applySingleMutation(
            version = excluded.version`
       )
       .bind(
+        uid,
         mutation.recordId,
         v.updateMode,
         v.majorType,
@@ -737,8 +761,8 @@ async function applySingleMutation(
 
   if (mutation.entity === 'savings_adjustment') {
     const existing = await db
-      .prepare('SELECT * FROM savings_adjustments WHERE id = ?')
-      .bind(mutation.recordId)
+      .prepare('SELECT * FROM savings_adjustments WHERE user_id = ? AND id = ?')
+      .bind(uid, mutation.recordId)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -751,8 +775,8 @@ async function applySingleMutation(
     if (mutation.op === 'delete') {
       if (!existing) return;
       await db
-        .prepare('UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ? WHERE id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, mutation.recordId)
+        .prepare('UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
         .run();
       return;
     }
@@ -773,9 +797,9 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO savings_adjustments
-          (id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(id) DO UPDATE SET
+          (user_id, id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, id) DO UPDATE SET
            account_id = excluded.account_id,
            date = excluded.date,
            amount = excluded.amount,
@@ -786,6 +810,7 @@ async function applySingleMutation(
            version = excluded.version`
       )
       .bind(
+        uid,
         mutation.recordId,
         v.accountId,
         v.date,
@@ -802,8 +827,8 @@ async function applySingleMutation(
 
   if (mutation.entity === 'stock_tx') {
     const existing = await db
-      .prepare('SELECT * FROM stock_transactions WHERE id = ?')
-      .bind(mutation.recordId)
+      .prepare('SELECT * FROM stock_transactions WHERE user_id = ? AND id = ?')
+      .bind(uid, mutation.recordId)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -816,8 +841,8 @@ async function applySingleMutation(
     if (mutation.op === 'delete') {
       if (!existing) return;
       await db
-        .prepare('UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ? WHERE id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, mutation.recordId)
+        .prepare('UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
         .run();
       return;
     }
@@ -837,9 +862,9 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO stock_transactions
-          (id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(id) DO UPDATE SET
+          (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, id) DO UPDATE SET
            asset_id = excluded.asset_id,
            date = excluded.date,
            tx_type = excluded.tx_type,
@@ -853,6 +878,7 @@ async function applySingleMutation(
            version = excluded.version`
       )
       .bind(
+        uid,
         mutation.recordId,
         v.assetId,
         v.date,
@@ -871,9 +897,10 @@ async function applySingleMutation(
   }
 
   if (mutation.entity === 'utility_rents') {
-    const existing = await ensureRentUtilitySettings(db);
+    const existing = await ensureRentUtilitySettings(db, uid);
     const existingRow = await db
-      .prepare('SELECT * FROM rent_utility_settings WHERE id = 1')
+      .prepare('SELECT * FROM rent_utility_settings WHERE user_id = ?')
+      .bind(uid)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -885,9 +912,9 @@ async function applySingleMutation(
     const v = validateUtilityRentsInput((mutation.payload || {}) as Partial<RentUtilityRents>);
     await db
       .prepare(
-        `INSERT INTO rent_utility_settings (id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
-         VALUES (1, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
+        `INSERT INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
            rent_6f = excluded.rent_6f,
            rent_a = excluded.rent_a,
            rent_b = excluded.rent_b,
@@ -895,15 +922,15 @@ async function applySingleMutation(
            updated_at = excluded.updated_at,
            version = excluded.version`
       )
-      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, check.writeTs, check.nextVersion)
+      .bind(uid, v.rent6F, v.rentA, v.rentB, v.rentC, check.writeTs, check.nextVersion)
       .run();
     return;
   }
 
   if (mutation.entity === 'utility_record') {
     const existing = await db
-      .prepare('SELECT * FROM rent_utility_records WHERE period = ?')
-      .bind(mutation.recordId)
+      .prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND period = ?')
+      .bind(uid, mutation.recordId)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -919,8 +946,8 @@ async function applySingleMutation(
       }
       if (!existing) return;
       await db
-        .prepare('UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ? WHERE period = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, mutation.recordId)
+        .prepare('UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND period = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
         .run();
       return;
     }
@@ -943,9 +970,9 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO rent_utility_records
-          (period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(period) DO UPDATE SET
+          (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, period) DO UPDATE SET
            is_baseline = excluded.is_baseline,
            cur_total = excluded.cur_total,
            cur_6f = excluded.cur_6f,
@@ -961,6 +988,7 @@ async function applySingleMutation(
            version = excluded.version`
       )
       .bind(
+        uid,
         v.period,
         v.isBaseline ? 1 : 0,
         v.curTotal,
@@ -980,22 +1008,27 @@ async function applySingleMutation(
   }
 }
 
-export async function querySyncDelta(db: D1Database, since?: string | null): Promise<SyncDelta> {
+export async function querySyncDelta(
+  db: D1Database,
+  userId: string,
+  since?: string | null
+): Promise<SyncDelta> {
+  const uid = assertUserId(userId);
   const [settings, utilityRents] = await Promise.all([
-    ensureAppSettings(db),
-    ensureRentUtilitySettings(db),
+    ensureAppSettings(db, uid),
+    ensureRentUtilitySettings(db, uid),
   ]);
 
   if (since) {
     const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
-      db.prepare('SELECT * FROM cashflow_logs WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
-      db.prepare('SELECT * FROM recurring_items WHERE updated_at > ?').bind(since).all(),
-      db.prepare('SELECT * FROM sinking_fund_items WHERE updated_at > ?').bind(since).all(),
-      db.prepare('SELECT * FROM asset_items WHERE updated_at > ?').bind(since).all(),
-      db.prepare('SELECT * FROM savings_adjustments WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
-      db.prepare('SELECT * FROM stock_transactions WHERE updated_at > ? ORDER BY date DESC').bind(since).all(),
-      db.prepare('SELECT * FROM networth_history WHERE updated_at > ? ORDER BY year_month DESC').bind(since).all(),
-      db.prepare('SELECT * FROM rent_utility_records WHERE updated_at > ?').bind(since).all(),
+      db.prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND updated_at > ? ORDER BY date DESC').bind(uid, since).all(),
+      db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND updated_at > ?').bind(uid, since).all(),
+      db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND updated_at > ?').bind(uid, since).all(),
+      db.prepare('SELECT * FROM asset_items WHERE user_id = ? AND updated_at > ?').bind(uid, since).all(),
+      db.prepare('SELECT * FROM savings_adjustments WHERE user_id = ? AND updated_at > ? ORDER BY date DESC').bind(uid, since).all(),
+      db.prepare('SELECT * FROM stock_transactions WHERE user_id = ? AND updated_at > ? ORDER BY date DESC').bind(uid, since).all(),
+      db.prepare('SELECT * FROM networth_history WHERE user_id = ? AND updated_at > ? ORDER BY year_month DESC').bind(uid, since).all(),
+      db.prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND updated_at > ?').bind(uid, since).all(),
     ]);
 
     return {
@@ -1013,14 +1046,14 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
   }
 
   const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
-    db.prepare('SELECT * FROM cashflow_logs WHERE deleted_at IS NULL ORDER BY date DESC').all(),
-    db.prepare('SELECT * FROM recurring_items WHERE deleted_at IS NULL').all(),
-    db.prepare('SELECT * FROM sinking_fund_items WHERE deleted_at IS NULL').all(),
-    db.prepare('SELECT * FROM asset_items WHERE deleted_at IS NULL').all(),
-    db.prepare('SELECT * FROM savings_adjustments WHERE deleted_at IS NULL ORDER BY date DESC').all(),
-    db.prepare('SELECT * FROM stock_transactions WHERE deleted_at IS NULL ORDER BY date DESC').all(),
-    db.prepare('SELECT * FROM networth_history ORDER BY year_month DESC').all(),
-    db.prepare('SELECT * FROM rent_utility_records WHERE deleted_at IS NULL').all(),
+    db.prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND deleted_at IS NULL ORDER BY date DESC').bind(uid).all(),
+    db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND deleted_at IS NULL').bind(uid).all(),
+    db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND deleted_at IS NULL').bind(uid).all(),
+    db.prepare('SELECT * FROM asset_items WHERE user_id = ? AND deleted_at IS NULL').bind(uid).all(),
+    db.prepare('SELECT * FROM savings_adjustments WHERE user_id = ? AND deleted_at IS NULL ORDER BY date DESC').bind(uid).all(),
+    db.prepare('SELECT * FROM stock_transactions WHERE user_id = ? AND deleted_at IS NULL ORDER BY date DESC').bind(uid).all(),
+    db.prepare('SELECT * FROM networth_history WHERE user_id = ? ORDER BY year_month DESC').bind(uid).all(),
+    db.prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND deleted_at IS NULL').bind(uid).all(),
   ]);
 
   return {
@@ -1037,9 +1070,14 @@ export async function querySyncDelta(db: D1Database, since?: string | null): Pro
   };
 }
 
-export async function processSyncRequest(db: D1Database, req: SyncRequest): Promise<SyncResponse> {
+export async function processSyncRequest(
+  db: D1Database,
+  userId: string,
+  req: SyncRequest
+): Promise<SyncResponse> {
+  const uid = assertUserId(userId);
   const serverTime = new Date().toISOString();
-  const settings = await ensureAppSettings(db);
+  const settings = await ensureAppSettings(db, uid);
   const mutations = Array.isArray(req.mutations) ? req.mutations : [];
   const ackedMutationIds: string[] = [];
   const rejected: Array<{ mutationId: string; reason: string }> = [];
@@ -1052,8 +1090,8 @@ export async function processSyncRequest(db: D1Database, req: SyncRequest): Prom
     }
 
     const already = await db
-      .prepare('SELECT mutation_id FROM sync_idempotency WHERE mutation_id = ?')
-      .bind(mut.mutationId)
+      .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
+      .bind(uid, mut.mutationId)
       .first();
 
     if (already) {
@@ -1062,10 +1100,10 @@ export async function processSyncRequest(db: D1Database, req: SyncRequest): Prom
     }
 
     try {
-      await applySingleMutation(db, mut, settings.usdTwdRate, serverTime);
+      await applySingleMutation(db, uid, mut, settings.usdTwdRate, serverTime);
       await db
-        .prepare('INSERT INTO sync_idempotency (mutation_id, applied_at) VALUES (?, ?)')
-        .bind(mut.mutationId, serverTime)
+        .prepare('INSERT INTO sync_idempotency (user_id, mutation_id, applied_at) VALUES (?, ?, ?)')
+        .bind(uid, mut.mutationId, serverTime)
         .run();
       ackedMutationIds.push(mut.mutationId);
     } catch (err) {
@@ -1080,7 +1118,7 @@ export async function processSyncRequest(db: D1Database, req: SyncRequest): Prom
     }
   }
 
-  const delta = await querySyncDelta(db, req.since);
+  const delta = await querySyncDelta(db, uid, req.since);
   return {
     ok: true,
     serverTime,
@@ -1091,10 +1129,14 @@ export async function processSyncRequest(db: D1Database, req: SyncRequest): Prom
   };
 }
 
-export async function exportFullSnapshot(db: D1Database): Promise<FinanceSnapshot> {
-  const delta = await querySyncDelta(db, null);
+export async function exportFullSnapshot(
+  db: D1Database,
+  userId: string
+): Promise<FinanceSnapshot> {
+  const uid = assertUserId(userId);
+  const delta = await querySyncDelta(db, uid, null);
   return {
-    settings: delta.settings || (await ensureAppSettings(db)),
+    settings: delta.settings || (await ensureAppSettings(db, uid)),
     cashflowLogs: delta.cashflowLogs,
     recurringItems: delta.recurringItems,
     sinkingItems: delta.sinkingItems,
@@ -1103,43 +1145,46 @@ export async function exportFullSnapshot(db: D1Database): Promise<FinanceSnapsho
     stockTransactions: delta.stockTransactions || [],
     netWorthHistory: delta.netWorthHistory,
     rentUtilityRecords: delta.rentUtilityRecords,
-    rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db)),
+    rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db, uid)),
   };
 }
 
 export async function importFullSnapshot(
   db: D1Database,
+  userId: string,
   data: Partial<FinanceSnapshot>,
   mode: 'merge' | 'replace' = 'merge'
 ): Promise<{ importedLogs: number; importedRecurring: number; importedSinking: number; importedAssets: number }> {
+  const uid = assertUserId(userId);
   const nowIso = new Date().toISOString();
 
   if (mode === 'replace') {
-    await db.prepare('DELETE FROM cashflow_logs').run();
-    await db.prepare('DELETE FROM recurring_items').run();
-    await db.prepare('DELETE FROM sinking_fund_items').run();
-    await db.prepare('DELETE FROM asset_items').run();
-    await db.prepare('DELETE FROM savings_adjustments').run();
-    await db.prepare('DELETE FROM stock_transactions').run();
-    await db.prepare('DELETE FROM networth_history').run();
+    await db.prepare('DELETE FROM cashflow_logs WHERE user_id = ?').bind(uid).run();
+    await db.prepare('DELETE FROM recurring_items WHERE user_id = ?').bind(uid).run();
+    await db.prepare('DELETE FROM sinking_fund_items WHERE user_id = ?').bind(uid).run();
+    await db.prepare('DELETE FROM asset_items WHERE user_id = ?').bind(uid).run();
+    await db.prepare('DELETE FROM savings_adjustments WHERE user_id = ?').bind(uid).run();
+    await db.prepare('DELETE FROM stock_transactions WHERE user_id = ?').bind(uid).run();
+    await db.prepare('DELETE FROM networth_history WHERE user_id = ?').bind(uid).run();
     if (Array.isArray(data.rentUtilityRecords) && data.rentUtilityRecords.length > 0) {
-      await db.prepare('DELETE FROM rent_utility_records').run();
+      await db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid).run();
     }
   }
 
-  const currentSettings = await ensureAppSettings(db);
+  const currentSettings = await ensureAppSettings(db, uid);
   if (data.settings) {
     await db
       .prepare(
         `UPDATE app_settings
          SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, updated_at = ?, version = 1
-         WHERE id = 1`
+         WHERE user_id = ?`
       )
       .bind(
         Math.max(0, Math.round(toSafeNumber(data.settings.monthlyDailyBudget, currentSettings.monthlyDailyBudget))),
         Math.min(60, Math.max(1, Math.round(toSafeNumber(data.settings.emergencyTargetMonths, currentSettings.emergencyTargetMonths)))),
         toSafeNumber(data.settings.usdTwdRate, currentSettings.usdTwdRate),
-        nowIso
+        nowIso,
+        uid
       )
       .run();
   }
@@ -1150,10 +1195,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO cashflow_logs
-          (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         log.id || crypto.randomUUID(),
         v.date,
         v.yearMonth,
@@ -1180,10 +1226,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO recurring_items
-          (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         r.id || crypto.randomUUID(),
         v.itemName,
         v.category,
@@ -1208,10 +1255,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO sinking_fund_items
-          (id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         s.id || crypto.randomUUID(),
         v.itemName,
         v.category,
@@ -1233,10 +1281,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO asset_items
-          (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         a.id || crypto.randomUUID(),
         v.updateMode,
         v.majorType,
@@ -1269,10 +1318,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO savings_adjustments
-          (id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (user_id, id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         adj.id || crypto.randomUUID(),
         v.accountId,
         v.date,
@@ -1290,10 +1340,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO stock_transactions
-          (id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         tx.id || crypto.randomUUID(),
         v.assetId,
         v.date,
@@ -1313,10 +1364,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO networth_history
-          (year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
+        uid,
         h.yearMonth,
         h.snapshotDate,
         Math.round(h.totalAssets),
@@ -1338,10 +1390,10 @@ export async function importFullSnapshot(
     const v = validateUtilityRentsInput(data.rentUtilityRents);
     await db
       .prepare(
-        `INSERT OR REPLACE INTO rent_utility_settings (id, rent_6f, rent_a, rent_b, rent_c, updated_at)
-         VALUES (1, ?, ?, ?, ?, ?)`
+        `INSERT OR REPLACE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, 1)`
       )
-      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, nowIso)
+      .bind(uid, v.rent6F, v.rentA, v.rentB, v.rentC, nowIso)
       .run();
   }
 
@@ -1350,10 +1402,11 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO rent_utility_records
-          (period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+          (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
+        uid,
         v.period,
         v.isBaseline ? 1 : 0,
         v.curTotal,

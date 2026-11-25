@@ -318,38 +318,38 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     const nowIso = '2026-11-01T00:00:00.000Z';
     await db
       .prepare(
-        `INSERT INTO app_settings (id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
-         VALUES (1, 45000, 6, 32.5, ?)`
+        `INSERT INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
+         VALUES ('owner', 45000, 6, 32.5, ?)`
       )
       .bind(nowIso)
       .run();
 
     await db
       .prepare(
-        `INSERT INTO recurring_items (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at)
+        `INSERT INTO recurring_items (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at)
          VALUES
-           ('r1', 'Claude Pro', 'AI訂閱', '訂閱扣款', 20, 'USD', '月繳', '', '啟用', '', ?, ?),
-           ('r2', '年終獎金', '獎金', '其他收入', 150000, 'TWD', '一次性', '2026-11', '啟用', '一次性測試', ?, ?),
-           ('r3', '已停用訂閱', '影音', '訂閱扣款', 390, 'TWD', '月繳', '', '停用', '', ?, ?)`
+           ('owner', 'r1', 'Claude Pro', 'AI訂閱', '訂閱扣款', 20, 'USD', '月繳', '', '啟用', '', ?, ?),
+           ('owner', 'r2', '年終獎金', '獎金', '其他收入', 150000, 'TWD', '一次性', '2026-11', '啟用', '一次性測試', ?, ?),
+           ('owner', 'r3', '已停用訂閱', '影音', '訂閱扣款', 390, 'TWD', '月繳', '', '停用', '', ?, ?)`
       )
       .bind(nowIso, nowIso, nowIso, nowIso, nowIso, nowIso)
       .run();
 
-    const first = await runMonthlyRecurringD1(db, 2026, 11);
+    const first = await runMonthlyRecurringD1(db, 'owner', 2026, 11);
     expect(first.insertedCount).toBe(2);
     expect(first.skippedCount).toBe(0);
     expect(first.deactivatedOneTimeCount).toBe(1);
 
     // One-time item must now be deactivated
     const oneTime = await db
-      .prepare('SELECT status, note FROM recurring_items WHERE id = ?')
-      .bind('r2')
+      .prepare('SELECT status, note FROM recurring_items WHERE user_id = ? AND id = ?')
+      .bind('owner', 'r2')
       .first<{ status: string; note: string }>();
     expect(oneTime?.status).toBe('停用');
     expect(oneTime?.note).toContain('2026-11');
 
     // Second run in same month inserts 0 and skips existing
-    const second = await runMonthlyRecurringD1(db, 2026, 11);
+    const second = await runMonthlyRecurringD1(db, 'owner', 2026, 11);
     expect(second.insertedCount).toBe(0);
     expect(second.skippedCount).toBe(1);
   });
@@ -358,24 +358,24 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     const nowIso = '2026-11-30T15:00:00.000Z';
     await db
       .prepare(
-        `INSERT INTO app_settings (id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
-         VALUES (1, 45000, 6, 32.0, ?)`
+        `INSERT INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
+         VALUES ('owner', 45000, 6, 32.0, ?)`
       )
       .bind(nowIso)
       .run();
 
     await db
       .prepare(
-        `INSERT INTO asset_items (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at)
+        `INSERT INTO asset_items (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at)
          VALUES
-           ('a1', '自動更新', '資產', '台股', '高流動', '0050', 'TPE:0050', 1000, 'TWD', 200, '', ?, ?),
-           ('a2', '自動更新', '資產', '美金', '高流動', '美金存款', '', 1000, 'USD', 1, '', ?, ?),
-           ('l1', '手動快照', '負債', '房貸餘額', '負債', '房貸', '', 50000, 'TWD', 1, '', ?, ?)`
+           ('owner', 'a1', '自動更新', '資產', '台股', '高流動', '0050', 'TPE:0050', 1000, 'TWD', 200, '', ?, ?),
+           ('owner', 'a2', '自動更新', '資產', '美金', '高流動', '美金存款', '', 1000, 'USD', 1, '', ?, ?),
+           ('owner', 'l1', '手動快照', '負債', '房貸餘額', '負債', '房貸', '', 50000, 'TWD', 1, '', ?, ?)`
       )
       .bind(nowIso, nowIso, nowIso, nowIso, nowIso, nowIso)
       .run();
 
-    const snap1 = await runMonthEndSnapshotD1(db, new Date('2026-11-30T15:00:00.000Z'));
+    const snap1 = await runMonthEndSnapshotD1(db, 'owner', new Date('2026-11-30T15:00:00.000Z'));
     expect(snap1.yearMonth).toBe('2026-11');
     expect(snap1.totalAssets).toBe(232000);
     expect(snap1.totalLiabilities).toBe(50000);
@@ -383,7 +383,7 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     expect(snap1.updated).toBe(false);
 
     // Re-running same month updates in place
-    const snap2 = await runMonthEndSnapshotD1(db, new Date('2026-11-30T15:05:00.000Z'));
+    const snap2 = await runMonthEndSnapshotD1(db, 'owner', new Date('2026-11-30T15:05:00.000Z'));
     expect(snap2.updated).toBe(true);
   });
 
@@ -394,15 +394,15 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     const nowIso = '2026-11-23T00:00:00.000Z';
     await db
       .prepare(
-        `INSERT INTO app_settings (id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
-         VALUES (1, 45000, 6, 32.1, ?)`
+        `INSERT INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
+         VALUES ('owner', 45000, 6, 32.1, ?)`
       )
       .bind(nowIso)
       .run();
     await db
       .prepare(
-        `INSERT INTO asset_items (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at)
-         VALUES ('a1', '自動更新', '資產', '台股', '高流動', '0050', 'TPE:0050', 1000, 'TWD', 190, '', ?, ?)`
+        `INSERT INTO asset_items (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at)
+         VALUES ('owner', 'a1', '自動更新', '資產', '台股', '高流動', '0050', 'TPE:0050', 1000, 'TWD', 190, '', ?, ?)`
       )
       .bind(nowIso, nowIso)
       .run();
@@ -424,15 +424,15 @@ describe('Cloudflare Worker API + D1 Integration', () => {
       return new Response('not found', { status: 404 });
     });
 
-    const marketRes = await refreshMarketData(db, fetchMock);
+    const marketRes = await refreshMarketData(db, fetchMock, 'owner');
     expect(marketRes.usdTwdRate).toBe(32.65);
     expect(marketRes.updatedTickers).toEqual([{ id: 'a1', ticker: 'TPE:0050', price: 198.5 }]);
 
     // Total failure preserves previous valid values (never overwrites to 0)
     const failingFetch = vi.fn().mockRejectedValue(new Error('network down'));
-    const failRes = await refreshMarketData(db, failingFetch);
+    const failRes = await refreshMarketData(db, failingFetch, 'owner');
     expect(failRes.usdTwdRate).toBe(32.65);
-    const assetRow = await db.prepare('SELECT unit_price FROM asset_items WHERE id = ?').bind('a1').first<{ unit_price: number }>();
+    const assetRow = await db.prepare('SELECT unit_price FROM asset_items WHERE user_id = ? AND id = ?').bind('owner', 'a1').first<{ unit_price: number }>();
     expect(assetRow?.unit_price).toBe(198.5);
   });
 
@@ -676,15 +676,15 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     expect(syncJson.delta.savingsAdjustments).toHaveLength(1);
 
     // Month-end snapshot on 2026-11-30 must capture live balance = 300k + 200k - 100k = 400k
-    const snap = await runMonthEndSnapshotD1(db, new Date('2026-11-30T15:00:00.000Z'));
+    const snap = await runMonthEndSnapshotD1(db, 'owner', new Date('2026-11-30T15:00:00.000Z'));
     expect(snap.totalAssets).toBe(400000);
     expect(snap.netWorth).toBe(400000);
 
     // Next month's recurring run propagates linked_account_id into generated cashflow_logs
-    const recRun = await runMonthlyRecurringD1(db, 2026, 12);
+    const recRun = await runMonthlyRecurringD1(db, 'owner', 2026, 12);
     expect(recRun.insertedCount).toBe(1);
     const posted = await db
-      .prepare(`SELECT linked_account_id FROM cashflow_logs WHERE year_month = '2026-12' AND source = '自動入帳'`)
+      .prepare(`SELECT linked_account_id FROM cashflow_logs WHERE user_id = 'owner' AND year_month = '2026-12' AND source = '自動入帳'`)
       .first<{ linked_account_id: string | null }>();
     expect(posted?.linked_account_id).toBe('sav-acc-1');
   });
@@ -737,7 +737,7 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     expect(syncedLoan?.loanAnnualRate).toBe(2.37);
 
     // Month-end snapshot on 2026-11-30 captures 18 elapsed cycles (~3.33M, not raw 3.76M)
-    const snap = await runMonthEndSnapshotD1(db, new Date('2026-11-30T15:00:00.000Z'));
+    const snap = await runMonthEndSnapshotD1(db, 'owner', new Date('2026-11-30T15:00:00.000Z'));
     expect(snap.totalLiabilities).toBeGreaterThan(3330000);
     expect(snap.totalLiabilities).toBeLessThan(3336000);
   });

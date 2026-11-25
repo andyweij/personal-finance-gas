@@ -242,7 +242,7 @@ describe('Stock cost basis, moving average, and dividend recovery calculations',
       const url = String(input);
       if (url === '/api/sync') {
         const body = JSON.parse(String(init?.body || '{}'));
-        const resp = await processSyncRequest(d1, body);
+        const resp = await processSyncRequest(d1, 'owner', body);
         return new Response(JSON.stringify(resp), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -314,7 +314,7 @@ describe('Stock cost basis, moving average, and dividend recovery calculations',
     expect(savSum.totalSavingsTwd).toBe(458000);
 
     // Verify stock position derived across D1 export/import backup roundtrip
-    const exported = await exportFullSnapshot(d1);
+    const exported = await exportFullSnapshot(d1, 'owner');
     expect(exported.stockTransactions.length).toBe(2);
     const d1Pos = computeStockPositionSummary(
       exported.assetItems.find((a) => a.id === stock.id)!,
@@ -327,8 +327,8 @@ describe('Stock cost basis, moving average, and dividend recovery calculations',
 
     // Import into a brand new D1 database to verify backup restore integrity
     const d1Restored = createTestD1();
-    await importFullSnapshot(d1Restored, exported, 'replace');
-    const restored = await exportFullSnapshot(d1Restored);
+    await importFullSnapshot(d1Restored, 'owner', exported, 'replace');
+    const restored = await exportFullSnapshot(d1Restored, 'owner');
     expect(restored.stockTransactions.length).toBe(2);
     expect(restored.assetItems.find((a) => a.id === stock.id)?.costBasis).toBe(40000);
 

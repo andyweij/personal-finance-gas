@@ -43,7 +43,19 @@ export interface LocalMeta {
 export class LocalFinanceDB {
   private db: IDBDatabase | null = null;
 
+  static dbNameForUser(userId?: string | null): string {
+    const cleaned = String(userId || '').trim();
+    if (!cleaned || cleaned === 'owner') {
+      return 'personal-finance-pwa-db';
+    }
+    return `personal-finance-pwa-db:${cleaned}`;
+  }
+
   constructor(private readonly dbName = 'personal-finance-pwa-db') {}
+
+  getDbName(): string {
+    return this.dbName;
+  }
 
   async open(): Promise<void> {
     if (this.db) return;
@@ -62,6 +74,13 @@ export class LocalFinanceDB {
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
     });
+  }
+
+  close(): void {
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
   }
 
   private getDb(): IDBDatabase {

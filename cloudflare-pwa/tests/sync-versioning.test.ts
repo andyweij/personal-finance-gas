@@ -16,7 +16,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
 
   it('increments server version monotonically (1 -> 2 -> 3) and is immune to client clock skew', async () => {
     // 1. Create asset -> version 1
-    const r1 = await processSyncRequest(d1, {
+    const r1 = await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'm-1',
@@ -45,7 +45,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
     expect(created?.version).toBe(1);
 
     // 2. Update with baseVersion=1 even if client clock is skewed 2 hours backward -> succeeds to v2
-    const r2 = await processSyncRequest(d1, {
+    const r2 = await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'm-2',
@@ -74,7 +74,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
     expect(r2.delta.assetItems.find((a) => a.id === 'asset-ver-1')?.quantityOrAmount).toBe(3320000);
 
     // 3. Update with baseVersion=2 -> succeeds to v3
-    const r3 = await processSyncRequest(d1, {
+    const r3 = await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'm-3',
@@ -103,7 +103,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
 
   it('detects stale offline edit conflict without overwriting D1 and without blocking non-conflicting mutations', async () => {
     // Seed v1
-    await processSyncRequest(d1, {
+    await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'seed-1',
@@ -128,7 +128,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
     });
 
     // Desktop edits online: v1 -> v2 (updates balance to 3,320,000)
-    await processSyncRequest(d1, {
+    await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'desktop-v2',
@@ -153,7 +153,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
     });
 
     // iPhone was offline at v1, later at 10:10 edits note on mortgage-1 AND adds a new lunch cashflow
-    const phoneSync = await processSyncRequest(d1, {
+    const phoneSync = await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'phone-stale-asset',
@@ -229,7 +229,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
     let onlineB = true;
     const mockFetch = async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const req = JSON.parse(String(init?.body || '{}')) as SyncRequest;
-      const res = await processSyncRequest(d1, req);
+      const res = await processSyncRequest(d1, 'owner', req);
       return new Response(JSON.stringify(res), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -328,7 +328,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
   });
 
   it('remains backward-compatible when legacy mutations omit baseVersion', async () => {
-    const r1 = await processSyncRequest(d1, {
+    const r1 = await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'legacy-1',
@@ -346,7 +346,7 @@ describe('Optimistic Locking (version) & Offline Conflict Resolution', () => {
     expect(r1.delta.settings?.version).toBe(2);
 
     // Stale legacy mutation with older timestamp is safely ignored via LWW without conflict
-    const r2 = await processSyncRequest(d1, {
+    const r2 = await processSyncRequest(d1, 'owner', {
       mutations: [
         {
           mutationId: 'legacy-old',

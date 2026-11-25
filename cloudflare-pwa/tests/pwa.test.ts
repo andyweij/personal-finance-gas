@@ -48,7 +48,7 @@ describe('PWA assets & D1 migration integrity', () => {
     expect(code).toContain('caches.open');
   });
 
-  it('initializes all 16 D1 tables cleanly from migrations (including rent_utility, savings_adjustments, and stock_transactions)', async () => {
+  it('initializes all 19 D1 tables cleanly from migrations (including multi-tenant users, invites, and resets)', async () => {
     const db = createTestD1();
     const res = await db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
@@ -59,8 +59,10 @@ describe('PWA assets & D1 migration integrity', () => {
       'app_settings',
       'asset_items',
       'auth_challenges',
+      'auth_invites',
       'auth_owner',
       'auth_passkeys',
+      'auth_password_resets',
       'auth_rate_limits',
       'auth_sessions',
       'cashflow_logs',
@@ -72,6 +74,7 @@ describe('PWA assets & D1 migration integrity', () => {
       'sinking_fund_items',
       'stock_transactions',
       'sync_idempotency',
+      'users',
     ]);
 
     // Verify seeded confirmed history (11409 baseline + 11411~11509)

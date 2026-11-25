@@ -2,26 +2,31 @@
 
 獨立於根目錄 GAS 專案之外的次世代架構，採用 **Local-First PWA + Cloudflare Workers + D1 (SQLite) + Cron Triggers**，解決 GAS 冷啟動延遲與無法離線記帳的痛點，且完全運作於 Cloudflare 免費方案（免綁信用卡、永不休眠）。
 
-> 完整設計規格請參閱 [docs/SDD.md](./docs/SDD.md)、[docs/SDD_savings_linkage.md](./docs/SDD_savings_linkage.md)、[docs/SDD_loan_amortization.md](./docs/SDD_loan_amortization.md) 與 [docs/SDD_sync_versioning.md](./docs/SDD_sync_versioning.md)。
+> 完整設計規格請參閱 [docs/SDD.md](./docs/SDD.md)、[docs/SDD_savings_linkage.md](./docs/SDD_savings_linkage.md)、[docs/SDD_loan_amortization.md](./docs/SDD_loan_amortization.md)、[docs/SDD_sync_versioning.md](./docs/SDD_sync_versioning.md) 與 [docs/SDD_multi_tenant.md](./docs/SDD_multi_tenant.md)。
 
 ---
 
 ## 核心特色
 
 - **真正的離線記帳（0ms 回應）＋ 樂觀鎖防覆蓋**：Service Worker 預快取 App Shell，離線秒開秒記帳；伺服器統一發放遞增版號（`version`），多裝置同時編輯同一筆資料時自動攔截靜默覆蓋，並提供欄位差異對照與一鍵決策視窗。
+- **多租戶家庭版嚴格資料隔離（維持免費方案）**：
+  - 所有財務資料表採 `(user_id, ...)` 複合主鍵與伺服器 Session 綁定隔離，前端 IndexedDB 依使用者切庫（`personal-finance-pwa-db:<userId>`），成員間完全獨立互不可見（連管理員亦無法查閱他人帳目）。
+  - **一次性邀請碼註冊**：由管理員發放一次性邀請碼（僅存 SHA-256 雜湊），註冊完成立即永久失效。
+  - **管理員零知情密碼重置**：成員忘記密碼時由管理員產生一次性重置碼，成員自行重設新密碼並強制登出舊裝置，管理員全程無法得知對方密碼。
+  - **無痛日常解鎖與登入**：30 天滑動續期 Session ＋ 離線 Face ID / PIN 鎖屏；升級 **Discoverable Passkey** 支援免輸入帳號一鍵刷臉登入，本機亦自動記憶上次帳號。
 - **活存帳戶與流水帳即時連動**：支援多活存帳戶加總與單帳戶 N 筆存入／轉出累加（不扭曲儲蓄率），記帳頁即時顯示活存餘額與扣減前後預覽，並內建基準生效日與對帳校準機制，避免歷史舊帳重複扣款。
 - **貸款自動還本推算＋保留快照更新**：針對房貸／車貸可選填啟用本息均攤自動還本推算（內建「申貸日＋年限反推年利率」小工具與未來攤還試算表），免跑銀行即時掌握預估剩餘本金，並可隨時透過「快照校準」覆蓋或切回純手動快照。
 - **0ms 切換月份與報表**：所有帳目鏡像於本機 IndexedDB，切月份、看年度 12 個月趨勢與資產配置圖完全不需等待網路。
-- **高強度單人安全保護**：
-  - 首次初始化受 `SETUP_SECRET` Worker Secret 保護，初始化完成後永久鎖死註冊端點。
+- **高強度安全保護**：
+  - 首次初始化受 `SETUP_SECRET` Worker Secret 保護，初始化完成後僅能憑管理員發放的一次性邀請碼註冊新成員。
   - 主密碼採用 `PBKDF2-SHA256`（100,000 次迭代 + 隨機 Salt），並內建 D1 登入限速（連續失敗 5 次鎖定 15 分鐘）。
-  - 支援 **WebAuthn Passkey（iPhone Face ID / Touch ID / Mac Touch ID）** 一鍵生物辨識登入。
+  - 支援 **WebAuthn Passkey（iPhone Face ID / Touch ID / Mac Touch ID）** 免帳號一鍵生物辨識登入。
   - 保留 **本機離線 4～6 位數 PIN 鎖**、**閒置自動上鎖（5/15/30/60 分）** 與 **一鍵金額隱私遮罩**。
 - **全自動排程與行情更新**：
-  - 每月 1 號 08:00（台灣時間）：自動依週期（月繳/年繳/特定月份/一次性）將常態收支寫入流水帳，具冪等防重複與一次性自動停用機制。
-  - 每日 23:00（台灣時間）：自動更新 USD/TWD 匯率與台股報價（TWSE + Yahoo Finance 雙備援），並於當月最後一天自動凍結淨資產快照。
+  - 每月 1 號 08:00（台灣時間）：依每位啟用成員各自執行常態收支自動入帳，具冪等防重複與一次性自動停用機制。
+  - 每日 23:00（台灣時間）：去重查詢 USD/TWD 匯率與台股報價（TWSE + Yahoo Finance 雙備援），並於當月最後一天為每位成員自動凍結淨資產快照。
 - **無痛資料遷移與自主備份**：支援直接匯入原本 Google Sheets 匯出的 `CashFlow_Log` CSV，以及一鍵下載/還原完整 JSON 備份與 UTF-8 BOM CSV。
-- **整合 5F & 6F 房租水電自動分攤（第 5 分頁，離線可用）**：內建 `11409` 起點表底與 `11411～11509` 歷史抄表紀錄（透過 `0002_rent_utility.sql` 自動建立 D1 資料表），支援滿 10,000/100,000 度歸零換算、一鍵複製 6F/5F LINE 對帳明細、匯出 CSV、0ms 離線抄表與背景同步，以及一鍵將水電帳單／代收水電費寫入個人現金流。
+- **整合 5F & 6F 房租水電自動分攤（預設僅管理員開啟，可於設定自由開關）**：內建 `11409` 起點表底與 `11411～11509` 歷史抄表紀錄（歸屬首位管理員，新成員預設空白且隱藏分頁），支援滿 10,000/100,000 度歸零換算、一鍵複製 6F/5F LINE 對帳明細、匯出 CSV、0ms 離線抄表與背景同步，以及一鍵將水電帳單／代收水電費寫入個人現金流。
 
 ---
 
@@ -90,10 +95,10 @@ npm run deploy
 
 ## 忘記主密碼或 PIN 鎖復原指令
 
-```bash
-# 僅關閉 App PIN 鎖（保留主密碼與所有帳目）
-npx wrangler d1 execute finance-db --remote --command "UPDATE auth_owner SET pin_enabled = 0, pin_hash = NULL, pin_salt = NULL WHERE id = 1;"
+- **一般家庭成員忘記密碼**：請管理員於 App 內「帳號、安全與資料備份 → 家庭成員與邀請碼」產生**一次性密碼重置碼**交給對方自行重設（管理員全程無法得知對方密碼）。
+- **管理員本機 PIN 鎖復原**：
 
-# 重設主密碼（清除後可重新用 SETUP_SECRET 設定新密碼，所有帳目資料完全保留）
-npx wrangler d1 execute finance-db --remote --command "DELETE FROM auth_owner; DELETE FROM auth_sessions;"
+```bash
+# 僅關閉管理員 App PIN 鎖（保留主密碼與所有帳目）
+npx wrangler d1 execute finance-db --remote --command "UPDATE users SET pin_enabled = 0, pin_hash = NULL, pin_salt = NULL WHERE id = 'owner';"
 ```

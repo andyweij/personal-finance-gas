@@ -5,22 +5,33 @@ import type {
   RegistrationResponseJSON,
 } from '@simplewebauthn/server';
 import {
+  adminUpdateUser,
   buildSessionCookie,
+  changeUserPassword,
   checkRateLimit,
   clearRateLimit,
-  configureOwnerPin,
+  configureUserPin,
   constantTimeEqual,
+  createInviteCode,
   createPasskeyAuthenticationOptions,
   createPasskeyRegistrationOptions,
+  createPasswordResetCode,
   createSession,
   finishPasskeyAuthentication,
   finishPasskeyRegistration,
-  getAuthOwner,
+  hasAnyUser,
+  listAdminUsers,
+  listInvites,
   recordLoginFailure,
+  registerWithInviteCode,
+  resetPasswordWithCode,
+  revokeInviteCode,
   revokeSession,
-  setupOwnerPassword,
-  verifyOwnerPassword,
+  setupInitialAdmin,
+  toAuthUser,
+  updateUserProfile,
   verifySessionCookie,
+  verifyUserPassword,
 } from './auth';
 import {
   ensureAppSettings,
@@ -31,7 +42,9 @@ import {
 import {
   getTaiwanDateParts,
   isTaiwanMonthEnd,
+  runMonthEndSnapshotAllUsersD1,
   runMonthEndSnapshotD1,
+  runMonthlyRecurringAllUsersD1,
   runMonthlyRecurringD1,
 } from './automation';
 import { refreshMarketData } from './market';
@@ -45,9 +58,16 @@ import {
   type GoogleSheetCsvKind,
 } from '../shared/csv';
 import type { SyncRequest } from '../shared/types';
-import type { WorkerEnv } from './types';
+import type { UserRow, WorkerEnv } from './types';
 
-function getClientIp(c: Context): string {
+type AppVariables = {
+  authUser: UserRow;
+  tokenHash: string;
+};
+
+type AppContext = Context<{ Bindings: WorkerEnv; Variables: AppVariables }>;
+
+function getClientIp(c: AppContext): string {
   return (
     c.req.header('cf-connecting-ip') ||
     c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
@@ -55,7 +75,7 @@ function getClientIp(c: Context): string {
   );
 }
 
-function getOriginAndRpId(c: Context): { origin: string; rpID: string; isHttps: boolean } {
+function getOriginAndRpId(c: AppContext): { origin: string; rpID: string; isHttps: boolean } {
   const url = new URL(c.req.url);
   return {
     origin: url.origin,
@@ -65,7 +85,7 @@ function getOriginAndRpId(c: Context): { origin: string; rpID: string; isHttps: 
 }
 
 export function createApp() {
-  const app = new Hono<{ Bindings: WorkerEnv }>();
+  const app = new Hono<{ Bindings: WorkerEnv; Variables: AppVariables }>();
 
   // Security headers for all API responses
   app.use('/api/*', async (c, next) => {
@@ -76,69 +96,155 @@ export function createApp() {
     c.header('Cache-Control', 'no-store');
   });
 
-  // Auth status (public, no financial data exposed)
+  // Auth status (public when unauthenticated — NEVER leaks tenant/user/passkey info)
   app.get('/api/auth/status', async (c) => {
-    const owner = await getAuthOwner(c.env.DB);
+    const initialized = await hasAnyUser(c.env.DB);
     const session = await verifySessionCookie(c.env.DB, c.req.header('cookie'));
+
+    if (!session.valid || !session.user) {
+      return c.json({
+        initialized,
+        authenticated: false,
+      });
+    }
+
+    const user = session.user;
     const passkeyRows = await c.env.DB.prepare(
-      'SELECT credential_id, public_key, transports FROM auth_passkeys'
-    ).all<{ credential_id: string; public_key: string; transports: string }>();
+      'SELECT credential_id, public_key, transports FROM auth_passkeys WHERE user_id = ?'
+    )
+      .bind(user.id)
+      .all<{ credential_id: string; public_key: string; transports: string }>();
 
     return c.json({
-      initialized: Boolean(owner),
-      authenticated: session.valid,
-      pinEnabled: Boolean(owner && owner.pin_enabled === 1 && owner.pin_hash),
-      pinSalt: session.valid && owner?.pin_enabled === 1 ? owner.pin_salt : null,
-      pinHash: session.valid && owner?.pin_enabled === 1 ? owner.pin_hash : null,
+      initialized,
+      authenticated: true,
+      user: toAuthUser(user),
+      pinEnabled: Boolean(user.pin_enabled === 1 && user.pin_hash),
+      pinSalt: user.pin_enabled === 1 ? user.pin_salt : null,
+      pinHash: user.pin_enabled === 1 ? user.pin_hash : null,
       passkeyCount: passkeyRows.results.length,
-      ...(session.valid
-        ? {
-            passkeys: passkeyRows.results.map((p) => ({
-              id: p.credential_id,
-              publicKey: p.public_key,
-              transports: JSON.parse(p.transports || '[]'),
-            })),
-          }
-        : {}),
+      passkeys: passkeyRows.results.map((p) => ({
+        id: p.credential_id,
+        publicKey: p.public_key,
+        transports: JSON.parse(p.transports || '[]'),
+      })),
     });
   });
 
-  // First-time owner password setup (protected by SETUP_SECRET Worker Secret)
+  // First-time admin setup (protected by SETUP_SECRET Worker Secret)
   app.post('/api/auth/setup', async (c) => {
-    const existing = await getAuthOwner(c.env.DB);
-    if (existing) {
+    const alreadyInit = await hasAnyUser(c.env.DB);
+    if (alreadyInit) {
       return c.json({ error: '系統已完成初始化，禁止重複設定。' }, 403);
     }
 
     const body = (await c.req.json().catch(() => ({}))) as {
       setupSecret?: string;
+      username?: string;
+      displayName?: string;
       password?: string;
     };
 
     const expectedSecret = c.env.SETUP_SECRET || '';
     if (!expectedSecret) {
-      return c.json({ error: '伺服器尚未設定 SETUP_SECRET，請先透過 wrangler secret put SETUP_SECRET 設定。' }, 500);
+      return c.json(
+        { error: '伺服器尚未設定 SETUP_SECRET，請先透過 wrangler secret put SETUP_SECRET 設定。' },
+        500
+      );
     }
     if (!body.setupSecret || !constantTimeEqual(String(body.setupSecret), expectedSecret)) {
       return c.json({ error: '初始化密鑰錯誤。' }, 403);
     }
 
     try {
-      await setupOwnerPassword(c.env.DB, String(body.password || ''));
-      await ensureAppSettings(c.env.DB);
-      const token = await createSession(c.env.DB, c.req.header('user-agent') || 'setup');
+      const admin = await setupInitialAdmin(c.env.DB, {
+        username: body.username,
+        displayName: body.displayName,
+        password: String(body.password || ''),
+      });
+      await ensureAppSettings(c.env.DB, admin.id);
+      const token = await createSession(c.env.DB, admin.id, c.req.header('user-agent') || 'setup');
       const { isHttps } = getOriginAndRpId(c);
       c.header('Set-Cookie', buildSessionCookie(token, isHttps));
-      return c.json({ ok: true, message: '初始化完成並已登入。' });
+      return c.json({ ok: true, user: toAuthUser(admin), message: '初始化完成並已登入。' });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : '初始化失敗' }, 400);
     }
   });
 
+  // One-time invite code registration
+  app.post('/api/auth/register-invite', async (c) => {
+    const ip = getClientIp(c);
+    const rateKey = `reg:${ip}`;
+    const limit = await checkRateLimit(c.env.DB, rateKey);
+    if (limit.blocked) {
+      return c.json(
+        { error: `註冊失敗次數過多，請於 ${Math.ceil((limit.retryAfterSec || 900) / 60)} 分鐘後再試。` },
+        429
+      );
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as {
+      inviteCode?: string;
+      username?: string;
+      displayName?: string;
+      password?: string;
+    };
+
+    try {
+      const created = await registerWithInviteCode(c.env.DB, {
+        inviteCode: String(body.inviteCode || ''),
+        username: String(body.username || ''),
+        displayName: body.displayName,
+        password: String(body.password || ''),
+      });
+      await clearRateLimit(c.env.DB, rateKey);
+      await ensureAppSettings(c.env.DB, created.id);
+      const token = await createSession(c.env.DB, created.id, c.req.header('user-agent') || 'register');
+      const { isHttps } = getOriginAndRpId(c);
+      c.header('Set-Cookie', buildSessionCookie(token, isHttps));
+      return c.json({ ok: true, user: toAuthUser(created) });
+    } catch (err) {
+      await recordLoginFailure(c.env.DB, rateKey);
+      return c.json({ error: err instanceof Error ? err.message : '註冊失敗' }, 400);
+    }
+  });
+
+  // Zero-knowledge one-time password reset (user chooses new password; admin never sees it)
+  app.post('/api/auth/reset-password', async (c) => {
+    const ip = getClientIp(c);
+    const rateKey = `rst:${ip}`;
+    const limit = await checkRateLimit(c.env.DB, rateKey);
+    if (limit.blocked) {
+      return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as {
+      username?: string;
+      resetCode?: string;
+      newPassword?: string;
+    };
+
+    try {
+      await resetPasswordWithCode(c.env.DB, {
+        username: String(body.username || ''),
+        resetCode: String(body.resetCode || ''),
+        newPassword: String(body.newPassword || ''),
+      });
+      await clearRateLimit(c.env.DB, rateKey);
+      return c.json({ ok: true, message: '密碼已重設完成，請以新密碼登入。' });
+    } catch (err) {
+      await recordLoginFailure(c.env.DB, rateKey);
+      return c.json({ error: err instanceof Error ? err.message : '重設密碼失敗' }, 400);
+    }
+  });
+
   // Master password login with D1 brute-force rate limit
   app.post('/api/auth/login', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { username?: string; password?: string };
     const ip = getClientIp(c);
-    const limit = await checkRateLimit(c.env.DB, ip);
+    const rateKey = body.username ? `${ip}:${String(body.username).trim().toLowerCase()}` : ip;
+    const limit = await checkRateLimit(c.env.DB, rateKey);
     if (limit.blocked) {
       return c.json(
         { error: `登入失敗次數過多，請於 ${Math.ceil((limit.retryAfterSec || 900) / 60)} 分鐘後再試。` },
@@ -146,34 +252,35 @@ export function createApp() {
       );
     }
 
-    const body = (await c.req.json().catch(() => ({}))) as { password?: string };
-    const ok = await verifyOwnerPassword(c.env.DB, String(body.password || ''));
-    if (!ok) {
-      await recordLoginFailure(c.env.DB, ip);
-      return c.json({ error: '主密碼不正確。' }, 401);
+    const user = await verifyUserPassword(c.env.DB, body.username, String(body.password || ''));
+    if (!user) {
+      await recordLoginFailure(c.env.DB, rateKey);
+      return c.json({ error: '帳號或主密碼不正確。' }, 401);
     }
 
-    await clearRateLimit(c.env.DB, ip);
-    const token = await createSession(c.env.DB, c.req.header('user-agent') || 'browser');
+    await clearRateLimit(c.env.DB, rateKey);
+    const token = await createSession(c.env.DB, user.id, c.req.header('user-agent') || 'browser');
     const { isHttps } = getOriginAndRpId(c);
     c.header('Set-Cookie', buildSessionCookie(token, isHttps));
-    return c.json({ ok: true });
+    return c.json({ ok: true, user: toAuthUser(user) });
   });
 
-  // Logout (current device or ?all=1)
+  // Logout (current device or ?all=1 for current user only)
   app.post('/api/auth/logout', async (c) => {
     const revokeAll = c.req.query('all') === '1';
-    await revokeSession(c.env.DB, c.req.header('cookie'), revokeAll);
+    const session = await verifySessionCookie(c.env.DB, c.req.header('cookie'));
+    await revokeSession(c.env.DB, c.req.header('cookie'), session.user?.id, revokeAll);
     const { isHttps } = getOriginAndRpId(c);
     c.header('Set-Cookie', buildSessionCookie('', isHttps, true));
     return c.json({ ok: true });
   });
 
-  // Passkey login (public)
+  // Discoverable Passkey login (username-less 1-tap Face ID / Touch ID)
   app.post('/api/auth/passkey/login/options', async (c) => {
     try {
+      const body = (await c.req.json().catch(() => ({}))) as { username?: string };
       const { rpID } = getOriginAndRpId(c);
-      const options = await createPasskeyAuthenticationOptions(c.env.DB, rpID);
+      const options = await createPasskeyAuthenticationOptions(c.env.DB, rpID, body.username);
       return c.json(options);
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : '無法產生 Passkey 選項' }, 400);
@@ -182,41 +289,90 @@ export function createApp() {
 
   app.post('/api/auth/passkey/login/verify', async (c) => {
     const ip = getClientIp(c);
-    const limit = await checkRateLimit(c.env.DB, ip);
+    const limit = await checkRateLimit(c.env.DB, `pk:${ip}`);
     if (limit.blocked) {
       return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
     }
     try {
       const { rpID, origin, isHttps } = getOriginAndRpId(c);
       const body = (await c.req.json()) as AuthenticationResponseJSON;
-      await finishPasskeyAuthentication(c.env.DB, rpID, origin, body);
-      await clearRateLimit(c.env.DB, ip);
-      const token = await createSession(c.env.DB, c.req.header('user-agent') || 'passkey');
+      const { user } = await finishPasskeyAuthentication(c.env.DB, rpID, origin, body);
+      await clearRateLimit(c.env.DB, `pk:${ip}`);
+      const token = await createSession(c.env.DB, user.id, c.req.header('user-agent') || 'passkey');
       c.header('Set-Cookie', buildSessionCookie(token, isHttps));
-      return c.json({ ok: true });
+      return c.json({ ok: true, user: toAuthUser(user) });
     } catch (err) {
-      await recordLoginFailure(c.env.DB, ip);
+      await recordLoginFailure(c.env.DB, `pk:${ip}`);
       return c.json({ error: err instanceof Error ? err.message : 'Passkey 登入失敗' }, 401);
     }
   });
 
-  // Authentication middleware for all remaining protected API endpoints
-  const requireAuth = async (c: Context<{ Bindings: WorkerEnv }>, next: () => Promise<void>) => {
+  // Authentication middleware: binds authenticated UserRow into Hono Context
+  const requireAuth = async (c: AppContext, next: () => Promise<void>) => {
     const session = await verifySessionCookie(c.env.DB, c.req.header('cookie'));
-    if (!session.valid) {
+    if (!session.valid || !session.user) {
       return c.json({ error: 'AUTH_REQUIRED' }, 401);
+    }
+    c.set('authUser', session.user);
+    c.set('tokenHash', session.tokenHash || '');
+    await next();
+  };
+
+  // Admin middleware: strictly requires role === 'admin' (and admin routes NEVER query financial tables)
+  const requireAdmin = async (c: AppContext, next: () => Promise<void>) => {
+    const user = c.get('authUser');
+    if (!user || user.role !== 'admin') {
+      return c.json({ error: '僅管理員可執行此操作。' }, 403);
     }
     await next();
   };
 
+  // Authenticated User Profile & Security Settings
+  app.patch('/api/auth/profile', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as {
+        username?: string;
+        displayName?: string;
+        showUtilityTab?: boolean;
+      };
+      const updated = await updateUserProfile(c.env.DB, user.id, body);
+      return c.json({ ok: true, user: updated });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : '更新個人資料失敗' }, 400);
+    }
+  });
+
+  app.post('/api/auth/change-password', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as {
+        currentPassword?: string;
+        newPassword?: string;
+      };
+      await changeUserPassword(
+        c.env.DB,
+        user.id,
+        String(body.currentPassword || ''),
+        String(body.newPassword || ''),
+        c.get('tokenHash')
+      );
+      return c.json({ ok: true, message: '主密碼已更新。' });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : '變更密碼失敗' }, 400);
+    }
+  });
+
   app.post('/api/auth/passkey/register/options', requireAuth, async (c) => {
+    const user = c.get('authUser');
     const { rpID } = getOriginAndRpId(c);
-    const options = await createPasskeyRegistrationOptions(c.env.DB, rpID);
+    const options = await createPasskeyRegistrationOptions(c.env.DB, user, rpID);
     return c.json(options);
   });
 
   app.post('/api/auth/passkey/register/verify', requireAuth, async (c) => {
     try {
+      const user = c.get('authUser');
       const { rpID, origin } = getOriginAndRpId(c);
       const body = (await c.req.json()) as {
         response: RegistrationResponseJSON;
@@ -224,6 +380,7 @@ export function createApp() {
       };
       const res = await finishPasskeyRegistration(
         c.env.DB,
+        user,
         rpID,
         origin,
         body.response,
@@ -237,45 +394,109 @@ export function createApp() {
 
   app.post('/api/auth/pin', requireAuth, async (c) => {
     try {
+      const user = c.get('authUser');
       const body = (await c.req.json()) as {
         enable: boolean;
         currentPin?: string;
         newPin?: string;
       };
-      const result = await configureOwnerPin(c.env.DB, body);
+      const result = await configureUserPin(c.env.DB, user.id, body);
       return c.json({ ok: true, ...result });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : 'PIN 設定失敗' }, 400);
     }
   });
 
-  // Core Offline-First Bidirectional Sync Endpoint
+  // Admin Family Member Management API (metadata only — ZERO financial data access)
+  app.get('/api/admin/users', requireAuth, requireAdmin, async (c) => {
+    const [users, invites] = await Promise.all([listAdminUsers(c.env.DB), listInvites(c.env.DB)]);
+    return c.json({ ok: true, users, invites });
+  });
+
+  app.post('/api/admin/invites', requireAuth, requireAdmin, async (c) => {
+    try {
+      const admin = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as {
+        note?: string;
+        expiresInDays?: number;
+      };
+      const created = await createInviteCode(c.env.DB, admin.id, body);
+      return c.json({ ok: true, ...created });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : '產生邀請碼失敗' }, 400);
+    }
+  });
+
+  app.delete('/api/admin/invites/:id', requireAuth, requireAdmin, async (c) => {
+    const ok = await revokeInviteCode(c.env.DB, c.req.param('id') || '');
+    if (!ok) {
+      return c.json({ error: '找不到可作廢的邀請碼。' }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/admin/users/:id/reset-code', requireAuth, requireAdmin, async (c) => {
+    try {
+      const admin = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as { expiresInMinutes?: number };
+      const created = await createPasswordResetCode(
+        c.env.DB,
+        admin.id,
+        c.req.param('id') || '',
+        body.expiresInMinutes
+      );
+      return c.json({ ok: true, ...created });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : '產生密碼重置碼失敗' }, 400);
+    }
+  });
+
+  app.patch('/api/admin/users/:id', requireAuth, requireAdmin, async (c) => {
+    try {
+      const admin = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as {
+        isActive?: boolean;
+        showUtilityTab?: boolean;
+      };
+      const updated = await adminUpdateUser(c.env.DB, admin.id, c.req.param('id') || '', body);
+      return c.json({ ok: true, user: updated });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : '更新成員狀態失敗' }, 400);
+    }
+  });
+
+  // Core Offline-First Bidirectional Sync Endpoint (strictly scoped to authUser.id)
   app.post('/api/sync', requireAuth, async (c) => {
+    const user = c.get('authUser');
     const body = (await c.req.json().catch(() => ({ mutations: [] }))) as SyncRequest;
-    const res = await processSyncRequest(c.env.DB, body);
+    const res = await processSyncRequest(c.env.DB, user.id, body);
     return c.json(res);
   });
 
-  // Manual Automation Triggers
+  // Manual Automation Triggers (strictly scoped to authUser.id)
   app.post('/api/automation/recurring', requireAuth, async (c) => {
+    const user = c.get('authUser');
     const body = (await c.req.json().catch(() => ({}))) as { year?: number; month?: number };
-    const result = await runMonthlyRecurringD1(c.env.DB, body.year, body.month);
+    const result = await runMonthlyRecurringD1(c.env.DB, user.id, body.year, body.month);
     return c.json({ ok: true, ...result });
   });
 
   app.post('/api/automation/snapshot', requireAuth, async (c) => {
-    const result = await runMonthEndSnapshotD1(c.env.DB);
+    const user = c.get('authUser');
+    const result = await runMonthEndSnapshotD1(c.env.DB, user.id);
     return c.json({ ok: true, ...result });
   });
 
   app.post('/api/market/refresh', requireAuth, async (c) => {
-    const result = await refreshMarketData(c.env.DB);
+    const user = c.get('authUser');
+    const result = await refreshMarketData(c.env.DB, fetch, user.id);
     return c.json({ ok: true, ...result });
   });
 
-  // Data Portability: JSON Export/Import & GAS CSV Import
+  // Data Portability: JSON Export/Import & GAS CSV Import (strictly scoped to authUser.id)
   app.get('/api/export/json', requireAuth, async (c) => {
-    const data = await exportFullSnapshot(c.env.DB);
+    const user = c.get('authUser');
+    const data = await exportFullSnapshot(c.env.DB, user.id);
     return c.json({
       exportedAt: new Date().toISOString(),
       version: 1,
@@ -285,9 +506,11 @@ export function createApp() {
 
   app.post('/api/import/json', requireAuth, async (c) => {
     try {
+      const user = c.get('authUser');
       const body = (await c.req.json()) as { mode?: 'merge' | 'replace'; data?: Record<string, unknown> };
       const summary = await importFullSnapshot(
         c.env.DB,
+        user.id,
         (body.data || body) as never,
         body.mode === 'replace' ? 'replace' : 'merge'
       );
@@ -299,6 +522,7 @@ export function createApp() {
 
   app.post('/api/import/csv', requireAuth, async (c) => {
     try {
+      const user = c.get('authUser');
       const body = (await c.req.json()) as { csvText?: string; kind?: GoogleSheetCsvKind };
       const csvText = String(body.csvText || '');
       const kind = body.kind || detectGoogleSheetCsvKind(csvText);
@@ -322,16 +546,17 @@ export function createApp() {
       };
 
       if (kind === 'cashflow') {
-        const settings = await ensureAppSettings(c.env.DB);
+        const settings = await ensureAppSettings(c.env.DB, user.id);
         const rows = parseCashFlowCsv(csvText, settings.usdTwdRate);
         for (const v of rows) {
           await c.env.DB
             .prepare(
               `INSERT INTO cashflow_logs
-                (id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+                (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
             )
             .bind(
+              user.id,
               crypto.randomUUID(),
               v.date,
               v.yearMonth,
@@ -358,10 +583,11 @@ export function createApp() {
           await c.env.DB
             .prepare(
               `INSERT INTO recurring_items
-                (id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+                (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
             )
             .bind(
+              user.id,
               crypto.randomUUID(),
               v.itemName,
               v.category,
@@ -386,10 +612,11 @@ export function createApp() {
           await c.env.DB
             .prepare(
               `INSERT INTO sinking_fund_items
-                (id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+                (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
             )
             .bind(
+              user.id,
               crypto.randomUUID(),
               v.itemName,
               v.category,
@@ -412,10 +639,11 @@ export function createApp() {
           await c.env.DB
             .prepare(
               `INSERT INTO asset_items
-                (id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+                (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
             )
             .bind(
+              user.id,
               crypto.randomUUID(),
               v.updateMode,
               v.majorType,
@@ -440,10 +668,11 @@ export function createApp() {
         await c.env.DB
           .prepare(
             `INSERT OR REPLACE INTO networth_history
-              (year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .bind(
+            user.id,
             h.yearMonth,
             h.snapshotDate,
             h.totalAssets,
@@ -487,14 +716,14 @@ export default {
 
     if (controller.cron === '0 0 1 * *') {
       await refreshMarketData(env.DB);
-      await runMonthlyRecurringD1(env.DB, tw.year, tw.month);
+      await runMonthlyRecurringAllUsersD1(env.DB, tw.year, tw.month);
       return;
     }
 
-    // Daily 23:00 Asia/Taipei (15:00 UTC): refresh prices & FX, snapshot on month-end
+    // Daily 23:00 Asia/Taipei (15:00 UTC): refresh prices & FX for all active users, snapshot on month-end
     await refreshMarketData(env.DB);
     if (isTaiwanMonthEnd(now)) {
-      await runMonthEndSnapshotD1(env.DB, now);
+      await runMonthEndSnapshotAllUsersD1(env.DB, now);
     }
   },
 };

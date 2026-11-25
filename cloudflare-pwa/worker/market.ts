@@ -111,44 +111,81 @@ export async function fetchTaiwanStockPrice(
 
 export async function refreshMarketData(
   db: D1Database,
-  fetchImpl: FetchLike = fetch
+  fetchImpl: FetchLike = fetch,
+  targetUserId?: string
 ): Promise<{
   usdTwdRate: number;
   fxUpdated: boolean;
   updatedTickers: Array<{ id: string; ticker: string; price: number }>;
   failedTickers: string[];
 }> {
-  const settings = await ensureAppSettings(db);
   const nowIso = new Date().toISOString();
+  let usdTwdRate = 32.5;
 
-  let usdTwdRate = settings.usdTwdRate;
+  if (targetUserId) {
+    const settings = await ensureAppSettings(db, targetUserId);
+    usdTwdRate = settings.usdTwdRate;
+  }
+
   let fxUpdated = false;
   const liveFx = await fetchUsdTwdRate(fetchImpl);
   if (liveFx !== null) {
     usdTwdRate = liveFx;
     fxUpdated = true;
-    await db
-      .prepare('UPDATE app_settings SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ? WHERE id = 1')
-      .bind(usdTwdRate, nowIso, nowIso)
-      .run();
+    if (targetUserId) {
+      await db
+        .prepare('UPDATE app_settings SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ? WHERE user_id = ?')
+        .bind(usdTwdRate, nowIso, nowIso, targetUserId)
+        .run();
+    } else {
+      await db
+        .prepare(
+          `UPDATE app_settings
+           SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ?
+           WHERE user_id IN (SELECT id FROM users WHERE is_active = 1)`
+        )
+        .bind(usdTwdRate, nowIso, nowIso)
+        .run();
+    }
   }
 
-  const autoAssets = await db
-    .prepare(
-      `SELECT id, ticker FROM asset_items
-       WHERE update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL`
-    )
-    .all<{ id: string; ticker: string }>();
+  const autoAssets = targetUserId
+    ? await db
+        .prepare(
+          `SELECT user_id, id, ticker FROM asset_items
+           WHERE user_id = ? AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL`
+        )
+        .bind(targetUserId)
+        .all<{ user_id: string; id: string; ticker: string }>()
+    : await db
+        .prepare(
+          `SELECT user_id, id, ticker FROM asset_items
+           WHERE user_id IN (SELECT id FROM users WHERE is_active = 1)
+             AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL`
+        )
+        .all<{ user_id: string; id: string; ticker: string }>();
 
+  // Deduplicate price lookups across users/holdings
+  const priceCache = new Map<string, number | null>();
   const updatedTickers: Array<{ id: string; ticker: string; price: number }> = [];
   const failedTickers: string[] = [];
 
   for (const item of autoAssets.results) {
-    const price = await fetchTaiwanStockPrice(item.ticker, fetchImpl);
+    const key = item.ticker.trim().toUpperCase();
+    let price: number | null;
+    if (priceCache.has(key)) {
+      price = priceCache.get(key) ?? null;
+    } else {
+      price = await fetchTaiwanStockPrice(item.ticker, fetchImpl);
+      priceCache.set(key, price);
+    }
+
     if (price !== null) {
       await db
-        .prepare('UPDATE asset_items SET unit_price = ?, price_updated_at = ?, updated_at = ? WHERE id = ?')
-        .bind(price, nowIso, nowIso, item.id)
+        .prepare(
+          'UPDATE asset_items SET unit_price = ?, price_updated_at = ?, updated_at = ? WHERE user_id = ? AND id = ?'
+        )
+        .bind(price, nowIso, nowIso, item.user_id, item.id)
         .run();
       updatedTickers.push({ id: item.id, ticker: item.ticker, price });
     } else {
@@ -158,3 +195,4 @@ export async function refreshMarketData(
 
   return { usdTwdRate, fxUpdated, updatedTickers, failedTickers };
 }
+

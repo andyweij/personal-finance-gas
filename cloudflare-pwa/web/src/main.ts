@@ -2,7 +2,7 @@ import './styles.css';
 import { computeAllSavingsSummary } from '../../shared/calculations';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
-import { fetchAuthStatus } from './auth/authClient';
+import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount } from './auth/authClient';
 import { closeModal, el, fmtMoney, isDesktopDevice, setLoading, showToast } from './ui/helpers';
 import {
   getTodayYmd,
@@ -73,7 +73,13 @@ async function bootstrap(): Promise<void> {
   const parsedIdle = storedIdle !== null && !Number.isNaN(Number(storedIdle)) ? Number(storedIdle) : 5;
   const storedAlloc = localStorage.getItem('finance_alloc_mode');
   const storedStockView = localStorage.getItem('finance_stock_view_mode');
+  const remembered = getRememberedAccount();
   const now = new Date();
+
+  const urlParams = new URLSearchParams(window.location.search);
+  const inviteParam = (urlParams.get('invite') || '').trim();
+  const resetParam = (urlParams.get('reset') || '').trim();
+  const userParam = (urlParams.get('user') || '').trim();
 
   const state: AppUiState = {
     masked: localStorage.getItem('finance_masked') === '1',
@@ -108,10 +114,23 @@ async function bootstrap(): Promise<void> {
     passkeyCount: 0,
     authenticated: false,
     initialized: true,
+    currentUser: null,
   };
 
   let syncDebounce: number | undefined;
-  const localDb = new LocalFinanceDB();
+  let activeDb = new LocalFinanceDB(LocalFinanceDB.dbNameForUser(remembered?.id));
+
+  const createSyncEngineForDb = (db: LocalFinanceDB): SyncEngine =>
+    new SyncEngine(db, {
+      onStatusChange: (status) => renderSyncPill(status),
+      onSnapshotChange: () => ctx.renderAll(),
+      onAuthRequired: () => {
+        ctx.state.authenticated = false;
+        openAuthScreen(ctx, 'login', '登入憑證已過期，重新登入後將自動上傳待同步帳目', () => {
+          void ctx.engine.syncNow();
+        });
+      },
+    });
 
   const ctx: UiContext = {
     state,
@@ -133,23 +152,56 @@ async function bootstrap(): Promise<void> {
       }, 300);
     },
     navigateToTab: () => {},
+    applyUtilityTabVisibility: () => {
+      const show =
+        ctx.state.currentUser !== null
+          ? ctx.state.currentUser.showUtilityTab
+          : Boolean(remembered?.showUtilityTab);
+      const bar = el('toolsSubtabBar');
+      const utilBtn = bar.querySelector<HTMLButtonElement>('[data-tools-sub="utility"]');
+      if (utilBtn) {
+        utilBtn.style.display = show ? '' : 'none';
+      }
+      bar.classList.toggle('cols-3', show);
+      bar.classList.toggle('cols-2', !show);
+      if (!show && ctx.state.toolsSubtab === 'utility') {
+        ctx.state.toolsSubtab = 'recurring';
+        bar.querySelectorAll<HTMLButtonElement>('[data-tools-sub]').forEach((b) => {
+          b.classList.toggle('active', b.dataset.toolsSub === 'recurring');
+        });
+        el('subtab-recurring').style.display = 'flex';
+        el('subtab-sinking').style.display = 'none';
+        el('subtab-utility').style.display = 'none';
+      }
+    },
+    switchAccountDb: async (user) => {
+      ctx.state.currentUser = user;
+      saveRememberedAccount(user);
+      const nextDbName = LocalFinanceDB.dbNameForUser(user.id);
+      if (activeDb.getDbName() !== nextDbName) {
+        activeDb.close();
+        activeDb = new LocalFinanceDB(nextDbName);
+        const nextEngine = createSyncEngineForDb(activeDb);
+        ctx.engine = nextEngine;
+        await nextEngine.init();
+        const nextMeta = nextEngine.getMeta();
+        state.pinEnabled = nextMeta.pinEnabled;
+        state.pinSalt = nextMeta.pinSalt;
+        state.pinHash = nextMeta.pinHash;
+        state.passkeys = nextMeta.passkeys || [];
+        state.passkeyCount = state.passkeys.length;
+        state.biometricLockEnabled = Boolean(nextMeta.biometricLockEnabled);
+      }
+      ctx.applyUtilityTabVisibility();
+      ctx.renderAll();
+    },
   };
 
-  const engine = new SyncEngine(localDb, {
-    onStatusChange: (status) => renderSyncPill(status),
-    onSnapshotChange: () => ctx.renderAll(),
-    onAuthRequired: () => {
-      ctx.state.authenticated = false;
-      openAuthScreen(ctx, 'login', '登入憑證已過期，重新登入後將自動上傳待同步帳目', () => {
-        void ctx.engine.syncNow();
-      });
-    },
-  });
-  ctx.engine = engine;
+  ctx.engine = createSyncEngineForDb(activeDb);
 
-  // 1. 0ms 立即從本機 IndexedDB 載入畫面（離線也能秒開）
-  await engine.init();
-  const meta = engine.getMeta();
+  // 1. 0ms 立即從該帳號專屬的本機 IndexedDB 載入畫面（離線也能秒開）
+  await ctx.engine.init();
+  const meta = ctx.engine.getMeta();
   state.pinEnabled = meta.pinEnabled;
   state.pinSalt = meta.pinSalt;
   state.pinHash = meta.pinHash;
@@ -159,10 +211,11 @@ async function bootstrap(): Promise<void> {
 
   el<HTMLInputElement>('dateInput').value = getTodayYmd();
   renderLogCategories(ctx);
+  ctx.applyUtilityTabVisibility();
   updateSecurityButtons(ctx);
   ctx.renderAll();
 
-  if (isAnyLockEnabled(ctx)) {
+  if (!inviteParam && !resetParam && isAnyLockEnabled(ctx)) {
     openLockScreen(ctx, '');
   }
 
@@ -173,40 +226,56 @@ async function bootstrap(): Promise<void> {
 
   bindEvents(ctx);
 
+  // 網址帶入邀請碼或密碼重置碼時，直接開啟對應畫面
+  if (inviteParam) {
+    closeLockScreen(ctx);
+    openAuthScreen(ctx, 'register', '', () => void ctx.engine.syncNow(true), { inviteCode: inviteParam });
+    return;
+  }
+  if (resetParam) {
+    closeLockScreen(ctx);
+    openAuthScreen(ctx, 'reset', '', () => void ctx.engine.syncNow(true), {
+      resetCode: resetParam,
+      username: userParam,
+    });
+    return;
+  }
+
   // 2. 背景檢查雲端登入狀態並自動同步
   if (navigator.onLine) {
     try {
       const auth = await fetchAuthStatus();
       state.initialized = auth.initialized;
       state.authenticated = auth.authenticated;
-      state.passkeyCount = auth.passkeyCount;
-      if (auth.authenticated) {
-        state.pinEnabled = auth.pinEnabled;
+      if (auth.authenticated && auth.user) {
+        await ctx.switchAccountDb(auth.user);
+        state.pinEnabled = Boolean(auth.pinEnabled);
         state.pinSalt = auth.pinSalt || null;
         state.pinHash = auth.pinHash || null;
         state.passkeys = auth.passkeys || [];
-        await engine.updateLocalPinCache(state.pinEnabled, state.pinSalt, state.pinHash);
-        await engine.updateLocalBiometricCache(state.biometricLockEnabled, state.passkeys);
+        state.passkeyCount = auth.passkeyCount || 0;
+        await ctx.engine.updateLocalPinCache(state.pinEnabled, state.pinSalt, state.pinHash);
+        await ctx.engine.updateLocalBiometricCache(state.biometricLockEnabled, state.passkeys);
         updateSecurityButtons(ctx);
         if (!isAnyLockEnabled(ctx)) {
           closeLockScreen(ctx);
         }
-        void engine.syncNow();
+        void ctx.engine.syncNow();
       } else if (!auth.initialized) {
         state.pinEnabled = false;
         state.pinSalt = null;
         state.pinHash = null;
         state.biometricLockEnabled = false;
         state.passkeys = [];
-        await engine.updateLocalPinCache(false, null, null);
-        await engine.updateLocalBiometricCache(false, []);
+        await ctx.engine.updateLocalPinCache(false, null, null);
+        await ctx.engine.updateLocalBiometricCache(false, []);
         updateSecurityButtons(ctx);
         closeLockScreen(ctx);
-        openAuthScreen(ctx, 'setup', '', () => void engine.syncNow(true));
+        openAuthScreen(ctx, 'setup', '', () => void ctx.engine.syncNow(true));
       } else if (!meta.lastSyncedAt) {
         // 首次使用無本機快取時要求登入
         closeLockScreen(ctx);
-        openAuthScreen(ctx, 'login', '', () => void engine.syncNow(true));
+        openAuthScreen(ctx, 'login', '', () => void ctx.engine.syncNow(true));
       }
     } catch {
       // 離線或伺服器暫時無法連線，維持本機模式運作

@@ -1,4 +1,4 @@
-import type { CachedPasskeyDto } from '../../../shared/types';
+import type { AuthUser, CachedPasskeyDto } from '../../../shared/types';
 import type { SyncEngine } from '../sync/syncEngine';
 
 export interface AppUiState {
@@ -34,6 +34,7 @@ export interface AppUiState {
   passkeyCount: number;
   authenticated: boolean;
   initialized: boolean;
+  currentUser: AuthUser | null;
 }
 
 export interface UiContext {
@@ -42,4 +43,7 @@ export interface UiContext {
   renderAll: () => void;
   scheduleSync: () => void;
   navigateToTab: (tab: AppUiState['activeTab']) => void;
+  switchAccountDb: (user: AuthUser) => Promise<void>;
+  applyUtilityTabVisibility: () => void;
 }
+

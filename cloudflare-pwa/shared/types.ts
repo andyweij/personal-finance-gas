@@ -396,12 +396,47 @@ export interface CachedPasskeyDto {
   transports: string[];
 }
 
+export type UserRole = 'admin' | 'member';
+
+export interface AuthUser {
+  id: string;
+  username: string;
+  displayName: string;
+  role: UserRole;
+  showUtilityTab: boolean;
+}
+
+export interface AdminUserSummary {
+  id: string;
+  username: string;
+  displayName: string;
+  role: UserRole;
+  showUtilityTab: boolean;
+  isActive: boolean;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export interface InviteSummary {
+  id: string;
+  note: string;
+  expiresAt: string;
+  usedBy: string | null;
+  usedByUsername?: string | null;
+  usedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+  status: 'active' | 'used' | 'revoked' | 'expired';
+}
+
 export interface AuthStatusResponse {
   initialized: boolean;
   authenticated: boolean;
-  pinEnabled: boolean;
+  user?: AuthUser;
+  pinEnabled?: boolean;
   pinSalt?: string | null;
   pinHash?: string | null;
-  passkeyCount: number;
+  passkeyCount?: number;
   passkeys?: CachedPasskeyDto[];
 }
+
