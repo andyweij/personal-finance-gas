@@ -26,6 +26,7 @@ import {
   computePieArcs,
   computeTreemapRects,
 } from '../web/src/ui/stockCharts';
+import { computeDropTargetIndex } from '../web/src/ui/reorderHelper';
 import { DB_SCHEMA_VERSION, SW_CACHE_VERSION, VERSION_HIGHLIGHTS } from '../web/src/version';
 import { createTestD1 } from './helpers/mockD1';
 
@@ -673,6 +674,70 @@ describe('Custom PnL Color Scheme, Manual Sort Order & Stock Allocation Charts',
       const latestMigration = migrations[migrations.length - 1];
       expect(latestMigration.startsWith(`${DB_SCHEMA_VERSION}_`)).toBe(true);
       expect(VERSION_HIGHLIGHTS.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('7. Drag Target Multi-Slot Math & Rapid In-Flight Scheme Switching', () => {
+    it('computes exact multi-slot drop target index across any drag jump', () => {
+      const midpoints = [100, 160, 220, 280];
+      expect(computeDropTargetIndex(50, midpoints)).toBe(0);
+      expect(computeDropTargetIndex(130, midpoints)).toBe(1);
+      expect(computeDropTargetIndex(250, midpoints)).toBe(3);
+      expect(computeDropTargetIndex(400, midpoints)).toBe(4);
+    });
+
+    it('preserves tw_stocks when user switches tw -> tw_stocks while first sync is still in flight', async () => {
+      const d1 = createTestD1();
+      let releaseFirstSync!: () => void;
+      let syncCallCount = 0;
+
+      const delayedFetch: typeof fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        syncCallCount += 1;
+        const reqBody = JSON.parse(String(init?.body || '{}')) as SyncRequest;
+        const res = await processSyncRequest(d1, 'owner', reqBody);
+        if (syncCallCount === 2) {
+          // Hold the 'tw' sync response until after the user clicks 'tw_stocks'
+          await new Promise<void>((resolve) => {
+            releaseFirstSync = resolve;
+          });
+        }
+        return new Response(JSON.stringify(res), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }) as typeof fetch;
+
+      const db = new LocalFinanceDB(`inflight-pnl-${crypto.randomUUID()}`);
+      const engine = new SyncEngine(db, {
+        fetchImpl: delayedFetch,
+        isOnline: () => true,
+      });
+      await engine.init();
+      await engine.syncNow(true); // call 1: initial pull
+
+      // User clicks 'tw', starts syncing (call 2, held in flight)
+      await engine.savePnlColorScheme('tw');
+      const firstSyncPromise = engine.syncNow();
+
+      // Wait a tick for call 2 to start, then user immediately switches to 'tw_stocks'
+      await new Promise((r) => setTimeout(r, 20));
+      await engine.savePnlColorScheme('tw_stocks');
+      expect(engine.getSnapshot().settings.pnlColorScheme).toBe('tw_stocks');
+
+      // Release call 2 ('tw' finishes on server) -> must NOT revert local 'tw_stocks'
+      releaseFirstSync();
+      await firstSyncPromise;
+      expect(engine.getSnapshot().settings.pnlColorScheme).toBe('tw_stocks');
+      expect(engine.getConflicts()).toHaveLength(0);
+
+      // Next sync uploads rebased 'tw_stocks' cleanly with zero conflicts
+      const secondSync = await engine.syncNow();
+      expect(secondSync.ok).toBe(true);
+      expect(engine.getConflicts()).toHaveLength(0);
+      expect(engine.getSnapshot().settings.pnlColorScheme).toBe('tw_stocks');
+
+      const exported = await exportFullSnapshot(d1, 'owner');
+      expect(exported.settings.pnlColorScheme).toBe('tw_stocks');
     });
   });
 });

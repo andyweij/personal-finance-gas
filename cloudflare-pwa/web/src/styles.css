@@ -20,19 +20,19 @@
   --danger: #D70015;
   --danger-bar: #FF3B30;
   --danger-soft: rgba(255, 59, 48, 0.12);
-  /* Financial positive/negative semantic tokens (customizable via data-pnl-scheme) */
-  --pos: var(--success);
-  --pos-bar: var(--success-bar);
-  --pos-soft: var(--success-soft);
-  --neg: var(--danger);
-  --neg-bar: var(--danger-bar);
-  --neg-soft: var(--danger-soft);
-  --stock-pos: var(--pos);
-  --stock-pos-bar: var(--pos-bar);
-  --stock-pos-soft: var(--pos-soft);
-  --stock-neg: var(--neg);
-  --stock-neg-bar: var(--neg-bar);
-  --stock-neg-soft: var(--neg-soft);
+  /* Financial positive/negative semantic tokens (customizable via data-pnl-scheme / .pnl-scheme-*) */
+  --pos: #248A3D;
+  --pos-bar: #34C759;
+  --pos-soft: rgba(52, 199, 89, 0.13);
+  --neg: #D70015;
+  --neg-bar: #FF3B30;
+  --neg-soft: rgba(255, 59, 48, 0.12);
+  --stock-pos: #248A3D;
+  --stock-pos-bar: #34C759;
+  --stock-pos-soft: rgba(52, 199, 89, 0.13);
+  --stock-neg: #D70015;
+  --stock-neg-bar: #FF3B30;
+  --stock-neg-soft: rgba(255, 59, 48, 0.12);
   --glass: rgba(242, 242, 247, 0.84);
   --lock-glass: rgba(242, 242, 247, 0.94);
   --seg-active-bg: #FFFFFF;
@@ -65,6 +65,18 @@
     --danger: #FF453A;
     --danger-bar: #FF453A;
     --danger-soft: rgba(255, 69, 58, 0.16);
+    --pos: #30D158;
+    --pos-bar: #30D158;
+    --pos-soft: rgba(48, 209, 88, 0.16);
+    --neg: #FF453A;
+    --neg-bar: #FF453A;
+    --neg-soft: rgba(255, 69, 58, 0.16);
+    --stock-pos: #30D158;
+    --stock-pos-bar: #30D158;
+    --stock-pos-soft: rgba(48, 209, 88, 0.16);
+    --stock-neg: #FF453A;
+    --stock-neg-bar: #FF453A;
+    --stock-neg-soft: rgba(255, 69, 58, 0.16);
     --glass: rgba(28, 28, 30, 0.82);
     --lock-glass: rgba(12, 12, 14, 0.94);
     --seg-active-bg: #3A3A3C;
@@ -73,22 +85,70 @@
   }
 }
 
-:root[data-pnl-scheme="tw"] {
-  --pos: var(--danger);
-  --pos-bar: var(--danger-bar);
-  --pos-soft: var(--danger-soft);
-  --neg: var(--success);
-  --neg-bar: var(--success-bar);
-  --neg-soft: var(--success-soft);
+html[data-pnl-scheme="tw"],
+html.pnl-scheme-tw {
+  --pos: #D70015;
+  --pos-bar: #FF3B30;
+  --pos-soft: rgba(255, 59, 48, 0.12);
+  --neg: #248A3D;
+  --neg-bar: #34C759;
+  --neg-soft: rgba(52, 199, 89, 0.13);
+  --stock-pos: #D70015;
+  --stock-pos-bar: #FF3B30;
+  --stock-pos-soft: rgba(255, 59, 48, 0.12);
+  --stock-neg: #248A3D;
+  --stock-neg-bar: #34C759;
+  --stock-neg-soft: rgba(52, 199, 89, 0.13);
 }
 
-:root[data-pnl-scheme="tw_stocks"] {
-  --stock-pos: var(--danger);
-  --stock-pos-bar: var(--danger-bar);
-  --stock-pos-soft: var(--danger-soft);
-  --stock-neg: var(--success);
-  --stock-neg-bar: var(--success-bar);
-  --stock-neg-soft: var(--success-soft);
+html[data-pnl-scheme="tw_stocks"],
+html.pnl-scheme-tw_stocks {
+  --pos: #248A3D;
+  --pos-bar: #34C759;
+  --pos-soft: rgba(52, 199, 89, 0.13);
+  --neg: #D70015;
+  --neg-bar: #FF3B30;
+  --neg-soft: rgba(255, 59, 48, 0.12);
+  --stock-pos: #D70015;
+  --stock-pos-bar: #FF3B30;
+  --stock-pos-soft: rgba(255, 59, 48, 0.12);
+  --stock-neg: #248A3D;
+  --stock-neg-bar: #34C759;
+  --stock-neg-soft: rgba(52, 199, 89, 0.13);
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-pnl-scheme="tw"],
+  html.pnl-scheme-tw {
+    --pos: #FF453A;
+    --pos-bar: #FF453A;
+    --pos-soft: rgba(255, 69, 58, 0.16);
+    --neg: #30D158;
+    --neg-bar: #30D158;
+    --neg-soft: rgba(48, 209, 88, 0.16);
+    --stock-pos: #FF453A;
+    --stock-pos-bar: #FF453A;
+    --stock-pos-soft: rgba(255, 69, 58, 0.16);
+    --stock-neg: #30D158;
+    --stock-neg-bar: #30D158;
+    --stock-neg-soft: rgba(48, 209, 88, 0.16);
+  }
+
+  html[data-pnl-scheme="tw_stocks"],
+  html.pnl-scheme-tw_stocks {
+    --pos: #30D158;
+    --pos-bar: #30D158;
+    --pos-soft: rgba(48, 209, 88, 0.16);
+    --neg: #FF453A;
+    --neg-bar: #FF453A;
+    --neg-soft: rgba(255, 69, 58, 0.16);
+    --stock-pos: #FF453A;
+    --stock-pos-bar: #FF453A;
+    --stock-pos-soft: rgba(255, 69, 58, 0.16);
+    --stock-neg: #30D158;
+    --stock-neg-bar: #30D158;
+    --stock-neg-soft: rgba(48, 209, 88, 0.16);
+  }
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -1154,11 +1214,29 @@ body {
   height: 0.5px;
   background: var(--sep);
 }
-.reorder-row.dragging {
-  z-index: 5;
-  background: var(--surface-alt);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
-  border-radius: 10px;
+body.is-reordering-drag {
+  user-select: none;
+  -webkit-user-select: none;
+  overscroll-behavior: none;
+}
+.reorder-row.dragging,
+.reorder-row.dragging-floating {
+  z-index: 999;
+  background: var(--surface);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22), 0 0 0 1.5px var(--primary);
+  border-radius: 12px;
+  transition: none;
+}
+.reorder-row.dragging-floating::before {
+  display: none;
+}
+.reorder-placeholder {
+  border-radius: 11px;
+  border: 1.5px dashed var(--primary);
+  background: var(--primary-soft);
+  margin: 2px 6px;
+  box-sizing: border-box;
+  transition: height 0.12s ease;
 }
 .reorder-rank {
   width: 24px;
@@ -1189,8 +1267,8 @@ body {
   cursor: not-allowed;
 }
 .reorder-handle {
-  width: 34px;
-  height: 34px;
+  width: 40px;
+  height: 38px;
   border-radius: 10px;
   border: none;
   background: var(--fill);
@@ -1207,6 +1285,10 @@ body {
   cursor: grabbing;
   background: var(--primary-soft);
   color: var(--primary);
+}
+.badge.stock-recovered {
+  background: var(--stock-pos-soft);
+  color: var(--stock-pos);
 }
 
 /* ==================== Stock Allocation Charts UI ==================== */

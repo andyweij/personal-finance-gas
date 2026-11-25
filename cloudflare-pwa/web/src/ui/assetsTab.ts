@@ -346,16 +346,25 @@ export function renderAssetsTab(ctx: UiContext): void {
       b.textContent = item.subCategory;
       sub.appendChild(b);
       const displayQty = stockPos ? stockPos.currentShares : item.quantityOrAmount;
-      const pnlSuffix =
-        stockPos && stockPos.hasCostBasis
-          ? ` · 含息 ${fmtSignedMoney(stockPos.totalReturnPnlTwd, ctx.state.masked)}`
-          : '';
       const detail = item.ticker || isStock
-        ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}${pnlSuffix}`
+        ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}`
         : item.currency === 'USD'
           ? fmtRaw(item.quantityOrAmount, 'USD', ctx.state.masked)
           : item.liquidity;
       sub.appendChild(document.createTextNode(detail));
+      if (stockPos && stockPos.hasCostBasis) {
+        sub.appendChild(document.createTextNode(' · '));
+        const pnlSpan = document.createElement('span');
+        pnlSpan.style.fontWeight = '600';
+        pnlSpan.style.color =
+          stockPos.totalReturnPnlTwd > 0
+            ? 'var(--stock-pos)'
+            : stockPos.totalReturnPnlTwd < 0
+              ? 'var(--stock-neg)'
+              : 'var(--text-secondary)';
+        pnlSpan.textContent = `含息 ${fmtSignedMoney(stockPos.totalReturnPnlTwd, ctx.state.masked)}`;
+        sub.appendChild(pnlSpan);
+      }
       main.appendChild(t);
       main.appendChild(sub);
 

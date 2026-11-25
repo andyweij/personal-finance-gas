@@ -234,7 +234,7 @@ export function renderStocksTab(ctx: UiContext): void {
   const unrecoveredText = el('stocksUnrecoveredText');
   recoveryBar.style.width = `${Math.min(100, Math.max(0, portfolio.overallCostRecoveryPct))}%`;
   recoveryBar.style.background =
-    portfolio.overallCostRecoveryPct >= 100 ? 'var(--success)' : 'var(--primary)';
+    portfolio.overallCostRecoveryPct >= 100 ? 'var(--stock-pos-bar)' : 'var(--primary)';
   recoveryPctText.textContent = `整體配息回本：${portfolio.overallCostRecoveryPct.toFixed(1)}%`;
   if (!portfolio.hasAnyCostBasis) {
     unrecoveredText.textContent = '尚未設定成本';
@@ -371,7 +371,7 @@ function renderStockPositionCard(
   }
   if (pos.isCostRecovered) {
     const recBadge = document.createElement('span');
-    recBadge.className = 'badge green';
+    recBadge.className = 'badge stock-recovered';
     recBadge.style.marginRight = '0';
     recBadge.textContent = '✓ 已回本';
     titleRow.appendChild(recBadge);
@@ -534,7 +534,7 @@ function renderStockPositionCard(
       const fill = document.createElement('div');
       fill.className = 'progress-fill';
       fill.style.width = `${Math.min(100, Math.max(0, pos.costRecoveryPct))}%`;
-      fill.style.background = pos.isCostRecovered ? 'var(--success)' : 'var(--primary)';
+      fill.style.background = pos.isCostRecovered ? 'var(--stock-pos-bar)' : 'var(--primary)';
       track.appendChild(fill);
 
       const meta = document.createElement('div');

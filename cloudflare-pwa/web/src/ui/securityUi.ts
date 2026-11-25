@@ -792,8 +792,10 @@ export function openSecurityModal(ctx: UiContext): void {
     btn.appendChild(preview);
     btn.addEventListener('click', async () => {
       try {
+        ctx.applyPnlColorScheme(opt.id);
         await ctx.engine.savePnlColorScheme(opt.id);
         ctx.applyPnlColorScheme(opt.id);
+        ctx.renderAll();
         ctx.scheduleSync();
         showToast(`已切換配色：${opt.title}`, 'success');
         openSecurityModal(ctx);

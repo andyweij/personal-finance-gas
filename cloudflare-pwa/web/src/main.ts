@@ -90,6 +90,8 @@ async function bootstrap(): Promise<void> {
   const now = new Date();
 
   document.documentElement.dataset.pnlScheme = storedPnlScheme;
+  document.documentElement.classList.remove('pnl-scheme-intl', 'pnl-scheme-tw', 'pnl-scheme-tw_stocks');
+  document.documentElement.classList.add(`pnl-scheme-${storedPnlScheme}`);
 
   const urlParams = new URLSearchParams(window.location.search);
   const inviteParam = (urlParams.get('invite') || '').trim();
@@ -167,6 +169,8 @@ async function bootstrap(): Promise<void> {
     const normalized = normalizePnlColorScheme(scheme);
     state.pnlColorScheme = normalized;
     document.documentElement.dataset.pnlScheme = normalized;
+    document.documentElement.classList.remove('pnl-scheme-intl', 'pnl-scheme-tw', 'pnl-scheme-tw_stocks');
+    document.documentElement.classList.add(`pnl-scheme-${normalized}`);
     localStorage.setItem('finance_pnl_scheme', normalized);
   };
 

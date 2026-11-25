@@ -1273,7 +1273,6 @@ export class SyncEngine {
       }
 
       const merged = this.mergeDelta(this.snapshot, data.delta, forceFullPull);
-      this.snapshot = merged;
       this.meta = {
         ...this.meta,
         lastSyncedAt: data.serverTime,
@@ -1283,7 +1282,43 @@ export class SyncEngine {
         ...(data.ackedMutationIds || []),
         ...incomingConflicts.map((c) => c.mutationId),
       ];
-      await this.db.acknowledgeOutboxAndSave(outboxIdsToClear, this.snapshot, this.meta, this.conflicts);
+      const clearedSet = new Set(outboxIdsToClear);
+      const currentOutbox = await this.db.getOutbox();
+      const pendingSettingsMut = currentOutbox.find(
+        (m) => m.entity === 'settings' && !clearedSet.has(m.mutationId)
+      );
+
+      if (pendingSettingsMut && pendingSettingsMut.payload && data.delta.settings) {
+        // User changed settings again while an earlier sync was in flight:
+        // preserve local pending settings fields and rebase baseVersion to server's latest version
+        const p = pendingSettingsMut.payload as Partial<AppSettings>;
+        const rebasedSettings: AppSettings = {
+          ...merged.settings,
+          ...(p.monthlyDailyBudget !== undefined ? { monthlyDailyBudget: p.monthlyDailyBudget } : {}),
+          ...(p.emergencyTargetMonths !== undefined ? { emergencyTargetMonths: p.emergencyTargetMonths } : {}),
+          ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
+          ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
+        };
+        this.snapshot = { ...merged, settings: rebasedSettings };
+        await this.db.acknowledgeOutboxAndSave(
+          [...outboxIdsToClear, pendingSettingsMut.mutationId],
+          this.snapshot,
+          this.meta,
+          this.conflicts
+        );
+        await this.db.commitLocalMutation(this.snapshot, [
+          {
+            ...pendingSettingsMut,
+            mutationId: crypto.randomUUID(),
+            baseVersion: data.delta.settings.version,
+            payload: { ...rebasedSettings },
+          },
+        ]);
+      } else {
+        this.snapshot = merged;
+        await this.db.acknowledgeOutboxAndSave(outboxIdsToClear, this.snapshot, this.meta, this.conflicts);
+      }
+
       const remainingOutbox = await this.db.getOutbox();
       this.emitSnapshot();
       this.updateStatus(this.computeStatus(remainingOutbox.length));
