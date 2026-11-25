@@ -973,5 +973,83 @@ body {
   gap: 8px;
 }
 
+/* ==================== In-App Help Guide Accordion ==================== */
+.help-intro {
+  padding: 10px 12px;
+  border-radius: 11px;
+  background: var(--surface-alt);
+  margin-bottom: 12px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+.help-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.help-item {
+  border-radius: 12px;
+  border: 0.5px solid var(--sep);
+  background: var(--surface);
+  overflow: hidden;
+}
+.help-summary {
+  padding: 11px 13px;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+}
+.help-summary::-webkit-details-marker {
+  display: none;
+}
+.help-summary::after {
+  content: '▾';
+  font-size: 13px;
+  color: var(--text-tertiary);
+  transition: transform 0.18s ease;
+}
+.help-item[open] > .help-summary {
+  background: var(--surface-alt);
+  border-bottom: 0.5px solid var(--sep);
+}
+.help-item[open] > .help-summary::after {
+  transform: rotate(180deg);
+}
+.help-content {
+  padding: 11px 13px 12px;
+}
+.help-formula {
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+.help-bullets {
+  margin: 0;
+  padding-left: 17px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+.help-bullets strong {
+  color: var(--text);
+}
+
+
 
 

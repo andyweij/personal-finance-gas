@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'finance-pwa-v12';
+const CACHE_VERSION = 'finance-pwa-v13';
 const APP_SHELL_URLS = [
   '/',
   '/index.html',

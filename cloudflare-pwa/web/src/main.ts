@@ -28,6 +28,7 @@ import {
 } from './ui/securityUi';
 import { initBottomNavScrub } from './ui/tabBarScrub';
 import { openConflictsModal } from './ui/conflictUi';
+import { openHelpGuideModal } from './ui/helpGuideUi';
 import type { AppUiState, UiContext } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
@@ -546,6 +547,8 @@ function bindEvents(ctx: UiContext): void {
   });
 
   // Tab 2 Overview events
+  el('overviewHelpBtn').addEventListener('click', () => openHelpGuideModal('savings'));
+
   document.querySelectorAll<HTMLButtonElement>('[data-period]').forEach((btn) => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('[data-period]').forEach((b) => b.classList.remove('active'));

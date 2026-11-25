@@ -17,6 +17,7 @@ import {
 } from '../auth/authClient';
 import { triggerOfflineFaceIdUnlock } from '../auth/offlineWebAuthn';
 import { openFamilyAdminModal } from './adminUi';
+import { openHelpGuideModal } from './helpGuideUi';
 import {
   closeModal,
   downloadTextFile,
@@ -610,6 +611,14 @@ function openChangePasswordModal(ctx: UiContext): void {
 export function openSecurityModal(ctx: UiContext): void {
   const body = openModal('帳號、安全與資料備份');
   const user = ctx.state.currentUser;
+
+  const guideBtn = document.createElement('button');
+  guideBtn.type = 'button';
+  guideBtn.className = 'btn btn-tinted btn-block btn-sm';
+  guideBtn.style.marginBottom = '12px';
+  guideBtn.textContent = '📖 使用指南與計算口徑說明（離線可查）';
+  guideBtn.addEventListener('click', () => openHelpGuideModal());
+  body.appendChild(guideBtn);
 
   // 0. Current Account + Utility Tab Toggle + Admin Family Entry
   if (user) {
