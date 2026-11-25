@@ -82,6 +82,7 @@ export function renderOverviewTab(ctx: UiContext): void {
     ['房貸 / 車貸固定支出', monthly.fixedExpense, yearly.fixedExpense],
     ['常態性訂閱扣款', monthly.subscription, yearly.subscription],
     ['日常花費', monthly.dailyExpense, yearly.dailyExpense],
+    ['稅金攤提(月) / 實支(年)', monthly.sinkingReserve, yearly.taxLargeActual],
     ['台股定期定額 / 加碼', monthly.investmentStock, yearly.investmentStock],
     ['中信基金 / 其他投資', monthly.investmentFund + monthly.investmentOther, yearly.investmentFund + yearly.investmentOther],
     ['總儲蓄（投資＋結餘）', monthly.totalSavings, yearly.totalSavings, true],

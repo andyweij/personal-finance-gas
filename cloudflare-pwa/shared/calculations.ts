@@ -650,6 +650,7 @@ export function aggregatePeriodMetrics(
       totalIncome += amt;
       if (l.category === '薪資') salary += amt;
       else if (l.category === '房租收入') rentIncome += amt;
+      else otherIncome += amt;
     } else if (l.type === CASHFLOW_TYPES.OTHER_INCOME) {
       totalIncome += amt;
       otherIncome += amt;

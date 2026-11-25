@@ -520,4 +520,72 @@ describe('shared/csv', () => {
     const csv = buildUtilityCsv(chained);
     expect(csv).toContain('11509,59341,61261,1920');
   });
+
+  it('reconciles custom FIXED_INCOME categories into otherIncome and keeps monthly sinking reserve transparent', () => {
+    const logs: CashFlowLog[] = [
+      {
+        id: '1',
+        date: '2026-11-01',
+        yearMonth: '2026-11',
+        type: CASHFLOW_TYPES.FIXED_INCOME,
+        category: '薪資',
+        itemName: '本薪',
+        amount: 87000,
+        currency: 'TWD',
+        fxRate: 1,
+        twdAmount: 87000,
+        source: '自動入帳',
+        note: '',
+        createdAt: '',
+        updatedAt: '',
+      },
+      {
+        id: '2',
+        date: '2026-11-01',
+        yearMonth: '2026-11',
+        type: CASHFLOW_TYPES.FIXED_INCOME,
+        category: '額外津貼',
+        itemName: '津貼',
+        amount: 24000,
+        currency: 'TWD',
+        fxRate: 1,
+        twdAmount: 24000,
+        source: '自動入帳',
+        note: '',
+        createdAt: '',
+        updatedAt: '',
+      },
+      {
+        id: '3',
+        date: '2026-11-01',
+        yearMonth: '2026-11',
+        type: CASHFLOW_TYPES.FIXED_INCOME,
+        category: '房租收入',
+        itemName: '6F 房租',
+        amount: 12000,
+        currency: 'TWD',
+        fxRate: 1,
+        twdAmount: 12000,
+        source: '自動入帳',
+        note: '',
+        createdAt: '',
+        updatedAt: '',
+      },
+    ];
+
+    const monthly = aggregatePeriodMetrics(logs, 1500, true);
+    const yearly = aggregatePeriodMetrics(logs, 18000, false);
+
+    // Every dollar of FIXED_INCOME is accounted for in salary + rentIncome + otherIncome
+    expect(monthly.salary).toBe(87000);
+    expect(monthly.rentIncome).toBe(12000);
+    expect(monthly.otherIncome).toBe(24000);
+    expect(monthly.salary + monthly.rentIncome + monthly.otherIncome).toBe(monthly.totalIncome);
+
+    // Monthly includes 1,500 sinking reserve, while yearly uses actual taxLargeActual (0)
+    expect(monthly.sinkingReserve).toBe(1500);
+    expect(yearly.taxLargeActual).toBe(0);
+    expect(yearly.totalSavings - monthly.totalSavings).toBe(1500);
+  });
 });
+

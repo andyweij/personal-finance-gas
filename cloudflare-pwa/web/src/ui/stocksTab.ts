@@ -1,4 +1,4 @@
-import { STOCK_TX_TYPES } from '../../../shared/constants';
+import { CASHFLOW_TYPES, STOCK_TX_TYPES } from '../../../shared/constants';
 import {
   computeAllSavingsSummary,
   computeStockPortfolioSummary,
@@ -880,10 +880,56 @@ export function openStockTradeModal(
       'trSyncCf',
       'trLinkedAcc',
       isBuy ? '同步寫入流水帳（投資流出）並扣減活存' : '同步寫入流水帳（其他收入）並加計活存',
-      isBuy ? '避免在記帳頁重複記一次投資流出' : '賣出款項若要直接入帳活存可勾選',
+      isBuy ? '僅限「額外臨時加碼」勾選；定期定額已由固定收支扣款請勿重複勾選' : '賣出款項若要直接入帳活存可勾選',
       false
     )
   );
+
+  if (isBuy) {
+    const dupHint = document.createElement('div');
+    dupHint.className = 'stock-live-preview tnum';
+    dupHint.style.cssText = 'display:none;margin-top:8px;font-size:12px;line-height:1.55';
+    form.appendChild(dupHint);
+
+    const dateInp = form.querySelector<HTMLInputElement>('#trDate')!;
+    const syncCb = form.querySelector<HTMLInputElement>('#trSyncCf')!;
+
+    const refreshDupHint = () => {
+      const ym = String(dateInp.value || todayYmdLocal()).slice(0, 7);
+      const monthInvLogs = snap.cashflowLogs.filter(
+        (l) => !l.deletedAt && l.yearMonth === ym && l.type === CASHFLOW_TYPES.INVESTMENT
+      );
+      const monthInvTotal = monthInvLogs.reduce((s, l) => s + l.twdAmount, 0);
+      const hasAutoRecurringInv = monthInvLogs.some((l) => l.source === '自動入帳');
+      const activeRecInvCount = snap.recurringItems.filter(
+        (r) => !r.deletedAt && r.status === '啟用' && r.type === CASHFLOW_TYPES.INVESTMENT
+      ).length;
+
+      if (monthInvTotal <= 0 && activeRecInvCount === 0) {
+        dupHint.style.display = 'none';
+        return;
+      }
+
+      dupHint.style.display = 'block';
+      const checked = syncCb.checked;
+      dupHint.className = checked ? 'stock-warn-box tnum' : 'stock-live-preview tnum';
+
+      if (monthInvTotal > 0) {
+        const tag = hasAutoRecurringInv ? '（含每月固定排程入帳）' : '';
+        dupHint.textContent = checked
+          ? `⚠️ ${ym} 流水帳已有投資流出 ${fmtMoney(monthInvTotal, ctx.state.masked)}${tag}！若本次為定期定額請「取消勾選」以免重複扣款；若為額外加碼則可保留勾選。`
+          : `💡 ${ym} 流水帳已有投資流出 ${fmtMoney(monthInvTotal, ctx.state.masked)}${tag}。定期定額請維持不勾選（只更新股數與均價，不重複扣款）。`;
+      } else {
+        dupHint.textContent = checked
+          ? `⚠️ 你已有 ${activeRecInvCount} 筆啟用中的固定投資排程，若本次屬於定期定額請取消勾選以免重複計算。`
+          : `💡 你已有 ${activeRecInvCount} 筆啟用中的固定投資排程；定期定額維持不勾選即可避免重複扣款。`;
+      }
+    };
+
+    dateInp.addEventListener('change', refreshDupHint);
+    syncCb.addEventListener('change', refreshDupHint);
+    refreshDupHint();
+  }
 
   const sharesInp = form.querySelector<HTMLInputElement>('#trShares')!;
   const amtInp = form.querySelector<HTMLInputElement>('#trAmount')!;
