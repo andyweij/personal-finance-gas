@@ -17,6 +17,74 @@ import type {
   StockTransaction,
 } from './types';
 
+export function compareBySortOrder<T extends { sortOrder?: number; createdAt: string; id: string }>(
+  a: T,
+  b: T
+): number {
+  const oa = a.sortOrder ?? 0;
+  const ob = b.sortOrder ?? 0;
+  if (oa !== ob) return oa - ob;
+  return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+}
+
+/**
+ * Reorder a visible subset of items (e.g. stocks, a filtered recurring category, or one asset section)
+ * within the full list while preserving the relative slots of items outside the subset.
+ * Returns the full reordered list (with normalized 1-based sortOrder) and only the items whose sortOrder changed.
+ */
+export function applySubsetReorder<T extends { id: string; sortOrder?: number; createdAt: string; deletedAt?: string | null }>(
+  allItems: T[],
+  orderedSubsetIds: string[]
+): { nextItems: T[]; changedItems: T[] } {
+  const active = allItems.filter((item) => !item.deletedAt).slice().sort(compareBySortOrder);
+  const deleted = allItems.filter((item) => Boolean(item.deletedAt));
+
+  const byId = new Map(active.map((item) => [item.id, item]));
+  const subsetIdSet = new Set<string>();
+  const orderedSubset: T[] = [];
+  for (const id of orderedSubsetIds) {
+    if (subsetIdSet.has(id)) continue;
+    const found = byId.get(id);
+    if (found) {
+      subsetIdSet.add(id);
+      orderedSubset.push(found);
+    }
+  }
+
+  if (orderedSubset.length < 2) {
+    return { nextItems: [...active, ...deleted], changedItems: [] };
+  }
+
+  // Find the exact slot positions occupied by the subset in the currently sorted full list
+  const slotIndices: number[] = [];
+  active.forEach((item, idx) => {
+    if (subsetIdSet.has(item.id)) {
+      slotIndices.push(idx);
+    }
+  });
+
+  const reorderedActive = active.slice();
+  slotIndices.forEach((slotIdx, i) => {
+    reorderedActive[slotIdx] = orderedSubset[i];
+  });
+
+  const changedItems: T[] = [];
+  const normalizedActive = reorderedActive.map((item, idx) => {
+    const nextOrder = idx + 1;
+    if ((item.sortOrder ?? 0) !== nextOrder) {
+      const updated = { ...item, sortOrder: nextOrder };
+      changedItems.push(updated);
+      return updated;
+    }
+    return item;
+  });
+
+  return {
+    nextItems: [...normalizedActive, ...deleted],
+    changedItems,
+  };
+}
+
 function getTodayYmdLocal(): string {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -327,7 +395,10 @@ export function computeAllSavingsSummary(
   adjustments: SavingsAdjustment[],
   usdTwdRate: number
 ): AllSavingsSummary {
-  const linkedAccounts = assets.filter((a) => !a.deletedAt && a.isLinkedSavings);
+  const linkedAccounts = assets
+    .filter((a) => !a.deletedAt && a.isLinkedSavings)
+    .slice()
+    .sort(compareBySortOrder);
   const accounts = linkedAccounts.map((acc) =>
     computeSavingsAccountSummary(acc, logs, adjustments, usdTwdRate)
   );
@@ -506,7 +577,10 @@ export function computeStockPortfolioSummary(
   stockTransactions: StockTransaction[],
   usdTwdRate: number
 ): StockPortfolioSummary {
-  const stockAssets = (assets || []).filter((a) => isStockAsset(a));
+  const stockAssets = (assets || [])
+    .filter((a) => isStockAsset(a))
+    .slice()
+    .sort(compareBySortOrder);
   const positions = stockAssets.map((a) =>
     computeStockPositionSummary(a, stockTransactions || [], usdTwdRate)
   );
@@ -699,6 +773,142 @@ export function aggregatePeriodMetrics(
     mortgage: Math.round(mortgage),
     carLoan: Math.round(carLoan),
   };
+}
+
+function buildCategoryChildren(
+  monthLogs: CashFlowLog[],
+  yearLogs: CashFlowLog[],
+  targetType: string
+): Array<{ label: string; monthlyAmount: number; yearlyAmount: number }> {
+  const map = new Map<string, { monthly: number; yearly: number }>();
+  for (const l of yearLogs) {
+    if (l.deletedAt || l.type !== targetType) continue;
+    const key = l.category || l.itemName || '其他';
+    const cur = map.get(key) || { monthly: 0, yearly: 0 };
+    cur.yearly += l.twdAmount;
+    map.set(key, cur);
+  }
+  for (const l of monthLogs) {
+    if (l.deletedAt || l.type !== targetType) continue;
+    const key = l.category || l.itemName || '其他';
+    const cur = map.get(key) || { monthly: 0, yearly: 0 };
+    cur.monthly += l.twdAmount;
+    map.set(key, cur);
+  }
+  return Array.from(map.entries())
+    .map(([label, v]) => ({
+      label,
+      monthlyAmount: Math.round(v.monthly),
+      yearlyAmount: Math.round(v.yearly),
+    }))
+    .sort((a, b) => b.yearlyAmount - a.yearlyAmount || b.monthlyAmount - a.monthlyAmount || a.label.localeCompare(b.label));
+}
+
+export function computeOverviewBreakdownGroups(
+  monthLogs: CashFlowLog[],
+  yearLogs: CashFlowLog[],
+  sinkingItems: SinkingFundItem[],
+  monthly: PeriodMetrics,
+  yearly: PeriodMetrics
+): Array<{
+  key: string;
+  label: string;
+  monthlyAmount: number;
+  yearlyAmount: number;
+  isTotal?: boolean;
+  children: Array<{ label: string; monthlyAmount: number; yearlyAmount: number }>;
+}> {
+  const sumByType = (logs: CashFlowLog[], type: string): number =>
+    Math.round(logs.filter((l) => !l.deletedAt && l.type === type).reduce((s, l) => s + l.twdAmount, 0));
+
+  // Build sinking/tax breakdown combining active sinking items (monthly reserve) + actual YTD tax/large logs
+  const sinkingChildrenMap = new Map<string, { monthly: number; yearly: number }>();
+  const activeSinking = (sinkingItems || [])
+    .filter((s) => !s.deletedAt && s.status === '啟用')
+    .slice()
+    .sort(compareBySortOrder);
+  for (const sf of activeSinking) {
+    const reserve = computeSinkingMonthlyReserve(sf);
+    const cur = sinkingChildrenMap.get(sf.itemName) || { monthly: 0, yearly: 0 };
+    cur.monthly += reserve;
+    sinkingChildrenMap.set(sf.itemName, cur);
+  }
+  for (const l of yearLogs) {
+    if (l.deletedAt || l.type !== CASHFLOW_TYPES.TAX_LARGE) continue;
+    // Match an active sinking item by name if possible, else group by category
+    const matched = activeSinking.find((sf) => l.itemName.includes(sf.itemName));
+    const key = matched ? matched.itemName : l.category || l.itemName || '其他稅金/大額';
+    const cur = sinkingChildrenMap.get(key) || { monthly: 0, yearly: 0 };
+    cur.yearly += l.twdAmount;
+    sinkingChildrenMap.set(key, cur);
+  }
+  const sinkingChildren = Array.from(sinkingChildrenMap.entries())
+    .map(([label, v]) => ({
+      label,
+      monthlyAmount: Math.round(v.monthly),
+      yearlyAmount: Math.round(v.yearly),
+    }))
+    .sort((a, b) => b.yearlyAmount - a.yearlyAmount || b.monthlyAmount - a.monthlyAmount);
+
+  return [
+    {
+      key: 'fixed_income',
+      label: '固定收入',
+      monthlyAmount: sumByType(monthLogs, CASHFLOW_TYPES.FIXED_INCOME),
+      yearlyAmount: sumByType(yearLogs, CASHFLOW_TYPES.FIXED_INCOME),
+      children: buildCategoryChildren(monthLogs, yearLogs, CASHFLOW_TYPES.FIXED_INCOME),
+    },
+    {
+      key: 'other_income',
+      label: '其他收入',
+      monthlyAmount: sumByType(monthLogs, CASHFLOW_TYPES.OTHER_INCOME),
+      yearlyAmount: sumByType(yearLogs, CASHFLOW_TYPES.OTHER_INCOME),
+      children: buildCategoryChildren(monthLogs, yearLogs, CASHFLOW_TYPES.OTHER_INCOME),
+    },
+    {
+      key: 'fixed_expense',
+      label: '固定支出',
+      monthlyAmount: monthly.fixedExpense,
+      yearlyAmount: yearly.fixedExpense,
+      children: buildCategoryChildren(monthLogs, yearLogs, CASHFLOW_TYPES.FIXED_EXPENSE),
+    },
+    {
+      key: 'subscription',
+      label: '訂閱扣款',
+      monthlyAmount: monthly.subscription,
+      yearlyAmount: yearly.subscription,
+      children: buildCategoryChildren(monthLogs, yearLogs, CASHFLOW_TYPES.SUBSCRIPTION),
+    },
+    {
+      key: 'daily_expense',
+      label: '日常花費',
+      monthlyAmount: monthly.dailyExpense,
+      yearlyAmount: yearly.dailyExpense,
+      children: buildCategoryChildren(monthLogs, yearLogs, CASHFLOW_TYPES.DAILY_EXPENSE),
+    },
+    {
+      key: 'sinking_tax',
+      label: '稅金攤提(月) / 實支(年)',
+      monthlyAmount: monthly.sinkingReserve,
+      yearlyAmount: yearly.taxLargeActual,
+      children: sinkingChildren,
+    },
+    {
+      key: 'investment',
+      label: '投資流出',
+      monthlyAmount: monthly.investment,
+      yearlyAmount: yearly.investment,
+      children: buildCategoryChildren(monthLogs, yearLogs, CASHFLOW_TYPES.INVESTMENT),
+    },
+    {
+      key: 'total_savings',
+      label: '總儲蓄（投資＋結餘）',
+      monthlyAmount: monthly.totalSavings,
+      yearlyAmount: yearly.totalSavings,
+      isTotal: true,
+      children: [],
+    },
+  ];
 }
 
 export function computeMonthlyTrend(logs: CashFlowLog[], year: number): MonthlyTrendPoint[] {

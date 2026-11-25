@@ -5,13 +5,16 @@ import {
   ASSET_UPDATE_MODES,
   BILLING_CYCLES,
   CURRENCIES,
+  DEFAULT_PNL_COLOR_SCHEME,
+  DEFAULT_STOCK_CATEGORIES,
   LIQUIDITY_LEVELS,
+  PNL_COLOR_SCHEMES,
   RECURRING_CASHFLOW_TYPES,
   SOURCE_OPTIONS,
   STATUS_OPTIONS,
   STOCK_TX_TYPES,
 } from './constants';
-import type { StockTransactionType } from './types';
+import type { PnlColorScheme, StockTransactionType } from './types';
 
 export interface ParsedLocalDate {
   year: number;
@@ -23,6 +26,50 @@ export interface ParsedLocalDate {
 export function toSafeNumber(value: unknown, fallback = 0): number {
   const num = Number(value);
   return Number.isNaN(num) || !Number.isFinite(num) ? fallback : num;
+}
+
+export function normalizePnlColorScheme(value: unknown): PnlColorScheme {
+  const s = String(value || '').trim();
+  if ((PNL_COLOR_SCHEMES as readonly string[]).includes(s)) {
+    return s as PnlColorScheme;
+  }
+  return DEFAULT_PNL_COLOR_SCHEME;
+}
+
+export function normalizeSortOrder(value: unknown, fallback = 0): number {
+  if (value === undefined || value === null || value === '') return fallback;
+  const num = Math.round(Number(value));
+  if (Number.isNaN(num) || !Number.isFinite(num)) return fallback;
+  return Math.max(-1_000_000, Math.min(1_000_000, num));
+}
+
+export function normalizeStockCategory(value: unknown): string {
+  return String(value || '').trim().slice(0, 24);
+}
+
+export function normalizeCustomStockCategories(value: unknown): string[] {
+  let rawList: unknown[] = [];
+  if (Array.isArray(value)) {
+    rawList = value;
+  } else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) rawList = parsed;
+    } catch {
+      rawList = [];
+    }
+  }
+  const defaultSet = new Set(DEFAULT_STOCK_CATEGORIES);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of rawList) {
+    const clean = normalizeStockCategory(item);
+    if (!clean || defaultSet.has(clean) || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+    if (out.length >= 30) break;
+  }
+  return out;
 }
 
 export function parseLocalDate(ymd: string): ParsedLocalDate {
@@ -142,6 +189,7 @@ export interface RecurringInputPayload {
   status?: string;
   note?: string;
   linkedAccountId?: string | null;
+  sortOrder?: number;
 }
 
 export function validateRecurringInput(payload: RecurringInputPayload) {
@@ -155,6 +203,7 @@ export function validateRecurringInput(payload: RecurringInputPayload) {
   const status = String(payload.status || '啟用').trim();
   const note = String(payload.note || '').trim().slice(0, 200);
   const linkedAccountId = payload.linkedAccountId ? String(payload.linkedAccountId).trim() : null;
+  const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
 
   if (!itemName) throw new Error('請輸入項目名稱。');
   if (!RECURRING_CASHFLOW_TYPES.includes(type)) throw new Error(`不支援的收支類型：${type}`);
@@ -163,7 +212,7 @@ export function validateRecurringInput(payload: RecurringInputPayload) {
   if (!BILLING_CYCLES.includes(cycle)) throw new Error(`不支援的週期：${cycle}`);
   if (!STATUS_OPTIONS.includes(status)) throw new Error(`不支援的狀態：${status}`);
 
-  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note, linkedAccountId };
+  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note, linkedAccountId, sortOrder };
 }
 
 export interface SinkingInputPayload {
@@ -174,6 +223,7 @@ export interface SinkingInputPayload {
   dueNote?: string;
   status?: string;
   note?: string;
+  sortOrder?: number;
 }
 
 export function validateSinkingInput(payload: SinkingInputPayload) {
@@ -184,13 +234,14 @@ export function validateSinkingInput(payload: SinkingInputPayload) {
   const dueNote = String(payload.dueNote || '').trim().slice(0, 40);
   const status = String(payload.status || '啟用').trim();
   const note = String(payload.note || '').trim().slice(0, 200);
+  const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
 
   if (!itemName) throw new Error('請輸入項目名稱。');
   if (Number.isNaN(totalAmount) || totalAmount <= 0) throw new Error('請輸入大於 0 的預估總金額。');
   if (Number.isNaN(months) || months < 1 || months > 120) throw new Error('分攤月數需介於 1～120 個月。');
   if (!STATUS_OPTIONS.includes(status)) throw new Error('狀態無效。');
 
-  return { itemName, category, totalAmount, months, dueNote, status, note };
+  return { itemName, category, totalAmount, months, dueNote, status, note, sortOrder };
 }
 
 export interface AssetInputPayload {
@@ -213,6 +264,8 @@ export interface AssetInputPayload {
   loanAnnualRate?: number | string | null;
   loanMonthlyPayment?: number | string | null;
   loanBillingDay?: number | string | null;
+  stockCategory?: string;
+  sortOrder?: number;
 }
 
 export function validateAssetInput(payload: AssetInputPayload) {
@@ -248,6 +301,8 @@ export function validateAssetInput(payload: AssetInputPayload) {
     : null;
   const balanceAnchorAt = payload.balanceAnchorAt ? String(payload.balanceAnchorAt).trim() : null;
   const isDefaultSavings = isLinkedSavings && Boolean(payload.isDefaultSavings);
+  const stockCategory = isLinkedSavings ? '' : normalizeStockCategory(payload.stockCategory);
+  const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
 
   const isAmortizingLoan = !isLinkedSavings && majorType === '負債' && Boolean(payload.isAmortizingLoan);
   let loanAnnualRate: number | null = null;
@@ -321,6 +376,8 @@ export function validateAssetInput(payload: AssetInputPayload) {
     loanAnnualRate,
     loanMonthlyPayment,
     loanBillingDay,
+    stockCategory,
+    sortOrder,
   };
 }
 

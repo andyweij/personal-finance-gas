@@ -1,10 +1,11 @@
-import { CASHFLOW_TYPES, STOCK_TX_TYPES } from '../../../shared/constants';
+import { CASHFLOW_TYPES, DEFAULT_STOCK_CATEGORIES, STOCK_TX_TYPES } from '../../../shared/constants';
 import {
   computeAllSavingsSummary,
   computeStockPortfolioSummary,
   computeStockPositionSummary,
 } from '../../../shared/calculations';
 import type { AssetItem, StockPositionSummary, StockTransaction } from '../../../shared/types';
+import { normalizeStockCategory } from '../../../shared/validation';
 import {
   closeModal,
   el,
@@ -16,7 +17,37 @@ import {
   showToast,
   TRASH_SVG,
 } from './helpers';
+import { renderReorderList } from './reorderHelper';
+import { renderStockChartCard } from './stockCharts';
 import type { UiContext } from './state';
+
+export function getAllStockCategories(ctx: UiContext): string[] {
+  const snap = ctx.engine.getSnapshot();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const push = (raw: string | undefined) => {
+    const cleaned = normalizeStockCategory(raw);
+    if (!cleaned || seen.has(cleaned)) return;
+    seen.add(cleaned);
+    out.push(cleaned);
+  };
+  for (const d of DEFAULT_STOCK_CATEGORIES) push(d);
+  for (const c of snap.settings.customStockCategories || []) push(c);
+  for (const a of snap.assetItems) {
+    if (!a.deletedAt && a.stockCategory) push(a.stockCategory);
+  }
+  return out;
+}
+
+export function getOrderedStockIds(ctx: UiContext): string[] {
+  const snap = ctx.engine.getSnapshot();
+  const portfolio = computeStockPortfolioSummary(
+    snap.assetItems,
+    snap.stockTransactions || [],
+    snap.settings.usdTwdRate || 32.5
+  );
+  return portfolio.positions.map((p) => p.asset.id);
+}
 
 function todayYmdLocal(): string {
   const d = new Date();
@@ -174,9 +205,9 @@ export function renderStocksTab(ctx: UiContext): void {
       : `${pSign}${fmtMoney(portfolio.totalUnrealizedPnlTwd, false)} (${fmtSignedPct(portfolio.totalUnrealizedRoiPct, false)})`;
     priceOnlyEl.style.color =
       portfolio.totalUnrealizedPnlTwd > 0
-        ? 'var(--success)'
+        ? 'var(--stock-pos)'
         : portfolio.totalUnrealizedPnlTwd < 0
-          ? 'var(--danger)'
+          ? 'var(--stock-neg)'
           : 'var(--text)';
     priceOnlySubEl.textContent = `投入成本 ${fmtMoney(portfolio.totalCostBasisTwd, masked)}`;
 
@@ -186,9 +217,9 @@ export function renderStocksTab(ctx: UiContext): void {
       : `${dSign}${fmtMoney(portfolio.totalReturnPnlTwd, false)} (${fmtSignedPct(portfolio.totalReturnRoiPct, false)})`;
     divAdjEl.style.color =
       portfolio.totalReturnPnlTwd > 0
-        ? 'var(--success)'
+        ? 'var(--stock-pos)'
         : portfolio.totalReturnPnlTwd < 0
-          ? 'var(--danger)'
+          ? 'var(--stock-neg)'
           : 'var(--text)';
     const realizedSuffix =
       portfolio.totalRealizedPnlTwd !== 0
@@ -216,7 +247,17 @@ export function renderStocksTab(ctx: UiContext): void {
     unrecoveredText.textContent = `未回本成本 ${fmtMoney(portfolio.totalUnrecoveredCostTwd, masked)}`;
   }
 
-  // Render stock cards list
+  // Render stock allocation chart card
+  renderStockChartCard(ctx, portfolio, el('stocksChartCard'), {
+    onManageCategories: () => openStockCategoryManagerModal(ctx),
+  });
+
+  // Reorder button visibility
+  const reorderBtn = el<HTMLButtonElement>('reorderStocksBtn');
+  const isReordering = ctx.state.reorderSection === 'stocks';
+  reorderBtn.style.display = portfolio.positions.length >= 2 && !isReordering ? '' : 'none';
+
+  // Render stock cards list (or reorder editor)
   const list = el('stocksPortfolioList');
   list.innerHTML = '';
 
@@ -242,12 +283,43 @@ export function renderStocksTab(ctx: UiContext): void {
     return;
   }
 
+  if (isReordering && portfolio.positions.length >= 2) {
+    renderReorderList(ctx, {
+      container: list,
+      section: 'stocks',
+      wrapInCard: true,
+      items: portfolio.positions.map((pos) => {
+        const weightPct =
+          portfolio.totalMarketValueTwd > 0
+            ? ((pos.marketValueTwd / portfolio.totalMarketValueTwd) * 100).toFixed(1)
+            : '0.0';
+        return {
+          id: pos.asset.id,
+          title: pos.asset.itemName,
+          badge: pos.asset.ticker || pos.asset.subCategory,
+          subtitle: `${fmtShares(pos.currentShares)} 股 · 市值 ${fmtMoney(pos.marketValueTwd, masked)} (${weightPct}%)`,
+        };
+      }),
+      onSave: (orderedIds) => ctx.engine.reorderAssets(orderedIds),
+      onReRender: () => renderStocksTab(ctx),
+    });
+    return;
+  }
+
   for (const pos of portfolio.positions) {
-    list.appendChild(renderStockPositionCard(ctx, pos));
+    const weightPct =
+      portfolio.totalMarketValueTwd > 0
+        ? (pos.marketValueTwd / portfolio.totalMarketValueTwd) * 100
+        : 0;
+    list.appendChild(renderStockPositionCard(ctx, pos, weightPct));
   }
 }
 
-function renderStockPositionCard(ctx: UiContext, pos: StockPositionSummary): HTMLElement {
+function renderStockPositionCard(
+  ctx: UiContext,
+  pos: StockPositionSummary,
+  weightPct = 0
+): HTMLElement {
   const masked = ctx.state.masked;
   const viewMode = ctx.state.stockPriceViewMode;
   const curr = pos.asset.currency || 'TWD';
@@ -274,6 +346,21 @@ function renderStockPositionCard(ctx: UiContext, pos: StockPositionSummary): HTM
     tickerBadge.style.marginRight = '0';
     tickerBadge.textContent = pos.asset.ticker;
     titleRow.appendChild(tickerBadge);
+  }
+  const catBtn = document.createElement('button');
+  catBtn.type = 'button';
+  catBtn.className = pos.asset.stockCategory ? 'stock-cat-btn set' : 'stock-cat-btn unset';
+  catBtn.textContent = pos.asset.stockCategory || '+ 分類';
+  catBtn.title = '點擊快速變更持股分類';
+  catBtn.addEventListener('click', () => openQuickStockCategoryPicker(ctx, pos.asset));
+  titleRow.appendChild(catBtn);
+
+  if (weightPct > 0) {
+    const wtBadge = document.createElement('span');
+    wtBadge.className = 'badge';
+    wtBadge.style.cssText = 'margin-right:0;background:var(--fill);color:var(--text-secondary)';
+    wtBadge.textContent = `佔 ${weightPct.toFixed(1)}%`;
+    titleRow.appendChild(wtBadge);
   }
   if (curr === 'USD') {
     const currBadge = document.createElement('span');
@@ -544,12 +631,74 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
   const r1 = document.createElement('div');
   r1.className = 'row-2';
   r1.appendChild(
-    makeSelectField('類別', 'stSub', ['台股', '美股/ETF'], existing?.subCategory === '美股/ETF' ? '美股/ETF' : '台股')
+    makeSelectField('市場', 'stSub', ['台股', '美股/ETF'], existing?.subCategory === '美股/ETF' ? '美股/ETF' : '台股')
   );
   r1.appendChild(
     makeSelectField('幣別', 'stCurr', ['TWD', 'USD'], existing?.currency || 'TWD')
   );
   form.appendChild(r1);
+
+  // Stock category selector (個股 / ETF / 特別股 + custom categories)
+  let selectedStockCategory = normalizeStockCategory(existing?.stockCategory);
+  const catSection = document.createElement('div');
+  catSection.className = 'field';
+  const catLbl = document.createElement('label');
+  catLbl.textContent = '持股分類（選填，用於圓餅圖分類佔比）';
+  catSection.appendChild(catLbl);
+
+  const catChipsWrap = document.createElement('div');
+  catChipsWrap.className = 'quick-row';
+  catChipsWrap.style.marginBottom = '8px';
+
+  const renderCategoryChips = () => {
+    catChipsWrap.innerHTML = '';
+    const allCats = getAllStockCategories(ctx);
+    const options: Array<{ label: string; value: string }> = [
+      { label: '未分類', value: '' },
+      ...allCats.map((c) => ({ label: c, value: c })),
+    ];
+    for (const opt of options) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chip-btn sm' + (selectedStockCategory === opt.value ? ' active' : '');
+      chip.textContent = opt.label;
+      chip.addEventListener('click', () => {
+        selectedStockCategory = opt.value;
+        renderCategoryChips();
+      });
+      catChipsWrap.appendChild(chip);
+    }
+  };
+  renderCategoryChips();
+  catSection.appendChild(catChipsWrap);
+
+  const customCatRow = document.createElement('div');
+  customCatRow.className = 'stock-cat-inline-add';
+  const customCatInp = document.createElement('input');
+  customCatInp.type = 'text';
+  customCatInp.maxLength = 24;
+  customCatInp.placeholder = '自訂新分類（例如：債券ETF、高股息）';
+  const customCatAddBtn = document.createElement('button');
+  customCatAddBtn.type = 'button';
+  customCatAddBtn.className = 'btn btn-tinted btn-sm';
+  customCatAddBtn.textContent = '+ 新增';
+  customCatAddBtn.addEventListener('click', async () => {
+    const cleaned = normalizeStockCategory(customCatInp.value);
+    if (!cleaned) return;
+    const curCustom = ctx.engine.getSnapshot().settings.customStockCategories || [];
+    if (!DEFAULT_STOCK_CATEGORIES.includes(cleaned) && !curCustom.includes(cleaned)) {
+      await ctx.engine.saveCustomStockCategories([...curCustom, cleaned]);
+      ctx.scheduleSync();
+    }
+    selectedStockCategory = cleaned;
+    customCatInp.value = '';
+    renderCategoryChips();
+    showToast(`已新增並套用分類：${cleaned}`, 'success');
+  });
+  customCatRow.appendChild(customCatInp);
+  customCatRow.appendChild(customCatAddBtn);
+  catSection.appendChild(customCatRow);
+  form.appendChild(catSection);
 
   const r2 = document.createElement('div');
   r2.className = 'row-2';
@@ -753,6 +902,7 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
         ticker,
         unitPrice: marketPrice,
         costBasis: hasCost ? totalCost : null,
+        stockCategory: selectedStockCategory,
         note: el<HTMLInputElement>('stNote').value.trim(),
       });
       closeModal();
@@ -1473,11 +1623,11 @@ export function openStockHistoryModal(ctx: UiContext, asset: AssetItem): void {
       amt.className = 'tnum';
       amt.style.fontWeight = '700';
       if (tx.txType === 'stock_dividend') {
-        amt.style.color = 'var(--success)';
+        amt.style.color = 'var(--stock-pos)';
         amt.textContent = `+${fmtShares(tx.shares)}股`;
       } else {
         amt.style.color =
-          tx.txType === 'cash_dividend' || tx.txType === 'sell' ? 'var(--success)' : 'var(--text)';
+          tx.txType === 'cash_dividend' || tx.txType === 'sell' ? 'var(--stock-pos)' : 'var(--text)';
         amt.textContent =
           (tx.txType === 'cash_dividend' || tx.txType === 'sell' ? '+' : '') +
           fmtCurrencyAmount(tx.totalAmount, curr, masked);
@@ -1512,4 +1662,273 @@ export function openStockHistoryModal(ctx: UiContext, asset: AssetItem): void {
   }
 
   body.appendChild(listWrap);
+}
+
+/* ==================== Modal 5: 單檔快速分類 & 分類管理 ==================== */
+
+export function openQuickStockCategoryPicker(ctx: UiContext, asset: AssetItem): void {
+  const snap = ctx.engine.getSnapshot();
+  const fresh = snap.assetItems.find((a) => a.id === asset.id && !a.deletedAt) || asset;
+  const currentCat = normalizeStockCategory(fresh.stockCategory);
+  const body = openModal(`設定持股分類 · ${fresh.itemName}`);
+
+  const desc = document.createElement('div');
+  desc.className = 'muted';
+  desc.style.marginBottom = '12px';
+  desc.textContent = '點擊下方標籤即可立即分類，方便在圓餅圖檢視「個股 / ETF / 特別股 / 自訂」佔比。';
+  body.appendChild(desc);
+
+  const chips = document.createElement('div');
+  chips.className = 'quick-row';
+  chips.style.marginBottom = '14px';
+
+  const applyCat = async (nextCat: string) => {
+    try {
+      await ctx.engine.updateAssetStockCategory(fresh.id, nextCat);
+      closeModal();
+      showToast(nextCat ? `${fresh.itemName} 已歸類為「${nextCat}」` : `已清除 ${fresh.itemName} 的分類`, 'success');
+      ctx.scheduleSync();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '分類更新失敗', 'error');
+    }
+  };
+
+  const allCats = getAllStockCategories(ctx);
+  for (const cat of allCats) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chip-btn' + (currentCat === cat ? ' active' : '');
+    btn.textContent = cat;
+    btn.addEventListener('click', () => {
+      void applyCat(cat);
+    });
+    chips.appendChild(btn);
+  }
+  const clearBtn = document.createElement('button');
+  clearBtn.type = 'button';
+  clearBtn.className = 'chip-btn' + (!currentCat ? ' active' : '');
+  clearBtn.textContent = '未分類';
+  clearBtn.addEventListener('click', () => {
+    void applyCat('');
+  });
+  chips.appendChild(clearBtn);
+  body.appendChild(chips);
+
+  // Quick add custom category & apply
+  const addWrap = document.createElement('div');
+  addWrap.className = 'stock-cat-inline-add';
+  addWrap.style.marginBottom = '12px';
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.maxLength = 24;
+  inp.placeholder = '新增自訂分類並立即套用（如 債券ETF）';
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'btn btn-primary btn-sm';
+  addBtn.textContent = '+ 新增套用';
+  addBtn.addEventListener('click', async () => {
+    const cleaned = normalizeStockCategory(inp.value);
+    if (!cleaned) {
+      showToast('請輸入分類名稱', 'error');
+      return;
+    }
+    const curCustom = ctx.engine.getSnapshot().settings.customStockCategories || [];
+    if (!DEFAULT_STOCK_CATEGORIES.includes(cleaned) && !curCustom.includes(cleaned)) {
+      await ctx.engine.saveCustomStockCategories([...curCustom, cleaned]);
+    }
+    await applyCat(cleaned);
+  });
+  addWrap.appendChild(inp);
+  addWrap.appendChild(addBtn);
+  body.appendChild(addWrap);
+
+  const manageLink = document.createElement('button');
+  manageLink.type = 'button';
+  manageLink.className = 'btn btn-outline btn-block btn-sm';
+  manageLink.textContent = '管理所有分類與批次設定持股';
+  manageLink.addEventListener('click', () => openStockCategoryManagerModal(ctx));
+  body.appendChild(manageLink);
+}
+
+export function openStockCategoryManagerModal(ctx: UiContext): void {
+  const body = openModal('持股分類管理與快速標記');
+
+  const renderContent = () => {
+    body.innerHTML = '';
+    const snap = ctx.engine.getSnapshot();
+    const rate = snap.settings.usdTwdRate || 32.5;
+    const portfolio = computeStockPortfolioSummary(
+      snap.assetItems,
+      snap.stockTransactions || [],
+      rate
+    );
+    const customCats = snap.settings.customStockCategories || [];
+    const allCats = getAllStockCategories(ctx);
+
+    // Section 1: Category tags
+    const s1 = document.createElement('div');
+    s1.className = 'stock-cat-section';
+    const s1Title = document.createElement('div');
+    s1Title.className = 'section-label';
+    s1Title.textContent = '分類標籤（預設：個股 / ETF / 特別股，可自由新增自訂分類）';
+    s1.appendChild(s1Title);
+
+    const tagRow = document.createElement('div');
+    tagRow.className = 'quick-row';
+    tagRow.style.marginBottom = '10px';
+
+    for (const def of DEFAULT_STOCK_CATEGORIES) {
+      const pill = document.createElement('span');
+      pill.className = 'stock-cat-chip is-default';
+      pill.textContent = def;
+      tagRow.appendChild(pill);
+    }
+
+    for (const custom of customCats) {
+      const pill = document.createElement('span');
+      pill.className = 'stock-cat-chip is-custom';
+      const txt = document.createElement('span');
+      txt.textContent = custom;
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'stock-cat-chip-del';
+      del.textContent = '×';
+      del.title = `刪除自訂分類「${custom}」`;
+      del.addEventListener('click', async () => {
+        const usingAssets = snap.assetItems.filter(
+          (a) => !a.deletedAt && normalizeStockCategory(a.stockCategory) === custom
+        );
+        if (usingAssets.length > 0) {
+          if (
+            !confirm(
+              `目前有 ${usingAssets.length} 檔持股使用「${custom}」。確定移除此自訂分類並將這些持股改為「未分類」？`
+            )
+          ) {
+            return;
+          }
+          for (const a of usingAssets) {
+            await ctx.engine.updateAssetStockCategory(a.id, '');
+          }
+        }
+        const nextCustom = customCats.filter((c) => c !== custom);
+        await ctx.engine.saveCustomStockCategories(nextCustom);
+        showToast(`已移除自訂分類：${custom}`, 'success');
+        ctx.scheduleSync();
+        renderContent();
+      });
+      pill.appendChild(txt);
+      pill.appendChild(del);
+      tagRow.appendChild(pill);
+    }
+    s1.appendChild(tagRow);
+
+    const addForm = document.createElement('form');
+    addForm.className = 'stock-cat-inline-add';
+    const addInp = document.createElement('input');
+    addInp.type = 'text';
+    addInp.maxLength = 24;
+    addInp.placeholder = '輸入新分類名稱（如：債券ETF、高股息、美股科技）';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'submit';
+    addBtn.className = 'btn btn-primary btn-sm';
+    addBtn.textContent = '+ 新增分類';
+    addForm.appendChild(addInp);
+    addForm.appendChild(addBtn);
+    addForm.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const cleaned = normalizeStockCategory(addInp.value);
+      if (!cleaned) {
+        showToast('請輸入分類名稱', 'error');
+        return;
+      }
+      if (DEFAULT_STOCK_CATEGORIES.includes(cleaned) || customCats.includes(cleaned)) {
+        showToast(`分類「${cleaned}」已存在`, 'error');
+        return;
+      }
+      await ctx.engine.saveCustomStockCategories([...customCats, cleaned]);
+      showToast(`已新增自訂分類：${cleaned}`, 'success');
+      ctx.scheduleSync();
+      renderContent();
+    });
+    s1.appendChild(addForm);
+    body.appendChild(s1);
+
+    // Section 2: Quick batch-tagging per stock
+    const s2 = document.createElement('div');
+    s2.className = 'stock-cat-section';
+    const s2Title = document.createElement('div');
+    s2Title.className = 'section-label';
+    s2Title.textContent = `快速標記各檔持股（共 ${portfolio.positions.length} 檔，點一下立即儲存）`;
+    s2.appendChild(s2Title);
+
+    if (!portfolio.positions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'list-empty';
+      empty.textContent = '目前尚未建立股票持股';
+      s2.appendChild(empty);
+    } else {
+      const rows = document.createElement('div');
+      rows.className = 'stock-cat-batch-list';
+
+      for (const pos of portfolio.positions) {
+        const row = document.createElement('div');
+        row.className = 'cat-manage-row';
+
+        const header = document.createElement('div');
+        header.className = 'cat-manage-head';
+        const nm = document.createElement('strong');
+        nm.textContent = pos.asset.itemName;
+        header.appendChild(nm);
+        if (pos.asset.ticker) {
+          const tk = document.createElement('span');
+          tk.className = 'badge';
+          tk.style.marginRight = '0';
+          tk.textContent = pos.asset.ticker;
+          header.appendChild(tk);
+        }
+        row.appendChild(header);
+
+        const curCat = normalizeStockCategory(pos.asset.stockCategory);
+        const pillWrap = document.createElement('div');
+        pillWrap.className = 'quick-row';
+
+        const choices: Array<{ label: string; value: string }> = [
+          ...allCats.map((c) => ({ label: c, value: c })),
+          { label: '未分類', value: '' },
+        ];
+        for (const ch of choices) {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'chip-btn sm' + (curCat === ch.value ? ' active' : '');
+          b.textContent = ch.label;
+          b.addEventListener('click', async () => {
+            await ctx.engine.updateAssetStockCategory(pos.asset.id, ch.value);
+            ctx.scheduleSync();
+            renderContent();
+          });
+          pillWrap.appendChild(b);
+        }
+        row.appendChild(pillWrap);
+        rows.appendChild(row);
+      }
+      s2.appendChild(rows);
+    }
+    body.appendChild(s2);
+
+    const footerBtn = document.createElement('button');
+    footerBtn.type = 'button';
+    footerBtn.className = 'btn btn-primary btn-block';
+    footerBtn.style.marginTop = '12px';
+    footerBtn.textContent = '完成並檢視「持股分類」圖表';
+    footerBtn.addEventListener('click', () => {
+      ctx.state.stockChartDimension = 'category';
+      ctx.state.stockChartHighlight = null;
+      localStorage.setItem('finance_stock_chart_dim', 'category');
+      closeModal();
+      renderStocksTab(ctx);
+    });
+    body.appendChild(footerBtn);
+  };
+
+  renderContent();
 }

@@ -1,6 +1,7 @@
 import {
   DEFAULT_EMERGENCY_MONTHS,
   DEFAULT_MONTHLY_DAILY_BUDGET,
+  DEFAULT_PNL_COLOR_SCHEME,
   DEFAULT_USD_TWD_RATE,
 } from '../shared/constants';
 import type {
@@ -27,6 +28,10 @@ import {
   validateUtilityRentsInput,
 } from '../shared/rentUtility';
 import {
+  normalizeCustomStockCategories,
+  normalizePnlColorScheme,
+  normalizeSortOrder,
+  normalizeStockCategory,
   toSafeNumber,
   validateAssetInput,
   validateCashFlowInput,
@@ -54,6 +59,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       emergency_target_months: number;
       usd_twd_rate: number;
       fx_updated_at: string | null;
+      pnl_color_scheme?: string | null;
+      custom_stock_categories?: string | null;
       updated_at: string;
       version?: number;
     }>();
@@ -64,6 +71,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       emergencyTargetMonths: row.emergency_target_months,
       usdTwdRate: row.usd_twd_rate,
       fxUpdatedAt: row.fx_updated_at,
+      pnlColorScheme: normalizePnlColorScheme(row.pnl_color_scheme),
+      customStockCategories: normalizeCustomStockCategories(row.custom_stock_categories),
       updatedAt: row.updated_at,
       version: Number(row.version ?? 1),
     };
@@ -72,10 +81,17 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
   const nowIso = new Date().toISOString();
   await db
     .prepare(
-      `INSERT OR IGNORE INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at, version)
-       VALUES (?, ?, ?, ?, ?, 1)`
+      `INSERT OR IGNORE INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, pnl_color_scheme, custom_stock_categories, updated_at, version)
+       VALUES (?, ?, ?, ?, ?, '[]', ?, 1)`
     )
-    .bind(uid, DEFAULT_MONTHLY_DAILY_BUDGET, DEFAULT_EMERGENCY_MONTHS, DEFAULT_USD_TWD_RATE, nowIso)
+    .bind(
+      uid,
+      DEFAULT_MONTHLY_DAILY_BUDGET,
+      DEFAULT_EMERGENCY_MONTHS,
+      DEFAULT_USD_TWD_RATE,
+      DEFAULT_PNL_COLOR_SCHEME,
+      nowIso
+    )
     .run();
 
   return {
@@ -83,6 +99,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
     emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
     usdTwdRate: DEFAULT_USD_TWD_RATE,
     fxUpdatedAt: null,
+    pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
+    customStockCategories: [],
     updatedAt: nowIso,
     version: 1,
   };
@@ -124,6 +142,7 @@ function mapRecurringRow(r: Record<string, unknown>): RecurringItem {
     status: String(r.status),
     note: String(r.note || ''),
     linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
+    sortOrder: Number(r.sort_order ?? 0),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -141,6 +160,7 @@ function mapSinkingRow(r: Record<string, unknown>): SinkingFundItem {
     dueNote: String(r.due_note || ''),
     status: String(r.status),
     note: String(r.note || ''),
+    sortOrder: Number(r.sort_order ?? 0),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -176,6 +196,8 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
         : null,
     loanBillingDay:
       r.loan_billing_day !== null && r.loan_billing_day !== undefined ? Number(r.loan_billing_day) : null,
+    stockCategory: String(r.stock_category || ''),
+    sortOrder: Number(r.sort_order ?? 0),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -391,13 +413,30 @@ async function applySingleMutation(
     const months = Math.min(60, Math.max(1, Math.round(toSafeNumber(p.emergencyTargetMonths, existing.emergencyTargetMonths))));
     const fx = toSafeNumber(p.usdTwdRate, existing.usdTwdRate);
     const validFx = fx > 10 && fx < 100 ? fx : existing.usdTwdRate;
+    const pnlScheme =
+      p.pnlColorScheme !== undefined
+        ? normalizePnlColorScheme(p.pnlColorScheme)
+        : existing.pnlColorScheme || DEFAULT_PNL_COLOR_SCHEME;
+    const customStockCats =
+      p.customStockCategories !== undefined
+        ? normalizeCustomStockCategories(p.customStockCategories)
+        : existing.customStockCategories || [];
     await db
       .prepare(
         `UPDATE app_settings
-         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, updated_at = ?, version = ?
+         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = ?
          WHERE user_id = ?`
       )
-      .bind(budget, months, validFx, check.writeTs, check.nextVersion, uid)
+      .bind(
+        budget,
+        months,
+        validFx,
+        pnlScheme,
+        JSON.stringify(customStockCats),
+        check.writeTs,
+        check.nextVersion,
+        uid
+      )
       .run();
     return;
   }
@@ -520,13 +559,19 @@ async function applySingleMutation(
       status: String(p.status || '啟用'),
       note: String(p.note || ''),
       linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
+      sortOrder:
+        p.sortOrder !== undefined
+          ? normalizeSortOrder(p.sortOrder, 0)
+          : existing?.sort_order !== undefined
+            ? Number(existing.sort_order)
+            : 0,
     });
 
     await db
       .prepare(
         `INSERT INTO recurring_items
-          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET
            item_name = excluded.item_name,
            category = excluded.category,
@@ -538,6 +583,7 @@ async function applySingleMutation(
            status = excluded.status,
            note = excluded.note,
            linked_account_id = excluded.linked_account_id,
+           sort_order = excluded.sort_order,
            updated_at = excluded.updated_at,
            deleted_at = NULL,
            version = excluded.version`
@@ -555,6 +601,7 @@ async function applySingleMutation(
         v.status,
         v.note,
         v.linkedAccountId,
+        v.sortOrder,
         String(p.createdAt || check.writeTs),
         check.writeTs,
         check.nextVersion
@@ -594,13 +641,19 @@ async function applySingleMutation(
       dueNote: String(p.dueNote || ''),
       status: String(p.status || '啟用'),
       note: String(p.note || ''),
+      sortOrder:
+        p.sortOrder !== undefined
+          ? normalizeSortOrder(p.sortOrder, 0)
+          : existing?.sort_order !== undefined
+            ? Number(existing.sort_order)
+            : 0,
     });
 
     await db
       .prepare(
         `INSERT INTO sinking_fund_items
-          (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+          (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET
            item_name = excluded.item_name,
            category = excluded.category,
@@ -609,6 +662,7 @@ async function applySingleMutation(
            due_note = excluded.due_note,
            status = excluded.status,
            note = excluded.note,
+           sort_order = excluded.sort_order,
            updated_at = excluded.updated_at,
            deleted_at = NULL,
            version = excluded.version`
@@ -623,6 +677,7 @@ async function applySingleMutation(
         v.dueNote,
         v.status,
         v.note,
+        v.sortOrder,
         String(p.createdAt || check.writeTs),
         check.writeTs,
         check.nextVersion
@@ -689,6 +744,18 @@ async function applySingleMutation(
           : null,
       loanBillingDay:
         p.loanBillingDay !== undefined && p.loanBillingDay !== null ? Number(p.loanBillingDay) : null,
+      stockCategory:
+        p.stockCategory !== undefined
+          ? normalizeStockCategory(p.stockCategory)
+          : existing?.stock_category !== undefined
+            ? String(existing.stock_category || '')
+            : '',
+      sortOrder:
+        p.sortOrder !== undefined
+          ? normalizeSortOrder(p.sortOrder, 0)
+          : existing?.sort_order !== undefined
+            ? Number(existing.sort_order)
+            : 0,
     });
 
     if (v.isDefaultSavings) {
@@ -703,8 +770,8 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO asset_items
-          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET
            update_mode = excluded.update_mode,
            major_type = excluded.major_type,
@@ -725,6 +792,8 @@ async function applySingleMutation(
            loan_annual_rate = excluded.loan_annual_rate,
            loan_monthly_payment = excluded.loan_monthly_payment,
            loan_billing_day = excluded.loan_billing_day,
+           stock_category = excluded.stock_category,
+           sort_order = excluded.sort_order,
            updated_at = excluded.updated_at,
            deleted_at = NULL,
            version = excluded.version`
@@ -751,6 +820,8 @@ async function applySingleMutation(
         v.loanAnnualRate,
         v.loanMonthlyPayment,
         v.loanBillingDay,
+        v.stockCategory,
+        v.sortOrder,
         String(p.createdAt || check.writeTs),
         check.writeTs,
         check.nextVersion
@@ -1022,9 +1093,9 @@ export async function querySyncDelta(
   if (since) {
     const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
       db.prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND updated_at > ? ORDER BY date DESC').bind(uid, since).all(),
-      db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND updated_at > ?').bind(uid, since).all(),
-      db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND updated_at > ?').bind(uid, since).all(),
-      db.prepare('SELECT * FROM asset_items WHERE user_id = ? AND updated_at > ?').bind(uid, since).all(),
+      db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND updated_at > ? ORDER BY sort_order ASC, created_at ASC').bind(uid, since).all(),
+      db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND updated_at > ? ORDER BY sort_order ASC, created_at ASC').bind(uid, since).all(),
+      db.prepare('SELECT * FROM asset_items WHERE user_id = ? AND updated_at > ? ORDER BY sort_order ASC, created_at ASC').bind(uid, since).all(),
       db.prepare('SELECT * FROM savings_adjustments WHERE user_id = ? AND updated_at > ? ORDER BY date DESC').bind(uid, since).all(),
       db.prepare('SELECT * FROM stock_transactions WHERE user_id = ? AND updated_at > ? ORDER BY date DESC').bind(uid, since).all(),
       db.prepare('SELECT * FROM networth_history WHERE user_id = ? AND updated_at > ? ORDER BY year_month DESC').bind(uid, since).all(),
@@ -1047,9 +1118,9 @@ export async function querySyncDelta(
 
   const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
     db.prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND deleted_at IS NULL ORDER BY date DESC').bind(uid).all(),
-    db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND deleted_at IS NULL').bind(uid).all(),
-    db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND deleted_at IS NULL').bind(uid).all(),
-    db.prepare('SELECT * FROM asset_items WHERE user_id = ? AND deleted_at IS NULL').bind(uid).all(),
+    db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC').bind(uid).all(),
+    db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC').bind(uid).all(),
+    db.prepare('SELECT * FROM asset_items WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC').bind(uid).all(),
     db.prepare('SELECT * FROM savings_adjustments WHERE user_id = ? AND deleted_at IS NULL ORDER BY date DESC').bind(uid).all(),
     db.prepare('SELECT * FROM stock_transactions WHERE user_id = ? AND deleted_at IS NULL ORDER BY date DESC').bind(uid).all(),
     db.prepare('SELECT * FROM networth_history WHERE user_id = ? ORDER BY year_month DESC').bind(uid).all(),
@@ -1173,16 +1244,21 @@ export async function importFullSnapshot(
 
   const currentSettings = await ensureAppSettings(db, uid);
   if (data.settings) {
+    const customStockCategories = normalizeCustomStockCategories(
+      data.settings.customStockCategories ?? currentSettings.customStockCategories
+    );
     await db
       .prepare(
         `UPDATE app_settings
-         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, updated_at = ?, version = 1
+         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = 1
          WHERE user_id = ?`
       )
       .bind(
         Math.max(0, Math.round(toSafeNumber(data.settings.monthlyDailyBudget, currentSettings.monthlyDailyBudget))),
         Math.min(60, Math.max(1, Math.round(toSafeNumber(data.settings.emergencyTargetMonths, currentSettings.emergencyTargetMonths)))),
         toSafeNumber(data.settings.usdTwdRate, currentSettings.usdTwdRate),
+        normalizePnlColorScheme(data.settings.pnlColorScheme ?? currentSettings.pnlColorScheme),
+        JSON.stringify(customStockCategories),
         nowIso,
         uid
       )
@@ -1226,8 +1302,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO recurring_items
-          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -1242,6 +1318,7 @@ export async function importFullSnapshot(
         v.status,
         v.note,
         v.linkedAccountId,
+        v.sortOrder,
         r.createdAt || nowIso,
         nowIso
       )
@@ -1255,8 +1332,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO sinking_fund_items
-          (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -1268,6 +1345,7 @@ export async function importFullSnapshot(
         v.dueNote,
         v.status,
         v.note,
+        v.sortOrder,
         s.createdAt || nowIso,
         nowIso
       )
@@ -1281,8 +1359,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO asset_items
-          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -1306,6 +1384,8 @@ export async function importFullSnapshot(
         v.loanAnnualRate,
         v.loanMonthlyPayment,
         v.loanBillingDay,
+        v.sortOrder,
+        v.stockCategory,
         a.createdAt || nowIso,
         nowIso
       )

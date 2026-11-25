@@ -2,6 +2,7 @@ import {
   aggregatePeriodMetrics,
   computeMonthlyTrend,
   computeNetWorthSummary,
+  computeOverviewBreakdownGroups,
   computeSinkingMonthlyReserve,
 } from '../../../shared/calculations';
 import { el, fmtMoney } from './helpers';
@@ -76,33 +77,93 @@ export function renderOverviewTab(ctx: UiContext): void {
 
   const tbody = el('majorStatsBody');
   tbody.innerHTML = '';
-  const rows: Array<[string, number, number, boolean?]> = [
-    ['薪資收入', monthly.salary, yearly.salary],
-    ['房租 / 其他收入', monthly.rentIncome + monthly.otherIncome, yearly.rentIncome + yearly.otherIncome],
-    ['房貸 / 車貸固定支出', monthly.fixedExpense, yearly.fixedExpense],
-    ['常態性訂閱扣款', monthly.subscription, yearly.subscription],
-    ['日常花費', monthly.dailyExpense, yearly.dailyExpense],
-    ['稅金攤提(月) / 實支(年)', monthly.sinkingReserve, yearly.taxLargeActual],
-    ['台股定期定額 / 加碼', monthly.investmentStock, yearly.investmentStock],
-    ['中信基金 / 其他投資', monthly.investmentFund + monthly.investmentOther, yearly.investmentFund + yearly.investmentOther],
-    ['總儲蓄（投資＋結餘）', monthly.totalSavings, yearly.totalSavings, true],
-  ];
+  const groups = computeOverviewBreakdownGroups(
+    monthLogs,
+    yearLogs,
+    snap.sinkingItems,
+    monthly,
+    yearly
+  );
+  const expandedSet = new Set(ctx.state.overviewExpandedGroups);
 
-  for (const [label, mv, yv, isTotal] of rows) {
+  for (const group of groups) {
+    const hasChildren = group.children.length > 0;
+    const isExpanded = hasChildren && expandedSet.has(group.key);
+
     const tr = document.createElement('tr');
-    if (isTotal) tr.className = 'total-row';
+    if (group.isTotal) {
+      tr.className = 'total-row';
+    } else if (hasChildren) {
+      tr.className = 'stat-expand-row' + (isExpanded ? ' is-open' : '');
+      tr.setAttribute('role', 'button');
+      tr.tabIndex = 0;
+      const toggle = () => {
+        const idx = ctx.state.overviewExpandedGroups.indexOf(group.key);
+        if (idx >= 0) {
+          ctx.state.overviewExpandedGroups.splice(idx, 1);
+        } else {
+          ctx.state.overviewExpandedGroups.push(group.key);
+        }
+        renderOverviewTab(ctx);
+      };
+      tr.addEventListener('click', toggle);
+      tr.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+    }
+
     const td1 = document.createElement('td');
-    td1.textContent = label;
+    if (hasChildren) {
+      const labelWrap = document.createElement('span');
+      labelWrap.className = 'stat-group-label';
+      const chev = document.createElement('span');
+      chev.className = 'stat-chevron';
+      chev.textContent = isExpanded ? '▾' : '▸';
+      const txt = document.createElement('span');
+      txt.textContent = group.label;
+      const count = document.createElement('span');
+      count.className = 'stat-child-count';
+      count.textContent = `${group.children.length}`;
+      labelWrap.appendChild(chev);
+      labelWrap.appendChild(txt);
+      labelWrap.appendChild(count);
+      td1.appendChild(labelWrap);
+    } else {
+      td1.textContent = group.label;
+    }
+
     const td2 = document.createElement('td');
     td2.className = 'num';
-    td2.textContent = fmtMoney(mv, ctx.state.masked, '');
+    td2.textContent = fmtMoney(group.monthlyAmount, ctx.state.masked, '');
     const td3 = document.createElement('td');
     td3.className = 'num';
-    td3.textContent = fmtMoney(yv, ctx.state.masked, '');
+    td3.textContent = fmtMoney(group.yearlyAmount, ctx.state.masked, '');
     tr.appendChild(td1);
     tr.appendChild(td2);
     tr.appendChild(td3);
     tbody.appendChild(tr);
+
+    if (isExpanded) {
+      for (const child of group.children) {
+        const subTr = document.createElement('tr');
+        subTr.className = 'stat-subrow';
+        const subTd1 = document.createElement('td');
+        subTd1.textContent = child.label;
+        const subTd2 = document.createElement('td');
+        subTd2.className = 'num';
+        subTd2.textContent = fmtMoney(child.monthlyAmount, ctx.state.masked, '');
+        const subTd3 = document.createElement('td');
+        subTd3.className = 'num';
+        subTd3.textContent = fmtMoney(child.yearlyAmount, ctx.state.masked, '');
+        subTr.appendChild(subTd1);
+        subTr.appendChild(subTd2);
+        subTr.appendChild(subTd3);
+        tbody.appendChild(subTr);
+      }
+    }
   }
 
   el<HTMLInputElement>('budgetInput').value = String(snap.settings.monthlyDailyBudget);

@@ -252,7 +252,7 @@ function createLedgerRow(
   row.className = 'list-row';
   const isInc = item.type.includes('收入');
   const isInv = item.type === '投資流出';
-  const dotColor = isInc ? 'var(--success-bar)' : isInv ? 'var(--primary)' : 'var(--text-muted)';
+  const dotColor = isInc ? 'var(--pos-bar)' : isInv ? 'var(--primary)' : 'var(--text-muted)';
 
   const leading = document.createElement('div');
   leading.className = 'row-leading';
@@ -281,7 +281,7 @@ function createLedgerRow(
   right.className = 'item-right';
   const amt = document.createElement('div');
   amt.className = 'item-amount';
-  amt.style.color = isInc ? 'var(--success)' : isInv ? 'var(--primary)' : 'var(--text)';
+  amt.style.color = isInc ? 'var(--pos)' : isInv ? 'var(--primary)' : 'var(--text)';
   amt.textContent = (isInc ? '+' : '-') + fmtMoney(item.twdAmount, ctx.state.masked, '');
 
   const delBtn = document.createElement('button');
@@ -321,7 +321,7 @@ export function renderLogTab(ctx: UiContext): void {
   el('ledgerMonthLabel').textContent = ym;
   el('ledgerCountBadge').textContent = String(monthLogs.length);
   el('remainingBudget').textContent = fmtMoney(remaining, ctx.state.masked);
-  el('remainingBudget').style.color = remaining < 0 ? 'var(--danger)' : 'var(--text)';
+  el('remainingBudget').style.color = remaining < 0 ? 'var(--neg)' : 'var(--text)';
   el('spentText').textContent = '已花費 ' + fmtMoney(monthly.dailyExpense, ctx.state.masked);
   el('budgetLimitText').textContent = '上限 ' + fmtMoney(budget, ctx.state.masked);
   el('usagePctText').textContent = `使用率：${usagePct.toFixed(1)}%`;
@@ -462,13 +462,13 @@ function renderLedgerCalendar(
       if (info.expense > 0) {
         const dt = document.createElement('span');
         dt.className = 'cal-dot';
-        dt.style.background = 'var(--danger-bar)';
+        dt.style.background = 'var(--neg-bar)';
         dots.appendChild(dt);
       }
       if (info.income > 0) {
         const dt = document.createElement('span');
         dt.className = 'cal-dot';
-        dt.style.background = 'var(--success-bar)';
+        dt.style.background = 'var(--pos-bar)';
         dots.appendChild(dt);
       }
       if (info.inv > 0) {

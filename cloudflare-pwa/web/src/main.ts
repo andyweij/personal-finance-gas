@@ -1,5 +1,7 @@
 import './styles.css';
 import { computeAllSavingsSummary } from '../../shared/calculations';
+import type { PnlColorScheme } from '../../shared/types';
+import { normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
 import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount } from './auth/authClient';
@@ -12,10 +14,17 @@ import {
   updateSavingsPreview,
 } from './ui/logTab';
 import { renderOverviewTab, renderTrendChart } from './ui/overviewTab';
-import { openRecurringModal, openSinkingModal, renderConfigTab } from './ui/configTab';
-import { openAssetModal, openSavingsAccountModal, renderAssetsTab } from './ui/assetsTab';
-import { openStockBaselineModal, renderStocksTab } from './ui/stocksTab';
+import {
+  getActiveSinkingItems,
+  getFilteredRecurringItems,
+  openRecurringModal,
+  openSinkingModal,
+  renderConfigTab,
+} from './ui/configTab';
+import { getAssetSectionIds, openAssetModal, openSavingsAccountModal, renderAssetsTab } from './ui/assetsTab';
+import { getOrderedStockIds, openStockBaselineModal, renderStocksTab } from './ui/stocksTab';
 import { bindUtilityTabEvents, renderUtilityTab } from './ui/utilityTab';
+import { cancelReorder, startReorder } from './ui/reorderHelper';
 import {
   closeLockScreen,
   isAnyLockEnabled,
@@ -29,7 +38,7 @@ import {
 import { initBottomNavScrub } from './ui/tabBarScrub';
 import { openConflictsModal } from './ui/conflictUi';
 import { openHelpGuideModal } from './ui/helpGuideUi';
-import type { AppUiState, UiContext } from './ui/state';
+import type { AppUiState, StockChartDimension, StockChartType, UiContext } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
 
@@ -74,13 +83,27 @@ async function bootstrap(): Promise<void> {
   const parsedIdle = storedIdle !== null && !Number.isNaN(Number(storedIdle)) ? Number(storedIdle) : 5;
   const storedAlloc = localStorage.getItem('finance_alloc_mode');
   const storedStockView = localStorage.getItem('finance_stock_view_mode');
+  const storedChartType = localStorage.getItem('finance_stock_chart_type');
+  const storedChartDim = localStorage.getItem('finance_stock_chart_dim');
+  const storedPnlScheme = normalizePnlColorScheme(localStorage.getItem('finance_pnl_scheme'));
   const remembered = getRememberedAccount();
   const now = new Date();
+
+  document.documentElement.dataset.pnlScheme = storedPnlScheme;
 
   const urlParams = new URLSearchParams(window.location.search);
   const inviteParam = (urlParams.get('invite') || '').trim();
   const resetParam = (urlParams.get('reset') || '').trim();
   const userParam = (urlParams.get('user') || '').trim();
+
+  const validChartType: StockChartType =
+    storedChartType === 'pie' || storedChartType === 'hbar' || storedChartType === 'treemap'
+      ? storedChartType
+      : 'donut';
+  const validChartDim: StockChartDimension =
+    storedChartDim === 'category' || storedChartDim === 'cost' || storedChartDim === 'market'
+      ? storedChartDim
+      : 'value';
 
   const state: AppUiState = {
     masked: localStorage.getItem('finance_masked') === '1',
@@ -91,12 +114,19 @@ async function bootstrap(): Promise<void> {
     pageSize: 10,
     selectedCalendarDay: getTodayYmd(),
     overviewPeriod: 'monthly',
+    overviewExpandedGroups: [],
     chartMetric: 'netCashFlow',
     toolsSubtab: 'recurring',
     recurringFilter: 'all',
     allocMode: storedAlloc === 'pct' || storedAlloc === 'amt' ? storedAlloc : 'both',
     allocHighlight: null,
     stockPriceViewMode: storedStockView === 'total' ? 'total' : 'unit',
+    stockChartType: validChartType,
+    stockChartDimension: validChartDim,
+    stockChartHighlight: null,
+    pnlColorScheme: storedPnlScheme,
+    reorderSection: null,
+    reorderDraftIds: [],
     selectedYear: now.getFullYear(),
     selectedMonth: now.getMonth() + 1,
     logType: '日常花費',
@@ -133,11 +163,24 @@ async function bootstrap(): Promise<void> {
       },
     });
 
+  const applyPnlSchemeDom = (scheme: PnlColorScheme) => {
+    const normalized = normalizePnlColorScheme(scheme);
+    state.pnlColorScheme = normalized;
+    document.documentElement.dataset.pnlScheme = normalized;
+    localStorage.setItem('finance_pnl_scheme', normalized);
+  };
+
   const ctx: UiContext = {
     state,
     engine: null as unknown as SyncEngine,
+    applyPnlColorScheme: (scheme) => {
+      applyPnlSchemeDom(scheme);
+    },
     renderAll: () => {
       const snap = ctx.engine.getSnapshot();
+      if (snap.settings.pnlColorScheme) {
+        applyPnlSchemeDom(snap.settings.pnlColorScheme);
+      }
       el('fxTopPill').textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}`;
       renderLogTab(ctx);
       renderOverviewTab(ctx);
@@ -177,6 +220,7 @@ async function bootstrap(): Promise<void> {
     },
     switchAccountDb: async (user) => {
       ctx.state.currentUser = user;
+      cancelReorder(ctx, true);
       saveRememberedAccount(user);
       const nextDbName = LocalFinanceDB.dbNameForUser(user.id);
       if (activeDb.getDbName() !== nextDbName) {
@@ -293,6 +337,9 @@ function bindEvents(ctx: UiContext): void {
     const safeIdx = Math.max(0, Math.min(navButtons.length - 1, idx));
     const btn = navButtons[safeIdx];
     const tab = (btn.dataset.tab as AppUiState['activeTab']) || tabOrder[safeIdx];
+    if (ctx.state.activeTab !== tab && ctx.state.reorderSection) {
+      cancelReorder(ctx);
+    }
     ctx.state.activeTab = tab;
     navButtons.forEach((b, i) => b.classList.toggle('active', i === safeIdx));
     document.querySelectorAll('.tab-view').forEach((v) => v.classList.toggle('active', v.id === 'tab-' + tab));
@@ -585,6 +632,7 @@ function bindEvents(ctx: UiContext): void {
   document.querySelectorAll<HTMLButtonElement>('#toolsSubtabBar [data-tools-sub]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const sub = btn.dataset.toolsSub as AppUiState['toolsSubtab'];
+      if (ctx.state.reorderSection) cancelReorder(ctx);
       ctx.state.toolsSubtab = sub;
       document.querySelectorAll('#toolsSubtabBar [data-tools-sub]').forEach((b) => b.classList.toggle('active', b === btn));
       el('subtab-recurring').style.display = sub === 'recurring' ? 'flex' : 'none';
@@ -595,6 +643,7 @@ function bindEvents(ctx: UiContext): void {
 
   document.querySelectorAll<HTMLButtonElement>('#recurringFilterPills .chip-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
+      if (ctx.state.reorderSection === 'recurring') cancelReorder(ctx, true);
       document.querySelectorAll('#recurringFilterPills .chip-btn').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       ctx.state.recurringFilter = btn.dataset.filter as AppUiState['recurringFilter'];
@@ -604,6 +653,20 @@ function bindEvents(ctx: UiContext): void {
 
   el('addRecurringBtn').addEventListener('click', () => openRecurringModal(ctx, null));
   el('addSinkingBtn').addEventListener('click', () => openSinkingModal(ctx, null));
+  el('reorderRecurringBtn').addEventListener('click', () => {
+    startReorder(
+      ctx,
+      'recurring',
+      getFilteredRecurringItems(ctx).map((i) => i.id)
+    );
+  });
+  el('reorderSinkingBtn').addEventListener('click', () => {
+    startReorder(
+      ctx,
+      'sinking',
+      getActiveSinkingItems(ctx).map((i) => i.id)
+    );
+  });
 
   el('runRecurringBtn').addEventListener('click', async () => {
     const ym = `${ctx.state.selectedYear}-${String(ctx.state.selectedMonth).padStart(2, '0')}`;
@@ -659,6 +722,15 @@ function bindEvents(ctx: UiContext): void {
   el('addSavingsBtn').addEventListener('click', () => openSavingsAccountModal(ctx, null));
   el('addAssetBtn').addEventListener('click', () => openAssetModal(ctx, null));
   el('refreshMarketBtn').addEventListener('click', () => void refreshMarketAction());
+  el('reorderSavingsBtn').addEventListener('click', () => {
+    startReorder(ctx, 'assets_savings', getAssetSectionIds(ctx, 'assets_savings'));
+  });
+  el('reorderAutoAssetsBtn').addEventListener('click', () => {
+    startReorder(ctx, 'assets_auto', getAssetSectionIds(ctx, 'assets_auto'));
+  });
+  el('reorderManualAssetsBtn').addEventListener('click', () => {
+    startReorder(ctx, 'assets_manual', getAssetSectionIds(ctx, 'assets_manual'));
+  });
 
   el('runSnapshotBtn').addEventListener('click', async () => {
     if (!confirm('確定立即將目前資產負債總計寫入本月歷史快照？')) return;
@@ -687,6 +759,9 @@ function bindEvents(ctx: UiContext): void {
   });
   el('addStockBtn').addEventListener('click', () => openStockBaselineModal(ctx, null));
   el('stocksRefreshMarketBtn').addEventListener('click', () => void refreshMarketAction());
+  el('reorderStocksBtn').addEventListener('click', () => {
+    startReorder(ctx, 'stocks', getOrderedStockIds(ctx));
+  });
 
   // Tab 5 Utility subtab events
   bindUtilityTabEvents(ctx);

@@ -102,3 +102,43 @@ npm run deploy
 # 僅關閉管理員 App PIN 鎖（保留主密碼與所有帳目）
 npx wrangler d1 execute finance-db --remote --command "UPDATE users SET pin_enabled = 0, pin_hash = NULL, pin_salt = NULL WHERE id = 'owner';"
 ```
+
+---
+
+## 部署前備份與快速回滾（Rollback）
+
+若部署新版本後發現異常，系統具備以下多層回滾與復原保護：
+
+### 1. Worker 程式與前端 PWA 一鍵回滾（約 10 秒生效）
+Cloudflare Workers 會保留歷次部署快照（含 Static Assets 與後端 API），可隨時列出並回滾到上一個穩定版本：
+
+```bash
+cd cloudflare-pwa
+
+# 查看最近部署版本清單（含 Version ID 與部署時間）
+npm run deployments
+
+# 一鍵回滾至上一個版本（或指定 Version ID：npx wrangler rollback <VERSION_ID>）
+npm run rollback
+```
+
+> **為什麼資料庫升級後仍能安全回滾程式？**
+> 本專案所有 D1 Migration（如 `0008`、`0009`）皆採**純向後相容的新增欄位設計**（`ADD COLUMN ... NOT NULL DEFAULT ...`），不會刪除或破壞既有欄位，因此舊版 Worker 直接讀取已升級的 D1 資料庫也能正常運作。
+
+### 2. 部署前建議備份 D1（或 App 內下載 JSON）
+重大更新前建議先匯出一份 SQL 備份檔（或於 App 右上角「安全設定 → 下載完整 JSON 備份」）：
+
+```bash
+npm run db:backup:remote
+```
+（會匯出至 `d1-backup.sql`，已列入 `.gitignore` 不會誤提交至 Git）
+
+### 3. D1 Time Travel（資料誤改時間點還原）
+若需要把資料庫內容本身還原到特定時間點（免費方案保留最近 7 天、付費方案 30 天）：
+
+```bash
+# 查詢某時間點的 bookmark，或直接還原至指定 ISO 時間點
+npx wrangler d1 time-travel info finance-db --timestamp="2026-01-01T00:00:00Z"
+npx wrangler d1 time-travel restore finance-db --timestamp="2026-01-01T00:00:00Z"
+```
+

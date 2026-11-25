@@ -5,6 +5,7 @@ import {
   SINKING_FUND_CATEGORIES,
 } from '../../../shared/constants';
 import {
+  compareBySortOrder,
   computeRecurringMonthlyTwd,
   computeSinkingMonthlyReserve,
   computeSinkingYtdSpent,
@@ -21,7 +22,33 @@ import {
   openModal,
   showToast,
 } from './helpers';
+import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
+
+export function getFilteredRecurringItems(ctx: UiContext): RecurringItem[] {
+  const snap = ctx.engine.getSnapshot();
+  return snap.recurringItems
+    .filter((item) => {
+      if (item.deletedAt) return false;
+      const f = ctx.state.recurringFilter;
+      if (f === 'all') return true;
+      if (f === 'income') return item.type.includes('收入');
+      if (f === 'invest') return item.type === CASHFLOW_TYPES.INVESTMENT;
+      if (f === 'fixed') return item.type === CASHFLOW_TYPES.FIXED_EXPENSE;
+      if (f === 'sub') return item.type === CASHFLOW_TYPES.SUBSCRIPTION;
+      return true;
+    })
+    .slice()
+    .sort(compareBySortOrder);
+}
+
+export function getActiveSinkingItems(ctx: UiContext): SinkingFundItem[] {
+  return ctx.engine
+    .getSnapshot()
+    .sinkingItems.filter((s) => !s.deletedAt)
+    .slice()
+    .sort(compareBySortOrder);
+}
 
 export function renderConfigTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
@@ -30,22 +57,32 @@ export function renderConfigTab(ctx: UiContext): void {
   const recList = el('recurringList');
   recList.innerHTML = '';
 
-  const filtered = snap.recurringItems.filter((item) => {
-    if (item.deletedAt) return false;
-    const f = ctx.state.recurringFilter;
-    if (f === 'all') return true;
-    if (f === 'income') return item.type.includes('收入');
-    if (f === 'invest') return item.type === CASHFLOW_TYPES.INVESTMENT;
-    if (f === 'fixed') return item.type === CASHFLOW_TYPES.FIXED_EXPENSE;
-    if (f === 'sub') return item.type === CASHFLOW_TYPES.SUBSCRIPTION;
-    return true;
-  });
+  const filtered = getFilteredRecurringItems(ctx);
+  const recReorderBtn = el<HTMLButtonElement>('reorderRecurringBtn');
+  const isReorderingRec = ctx.state.reorderSection === 'recurring';
+  recReorderBtn.style.display = filtered.length >= 2 && !isReorderingRec ? '' : 'none';
 
   const savingsMap = new Map(
     snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
   );
 
-  if (!filtered.length) {
+  if (isReorderingRec && filtered.length >= 2) {
+    renderReorderList(ctx, {
+      container: recList,
+      section: 'recurring',
+      items: filtered.map((item) => {
+        const monthlyTwd = computeRecurringMonthlyTwd(item, rate);
+        return {
+          id: item.id,
+          title: item.itemName,
+          badge: item.type,
+          subtitle: `${item.cycle} · ${fmtRaw(item.amount, item.currency, ctx.state.masked)} · 月均 ${fmtMoney(monthlyTwd, ctx.state.masked)}`,
+        };
+      }),
+      onSave: (orderedIds) => ctx.engine.reorderRecurring(orderedIds),
+      onReRender: () => renderConfigTab(ctx),
+    });
+  } else if (!filtered.length) {
     const e = document.createElement('div');
     e.className = 'list-empty';
     e.textContent = '此分類尚無固定設定，點右上角「+ 新增」';
@@ -112,13 +149,30 @@ export function renderConfigTab(ctx: UiContext): void {
   }
 
   // Sinking fund list
-  const activeSinking = snap.sinkingItems.filter((s) => !s.deletedAt);
+  const activeSinking = getActiveSinkingItems(ctx);
   const monthlyTotal = activeSinking.reduce((s, i) => s + computeSinkingMonthlyReserve(i), 0);
   el('sinkingMonthlyTotal').textContent = fmtMoney(monthlyTotal, ctx.state.masked);
 
+  const sinkReorderBtn = el<HTMLButtonElement>('reorderSinkingBtn');
+  const isReorderingSink = ctx.state.reorderSection === 'sinking';
+  sinkReorderBtn.style.display = activeSinking.length >= 2 && !isReorderingSink ? '' : 'none';
+
   const sList = el('sinkingList');
   sList.innerHTML = '';
-  if (!activeSinking.length) {
+  if (isReorderingSink && activeSinking.length >= 2) {
+    renderReorderList(ctx, {
+      container: sList,
+      section: 'sinking',
+      items: activeSinking.map((item) => ({
+        id: item.id,
+        title: item.itemName,
+        badge: `${item.months} 個月`,
+        subtitle: `總額 ${fmtMoney(item.totalAmount, ctx.state.masked)} · 每月提撥 ${fmtMoney(computeSinkingMonthlyReserve(item), ctx.state.masked)}`,
+      })),
+      onSave: (orderedIds) => ctx.engine.reorderSinking(orderedIds),
+      onReRender: () => renderConfigTab(ctx),
+    });
+  } else if (!activeSinking.length) {
     const e = document.createElement('div');
     e.className = 'list-empty';
     e.textContent = '尚無不定期攤提項目，點右上角「+ 新增攤提」';

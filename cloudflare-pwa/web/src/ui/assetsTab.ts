@@ -1,5 +1,6 @@
 import { ASSET_SUB_CATEGORIES } from '../../../shared/constants';
 import {
+  compareBySortOrder,
   computeAllSavingsSummary,
   computeAssetEffectiveTwdValue,
   computeLoanAmortizationSchedule,
@@ -23,7 +24,30 @@ import {
   showToast,
   TRASH_SVG,
 } from './helpers';
+import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
+
+export function getAssetSectionIds(
+  ctx: UiContext,
+  section: 'assets_savings' | 'assets_auto' | 'assets_manual'
+): string[] {
+  const active = ctx.engine
+    .getSnapshot()
+    .assetItems.filter((a) => !a.deletedAt)
+    .slice()
+    .sort(compareBySortOrder);
+  if (section === 'assets_savings') {
+    return active.filter((a) => a.isLinkedSavings).map((a) => a.id);
+  }
+  if (section === 'assets_auto') {
+    return active
+      .filter((a) => !a.isLinkedSavings && !(a.majorType === '負債' && a.isAmortizingLoan) && a.updateMode === '自動更新')
+      .map((a) => a.id);
+  }
+  return active
+    .filter((a) => !a.isLinkedSavings && ((a.majorType === '負債' && a.isAmortizingLoan) || a.updateMode !== '自動更新'))
+    .map((a) => a.id);
+}
 
 function todayYmdLocal(): string {
   const d = new Date();
@@ -41,7 +65,10 @@ function fmtSignedMoney(n: number, masked: boolean): string {
 export function renderAssetsTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
   const rate = snap.settings.usdTwdRate;
-  const activeAssets = snap.assetItems.filter((a) => !a.deletedAt);
+  const activeAssets = snap.assetItems
+    .filter((a) => !a.deletedAt)
+    .slice()
+    .sort(compareBySortOrder);
   const adjustments = snap.savingsAdjustments || [];
   const stockTxs = snap.stockTransactions || [];
   const nw = computeNetWorthSummary(activeAssets, rate, 0, snap.cashflowLogs, adjustments, stockTxs);
@@ -136,10 +163,27 @@ export function renderAssetsTab(ctx: UiContext): void {
   // ==================== 活存帳戶區（與流水帳即時連動） ====================
   const savings = computeAllSavingsSummary(activeAssets, snap.cashflowLogs, adjustments, rate);
   el('assetsSavingsTotalLabel').textContent = `合計 ${fmtMoney(savings.totalSavingsTwd, ctx.state.masked)}`;
+  const savReorderBtn = el<HTMLButtonElement>('reorderSavingsBtn');
+  const isReorderingSavings = ctx.state.reorderSection === 'assets_savings';
+  savReorderBtn.style.display = savings.accounts.length >= 2 && !isReorderingSavings ? '' : 'none';
+
   const savList = el('savingsAccountsList');
   savList.innerHTML = '';
 
-  if (!savings.accounts.length) {
+  if (isReorderingSavings && savings.accounts.length >= 2) {
+    renderReorderList(ctx, {
+      container: savList,
+      section: 'assets_savings',
+      items: savings.accounts.map((s) => ({
+        id: s.account.id,
+        title: s.account.itemName,
+        badge: s.account.isDefaultSavings ? '★ 預設' : s.account.currency,
+        subtitle: `即時餘額 ${fmtMoney(s.currentBalanceTwd, ctx.state.masked)}`,
+      })),
+      onSave: (orderedIds) => ctx.engine.reorderAssets(orderedIds),
+      onReRender: () => renderAssetsTab(ctx),
+    });
+  } else if (!savings.accounts.length) {
     const empty = document.createElement('div');
     empty.className = 'list-empty';
     empty.style.display = 'flex';
@@ -238,162 +282,261 @@ export function renderAssetsTab(ctx: UiContext): void {
   autoList.innerHTML = '';
   manualList.innerHTML = '';
 
-  let autoCount = 0;
-  let manualCount = 0;
-  const todayYmd = todayYmdLocal();
+  const autoItems: AssetItem[] = [];
+  const manualItems: AssetItem[] = [];
   for (const item of activeAssets) {
     if (item.isLinkedSavings) continue;
     if (item.majorType === '負債' && item.isAmortizingLoan) {
-      const loan = computeLoanAmortizationSummary(item, rate, todayYmd);
-      const row = document.createElement('div');
-      row.className = 'savings-acc-row';
-
-      const top = document.createElement('div');
-      top.className = 'savings-acc-top';
-
-      const main = document.createElement('div');
-      main.className = 'item-main';
-      const title = document.createElement('div');
-      title.className = 'item-title';
-      title.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap';
-      title.appendChild(document.createTextNode(item.itemName));
-
-      const catBadge = document.createElement('span');
-      catBadge.className = 'badge red';
-      catBadge.style.marginRight = '0';
-      catBadge.textContent = item.subCategory;
-      title.appendChild(catBadge);
-
-      const autoBadge = document.createElement('span');
-      autoBadge.className = 'badge';
-      autoBadge.style.marginRight = '0';
-      autoBadge.textContent = '自動還本';
-      title.appendChild(autoBadge);
-
-      const sub = document.createElement('div');
-      sub.className = 'item-sub tnum';
-      if (loan.currentBalance <= 0) {
-        sub.textContent = `已推算清償（基準 ${fmtMoney(loan.baseBalance, ctx.state.masked)} @ ${item.balanceAnchorDate || '-'}）`;
-      } else if (loan.isInterestOnly) {
-        sub.textContent = `寬限期/只繳息 · 年利 ${item.loanAnnualRate ?? 0}% · 月息 ~${fmtMoney(loan.nextInterest, ctx.state.masked)} · 基準 ${item.balanceAnchorDate || '-'}`;
-      } else {
-        const payoffTxt = loan.estimatedPayoffYm ? ` · 預計 ${loan.estimatedPayoffYm} 清償` : '';
-        sub.textContent = `年利 ${item.loanAnnualRate ?? 0}% · 已推算 ${loan.elapsedPeriods} 期 · 下期還本 ~${fmtMoney(loan.nextPrincipal, ctx.state.masked)} / 息 ~${fmtMoney(loan.nextInterest, ctx.state.masked)}${payoffTxt}`;
-      }
-      main.appendChild(title);
-      main.appendChild(sub);
-
-      const bal = document.createElement('div');
-      bal.className = 'savings-acc-bal neg tnum';
-      bal.textContent = '-' + fmtMoney(loan.currentBalanceTwd, ctx.state.masked);
-
-      top.appendChild(main);
-      top.appendChild(bal);
-
-      const actions = document.createElement('div');
-      actions.className = 'savings-acc-actions';
-
-      const recBtn = document.createElement('button');
-      recBtn.type = 'button';
-      recBtn.className = 'btn btn-tinted btn-sm';
-      recBtn.textContent = '快照校準';
-      recBtn.addEventListener('click', () => openLoanReconcileModal(ctx, item));
-
-      const schBtn = document.createElement('button');
-      schBtn.type = 'button';
-      schBtn.className = 'btn btn-outline btn-sm';
-      schBtn.textContent = '攤還試算';
-      schBtn.addEventListener('click', () => openLoanScheduleModal(ctx, item));
-
-      const editBtn = document.createElement('button');
-      editBtn.type = 'button';
-      editBtn.className = 'btn btn-outline btn-sm';
-      editBtn.textContent = '編輯';
-      editBtn.addEventListener('click', () => openAssetModal(ctx, item));
-
-      actions.appendChild(recBtn);
-      actions.appendChild(schBtn);
-      actions.appendChild(editBtn);
-
-      row.appendChild(top);
-      row.appendChild(actions);
-      manualList.appendChild(row);
-      manualCount++;
-      continue;
-    }
-
-    const isStock = isStockAsset(item);
-    const stockPos = isStock ? computeStockPositionSummary(item, stockTxs, rate) : null;
-    const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs, todayYmd);
-    const row = document.createElement('div');
-    row.className = 'list-row';
-
-    const main = document.createElement('div');
-    main.className = 'item-main';
-    const t = document.createElement('div');
-    t.className = 'item-title';
-    t.textContent = item.itemName;
-    const sub = document.createElement('div');
-    sub.className = 'item-sub tnum';
-    const b = document.createElement('span');
-    b.className = 'badge' + (item.majorType === '負債' ? ' red' : ' green');
-    b.textContent = item.subCategory;
-    sub.appendChild(b);
-    const displayQty = stockPos ? stockPos.currentShares : item.quantityOrAmount;
-    const pnlSuffix =
-      stockPos && stockPos.hasCostBasis
-        ? ` · 含息 ${fmtSignedMoney(stockPos.totalReturnPnlTwd, ctx.state.masked)}`
-        : '';
-    const detail = item.ticker || isStock
-      ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}${pnlSuffix}`
-      : item.currency === 'USD'
-        ? fmtRaw(item.quantityOrAmount, 'USD', ctx.state.masked)
-        : item.liquidity;
-    sub.appendChild(document.createTextNode(detail));
-    main.appendChild(t);
-    main.appendChild(sub);
-
-    const right = document.createElement('div');
-    right.className = 'item-right';
-    const amt = document.createElement('div');
-    amt.className = 'item-amount';
-    amt.style.color = item.majorType === '負債' ? 'var(--danger)' : 'var(--text)';
-    amt.textContent = (item.majorType === '負債' ? '-' : '') + fmtMoney(twdVal, ctx.state.masked);
-
-    const editBtn = document.createElement('button');
-    editBtn.type = 'button';
-    editBtn.className = 'btn btn-outline btn-sm';
-    editBtn.textContent = isStock ? '持股頁' : '更新';
-    editBtn.addEventListener('click', () => {
-      if (isStock) ctx.navigateToTab('stocks');
-      else openAssetModal(ctx, item);
-    });
-
-    right.appendChild(amt);
-    right.appendChild(editBtn);
-    row.appendChild(main);
-    row.appendChild(right);
-
-    if (item.updateMode === '自動更新') {
-      autoList.appendChild(row);
-      autoCount++;
+      manualItems.push(item);
+    } else if (item.updateMode === '自動更新') {
+      autoItems.push(item);
     } else {
-      manualList.appendChild(row);
-      manualCount++;
+      manualItems.push(item);
     }
   }
 
-  if (!autoCount) {
+  const autoReorderBtn = el<HTMLButtonElement>('reorderAutoAssetsBtn');
+  const isReorderingAuto = ctx.state.reorderSection === 'assets_auto';
+  autoReorderBtn.style.display = autoItems.length >= 2 && !isReorderingAuto ? '' : 'none';
+
+  const manualReorderBtn = el<HTMLButtonElement>('reorderManualAssetsBtn');
+  const isReorderingManual = ctx.state.reorderSection === 'assets_manual';
+  manualReorderBtn.style.display = manualItems.length >= 2 && !isReorderingManual ? '' : 'none';
+
+  const todayYmd = todayYmdLocal();
+
+  if (isReorderingAuto && autoItems.length >= 2) {
+    renderReorderList(ctx, {
+      container: autoList,
+      section: 'assets_auto',
+      items: autoItems.map((item) => {
+        const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs, todayYmd);
+        return {
+          id: item.id,
+          title: item.itemName,
+          badge: item.ticker || item.subCategory,
+          subtitle: `市值 ${fmtMoney(twdVal, ctx.state.masked)}`,
+        };
+      }),
+      onSave: (orderedIds) => ctx.engine.reorderAssets(orderedIds),
+      onReRender: () => renderAssetsTab(ctx),
+    });
+  } else if (!autoItems.length) {
     const e = document.createElement('div');
     e.className = 'list-empty';
     e.textContent = '尚無自動更新資產';
     autoList.appendChild(e);
+  } else {
+    for (const item of autoItems) {
+      const isStock = isStockAsset(item);
+      const stockPos = isStock ? computeStockPositionSummary(item, stockTxs, rate) : null;
+      const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs, todayYmd);
+      const row = document.createElement('div');
+      row.className = 'list-row';
+
+      const main = document.createElement('div');
+      main.className = 'item-main';
+      const t = document.createElement('div');
+      t.className = 'item-title';
+      t.textContent = item.itemName;
+      const sub = document.createElement('div');
+      sub.className = 'item-sub tnum';
+      const b = document.createElement('span');
+      b.className = 'badge' + (item.majorType === '負債' ? ' red' : ' green');
+      b.textContent = item.subCategory;
+      sub.appendChild(b);
+      const displayQty = stockPos ? stockPos.currentShares : item.quantityOrAmount;
+      const pnlSuffix =
+        stockPos && stockPos.hasCostBasis
+          ? ` · 含息 ${fmtSignedMoney(stockPos.totalReturnPnlTwd, ctx.state.masked)}`
+          : '';
+      const detail = item.ticker || isStock
+        ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}${pnlSuffix}`
+        : item.currency === 'USD'
+          ? fmtRaw(item.quantityOrAmount, 'USD', ctx.state.masked)
+          : item.liquidity;
+      sub.appendChild(document.createTextNode(detail));
+      main.appendChild(t);
+      main.appendChild(sub);
+
+      const right = document.createElement('div');
+      right.className = 'item-right';
+      const amt = document.createElement('div');
+      amt.className = 'item-amount';
+      amt.style.color = item.majorType === '負債' ? 'var(--neg)' : 'var(--text)';
+      amt.textContent = (item.majorType === '負債' ? '-' : '') + fmtMoney(twdVal, ctx.state.masked);
+
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'btn btn-outline btn-sm';
+      editBtn.textContent = isStock ? '持股頁' : '更新';
+      editBtn.addEventListener('click', () => {
+        if (isStock) ctx.navigateToTab('stocks');
+        else openAssetModal(ctx, item);
+      });
+
+      right.appendChild(amt);
+      right.appendChild(editBtn);
+      row.appendChild(main);
+      row.appendChild(right);
+      autoList.appendChild(row);
+    }
   }
-  if (!manualCount) {
+
+  if (isReorderingManual && manualItems.length >= 2) {
+    renderReorderList(ctx, {
+      container: manualList,
+      section: 'assets_manual',
+      items: manualItems.map((item) => {
+        const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs, todayYmd);
+        return {
+          id: item.id,
+          title: item.itemName,
+          badge: item.subCategory,
+          subtitle: `${item.majorType === '負債' ? '負債 -' : ''}${fmtMoney(twdVal, ctx.state.masked)}`,
+        };
+      }),
+      onSave: (orderedIds) => ctx.engine.reorderAssets(orderedIds),
+      onReRender: () => renderAssetsTab(ctx),
+    });
+  } else if (!manualItems.length) {
     const e = document.createElement('div');
     e.className = 'list-empty';
     e.textContent = '尚無手動快照項目';
     manualList.appendChild(e);
+  } else {
+    for (const item of manualItems) {
+      if (item.majorType === '負債' && item.isAmortizingLoan) {
+        const loan = computeLoanAmortizationSummary(item, rate, todayYmd);
+        const row = document.createElement('div');
+        row.className = 'savings-acc-row';
+
+        const top = document.createElement('div');
+        top.className = 'savings-acc-top';
+
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const title = document.createElement('div');
+        title.className = 'item-title';
+        title.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap';
+        title.appendChild(document.createTextNode(item.itemName));
+
+        const catBadge = document.createElement('span');
+        catBadge.className = 'badge red';
+        catBadge.style.marginRight = '0';
+        catBadge.textContent = item.subCategory;
+        title.appendChild(catBadge);
+
+        const autoBadge = document.createElement('span');
+        autoBadge.className = 'badge';
+        autoBadge.style.marginRight = '0';
+        autoBadge.textContent = '自動還本';
+        title.appendChild(autoBadge);
+
+        const sub = document.createElement('div');
+        sub.className = 'item-sub tnum';
+        if (loan.currentBalance <= 0) {
+          sub.textContent = `已推算清償（基準 ${fmtMoney(loan.baseBalance, ctx.state.masked)} @ ${item.balanceAnchorDate || '-'}）`;
+        } else if (loan.isInterestOnly) {
+          sub.textContent = `寬限期/只繳息 · 年利 ${item.loanAnnualRate ?? 0}% · 月息 ~${fmtMoney(loan.nextInterest, ctx.state.masked)} · 基準 ${item.balanceAnchorDate || '-'}`;
+        } else {
+          const payoffTxt = loan.estimatedPayoffYm ? ` · 預計 ${loan.estimatedPayoffYm} 清償` : '';
+          sub.textContent = `年利 ${item.loanAnnualRate ?? 0}% · 已推算 ${loan.elapsedPeriods} 期 · 下期還本 ~${fmtMoney(loan.nextPrincipal, ctx.state.masked)} / 息 ~${fmtMoney(loan.nextInterest, ctx.state.masked)}${payoffTxt}`;
+        }
+        main.appendChild(title);
+        main.appendChild(sub);
+
+        const bal = document.createElement('div');
+        bal.className = 'savings-acc-bal neg tnum';
+        bal.textContent = '-' + fmtMoney(loan.currentBalanceTwd, ctx.state.masked);
+
+        top.appendChild(main);
+        top.appendChild(bal);
+
+        const actions = document.createElement('div');
+        actions.className = 'savings-acc-actions';
+
+        const recBtn = document.createElement('button');
+        recBtn.type = 'button';
+        recBtn.className = 'btn btn-tinted btn-sm';
+        recBtn.textContent = '快照校準';
+        recBtn.addEventListener('click', () => openLoanReconcileModal(ctx, item));
+
+        const schBtn = document.createElement('button');
+        schBtn.type = 'button';
+        schBtn.className = 'btn btn-outline btn-sm';
+        schBtn.textContent = '攤還試算';
+        schBtn.addEventListener('click', () => openLoanScheduleModal(ctx, item));
+
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'btn btn-outline btn-sm';
+        editBtn.textContent = '編輯';
+        editBtn.addEventListener('click', () => openAssetModal(ctx, item));
+
+        actions.appendChild(recBtn);
+        actions.appendChild(schBtn);
+        actions.appendChild(editBtn);
+
+        row.appendChild(top);
+        row.appendChild(actions);
+        manualList.appendChild(row);
+        continue;
+      }
+
+      const isStock = isStockAsset(item);
+      const stockPos = isStock ? computeStockPositionSummary(item, stockTxs, rate) : null;
+      const twdVal = computeAssetEffectiveTwdValue(item, rate, snap.cashflowLogs, adjustments, stockTxs, todayYmd);
+      const row = document.createElement('div');
+      row.className = 'list-row';
+
+      const main = document.createElement('div');
+      main.className = 'item-main';
+      const t = document.createElement('div');
+      t.className = 'item-title';
+      t.textContent = item.itemName;
+      const sub = document.createElement('div');
+      sub.className = 'item-sub tnum';
+      const b = document.createElement('span');
+      b.className = 'badge' + (item.majorType === '負債' ? ' red' : ' green');
+      b.textContent = item.subCategory;
+      sub.appendChild(b);
+      const displayQty = stockPos ? stockPos.currentShares : item.quantityOrAmount;
+      const pnlSuffix =
+        stockPos && stockPos.hasCostBasis
+          ? ` · 含息 ${fmtSignedMoney(stockPos.totalReturnPnlTwd, ctx.state.masked)}`
+          : '';
+      const detail = item.ticker || isStock
+        ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}${pnlSuffix}`
+        : item.currency === 'USD'
+          ? fmtRaw(item.quantityOrAmount, 'USD', ctx.state.masked)
+          : item.liquidity;
+      sub.appendChild(document.createTextNode(detail));
+      main.appendChild(t);
+      main.appendChild(sub);
+
+      const right = document.createElement('div');
+      right.className = 'item-right';
+      const amt = document.createElement('div');
+      amt.className = 'item-amount';
+      amt.style.color = item.majorType === '負債' ? 'var(--neg)' : 'var(--text)';
+      amt.textContent = (item.majorType === '負債' ? '-' : '') + fmtMoney(twdVal, ctx.state.masked);
+
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'btn btn-outline btn-sm';
+      editBtn.textContent = isStock ? '持股頁' : '更新';
+      editBtn.addEventListener('click', () => {
+        if (isStock) ctx.navigateToTab('stocks');
+        else openAssetModal(ctx, item);
+      });
+
+      right.appendChild(amt);
+      right.appendChild(editBtn);
+      row.appendChild(main);
+      row.appendChild(right);
+      manualList.appendChild(row);
+    }
   }
 
   const hList = el('historyList');
@@ -421,7 +564,7 @@ export function renderAssetsTab(ctx: UiContext): void {
 
       const amt = document.createElement('div');
       amt.className = 'item-amount';
-      amt.style.color = h.netWorth >= 0 ? 'var(--success)' : 'var(--danger)';
+      amt.style.color = h.netWorth >= 0 ? 'var(--pos)' : 'var(--neg)';
       amt.textContent = fmtMoney(h.netWorth, ctx.state.masked);
       row.appendChild(main);
       row.appendChild(amt);
@@ -560,7 +703,7 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
   const banner = document.createElement('div');
   banner.style.cssText =
     'display:flex;justify-content:space-between;align-items:center;padding:10px 13px;border-radius:12px;background:var(--surface-alt);margin-bottom:14px;';
-  banner.innerHTML = `<span style="font-size:12.5px;color:var(--text-secondary);font-weight:600">目前即時餘額</span><strong class="tnum" style="font-size:18px;color:${summary.currentBalanceTwd < 0 ? 'var(--danger)' : 'var(--success)'}">${fmtMoney(summary.currentBalanceTwd, ctx.state.masked)}</strong>`;
+  banner.innerHTML = `<span style="font-size:12.5px;color:var(--text-secondary);font-weight:600">目前即時餘額</span><strong class="tnum" style="font-size:18px;color:${summary.currentBalanceTwd < 0 ? 'var(--neg)' : 'var(--pos)'}">${fmtMoney(summary.currentBalanceTwd, ctx.state.masked)}</strong>`;
   body.appendChild(banner);
 
   let mode: 'deposit' | 'withdraw' = 'deposit';
@@ -680,7 +823,7 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
       const amt = document.createElement('span');
       amt.className = 'tnum';
       amt.style.fontWeight = '700';
-      amt.style.color = adj.twdAmount >= 0 ? 'var(--success)' : 'var(--danger)';
+      amt.style.color = adj.twdAmount >= 0 ? 'var(--pos)' : 'var(--neg)';
       amt.textContent = fmtSignedMoney(adj.twdAmount, ctx.state.masked);
 
       const delBtn = document.createElement('button');
@@ -778,7 +921,7 @@ export function openLoanReconcileModal(ctx: UiContext, item: AssetItem): void {
   const info = document.createElement('div');
   info.style.cssText =
     'padding:11px 13px;border-radius:12px;background:var(--surface-alt);margin-bottom:14px;font-size:13px;line-height:1.55;color:var(--text-secondary)';
-  info.innerHTML = `目前推估剩餘本金：<strong class="tnum" style="color:var(--danger)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong><br/>拿到最新銀行對帳單或遇到調息時，直接填入最新本金與基準日覆蓋，後續會從新基準繼續自動還本推算；若想改回純手動快照也可於下方勾選。`;
+  info.innerHTML = `目前推估剩餘本金：<strong class="tnum" style="color:var(--neg)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong><br/>拿到最新銀行對帳單或遇到調息時，直接填入最新本金與基準日覆蓋，後續會從新基準繼續自動還本推算；若想改回純手動快照也可於下方勾選。`;
   body.appendChild(info);
 
   const form = document.createElement('form');
@@ -878,7 +1021,7 @@ export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
       ? '寬限期／只繳息'
       : `剩餘約 ${loan.remainingPeriods} 期${loan.estimatedPayoffYm ? `（預計 ${loan.estimatedPayoffYm} 清償）` : ''}`;
   banner.innerHTML =
-    `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span>截至今日預估餘額</span><strong class="tnum" style="font-size:17px;color:var(--danger)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong></div>` +
+    `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span>截至今日預估餘額</span><strong class="tnum" style="font-size:17px;color:var(--neg)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong></div>` +
     `<div class="tnum">年利率 ${item.loanAnnualRate ?? 0}% · 月付 ${fmtRaw(item.loanMonthlyPayment || 0, item.currency, ctx.state.masked)} · 每月 ${item.loanBillingDay || 1} 號扣款<br/>基準單據 ${fmtRaw(loan.baseBalance, item.currency, ctx.state.masked)} (${item.balanceAnchorDate || '-'}) · 已推算 ${loan.elapsedPeriods} 期 · ${remainText}</div>`;
   body.appendChild(banner);
 
@@ -924,7 +1067,7 @@ export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
       const tr = document.createElement('tr');
       tr.innerHTML =
         `<td>${row.paymentDate}</td>` +
-        `<td style="color:var(--success);font-weight:600">${ctx.state.masked ? '•••' : fmtNum(row.principal)}</td>` +
+        `<td style="color:var(--pos);font-weight:600">${ctx.state.masked ? '•••' : fmtNum(row.principal)}</td>` +
         `<td style="color:var(--text-secondary)">${ctx.state.masked ? '•••' : fmtNum(row.interest)}</td>` +
         `<td style="font-weight:600">${ctx.state.masked ? '•••••' : fmtNum(row.remainingBalance)}</td>`;
       tbody.appendChild(tr);

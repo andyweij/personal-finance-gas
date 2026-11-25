@@ -1,6 +1,7 @@
 import {
   DEFAULT_EMERGENCY_MONTHS,
   DEFAULT_MONTHLY_DAILY_BUDGET,
+  DEFAULT_PNL_COLOR_SCHEME,
   DEFAULT_USD_TWD_RATE,
 } from '../../../shared/constants';
 import { DEFAULT_UTILITY_RENTS } from '../../../shared/rentUtility';
@@ -17,6 +18,8 @@ export function createEmptySnapshot(): FinanceSnapshot {
       emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
       usdTwdRate: DEFAULT_USD_TWD_RATE,
       fxUpdatedAt: null,
+      pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
+      customStockCategories: [],
       updatedAt: '',
     },
     cashflowLogs: [],
@@ -103,7 +106,15 @@ export class LocalFinanceDB {
         resolve({
           ...empty,
           ...raw,
-          settings: raw.settings || empty.settings,
+          settings: raw.settings
+            ? {
+                ...empty.settings,
+                ...raw.settings,
+                customStockCategories: Array.isArray(raw.settings.customStockCategories)
+                  ? raw.settings.customStockCategories
+                  : [],
+              }
+            : empty.settings,
           cashflowLogs: Array.isArray(raw.cashflowLogs) ? raw.cashflowLogs : [],
           recurringItems: Array.isArray(raw.recurringItems) ? raw.recurringItems : [],
           sinkingItems: Array.isArray(raw.sinkingItems) ? raw.sinkingItems : [],

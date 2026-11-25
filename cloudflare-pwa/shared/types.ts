@@ -1,8 +1,12 @@
+export type PnlColorScheme = 'intl' | 'tw' | 'tw_stocks';
+
 export interface AppSettings {
   monthlyDailyBudget: number;
   emergencyTargetMonths: number;
   usdTwdRate: number;
   fxUpdatedAt?: string | null;
+  pnlColorScheme?: PnlColorScheme;
+  customStockCategories?: string[];
   updatedAt: string;
   version?: number;
 }
@@ -40,6 +44,7 @@ export interface RecurringItem {
   status: string;
   note: string;
   linkedAccountId?: string | null;
+  sortOrder?: number;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -55,6 +60,7 @@ export interface SinkingFundItem {
   dueNote: string;
   status: string;
   note: string;
+  sortOrder?: number;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -83,6 +89,8 @@ export interface AssetItem {
   loanAnnualRate?: number | null;
   loanMonthlyPayment?: number | null;
   loanBillingDay?: number | null;
+  stockCategory?: string;
+  sortOrder?: number;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -362,6 +370,21 @@ export interface PeriodMetrics {
   otherIncome: number;
   mortgage: number;
   carLoan: number;
+}
+
+export interface OverviewBreakdownItem {
+  label: string;
+  monthlyAmount: number;
+  yearlyAmount: number;
+}
+
+export interface OverviewBreakdownGroup {
+  key: string;
+  label: string;
+  monthlyAmount: number;
+  yearlyAmount: number;
+  isTotal?: boolean;
+  children: OverviewBreakdownItem[];
 }
 
 export interface MonthlyTrendPoint {

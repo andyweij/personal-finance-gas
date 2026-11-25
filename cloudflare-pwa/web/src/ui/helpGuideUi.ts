@@ -1,4 +1,12 @@
 import { openModal } from './helpers';
+import {
+  APP_VERSION,
+  BUILD_COMMIT,
+  BUILD_TIME,
+  DB_SCHEMA_VERSION,
+  SW_CACHE_VERSION,
+  VERSION_HIGHLIGHTS,
+} from '../version';
 
 export type HelpSectionId =
   | 'savings'
@@ -31,6 +39,10 @@ const HELP_SECTIONS: HelpSection[] = [
         text: '買股票或基金只是把現金轉成投資資產，錢並沒有花掉，因此會計入「總儲蓄」與「真實儲蓄率（總儲蓄 ÷ 總收入）」。',
       },
       {
+        lead: '大項統計可點擊展開明細',
+        text: '總覽頁的收支大項依記帳類型自動彙整，點擊有箭頭「▸」的項目即可展開各細項分類或稅金分攤明細，不受個人化命名限制。',
+      },
+      {
         lead: '為什麼每月開頭會是負數，或年度總儲蓄比當月高？',
         text: '「當月視角」採用保守預留口徑：會先把你在「工具 → 稅金分攤」啟用的每月應提撥預備金（例如所得稅、牌照稅、年繳保費 ÷ 12）先扣起來，避免繳稅月大爆表；而「年度累計視角」採實支口徑，只扣今年實際已繳出的稅金／大額支出。在真正繳稅前，兩邊差額正好就是「稅金攤提(月) / 實支(年)」那一列。',
       },
@@ -46,7 +58,7 @@ const HELP_SECTIONS: HelpSection[] = [
   },
   {
     id: 'stocks',
-    title: '📈 持股加碼、定期定額與避免重複扣款',
+    title: '📈 持股加碼、定期定額與分類統計圖表',
     bullets: [
       {
         lead: '每月定期定額（已有固定排程扣款）',
@@ -59,6 +71,10 @@ const HELP_SECTIONS: HelpSection[] = [
       {
         lead: '帳面價差（不含息）vs 配息扣成本（含息）',
         text: '「不含息」單純看股價相對原始均價的漲跌；「含息」則把歷年領到的現金配息從投入本金中扣除，反映真實未回本金額（歸零即顯示「✓ 已回本」）。',
+      },
+      {
+        lead: '持股分類與多樣化圖表',
+        text: '可為每檔持股標記「個股 / ETF / 特別股」或自訂分類（如債券 ETF、高股息），並切換甜甜圈、圓餅圖、長條圖、面積圖檢視「市值佔比 / 持股分類 / 成本佔比 / 台美市場」。',
       },
     ],
   },
@@ -129,6 +145,13 @@ const HELP_SECTIONS: HelpSection[] = [
   },
 ];
 
+function formatBuildTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 export function openHelpGuideModal(focusSection?: HelpSectionId): void {
   const body = openModal('使用指南與計算口徑說明');
 
@@ -184,6 +207,72 @@ export function openHelpGuideModal(focusSection?: HelpSectionId): void {
   }
 
   body.appendChild(list);
+
+  // Version & system info card
+  const verCard = document.createElement('div');
+  verCard.className = 'help-version-card';
+
+  const verHead = document.createElement('div');
+  verHead.className = 'help-version-head';
+  const verTitle = document.createElement('span');
+  verTitle.className = 'help-version-title';
+  verTitle.textContent = '目前版本資訊';
+  const verBadge = document.createElement('span');
+  verBadge.className = 'badge tnum';
+  verBadge.style.marginRight = '0';
+  verBadge.textContent = `v${APP_VERSION}`;
+  verHead.appendChild(verTitle);
+  verHead.appendChild(verBadge);
+  verCard.appendChild(verHead);
+
+  const verGrid = document.createElement('div');
+  verGrid.className = 'help-version-grid tnum';
+  const metaRows: Array<[string, string]> = [
+    ['建置編號', BUILD_COMMIT],
+    ['建置時間', formatBuildTime(BUILD_TIME)],
+    ['資料庫 Schema', `v${DB_SCHEMA_VERSION}`],
+    ['離線快取', SW_CACHE_VERSION],
+  ];
+  for (const [k, v] of metaRows) {
+    const cell = document.createElement('div');
+    cell.className = 'help-version-cell';
+    const kl = document.createElement('span');
+    kl.className = 'help-version-k';
+    kl.textContent = k;
+    const vl = document.createElement('span');
+    vl.className = 'help-version-v';
+    vl.textContent = v;
+    cell.appendChild(kl);
+    cell.appendChild(vl);
+    verGrid.appendChild(cell);
+  }
+  verCard.appendChild(verGrid);
+
+  const changelog = document.createElement('details');
+  changelog.className = 'help-changelog';
+  const clSum = document.createElement('summary');
+  clSum.textContent = '版本更新紀錄';
+  changelog.appendChild(clSum);
+
+  const relUl = document.createElement('ul');
+  relUl.className = 'help-bullets';
+  relUl.style.marginTop = '6px';
+  for (const line of VERSION_HIGHLIGHTS) {
+    const li = document.createElement('li');
+    const sepIdx = line.indexOf('：');
+    if (sepIdx > 0) {
+      const strong = document.createElement('strong');
+      strong.textContent = line.slice(0, sepIdx + 1);
+      li.appendChild(strong);
+      li.appendChild(document.createTextNode(line.slice(sepIdx + 1)));
+    } else {
+      li.textContent = line;
+    }
+    relUl.appendChild(li);
+  }
+  changelog.appendChild(relUl);
+  verCard.appendChild(changelog);
+  body.appendChild(verCard);
 
   if (focusedEl) {
     requestAnimationFrame(() => {

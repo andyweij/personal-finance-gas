@@ -1,5 +1,15 @@
-import type { AuthUser, CachedPasskeyDto } from '../../../shared/types';
+import type { AuthUser, CachedPasskeyDto, PnlColorScheme } from '../../../shared/types';
 import type { SyncEngine } from '../sync/syncEngine';
+
+export type StockChartType = 'donut' | 'pie' | 'hbar' | 'treemap';
+export type StockChartDimension = 'value' | 'category' | 'cost' | 'market';
+export type ReorderSectionKey =
+  | 'stocks'
+  | 'recurring'
+  | 'sinking'
+  | 'assets_savings'
+  | 'assets_auto'
+  | 'assets_manual';
 
 export interface AppUiState {
   masked: boolean;
@@ -10,12 +20,19 @@ export interface AppUiState {
   pageSize: number;
   selectedCalendarDay: string;
   overviewPeriod: 'monthly' | 'yearly';
+  overviewExpandedGroups: string[];
   chartMetric: 'netCashFlow' | 'investment' | 'totalSavings' | 'daily' | 'income';
   toolsSubtab: 'recurring' | 'sinking' | 'utility';
   recurringFilter: 'all' | 'income' | 'invest' | 'fixed' | 'sub';
   allocMode: 'both' | 'pct' | 'amt';
   allocHighlight: string | null;
   stockPriceViewMode: 'unit' | 'total';
+  stockChartType: StockChartType;
+  stockChartDimension: StockChartDimension;
+  stockChartHighlight: string | null;
+  pnlColorScheme: PnlColorScheme;
+  reorderSection: ReorderSectionKey | null;
+  reorderDraftIds: string[];
   selectedYear: number;
   selectedMonth: number;
   logType: string;
@@ -45,5 +62,6 @@ export interface UiContext {
   navigateToTab: (tab: AppUiState['activeTab']) => void;
   switchAccountDb: (user: AuthUser) => Promise<void>;
   applyUtilityTabVisibility: () => void;
+  applyPnlColorScheme: (scheme: PnlColorScheme) => void;
 }
 

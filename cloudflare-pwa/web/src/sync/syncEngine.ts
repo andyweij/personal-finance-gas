@@ -1,3 +1,4 @@
+import { applySubsetReorder, compareBySortOrder } from '../../../shared/calculations';
 import { CASHFLOW_TYPES, RECURRING_CASHFLOW_TYPES, STOCK_TX_TYPES } from '../../../shared/constants';
 import {
   sortUtilityRecords,
@@ -10,6 +11,7 @@ import type {
   AssetItem,
   CashFlowLog,
   FinanceSnapshot,
+  PnlColorScheme,
   RecurringItem,
   RentUtilityRecord,
   RentUtilityRents,
@@ -22,6 +24,9 @@ import type {
   SyncResponse,
 } from '../../../shared/types';
 import {
+  normalizeCustomStockCategories,
+  normalizePnlColorScheme,
+  normalizeStockCategory,
   validateAssetInput,
   validateCashFlowInput,
   validateRecurringInput,
@@ -258,11 +263,12 @@ export class SyncEngine {
         status: '啟用',
         note: record.note ? `[手機加入每月常態] ${record.note}` : '手機記帳加入每月常態',
         linkedAccountId: record.linkedAccountId,
+        sortOrder: this.nextSortOrderFor(nextRecurring),
         createdAt: nowIso,
         updatedAt: nowIso,
         deletedAt: null,
       };
-      nextRecurring = [...nextRecurring, recItem];
+      nextRecurring = [...nextRecurring, recItem].sort(compareBySortOrder);
       mutations.push({
         mutationId: crypto.randomUUID(),
         entity: 'recurring',
@@ -282,6 +288,13 @@ export class SyncEngine {
 
     await this.commitAndMaybeSync(mutations);
     return record;
+  }
+
+  private nextSortOrderFor<T extends { sortOrder?: number; deletedAt?: string | null }>(items: T[]): number {
+    const active = items.filter((i) => !i.deletedAt);
+    if (!active.length) return 1;
+    const maxOrder = active.reduce((max, i) => Math.max(max, i.sortOrder ?? 0), 0);
+    return maxOrder > 0 ? maxOrder + 1 : active.length + 1;
   }
 
   async deleteCashFlow(id: string): Promise<void> {
@@ -334,14 +347,73 @@ export class SyncEngine {
     ]);
   }
 
+  async savePnlColorScheme(scheme: PnlColorScheme): Promise<PnlColorScheme> {
+    const normalized = normalizePnlColorScheme(scheme);
+    const nowIso = new Date().toISOString();
+    const baseVersion = this.snapshot.settings.version;
+    this.snapshot = {
+      ...this.snapshot,
+      settings: {
+        ...this.snapshot.settings,
+        pnlColorScheme: normalized,
+        updatedAt: nowIso,
+      },
+    };
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'settings',
+        op: 'upsert',
+        recordId: '1',
+        clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
+        payload: { ...this.snapshot.settings },
+      },
+    ]);
+    return normalized;
+  }
+
+  async saveCustomStockCategories(categories: string[]): Promise<string[]> {
+    const normalized = normalizeCustomStockCategories(categories);
+    const nowIso = new Date().toISOString();
+    const baseVersion = this.snapshot.settings.version;
+    this.snapshot = {
+      ...this.snapshot,
+      settings: {
+        ...this.snapshot.settings,
+        customStockCategories: normalized,
+        updatedAt: nowIso,
+      },
+    };
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'settings',
+        op: 'upsert',
+        recordId: '1',
+        clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
+        payload: { ...this.snapshot.settings },
+      },
+    ]);
+    return normalized;
+  }
+
   async saveRecurring(payload: RecurringInputPayload & { id?: string }): Promise<RecurringItem> {
     const v = validateRecurringInput(payload);
     const nowIso = new Date().toISOString();
     const id = payload.id || crypto.randomUUID();
     const existing = this.snapshot.recurringItems.find((r) => r.id === id);
+    const sortOrder =
+      payload.sortOrder !== undefined
+        ? v.sortOrder
+        : existing
+          ? existing.sortOrder ?? 0
+          : this.nextSortOrderFor(this.snapshot.recurringItems);
     const item: RecurringItem = {
       id,
       ...v,
+      sortOrder,
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
@@ -349,7 +421,7 @@ export class SyncEngine {
     };
     this.snapshot = {
       ...this.snapshot,
-      recurringItems: mergeById(this.snapshot.recurringItems, [item]),
+      recurringItems: mergeById(this.snapshot.recurringItems, [item]).sort(compareBySortOrder),
     };
     await this.commitAndMaybeSync([
       {
@@ -363,6 +435,36 @@ export class SyncEngine {
       },
     ]);
     return item;
+  }
+
+  async reorderRecurring(orderedSubsetIds: string[]): Promise<number> {
+    const { nextItems, changedItems } = applySubsetReorder(
+      this.snapshot.recurringItems,
+      orderedSubsetIds
+    );
+    if (!changedItems.length) return 0;
+    const nowIso = new Date().toISOString();
+    const changedIdSet = new Set(changedItems.map((i) => i.id));
+    const stampedItems = nextItems.map((item) =>
+      changedIdSet.has(item.id) ? { ...item, updatedAt: nowIso } : item
+    );
+    const mutations: SyncMutation[] = stampedItems
+      .filter((item) => changedIdSet.has(item.id))
+      .map((item) => ({
+        mutationId: crypto.randomUUID(),
+        entity: 'recurring',
+        op: 'upsert',
+        recordId: item.id,
+        clientTimestamp: nowIso,
+        baseVersion: item.version ?? null,
+        payload: { ...item },
+      }));
+    this.snapshot = {
+      ...this.snapshot,
+      recurringItems: stampedItems,
+    };
+    await this.commitAndMaybeSync(mutations);
+    return mutations.length;
   }
 
   async deleteRecurring(id: string): Promise<void> {
@@ -389,9 +491,16 @@ export class SyncEngine {
     const nowIso = new Date().toISOString();
     const id = payload.id || crypto.randomUUID();
     const existing = this.snapshot.sinkingItems.find((s) => s.id === id);
+    const sortOrder =
+      payload.sortOrder !== undefined
+        ? v.sortOrder
+        : existing
+          ? existing.sortOrder ?? 0
+          : this.nextSortOrderFor(this.snapshot.sinkingItems);
     const item: SinkingFundItem = {
       id,
       ...v,
+      sortOrder,
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
@@ -399,7 +508,7 @@ export class SyncEngine {
     };
     this.snapshot = {
       ...this.snapshot,
-      sinkingItems: mergeById(this.snapshot.sinkingItems, [item]),
+      sinkingItems: mergeById(this.snapshot.sinkingItems, [item]).sort(compareBySortOrder),
     };
     await this.commitAndMaybeSync([
       {
@@ -413,6 +522,36 @@ export class SyncEngine {
       },
     ]);
     return item;
+  }
+
+  async reorderSinking(orderedSubsetIds: string[]): Promise<number> {
+    const { nextItems, changedItems } = applySubsetReorder(
+      this.snapshot.sinkingItems,
+      orderedSubsetIds
+    );
+    if (!changedItems.length) return 0;
+    const nowIso = new Date().toISOString();
+    const changedIdSet = new Set(changedItems.map((i) => i.id));
+    const stampedItems = nextItems.map((item) =>
+      changedIdSet.has(item.id) ? { ...item, updatedAt: nowIso } : item
+    );
+    const mutations: SyncMutation[] = stampedItems
+      .filter((item) => changedIdSet.has(item.id))
+      .map((item) => ({
+        mutationId: crypto.randomUUID(),
+        entity: 'sinking',
+        op: 'upsert',
+        recordId: item.id,
+        clientTimestamp: nowIso,
+        baseVersion: item.version ?? null,
+        payload: { ...item },
+      }));
+    this.snapshot = {
+      ...this.snapshot,
+      sinkingItems: stampedItems,
+    };
+    await this.commitAndMaybeSync(mutations);
+    return mutations.length;
   }
 
   async deleteSinking(id: string): Promise<void> {
@@ -456,16 +595,25 @@ export class SyncEngine {
     const balanceAnchorAt = v.isLinkedSavings
       ? v.balanceAnchorAt ?? existing?.balanceAnchorAt ?? nowIso
       : null;
+    const sortOrder =
+      payload.sortOrder !== undefined
+        ? v.sortOrder
+        : existing
+          ? existing.sortOrder ?? 0
+          : this.nextSortOrderFor(this.snapshot.assetItems);
 
     const item: AssetItem = {
       id,
       ...v,
       unitPrice: payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? 1,
       costBasis: payload.costBasis !== undefined ? v.costBasis : existing?.costBasis ?? null,
+      stockCategory:
+        payload.stockCategory !== undefined ? v.stockCategory : existing?.stockCategory ?? '',
       priceUpdatedAt: existing?.priceUpdatedAt ?? null,
       balanceAnchorDate,
       balanceAnchorAt,
       isDefaultSavings,
+      sortOrder,
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
@@ -479,7 +627,7 @@ export class SyncEngine {
     );
     this.snapshot = {
       ...this.snapshot,
-      assetItems: mergeById(updatedAssets, [item]),
+      assetItems: mergeById(updatedAssets, [item]).sort(compareBySortOrder),
     };
 
     await this.commitAndMaybeSync([
@@ -494,6 +642,67 @@ export class SyncEngine {
       },
     ]);
     return item;
+  }
+
+  async updateAssetStockCategory(assetId: string, stockCategory: string): Promise<AssetItem> {
+    const existing = this.snapshot.assetItems.find((a) => a.id === assetId && !a.deletedAt);
+    if (!existing) throw new Error('找不到該持股項目。');
+    const normalized = normalizeStockCategory(stockCategory);
+    if ((existing.stockCategory || '') === normalized) {
+      return existing;
+    }
+    const nowIso = new Date().toISOString();
+    const updated: AssetItem = {
+      ...existing,
+      stockCategory: normalized,
+      updatedAt: nowIso,
+    };
+    this.snapshot = {
+      ...this.snapshot,
+      assetItems: mergeById(this.snapshot.assetItems, [updated]).sort(compareBySortOrder),
+    };
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'asset',
+        op: 'upsert',
+        recordId: assetId,
+        clientTimestamp: nowIso,
+        baseVersion: existing.version ?? null,
+        payload: { ...updated },
+      },
+    ]);
+    return updated;
+  }
+
+  async reorderAssets(orderedSubsetIds: string[]): Promise<number> {
+    const { nextItems, changedItems } = applySubsetReorder(
+      this.snapshot.assetItems,
+      orderedSubsetIds
+    );
+    if (!changedItems.length) return 0;
+    const nowIso = new Date().toISOString();
+    const changedIdSet = new Set(changedItems.map((i) => i.id));
+    const stampedItems = nextItems.map((item) =>
+      changedIdSet.has(item.id) ? { ...item, updatedAt: nowIso } : item
+    );
+    const mutations: SyncMutation[] = stampedItems
+      .filter((item) => changedIdSet.has(item.id))
+      .map((item) => ({
+        mutationId: crypto.randomUUID(),
+        entity: 'asset',
+        op: 'upsert',
+        recordId: item.id,
+        clientTimestamp: nowIso,
+        baseVersion: item.version ?? null,
+        payload: { ...item },
+      }));
+    this.snapshot = {
+      ...this.snapshot,
+      assetItems: stampedItems,
+    };
+    await this.commitAndMaybeSync(mutations);
+    return mutations.length;
   }
 
   async reconcileLoanBalance(
@@ -897,19 +1106,19 @@ export class SyncEngine {
     if (entity === 'recurring') {
       const filtered = this.snapshot.recurringItems.filter((r) => r.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as RecurringItem] : filtered;
-      this.snapshot = { ...this.snapshot, recurringItems: next };
+      this.snapshot = { ...this.snapshot, recurringItems: next.sort(compareBySortOrder) };
       return;
     }
     if (entity === 'sinking') {
       const filtered = this.snapshot.sinkingItems.filter((s) => s.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as SinkingFundItem] : filtered;
-      this.snapshot = { ...this.snapshot, sinkingItems: next };
+      this.snapshot = { ...this.snapshot, sinkingItems: next.sort(compareBySortOrder) };
       return;
     }
     if (entity === 'asset') {
       const filtered = this.snapshot.assetItems.filter((a) => a.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as AssetItem] : filtered;
-      this.snapshot = { ...this.snapshot, assetItems: next };
+      this.snapshot = { ...this.snapshot, assetItems: next.sort(compareBySortOrder) };
       return;
     }
     if (entity === 'savings_adjustment') {
@@ -1095,9 +1304,9 @@ export class SyncEngine {
       return {
         settings: delta.settings || current.settings,
         cashflowLogs: this.sortCashFlows(delta.cashflowLogs.filter((l) => !l.deletedAt)),
-        recurringItems: delta.recurringItems.filter((r) => !r.deletedAt),
-        sinkingItems: delta.sinkingItems.filter((s) => !s.deletedAt),
-        assetItems: delta.assetItems.filter((a) => !a.deletedAt),
+        recurringItems: delta.recurringItems.filter((r) => !r.deletedAt).sort(compareBySortOrder),
+        sinkingItems: delta.sinkingItems.filter((s) => !s.deletedAt).sort(compareBySortOrder),
+        assetItems: delta.assetItems.filter((a) => !a.deletedAt).sort(compareBySortOrder),
         savingsAdjustments: incomingAdjs
           .filter((a) => !a.deletedAt)
           .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
@@ -1120,9 +1329,9 @@ export class SyncEngine {
     return {
       settings: delta.settings || current.settings,
       cashflowLogs: this.sortCashFlows(mergeById(current.cashflowLogs, delta.cashflowLogs)),
-      recurringItems: mergeById(current.recurringItems, delta.recurringItems),
-      sinkingItems: mergeById(current.sinkingItems, delta.sinkingItems),
-      assetItems: mergeById(current.assetItems, delta.assetItems),
+      recurringItems: mergeById(current.recurringItems, delta.recurringItems).sort(compareBySortOrder),
+      sinkingItems: mergeById(current.sinkingItems, delta.sinkingItems).sort(compareBySortOrder),
+      assetItems: mergeById(current.assetItems, delta.assetItems).sort(compareBySortOrder),
       savingsAdjustments: mergeById(current.savingsAdjustments || [], incomingAdjs).sort(
         (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
       ),

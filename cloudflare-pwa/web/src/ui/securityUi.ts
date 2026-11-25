@@ -29,6 +29,7 @@ import {
   setLoading,
   showToast,
 } from './helpers';
+import { APP_VERSION, BUILD_COMMIT, DB_SCHEMA_VERSION } from '../version';
 import type { UiContext } from './state';
 
 let pinInput = '';
@@ -609,7 +610,7 @@ function openChangePasswordModal(ctx: UiContext): void {
 /* ==================== Security, Account, Family & Data Migration Modal ==================== */
 
 export function openSecurityModal(ctx: UiContext): void {
-  const body = openModal('帳號、安全與資料備份');
+  const body = openModal('帳號、顯示與安全設定');
   const user = ctx.state.currentUser;
 
   const guideBtn = document.createElement('button');
@@ -714,6 +715,96 @@ export function openSecurityModal(ctx: UiContext): void {
 
     body.appendChild(accCard);
   }
+
+  // 0.5 Display Preference: Positive / Negative Color Scheme (synced per user)
+  const schemeCard = document.createElement('div');
+  schemeCard.style.cssText = 'padding:12px 13px;border-radius:12px;background:var(--surface-alt);margin-bottom:14px';
+  const schemeTitle = document.createElement('div');
+  schemeTitle.style.cssText = 'font-size:13px;font-weight:700;margin-bottom:3px';
+  schemeTitle.textContent = '正負數配色風格（同步至所有裝置）';
+  const schemeSub = document.createElement('div');
+  schemeSub.className = 'muted';
+  schemeSub.style.cssText = 'font-size:11px;margin-bottom:10px';
+  schemeSub.textContent = '依個人習慣切換國際綠紅或台股紅綠；系統提示與刪除警示色不受影響';
+  schemeCard.appendChild(schemeTitle);
+  schemeCard.appendChild(schemeSub);
+
+  const schemeList = document.createElement('div');
+  schemeList.className = 'scheme-options';
+  const currentScheme = ctx.state.pnlColorScheme;
+  const schemeOptions: Array<{
+    id: 'intl' | 'tw' | 'tw_stocks';
+    title: string;
+    sub: string;
+    posCls: 'green' | 'red';
+    negCls: 'green' | 'red';
+  }> = [
+    {
+      id: 'intl',
+      title: '全站正綠負紅（預設）',
+      sub: '國際直覺風格：正值 / 獲利為綠，負值 / 虧損為紅',
+      posCls: 'green',
+      negCls: 'red',
+    },
+    {
+      id: 'tw',
+      title: '全站正紅負綠（台股風格）',
+      sub: '台股看盤風格：全站正值 / 獲利為紅，負值 / 虧損為綠',
+      posCls: 'red',
+      negCls: 'green',
+    },
+    {
+      id: 'tw_stocks',
+      title: '僅持股正紅負綠（混合模式）',
+      sub: '記帳與總覽維持正綠負紅，持股損益改為台股紅漲綠跌',
+      posCls: 'red',
+      negCls: 'green',
+    },
+  ];
+
+  for (const opt of schemeOptions) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'scheme-option' + (currentScheme === opt.id ? ' active' : '');
+
+    const left = document.createElement('div');
+    const t = document.createElement('div');
+    t.className = 'scheme-option-title';
+    t.textContent = opt.title;
+    const s = document.createElement('div');
+    s.className = 'scheme-option-sub';
+    s.textContent = opt.sub;
+    left.appendChild(t);
+    left.appendChild(s);
+
+    const preview = document.createElement('div');
+    preview.className = 'scheme-preview tnum';
+    const p1 = document.createElement('span');
+    p1.className = `scheme-pill ${opt.posCls}`;
+    p1.textContent = '+12%';
+    const p2 = document.createElement('span');
+    p2.className = `scheme-pill ${opt.negCls}`;
+    p2.textContent = '-4%';
+    preview.appendChild(p1);
+    preview.appendChild(p2);
+
+    btn.appendChild(left);
+    btn.appendChild(preview);
+    btn.addEventListener('click', async () => {
+      try {
+        await ctx.engine.savePnlColorScheme(opt.id);
+        ctx.applyPnlColorScheme(opt.id);
+        ctx.scheduleSync();
+        showToast(`已切換配色：${opt.title}`, 'success');
+        openSecurityModal(ctx);
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : '儲存配色失敗', 'error');
+      }
+    });
+    schemeList.appendChild(btn);
+  }
+  schemeCard.appendChild(schemeList);
+  body.appendChild(schemeCard);
 
   // 1. Passkey (Face ID / Touch ID) + 啟動/閒置 Face ID 鎖定開關
   const pkCard = document.createElement('div');
@@ -1025,4 +1116,9 @@ export function openSecurityModal(ctx: UiContext): void {
   dataBox.appendChild(logoutBtn);
 
   body.appendChild(dataBox);
+
+  const verFooter = document.createElement('div');
+  verFooter.className = 'settings-version-footer tnum';
+  verFooter.textContent = `財務管家 v${APP_VERSION} (${BUILD_COMMIT}) · Schema v${DB_SCHEMA_VERSION}`;
+  body.appendChild(verFooter);
 }

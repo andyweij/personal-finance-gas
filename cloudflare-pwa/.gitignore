@@ -4,3 +4,4 @@ dist/
 .dev.vars
 wrangler.toml
 *.local
+d1-backup*.sql
