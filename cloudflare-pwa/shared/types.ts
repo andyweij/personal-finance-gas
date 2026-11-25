@@ -4,6 +4,7 @@ export interface AppSettings {
   usdTwdRate: number;
   fxUpdatedAt?: string | null;
   updatedAt: string;
+  version?: number;
 }
 
 export interface CashFlowLog {
@@ -24,6 +25,7 @@ export interface CashFlowLog {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+  version?: number;
 }
 
 export interface RecurringItem {
@@ -41,6 +43,7 @@ export interface RecurringItem {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+  version?: number;
 }
 
 export interface SinkingFundItem {
@@ -55,6 +58,7 @@ export interface SinkingFundItem {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+  version?: number;
 }
 
 export interface AssetItem {
@@ -82,6 +86,7 @@ export interface AssetItem {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+  version?: number;
 }
 
 export type StockTransactionType = 'buy' | 'sell' | 'cash_dividend' | 'stock_dividend';
@@ -99,6 +104,7 @@ export interface StockTransaction {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+  version?: number;
 }
 
 export interface StockPositionSummary {
@@ -198,6 +204,7 @@ export interface SavingsAdjustment {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+  version?: number;
 }
 
 export interface SavingsAccountSummary {
@@ -247,6 +254,7 @@ export interface RentUtilityRecord {
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
+  version?: number;
 }
 
 export interface RentUtilityRents {
@@ -255,6 +263,7 @@ export interface RentUtilityRents {
   rentB: number;
   rentC: number;
   updatedAt: string;
+  version?: number;
 }
 
 export interface FinanceSnapshot {
@@ -288,9 +297,22 @@ export interface SyncMutation {
   op: SyncOp;
   recordId: string;
   clientTimestamp: string;
+  baseVersion?: number | null;
   payload?: Record<string, unknown>;
   retryCount?: number;
   lastError?: string;
+}
+
+export interface SyncConflict {
+  mutationId: string;
+  entity: SyncEntity;
+  op: SyncOp;
+  recordId: string;
+  baseVersion: number;
+  serverVersion: number;
+  clientPayload?: Record<string, unknown>;
+  serverRecord: Record<string, unknown> | null;
+  detectedAt: string;
 }
 
 export interface SyncRequest {
@@ -316,6 +338,7 @@ export interface SyncResponse {
   serverTime: string;
   ackedMutationIds: string[];
   rejected: Array<{ mutationId: string; reason: string }>;
+  conflicts?: SyncConflict[];
   delta: SyncDelta;
 }
 

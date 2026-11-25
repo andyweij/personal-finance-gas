@@ -6,6 +6,7 @@ import {
   type UtilityRecordInputPayload,
 } from '../../../shared/rentUtility';
 import type {
+  AppSettings,
   AssetItem,
   CashFlowLog,
   FinanceSnapshot,
@@ -15,6 +16,7 @@ import type {
   SavingsAdjustment,
   SinkingFundItem,
   StockTransaction,
+  SyncConflict,
   SyncDelta,
   SyncMutation,
   SyncResponse,
@@ -35,11 +37,12 @@ import {
 } from '../../../shared/validation';
 import { createEmptySnapshot, type LocalFinanceDB, type LocalMeta } from '../db/localDb';
 
-export type SyncStateKind = 'synced' | 'syncing' | 'pending' | 'offline' | 'auth_required';
+export type SyncStateKind = 'synced' | 'syncing' | 'pending' | 'offline' | 'auth_required' | 'conflict';
 
 export interface SyncStatus {
   state: SyncStateKind;
   pendingCount: number;
+  conflictCount?: number;
   lastSyncedAt: string | null;
   lastError?: string;
 }
@@ -52,7 +55,22 @@ export interface SyncEngineOptions {
   onAuthRequired?: () => void;
 }
 
-function mergeById<T extends { id: string; deletedAt?: string | null; updatedAt: string }>(
+function isIncomingPreferred(
+  existing: { updatedAt: string; version?: number } | undefined,
+  incoming: { updatedAt: string; version?: number }
+): boolean {
+  if (!existing) return true;
+  if (incoming.version !== undefined && existing.version !== undefined) {
+    if (incoming.version !== existing.version) {
+      return incoming.version > existing.version;
+    }
+  } else if (incoming.version !== undefined && existing.version === undefined) {
+    return true;
+  }
+  return incoming.updatedAt >= existing.updatedAt;
+}
+
+function mergeById<T extends { id: string; deletedAt?: string | null; updatedAt: string; version?: number }>(
   current: T[],
   incoming: T[]
 ): T[] {
@@ -65,7 +83,7 @@ function mergeById<T extends { id: string; deletedAt?: string | null; updatedAt:
       map.delete(item.id);
     } else {
       const existing = map.get(item.id);
-      if (!existing || item.updatedAt >= existing.updatedAt) {
+      if (isIncomingPreferred(existing, item)) {
         map.set(item.id, item);
       }
     }
@@ -86,7 +104,7 @@ function mergeUtilityRecords(
       map.delete(item.period);
     } else {
       const existing = map.get(item.period);
-      if (!existing || item.updatedAt >= existing.updatedAt) {
+      if (isIncomingPreferred(existing, item)) {
         map.set(item.period, item);
       }
     }
@@ -102,9 +120,11 @@ export class SyncEngine {
     pinSalt: null,
     pinHash: null,
   };
+  private conflicts: SyncConflict[] = [];
   private status: SyncStatus = {
     state: 'synced',
     pendingCount: 0,
+    conflictCount: 0,
     lastSyncedAt: null,
   };
   private syncingPromise: Promise<{ ok: boolean; authRequired?: boolean; error?: string }> | null =
@@ -127,12 +147,9 @@ export class SyncEngine {
     await this.db.open();
     this.snapshot = await this.db.getSnapshot();
     this.meta = await this.db.getMeta();
+    this.conflicts = await this.db.getConflicts();
     const outbox = await this.db.getOutbox();
-    this.updateStatus({
-      state: !this.isOnline() ? 'offline' : outbox.length > 0 ? 'pending' : 'synced',
-      pendingCount: outbox.length,
-      lastSyncedAt: this.meta.lastSyncedAt,
-    });
+    this.updateStatus(this.computeStatus(outbox.length));
   }
 
   getSnapshot(): FinanceSnapshot {
@@ -145,6 +162,29 @@ export class SyncEngine {
 
   getStatus(): SyncStatus {
     return this.status;
+  }
+
+  getConflicts(): SyncConflict[] {
+    return this.conflicts.slice();
+  }
+
+  private computeStatus(pendingCount: number, lastError?: string): SyncStatus {
+    const conflictCount = this.conflicts.length;
+    const state: SyncStateKind =
+      conflictCount > 0
+        ? 'conflict'
+        : !this.isOnline()
+          ? 'offline'
+          : pendingCount > 0
+            ? 'pending'
+            : 'synced';
+    return {
+      state,
+      pendingCount,
+      conflictCount,
+      lastSyncedAt: this.meta.lastSyncedAt,
+      ...(lastError ? { lastError } : {}),
+    };
   }
 
   async updateLocalPinCache(pinEnabled: boolean, pinSalt: string | null, pinHash: string | null): Promise<void> {
@@ -198,6 +238,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: null,
         payload: { ...record },
       },
     ];
@@ -228,6 +269,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: recId,
         clientTimestamp: nowIso,
+        baseVersion: null,
         payload: { ...recItem },
       });
     }
@@ -244,6 +286,7 @@ export class SyncEngine {
 
   async deleteCashFlow(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
+    const existing = this.snapshot.cashflowLogs.find((l) => l.id === id);
     this.snapshot = {
       ...this.snapshot,
       cashflowLogs: this.snapshot.cashflowLogs.filter((l) => l.id !== id),
@@ -255,6 +298,7 @@ export class SyncEngine {
         op: 'delete',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
       },
     ]);
   }
@@ -267,6 +311,7 @@ export class SyncEngine {
       throw new Error('緊急預備金目標月數需介於 1～60 個月。');
     }
     const nowIso = new Date().toISOString();
+    const baseVersion = this.snapshot.settings.version;
     this.snapshot = {
       ...this.snapshot,
       settings: {
@@ -283,6 +328,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: '1',
         clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
         payload: { ...this.snapshot.settings },
       },
     ]);
@@ -299,6 +345,7 @@ export class SyncEngine {
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
+      ...(existing?.version !== undefined ? { version: existing.version } : {}),
     };
     this.snapshot = {
       ...this.snapshot,
@@ -311,6 +358,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
         payload: { ...item },
       },
     ]);
@@ -319,6 +367,7 @@ export class SyncEngine {
 
   async deleteRecurring(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
+    const existing = this.snapshot.recurringItems.find((r) => r.id === id);
     this.snapshot = {
       ...this.snapshot,
       recurringItems: this.snapshot.recurringItems.filter((r) => r.id !== id),
@@ -330,6 +379,7 @@ export class SyncEngine {
         op: 'delete',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
       },
     ]);
   }
@@ -345,6 +395,7 @@ export class SyncEngine {
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
+      ...(existing?.version !== undefined ? { version: existing.version } : {}),
     };
     this.snapshot = {
       ...this.snapshot,
@@ -357,6 +408,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
         payload: { ...item },
       },
     ]);
@@ -365,6 +417,7 @@ export class SyncEngine {
 
   async deleteSinking(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
+    const existing = this.snapshot.sinkingItems.find((s) => s.id === id);
     this.snapshot = {
       ...this.snapshot,
       sinkingItems: this.snapshot.sinkingItems.filter((s) => s.id !== id),
@@ -376,6 +429,7 @@ export class SyncEngine {
         op: 'delete',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
       },
     ]);
   }
@@ -415,6 +469,7 @@ export class SyncEngine {
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
+      ...(existing?.version !== undefined ? { version: existing.version } : {}),
     };
 
     const updatedAssets = this.snapshot.assetItems.map((a) =>
@@ -434,6 +489,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
         payload: { ...item },
       },
     ]);
@@ -514,6 +570,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: null,
         payload: { ...adj, currency },
       },
     ]);
@@ -522,6 +579,7 @@ export class SyncEngine {
 
   async deleteSavingsAdjustment(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
+    const existing = this.snapshot.savingsAdjustments.find((a) => a.id === id);
     this.snapshot = {
       ...this.snapshot,
       savingsAdjustments: this.snapshot.savingsAdjustments.filter((a) => a.id !== id),
@@ -533,6 +591,7 @@ export class SyncEngine {
         op: 'delete',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
       },
     ]);
   }
@@ -598,6 +657,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: cfId,
         clientTimestamp: nowIso,
+        baseVersion: null,
         payload: { ...createdCashflow },
       });
     }
@@ -617,6 +677,7 @@ export class SyncEngine {
       op: 'upsert',
       recordId: txId,
       clientTimestamp: nowIso,
+      baseVersion: null,
       payload: { ...tx },
     });
 
@@ -644,11 +705,13 @@ export class SyncEngine {
         op: 'delete',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: target?.version ?? null,
       },
     ];
 
     let nextLogs = this.snapshot.cashflowLogs;
     if (deleteLinkedCashflow && target?.linkedCashflowId) {
+      const linkedCf = nextLogs.find((l) => l.id === target.linkedCashflowId);
       nextLogs = nextLogs.filter((l) => l.id !== target.linkedCashflowId);
       mutations.push({
         mutationId: crypto.randomUUID(),
@@ -656,6 +719,7 @@ export class SyncEngine {
         op: 'delete',
         recordId: target.linkedCashflowId,
         clientTimestamp: nowIso,
+        baseVersion: linkedCf?.version ?? null,
       });
     }
 
@@ -669,6 +733,7 @@ export class SyncEngine {
 
   async deleteAsset(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
+    const existing = this.snapshot.assetItems.find((a) => a.id === id);
     this.snapshot = {
       ...this.snapshot,
       assetItems: this.snapshot.assetItems.filter((a) => a.id !== id),
@@ -680,6 +745,7 @@ export class SyncEngine {
         op: 'delete',
         recordId: id,
         clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
       },
     ]);
   }
@@ -693,6 +759,7 @@ export class SyncEngine {
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
       deletedAt: null,
+      ...(existing?.version !== undefined ? { version: existing.version } : {}),
     };
 
     const updates: RentUtilityRecord[] = [record];
@@ -725,6 +792,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: updatedBaseline.period,
         clientTimestamp: nowIso,
+        baseVersion: baseline.version ?? null,
         payload: { ...updatedBaseline },
       });
     }
@@ -735,6 +803,7 @@ export class SyncEngine {
       op: 'upsert',
       recordId: record.period,
       clientTimestamp: nowIso,
+      baseVersion: existing?.version ?? null,
       payload: { ...record },
     });
 
@@ -764,6 +833,7 @@ export class SyncEngine {
         op: 'delete',
         recordId: clean,
         clientTimestamp: nowIso,
+        baseVersion: target.version ?? null,
       },
     ]);
   }
@@ -771,7 +841,12 @@ export class SyncEngine {
   async saveUtilityRents(rents: Partial<RentUtilityRents>): Promise<RentUtilityRents> {
     const v = validateUtilityRentsInput(rents);
     const nowIso = new Date().toISOString();
-    const nextRents: RentUtilityRents = { ...v, updatedAt: nowIso };
+    const baseVersion = this.snapshot.rentUtilityRents.version;
+    const nextRents: RentUtilityRents = {
+      ...v,
+      updatedAt: nowIso,
+      ...(baseVersion !== undefined ? { version: baseVersion } : {}),
+    };
     this.snapshot = {
       ...this.snapshot,
       rentUtilityRents: nextRents,
@@ -783,6 +858,7 @@ export class SyncEngine {
         op: 'upsert',
         recordId: '1',
         clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
         payload: { ...nextRents },
       },
     ]);
@@ -793,11 +869,129 @@ export class SyncEngine {
     await this.db.commitLocalMutation(this.snapshot, mutations);
     const outbox = await this.db.getOutbox();
     this.emitSnapshot();
-    this.updateStatus({
-      state: this.isOnline() ? 'pending' : 'offline',
-      pendingCount: outbox.length,
-      lastSyncedAt: this.meta.lastSyncedAt,
-    });
+    this.updateStatus(this.computeStatus(outbox.length));
+  }
+
+  /* ==================== Conflict Resolution ==================== */
+
+  private applyRecordToSnapshot(
+    entity: SyncConflict['entity'],
+    recordId: string,
+    record: Record<string, unknown> | null,
+    isDelete: boolean
+  ): void {
+    if (entity === 'settings') {
+      if (record) this.snapshot = { ...this.snapshot, settings: record as unknown as AppSettings };
+      return;
+    }
+    if (entity === 'utility_rents') {
+      if (record) this.snapshot = { ...this.snapshot, rentUtilityRents: record as unknown as RentUtilityRents };
+      return;
+    }
+    if (entity === 'cashflow') {
+      const filtered = this.snapshot.cashflowLogs.filter((l) => l.id !== recordId);
+      const next = !isDelete && record && !record.deletedAt ? [record as unknown as CashFlowLog, ...filtered] : filtered;
+      this.snapshot = { ...this.snapshot, cashflowLogs: this.sortCashFlows(next) };
+      return;
+    }
+    if (entity === 'recurring') {
+      const filtered = this.snapshot.recurringItems.filter((r) => r.id !== recordId);
+      const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as RecurringItem] : filtered;
+      this.snapshot = { ...this.snapshot, recurringItems: next };
+      return;
+    }
+    if (entity === 'sinking') {
+      const filtered = this.snapshot.sinkingItems.filter((s) => s.id !== recordId);
+      const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as SinkingFundItem] : filtered;
+      this.snapshot = { ...this.snapshot, sinkingItems: next };
+      return;
+    }
+    if (entity === 'asset') {
+      const filtered = this.snapshot.assetItems.filter((a) => a.id !== recordId);
+      const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as AssetItem] : filtered;
+      this.snapshot = { ...this.snapshot, assetItems: next };
+      return;
+    }
+    if (entity === 'savings_adjustment') {
+      const filtered = this.snapshot.savingsAdjustments.filter((a) => a.id !== recordId);
+      const next = !isDelete && record && !record.deletedAt ? [record as unknown as SavingsAdjustment, ...filtered] : filtered;
+      this.snapshot = {
+        ...this.snapshot,
+        savingsAdjustments: next.sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+      };
+      return;
+    }
+    if (entity === 'stock_tx') {
+      const filtered = (this.snapshot.stockTransactions || []).filter((t) => t.id !== recordId);
+      const next = !isDelete && record && !record.deletedAt ? [record as unknown as StockTransaction, ...filtered] : filtered;
+      this.snapshot = {
+        ...this.snapshot,
+        stockTransactions: next.sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+      };
+      return;
+    }
+    if (entity === 'utility_record') {
+      const filtered = this.snapshot.rentUtilityRecords.filter((r) => r.period !== recordId);
+      const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as RentUtilityRecord] : filtered;
+      this.snapshot = { ...this.snapshot, rentUtilityRecords: sortUtilityRecords(next) };
+    }
+  }
+
+  async resolveConflictKeepServer(mutationId: string): Promise<void> {
+    const conflict = this.conflicts.find((c) => c.mutationId === mutationId);
+    if (!conflict) return;
+
+    this.conflicts = this.conflicts.filter((c) => c.mutationId !== mutationId);
+    this.applyRecordToSnapshot(
+      conflict.entity,
+      conflict.recordId,
+      conflict.serverRecord,
+      !conflict.serverRecord || Boolean(conflict.serverRecord.deletedAt)
+    );
+    await this.db.saveSnapshot(this.snapshot);
+    await this.db.saveConflicts(this.conflicts);
+    const outbox = await this.db.getOutbox();
+    this.emitSnapshot();
+    this.updateStatus(this.computeStatus(outbox.length));
+  }
+
+  async resolveConflictKeepLocal(
+    mutationId: string
+  ): Promise<{ ok: boolean; authRequired?: boolean; error?: string }> {
+    const conflict = this.conflicts.find((c) => c.mutationId === mutationId);
+    if (!conflict) return { ok: true };
+
+    const nowIso = new Date().toISOString();
+    this.conflicts = this.conflicts.filter((c) => c.mutationId !== mutationId);
+
+    const payloadWithVersion = conflict.clientPayload
+      ? { ...conflict.clientPayload, updatedAt: nowIso, version: conflict.serverVersion }
+      : undefined;
+
+    this.applyRecordToSnapshot(
+      conflict.entity,
+      conflict.recordId,
+      payloadWithVersion || null,
+      conflict.op === 'delete'
+    );
+
+    const retryMutation: SyncMutation = {
+      mutationId: crypto.randomUUID(),
+      entity: conflict.entity,
+      op: conflict.op,
+      recordId: conflict.recordId,
+      clientTimestamp: nowIso,
+      baseVersion: conflict.serverVersion,
+      ...(payloadWithVersion ? { payload: payloadWithVersion } : {}),
+    };
+
+    await this.db.saveConflicts(this.conflicts);
+    await this.commitAndMaybeSync([retryMutation]);
+
+    if (this.isOnline()) {
+      return this.syncNow();
+    }
+    return { ok: true };
   }
 
   /* ==================== Bidirectional Sync ==================== */
@@ -817,17 +1011,14 @@ export class SyncEngine {
     const outbox = await this.db.getOutbox();
 
     if (!this.isOnline()) {
-      this.updateStatus({
-        state: 'offline',
-        pendingCount: outbox.length,
-        lastSyncedAt: this.meta.lastSyncedAt,
-      });
+      this.updateStatus(this.computeStatus(outbox.length));
       return { ok: false, error: '目前處於離線模式' };
     }
 
     this.updateStatus({
       state: 'syncing',
       pendingCount: outbox.length,
+      conflictCount: this.conflicts.length,
       lastSyncedAt: this.meta.lastSyncedAt,
     });
 
@@ -846,6 +1037,7 @@ export class SyncEngine {
         this.updateStatus({
           state: 'auth_required',
           pendingCount: outbox.length,
+          conflictCount: this.conflicts.length,
           lastSyncedAt: this.meta.lastSyncedAt,
           lastError: '登入逾時，請重新驗證以同步待上傳資料',
         });
@@ -859,6 +1051,18 @@ export class SyncEngine {
       }
 
       const data = (await res.json()) as SyncResponse;
+      const incomingConflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+      if (incomingConflicts.length > 0) {
+        const byKey = new Map<string, SyncConflict>();
+        for (const c of this.conflicts) {
+          byKey.set(`${c.entity}:${c.recordId}`, c);
+        }
+        for (const c of incomingConflicts) {
+          byKey.set(`${c.entity}:${c.recordId}`, c);
+        }
+        this.conflicts = Array.from(byKey.values());
+      }
+
       const merged = this.mergeDelta(this.snapshot, data.delta, forceFullPull);
       this.snapshot = merged;
       this.meta = {
@@ -866,23 +1070,18 @@ export class SyncEngine {
         lastSyncedAt: data.serverTime,
       };
 
-      await this.db.acknowledgeOutboxAndSave(data.ackedMutationIds || [], this.snapshot, this.meta);
+      const outboxIdsToClear = [
+        ...(data.ackedMutationIds || []),
+        ...incomingConflicts.map((c) => c.mutationId),
+      ];
+      await this.db.acknowledgeOutboxAndSave(outboxIdsToClear, this.snapshot, this.meta, this.conflicts);
       const remainingOutbox = await this.db.getOutbox();
       this.emitSnapshot();
-      this.updateStatus({
-        state: remainingOutbox.length > 0 ? 'pending' : 'synced',
-        pendingCount: remainingOutbox.length,
-        lastSyncedAt: this.meta.lastSyncedAt,
-      });
+      this.updateStatus(this.computeStatus(remainingOutbox.length));
       return { ok: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : '網路同步失敗';
-      this.updateStatus({
-        state: !this.isOnline() ? 'offline' : 'pending',
-        pendingCount: outbox.length,
-        lastSyncedAt: this.meta.lastSyncedAt,
-        lastError: msg,
-      });
+      this.updateStatus(this.computeStatus(outbox.length, msg));
       return { ok: false, error: msg };
     }
   }

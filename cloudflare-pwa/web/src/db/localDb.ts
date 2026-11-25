@@ -4,7 +4,7 @@ import {
   DEFAULT_USD_TWD_RATE,
 } from '../../../shared/constants';
 import { DEFAULT_UTILITY_RENTS } from '../../../shared/rentUtility';
-import type { CachedPasskeyDto, FinanceSnapshot, SyncMutation } from '../../../shared/types';
+import type { CachedPasskeyDto, FinanceSnapshot, SyncConflict, SyncMutation } from '../../../shared/types';
 
 const DB_VERSION = 1;
 const STORE_KV = 'kv';
@@ -138,6 +138,26 @@ export class LocalFinanceDB {
     });
   }
 
+  async getConflicts(): Promise<SyncConflict[]> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readonly');
+      const req = tx.objectStore(STORE_KV).get('conflicts');
+      req.onsuccess = () => resolve(Array.isArray(req.result) ? (req.result as SyncConflict[]) : []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async saveConflicts(conflicts: SyncConflict[]): Promise<void> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      tx.objectStore(STORE_KV).put(conflicts, 'conflicts');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   private outboxSeq = 0;
 
   async getOutbox(): Promise<SyncMutation[]> {
@@ -158,7 +178,8 @@ export class LocalFinanceDB {
   }
 
   /**
-   * 單一 IndexedDB 交易同時更新本機 Snapshot 並加入 Outbox，確保離線寫入具原子性
+   * 單一 IndexedDB 交易同時更新本機 Snapshot 並加入 Outbox，並自動整併同一筆紀錄的離線多次修改
+   * （保留最初的伺服器 baseVersion；新建未同步後立即刪除則互相抵銷）
    */
   async commitLocalMutation(snapshot: FinanceSnapshot, mutations: SyncMutation[]): Promise<void> {
     const db = this.getDb();
@@ -166,10 +187,44 @@ export class LocalFinanceDB {
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
       tx.objectStore(STORE_KV).put(snapshot, 'snapshot');
       const outboxStore = tx.objectStore(STORE_OUTBOX);
-      for (const mut of mutations) {
-        this.outboxSeq += 1;
-        outboxStore.put({ ...mut, _seq: this.outboxSeq });
-      }
+      const getAllReq = outboxStore.getAll();
+
+      getAllReq.onsuccess = () => {
+        const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
+        const byKey = new Map<string, SyncMutation & { _seq?: number }>();
+        for (const item of existingList) {
+          byKey.set(`${item.entity}:${item.recordId}`, item);
+        }
+
+        for (const mut of mutations) {
+          const key = `${mut.entity}:${mut.recordId}`;
+          const prev = byKey.get(key);
+          if (prev) {
+            outboxStore.delete(prev.mutationId);
+            const prevIsNewUnsynced = prev.op === 'upsert' && (prev.baseVersion === null || prev.baseVersion === 0);
+            if (prevIsNewUnsynced && mut.op === 'delete') {
+              // Brand-new offline record deleted before ever syncing -> cancel out completely
+              byKey.delete(key);
+              continue;
+            }
+            // Coalesce while preserving the original server baseVersion
+            this.outboxSeq += 1;
+            const coalesced: SyncMutation & { _seq: number } = {
+              ...mut,
+              baseVersion: prev.baseVersion !== undefined ? prev.baseVersion : mut.baseVersion,
+              _seq: this.outboxSeq,
+            };
+            outboxStore.put(coalesced);
+            byKey.set(key, coalesced);
+          } else {
+            this.outboxSeq += 1;
+            const record = { ...mut, _seq: this.outboxSeq };
+            outboxStore.put(record);
+            byKey.set(key, record);
+          }
+        }
+      };
+
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -178,7 +233,8 @@ export class LocalFinanceDB {
   async acknowledgeOutboxAndSave(
     ackedIds: string[],
     snapshot: FinanceSnapshot,
-    meta: LocalMeta
+    meta: LocalMeta,
+    conflicts?: SyncConflict[]
   ): Promise<void> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
@@ -190,6 +246,9 @@ export class LocalFinanceDB {
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
       kv.put(meta, 'meta');
+      if (conflicts !== undefined) {
+        kv.put(conflicts, 'conflicts');
+      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });

@@ -195,13 +195,14 @@ describe('Offline-First IndexedDB & SyncEngine', () => {
     expect(engine.getSnapshot().cashflowLogs).toHaveLength(1);
   });
 
-  it('applies remote soft deletes when merging delta', async () => {
+  it('cancels out unsynced offline create+delete and queues delete for synced records', async () => {
     const engine = new SyncEngine(db, {
       fetchImpl: vi.fn(),
       isOnline: () => false,
     });
     await engine.init();
 
+    // 1. Unsynced brand-new offline record created then deleted -> cancels out in outbox
     const log = await engine.addCashFlow({
       date: '2026-11-23',
       type: CASHFLOW_TYPES.DAILY_EXPENSE,
@@ -213,11 +214,41 @@ describe('Offline-First IndexedDB & SyncEngine', () => {
 
     await engine.deleteCashFlow(log.id);
     expect(engine.getSnapshot().cashflowLogs).toHaveLength(0);
+    expect(await db.getOutbox()).toHaveLength(0);
+
+    // 2. Already-synced record deleted offline -> queues delete mutation with baseVersion
+    const syncedSnap = engine.getSnapshot();
+    await db.saveSnapshot({
+      ...syncedSnap,
+      cashflowLogs: [
+        {
+          id: 'cf-synced-1',
+          date: '2026-11-23',
+          yearMonth: '2026-11',
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: '餐飲',
+          itemName: '已同步支出',
+          amount: 200,
+          currency: 'TWD',
+          fxRate: 1,
+          twdAmount: 200,
+          source: 'manual',
+          note: '',
+          createdAt: '2026-11-23T00:00:00.000Z',
+          updatedAt: '2026-11-23T00:00:00.000Z',
+          version: 2,
+        },
+      ],
+    });
+    await engine.init();
+    await engine.deleteCashFlow('cf-synced-1');
+    expect(engine.getSnapshot().cashflowLogs).toHaveLength(0);
     const outbox = await db.getOutbox();
     expect(outbox[outbox.length - 1]).toMatchObject({
       entity: 'cashflow',
       op: 'delete',
-      recordId: log.id,
+      recordId: 'cf-synced-1',
+      baseVersion: 2,
     });
   });
 
@@ -258,11 +289,44 @@ describe('Offline-First IndexedDB & SyncEngine', () => {
     // Baseline deletion must be rejected
     await expect(engine.deleteUtilityRecord('11409')).rejects.toThrow(/起始表底/);
 
+    // Unsynced brand-new 11511 deleted offline -> cancels out in outbox
     await engine.deleteUtilityRecord('11511');
     expect(engine.getSnapshot().rentUtilityRecords).toHaveLength(1);
-    const outbox = await db.getOutbox();
-    expect(outbox.some((m) => m.entity === 'utility_record' && m.op === 'delete' && m.recordId === '11511')).toBe(true);
+    let outbox = await db.getOutbox();
+    expect(outbox.some((m) => m.entity === 'utility_record' && m.recordId === '11511')).toBe(false);
     expect(outbox.some((m) => m.entity === 'utility_rents' && m.op === 'upsert')).toBe(true);
+
+    // Synced utility record deleted offline -> queues delete mutation with baseVersion
+    await db.saveSnapshot({
+      ...engine.getSnapshot(),
+      rentUtilityRecords: [
+        ...engine.getSnapshot().rentUtilityRecords,
+        {
+          period: '11512',
+          isBaseline: false,
+          curTotal: 63000,
+          cur6F: 8200,
+          totalElec: 4300,
+          totalWater: 560,
+          f6People: 2,
+          f5People: 3,
+          curA: 300,
+          curB: 6000,
+          curC: 6500,
+          createdAt: '2026-11-24T00:00:00.000Z',
+          updatedAt: '2026-11-24T00:00:00.000Z',
+          version: 1,
+        },
+      ],
+    });
+    await engine.init();
+    await engine.deleteUtilityRecord('11512');
+    outbox = await db.getOutbox();
+    expect(
+      outbox.some(
+        (m) => m.entity === 'utility_record' && m.op === 'delete' && m.recordId === '11512' && m.baseVersion === 1
+      )
+    ).toBe(true);
   });
 
   it('tracks offline savings account deposits and linked cashflow deductions immediately in IndexedDB', async () => {

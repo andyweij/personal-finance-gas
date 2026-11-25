@@ -2,13 +2,13 @@
 
 獨立於根目錄 GAS 專案之外的次世代架構，採用 **Local-First PWA + Cloudflare Workers + D1 (SQLite) + Cron Triggers**，解決 GAS 冷啟動延遲與無法離線記帳的痛點，且完全運作於 Cloudflare 免費方案（免綁信用卡、永不休眠）。
 
-> 完整設計規格請參閱 [docs/SDD.md](./docs/SDD.md)、[docs/SDD_savings_linkage.md](./docs/SDD_savings_linkage.md) 與 [docs/SDD_loan_amortization.md](./docs/SDD_loan_amortization.md)。
+> 完整設計規格請參閱 [docs/SDD.md](./docs/SDD.md)、[docs/SDD_savings_linkage.md](./docs/SDD_savings_linkage.md)、[docs/SDD_loan_amortization.md](./docs/SDD_loan_amortization.md) 與 [docs/SDD_sync_versioning.md](./docs/SDD_sync_versioning.md)。
 
 ---
 
 ## 核心特色
 
-- **真正的離線記帳（0ms 回應）**：Service Worker 預快取 App Shell，沒網路（捷運、地下室、飛航模式）點開 iPhone 主畫面圖示照樣秒開、秒記帳，資料安全寫入本機 IndexedDB 佇列，恢復網路或切回 App 立即背景同步。
+- **真正的離線記帳（0ms 回應）＋ 樂觀鎖防覆蓋**：Service Worker 預快取 App Shell，離線秒開秒記帳；伺服器統一發放遞增版號（`version`），多裝置同時編輯同一筆資料時自動攔截靜默覆蓋，並提供欄位差異對照與一鍵決策視窗。
 - **活存帳戶與流水帳即時連動**：支援多活存帳戶加總與單帳戶 N 筆存入／轉出累加（不扭曲儲蓄率），記帳頁即時顯示活存餘額與扣減前後預覽，並內建基準生效日與對帳校準機制，避免歷史舊帳重複扣款。
 - **貸款自動還本推算＋保留快照更新**：針對房貸／車貸可選填啟用本息均攤自動還本推算（內建「申貸日＋年限反推年利率」小工具與未來攤還試算表），免跑銀行即時掌握預估剩餘本金，並可隨時透過「快照校準」覆蓋或切回純手動快照。
 - **0ms 切換月份與報表**：所有帳目鏡像於本機 IndexedDB，切月份、看年度 12 個月趨勢與資產配置圖完全不需等待網路。

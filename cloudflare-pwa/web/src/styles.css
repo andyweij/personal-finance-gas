@@ -900,4 +900,78 @@ body {
   font-weight: 700;
 }
 
+/* ==================== 離線同步版本衝突 UI ==================== */
+.sync-pill.conflict {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 0.5px solid rgba(255, 59, 48, 0.35);
+  font-weight: 700;
+}
+.conflict-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.conflict-card {
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface-alt);
+  border: 0.5px solid var(--sep);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.conflict-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.conflict-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+.conflict-del-note {
+  font-size: 12.5px;
+  color: var(--danger);
+  font-weight: 600;
+}
+.conflict-diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  background: var(--surface);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 0.5px solid var(--sep);
+}
+.conflict-diff-table th,
+.conflict-diff-table td {
+  padding: 6px 8px;
+  border-bottom: 0.5px solid var(--sep);
+  text-align: left;
+  word-break: break-word;
+}
+.conflict-diff-table th {
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-weight: 700;
+}
+.conflict-local-val {
+  color: var(--primary);
+  font-weight: 600;
+}
+.conflict-server-val {
+  color: var(--success);
+  font-weight: 600;
+}
+.conflict-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+
 

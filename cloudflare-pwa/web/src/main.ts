@@ -27,6 +27,7 @@ import {
   updateSecurityButtons,
 } from './ui/securityUi';
 import { initBottomNavScrub } from './ui/tabBarScrub';
+import { openConflictsModal } from './ui/conflictUi';
 import type { AppUiState, UiContext } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
@@ -44,16 +45,24 @@ function registerServiceWorker(): void {
 function renderSyncPill(status: SyncStatus): void {
   const pill = el('syncStatusPill');
   pill.className = `sync-pill ${status.state}`;
-  if (status.state === 'synced') {
+  if (status.state === 'conflict') {
+    pill.textContent = `⚠ 衝突 (${status.conflictCount || 1})`;
+    pill.title = '偵測到離線與雲端版本衝突，點擊選擇保留版本';
+  } else if (status.state === 'synced') {
     pill.textContent = '● 已同步';
+    pill.title = '點擊立即同步';
   } else if (status.state === 'syncing') {
     pill.textContent = '↻ 同步中';
+    pill.title = '正在同步雲端資料';
   } else if (status.state === 'pending') {
     pill.textContent = `☁ 待同步 (${status.pendingCount})`;
+    pill.title = '點擊立即上傳待同步資料';
   } else if (status.state === 'offline') {
     pill.textContent = status.pendingCount > 0 ? `✈ 離線 (${status.pendingCount})` : '✈ 離線模式';
+    pill.title = '目前處於離線模式，恢復網路後自動同步';
   } else {
     pill.textContent = status.pendingCount > 0 ? `🔒 需登入 (${status.pendingCount})` : '🔒 請重新登入';
+    pill.title = '點擊重新登入以同步';
   }
 }
 
@@ -243,13 +252,23 @@ function bindEvents(ctx: UiContext): void {
 
   // Topbar actions
   el('syncStatusPill').addEventListener('click', async () => {
+    if (ctx.engine.getConflicts().length > 0) {
+      openConflictsModal(ctx);
+      return;
+    }
     if (ctx.engine.getStatus().state === 'auth_required') {
       openAuthScreen(ctx, 'login', '請重新登入以同步資料', () => void ctx.engine.syncNow());
       return;
     }
     const res = await ctx.engine.syncNow();
-    if (res.ok) showToast('雲端同步完成', 'success');
-    else if (!res.authRequired) showToast(res.error || '目前處於離線模式');
+    if (ctx.engine.getConflicts().length > 0) {
+      showToast(`偵測到 ${ctx.engine.getConflicts().length} 筆離線版本衝突，請選擇保留版本`, 'error');
+      openConflictsModal(ctx);
+    } else if (res.ok) {
+      showToast('雲端同步完成', 'success');
+    } else if (!res.authRequired) {
+      showToast(res.error || '目前處於離線模式');
+    }
   });
 
   el('refreshBtn').addEventListener('click', async () => {
