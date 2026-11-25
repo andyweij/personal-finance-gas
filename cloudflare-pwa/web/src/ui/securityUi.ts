@@ -31,6 +31,7 @@ import {
 import type { UiContext } from './state';
 
 let pinInput = '';
+let pinVerifySeq = 0;
 
 export type AuthScreenMode = 'setup' | 'login' | 'register' | 'reset';
 
@@ -406,6 +407,7 @@ function renderPinDots(): void {
 
 export function openLockScreen(ctx: UiContext, errMsg = ''): void {
   pinInput = '';
+  pinVerifySeq += 1;
   const hasFaceId = ctx.state.passkeys.length > 0;
   const hasPin = Boolean(ctx.state.pinEnabled && ctx.state.pinHash);
 
@@ -417,10 +419,10 @@ export function openLockScreen(ctx: UiContext, errMsg = ''): void {
 
   el('lockSub').textContent =
     hasFaceId && hasPin
-      ? '點擊刷 Face ID 解鎖，或輸入 4～6 位數 PIN（離線皆可用）'
+      ? '輸入 4～6 位數 PIN 正確即自動解鎖，或點擊刷 Face ID'
       : hasFaceId
         ? '點擊下方按鈕刷 Face ID 解鎖（支援離線驗證）'
-        : '離線亦可解鎖使用（4～6 位數 PIN）';
+        : '輸入 4～6 位數 PIN 正確即自動解鎖（離線可用）';
 
   if (hasPin) {
     renderPinDots();
@@ -430,6 +432,7 @@ export function openLockScreen(ctx: UiContext, errMsg = ''): void {
 
 export function closeLockScreen(ctx: UiContext): void {
   pinInput = '';
+  pinVerifySeq += 1;
   ctx.state.lastActivityAt = Date.now();
   el('lockScreen').classList.remove('open');
 }
@@ -483,14 +486,21 @@ export async function unlockLockScreenWithFaceId(ctx: UiContext): Promise<void> 
 export async function triggerPinKey(ctx: UiContext, k: string): Promise<void> {
   el('pinError').textContent = '';
   if (k === 'del') {
+    pinVerifySeq += 1;
     pinInput = pinInput.slice(0, -1);
     renderPinDots();
-  } else if (k === 'ok') {
+    return;
+  }
+
+  if (k === 'ok') {
     if (pinInput.length < 4) {
       el('pinError').textContent = 'PIN 碼至少 4 位數字';
       return;
     }
-    const ok = await verifyOfflinePin(pinInput, ctx.state.pinSalt || '', ctx.state.pinHash || '');
+    const seq = ++pinVerifySeq;
+    const candidate = pinInput;
+    const ok = await verifyOfflinePin(candidate, ctx.state.pinSalt || '', ctx.state.pinHash || '');
+    if (seq !== pinVerifySeq) return;
     if (ok) {
       closeLockScreen(ctx);
       ctx.scheduleSync();
@@ -499,9 +509,30 @@ export async function triggerPinKey(ctx: UiContext, k: string): Promise<void> {
       renderPinDots();
       el('pinError').textContent = 'PIN 碼不正確，請重試';
     }
-  } else if (/^\d$/.test(k) && pinInput.length < 6) {
+    return;
+  }
+
+  if (/^\d$/.test(k) && pinInput.length < 6) {
     pinInput += k;
     renderPinDots();
+
+    // Support seamless auto-unlock for 4-, 5-, and 6-digit PINs without pressing OK
+    if (pinInput.length >= 4 && ctx.state.pinSalt && ctx.state.pinHash) {
+      const seq = ++pinVerifySeq;
+      const candidate = pinInput;
+      const ok = await verifyOfflinePin(candidate, ctx.state.pinSalt, ctx.state.pinHash);
+      if (ok && el('lockScreen').classList.contains('open') && pinInput.startsWith(candidate)) {
+        closeLockScreen(ctx);
+        ctx.scheduleSync();
+        return;
+      }
+      // Only auto-clear and show error if user has reached the 6-digit maximum and still no match
+      if (!ok && candidate.length === 6 && seq === pinVerifySeq) {
+        pinInput = '';
+        renderPinDots();
+        el('pinError').textContent = 'PIN 碼不正確，請重試';
+      }
+    }
   }
 }
 

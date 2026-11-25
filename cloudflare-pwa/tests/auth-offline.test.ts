@@ -183,3 +183,130 @@ describe('Offline WebAuthn Face ID / Passkey assertion verification', () => {
     ).toBe(false);
   });
 });
+
+describe('Offline PIN Auto-Unlock (4 to 6 digits)', () => {
+  function setupMockLockDom() {
+    const elements: Record<string, Record<string, unknown>> = {};
+    const makeEl = (id: string) => {
+      const classes = new Set<string>();
+      const node: Record<string, unknown> = {
+        id,
+        textContent: '',
+        innerHTML: '',
+        style: {} as Record<string, string>,
+        children: [] as unknown[],
+        className: '',
+        appendChild(child: unknown) {
+          (node.children as unknown[]).push(child);
+          return child;
+        },
+        classList: {
+          add: (c: string) => classes.add(c),
+          remove: (c: string) => classes.delete(c),
+          contains: (c: string) => classes.has(c),
+          toggle: (c: string, force?: boolean) => {
+            if (force === undefined) {
+              if (classes.has(c)) classes.delete(c);
+              else classes.add(c);
+            } else if (force) classes.add(c);
+            else classes.delete(c);
+          },
+        },
+      };
+      elements[id] = node;
+      return node;
+    };
+
+    for (const id of ['lockScreen', 'pinDots', 'pinError', 'lockFaceIdBtn', 'pinPad', 'lockUsePasswordBtn', 'lockSub']) {
+      makeEl(id);
+    }
+
+    const prevDoc = (globalThis as Record<string, unknown>).document;
+    (globalThis as Record<string, unknown>).document = {
+      getElementById: (id: string) => elements[id] || null,
+      createElement: () => ({ className: '' }),
+    };
+
+    return {
+      elements,
+      restore: () => {
+        (globalThis as Record<string, unknown>).document = prevDoc;
+      },
+    };
+  }
+
+  it('auto-unlocks immediately on 4th digit for 4-digit PIN and on 6th digit for 6-digit PIN without pressing OK', async () => {
+    const { hashSecretPbkdf2 } = await import('../worker/auth');
+    const { openLockScreen, triggerPinKey } = await import('../web/src/ui/securityUi');
+
+    const dom = setupMockLockDom();
+    try {
+      const salt = '0123456789abcdef0123456789abcdef';
+      let syncCalls = 0;
+
+      // 1. Test 4-digit PIN (2580)
+      const hash4 = await hashSecretPbkdf2('2580', salt);
+      const ctx4 = {
+        state: {
+          pinEnabled: true,
+          pinSalt: salt,
+          pinHash: hash4,
+          passkeys: [],
+          lastActivityAt: 0,
+        },
+        scheduleSync: () => {
+          syncCalls += 1;
+        },
+      } as never;
+
+      openLockScreen(ctx4);
+      expect((dom.elements.lockScreen.classList as { contains: (c: string) => boolean }).contains('open')).toBe(true);
+      for (const d of ['2', '5', '8', '0']) {
+        await triggerPinKey(ctx4, d);
+      }
+      expect((dom.elements.lockScreen.classList as { contains: (c: string) => boolean }).contains('open')).toBe(false);
+      expect(syncCalls).toBe(1);
+
+      // 2. Test 6-digit PIN (135790) — must NOT error or clear at digits 4 & 5, and auto-unlock at digit 6
+      const hash6 = await hashSecretPbkdf2('135790', salt);
+      const ctx6 = {
+        state: {
+          pinEnabled: true,
+          pinSalt: salt,
+          pinHash: hash6,
+          passkeys: [],
+          lastActivityAt: 0,
+        },
+        scheduleSync: () => {
+          syncCalls += 1;
+        },
+      } as never;
+
+      openLockScreen(ctx6);
+      for (const d of ['1', '3', '5', '7']) {
+        await triggerPinKey(ctx6, d);
+      }
+      expect((dom.elements.lockScreen.classList as { contains: (c: string) => boolean }).contains('open')).toBe(true);
+      expect(dom.elements.pinError.textContent).toBe('');
+
+      await triggerPinKey(ctx6, '9');
+      expect((dom.elements.lockScreen.classList as { contains: (c: string) => boolean }).contains('open')).toBe(true);
+      expect(dom.elements.pinError.textContent).toBe('');
+
+      await triggerPinKey(ctx6, '0');
+      expect((dom.elements.lockScreen.classList as { contains: (c: string) => boolean }).contains('open')).toBe(false);
+      expect(syncCalls).toBe(2);
+
+      // 3. Wrong 6-digit PIN auto-clears and displays error
+      openLockScreen(ctx6);
+      for (const d of ['9', '9', '9', '9', '9', '9']) {
+        await triggerPinKey(ctx6, d);
+      }
+      expect((dom.elements.lockScreen.classList as { contains: (c: string) => boolean }).contains('open')).toBe(true);
+      expect(dom.elements.pinError.textContent).toContain('PIN 碼不正確');
+    } finally {
+      dom.restore();
+    }
+  });
+});
+
