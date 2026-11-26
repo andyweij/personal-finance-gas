@@ -1,5 +1,6 @@
 import type { AuthUser, CachedPasskeyDto, PnlColorScheme } from '../../../shared/types';
 import type { SyncEngine } from '../sync/syncEngine';
+import type { LocalMeta } from '../db/localDb';
 
 export type StockChartType = 'donut' | 'pie' | 'hbar' | 'treemap';
 export type StockChartDimension = 'value' | 'category' | 'cost' | 'market';
@@ -74,3 +75,19 @@ export interface UiContext {
   applyPnlColorScheme: (scheme: PnlColorScheme) => void;
 }
 
+
+/**
+ * M9 (v1.8.12): the lock-screen settings live in the engine's stored meta (shared by all tabs). Copy them into the
+ * UI state whenever the engine reloads, so a PIN / Face ID change made in another tab is used here too.
+ */
+export function applyAuthMetaToState(
+  state: AppUiState,
+  meta: Pick<LocalMeta, 'pinEnabled' | 'pinSalt' | 'pinHash' | 'biometricLockEnabled' | 'passkeys'>
+): void {
+  state.pinEnabled = Boolean(meta.pinEnabled);
+  state.pinSalt = meta.pinSalt ?? null;
+  state.pinHash = meta.pinHash ?? null;
+  state.biometricLockEnabled = Boolean(meta.biometricLockEnabled);
+  state.passkeys = meta.passkeys || [];
+  state.passkeyCount = state.passkeys.length;
+}

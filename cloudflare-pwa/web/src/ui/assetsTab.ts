@@ -1135,9 +1135,7 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
         snap.savingsAdjustments || [],
         rate
       );
-      return acc.currency === 'USD'
-        ? Math.round((s.currentBalanceTwd / rate) * 100) / 100
-        : s.currentBalanceTwd;
+      return s.currentBalanceNative;
     }
     return acc.quantityOrAmount;
   };

@@ -68,6 +68,7 @@ import type {
   StockChartType,
   UiContext,
 } from './ui/state';
+import { applyAuthMetaToState } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
 
@@ -246,11 +247,18 @@ async function bootstrap(): Promise<void> {
   let activeDb = new LocalFinanceDB(LocalFinanceDB.dbNameForUser(remembered?.id));
   const accountChannel = createCrossTabChannel('personal-finance-account-sync');
 
-  const createSyncEngineForDb = (db: LocalFinanceDB, expectedUserId?: string): SyncEngine =>
-    new SyncEngine(db, {
+  const createSyncEngineForDb = (db: LocalFinanceDB, expectedUserId?: string): SyncEngine => {
+    const engine: SyncEngine = new SyncEngine(db, {
       expectedUserId,
       onStatusChange: (status) => renderSyncPill(status),
-      onSnapshotChange: () => ctx.renderAll(),
+      onSnapshotChange: () => {
+        // M9: a PIN / Face ID change made in another tab reloads this engine — pick the new lock settings up
+        if (ctx.engine === engine) {
+          applyAuthMetaToState(ctx.state, engine.getMeta());
+          updateSecurityButtons(ctx);
+        }
+        ctx.renderAll();
+      },
       onError: (msg) => showToast(`本機資料儲存失敗：${msg}`, 'error'),
       onAuthRequired: () => {
         ctx.state.authenticated = false;
@@ -271,6 +279,8 @@ async function bootstrap(): Promise<void> {
         });
       },
     });
+    return engine;
+  };
 
   const applyPnlSchemeDom = (scheme: PnlColorScheme) => {
     const normalized = normalizePnlColorScheme(scheme);
@@ -346,13 +356,7 @@ async function bootstrap(): Promise<void> {
         const nextEngine = createSyncEngineForDb(activeDb, user.id);
         ctx.engine = nextEngine;
         await nextEngine.init();
-        const nextMeta = nextEngine.getMeta();
-        state.pinEnabled = nextMeta.pinEnabled;
-        state.pinSalt = nextMeta.pinSalt;
-        state.pinHash = nextMeta.pinHash;
-        state.passkeys = nextMeta.passkeys || [];
-        state.passkeyCount = state.passkeys.length;
-        state.biometricLockEnabled = Boolean(nextMeta.biometricLockEnabled);
+        applyAuthMetaToState(state, nextEngine.getMeta());
         state.activeLedgerId = DEFAULT_LEDGER_ID;
         localStorage.setItem('finance_active_ledger_id', DEFAULT_LEDGER_ID);
         state.assetsLedgerScope = 'net_worth';
@@ -410,13 +414,7 @@ async function bootstrap(): Promise<void> {
 
   // 1. 0ms 立即從該帳號專屬的本機 IndexedDB 載入畫面（離線也能秒開）
   await ctx.engine.init();
-  const meta = ctx.engine.getMeta();
-  state.pinEnabled = meta.pinEnabled;
-  state.pinSalt = meta.pinSalt;
-  state.pinHash = meta.pinHash;
-  state.passkeys = meta.passkeys || [];
-  state.passkeyCount = state.passkeys.length;
-  state.biometricLockEnabled = Boolean(meta.biometricLockEnabled);
+  applyAuthMetaToState(state, ctx.engine.getMeta());
 
   el<HTMLInputElement>('dateInput').value = getTodayYmd();
   renderLogCategories(ctx);
@@ -475,13 +473,11 @@ async function bootstrap(): Promise<void> {
       state.authenticated = auth.authenticated;
       if (auth.authenticated && auth.user) {
         await ctx.switchAccountDb(auth.user);
-        state.pinEnabled = Boolean(auth.pinEnabled);
-        state.pinSalt = auth.pinSalt || null;
-        state.pinHash = auth.pinHash || null;
-        state.passkeys = auth.passkeys || [];
-        state.passkeyCount = auth.passkeyCount || 0;
-        await ctx.engine.updateLocalPinCache(state.pinEnabled, state.pinSalt, state.pinHash);
-        await ctx.engine.updateLocalBiometricCache(state.biometricLockEnabled, state.passkeys);
+        // M9: write the server's PIN / passkeys first, then read every lock setting back from the stored meta
+        // (the per-device Face ID toggle may have been changed by another tab and is not overwritten here)
+        await ctx.engine.updateLocalPinCache(Boolean(auth.pinEnabled), auth.pinSalt || null, auth.pinHash || null);
+        await ctx.engine.updateLocalPasskeysCache(auth.passkeys || []);
+        applyAuthMetaToState(state, ctx.engine.getMeta());
         updateSecurityButtons(ctx);
         if (!isAnyLockEnabled(ctx)) {
           closeLockScreen(ctx);
@@ -489,13 +485,9 @@ async function bootstrap(): Promise<void> {
         showSecurityNotices(auth.securityNotices);
         void ctx.engine.syncNow();
       } else if (!auth.initialized) {
-        state.pinEnabled = false;
-        state.pinSalt = null;
-        state.pinHash = null;
-        state.biometricLockEnabled = false;
-        state.passkeys = [];
         await ctx.engine.updateLocalPinCache(false, null, null);
         await ctx.engine.updateLocalBiometricCache(false, []);
+        applyAuthMetaToState(state, ctx.engine.getMeta());
         updateSecurityButtons(ctx);
         closeLockScreen(ctx);
         openAuthScreen(ctx, 'setup', '', () => void ctx.engine.syncNow(true));
@@ -506,7 +498,7 @@ async function bootstrap(): Promise<void> {
         openAuthScreen(
           ctx,
           'login',
-          meta.lastSyncedAt ? '登入已失效，請重新登入後繼續使用' : '',
+          ctx.engine.getMeta().lastSyncedAt ? '登入已失效，請重新登入後繼續使用' : '',
           () => void ctx.engine.syncNow(true)
         );
       }

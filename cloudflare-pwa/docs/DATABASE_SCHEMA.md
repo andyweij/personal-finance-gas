@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.11 / D1 Schema `0015`）
+# 資料庫 Schema 設計架構（v1.8.12 / D1 Schema `0015`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（21 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
 > **最新 Migration**：[`0015_security_events.sql`](../migrations/0015_security_events.sql)  
-> **對應版本**：`APP_VERSION = 1.8.11` / `DB_SCHEMA_VERSION = 0015` / `SW_CACHE_VERSION = finance-pwa-v31`
+> **對應版本**：`APP_VERSION = 1.8.12` / `DB_SCHEMA_VERSION = 0015` / `SW_CACHE_VERSION = finance-pwa-v32`
 
 ---
 
@@ -131,7 +131,7 @@ erDiagram
 | `twd_amount` | `INTEGER` | `NOT NULL` | 折合台幣整數金額 |
 | `source` | `TEXT` | `NOT NULL DEFAULT '手機記帳'` | 來源標記（手機記帳／自動入帳） |
 | `note` | `TEXT` | `NOT NULL DEFAULT ''` | 備註 |
-| `recurring_dedup_key` | `TEXT` | `NULL` | 常態自動入帳冪等鍵（非預設帳本含 `${ledgerId}\|\|` 前綴） |
+| `recurring_dedup_key` | `TEXT` | `NULL` | 常態自動入帳冪等鍵。v1.8.12 起為 `rec:<recurring_items.id>:<YYYY-MM>`（每個項目每月一筆，`INSERT … ON CONFLICT DO NOTHING`）；v1.8.11 以前為 `YYYY-MM\|\|類型\|\|名稱`（非預設帳本含 `${ledgerId}\|\|` 前綴），仍視為已入帳 |
 | `linked_account_id` | `TEXT` | `NULL` | 關聯的連動活存 `asset_items.id` |
 | `created_at` / `updated_at` / `deleted_at` / `version` | `TEXT` / `INTEGER` | 標準同步欄位 | 軟刪除與樂觀鎖 |
 
@@ -292,5 +292,7 @@ flowchart LR
     AND (price_updated_at IS NULL OR price_updated_at < '<部署日期，例如 2026-11-26>');
   ```
 - **沒有 `clientEpoch` 的客戶端（R-2）**：伺服器在發生過 replace 還原（`data_epoch > 1`）之後，若收到不帶 `clientEpoch` 且含 mutation 的請求，一律回傳 `epochMismatch` + 完整資料、不套用任何 mutation。目前的網頁客戶端會帶上本機 `dataEpoch`（新裝置為 `null` 時會先完整拉取並採用伺服器回傳的 epoch），因此只有極舊版本或 meta 遺失的裝置會走到這條路徑；其待送變更會被凍結並由使用者決定捨棄或重新套用。
+- **參照完整性（v1.8.12，M3）**：同步寫入 `cashflow_logs`、`recurring_items`、`asset_items`、`savings_adjustments`、`stock_transactions` 時，本次有變更的 `ledger_id`、`linked_account_id`、`account_id`、`asset_id` 必須指向同一使用者、未刪除的紀錄（寫入語句內 `AND EXISTS (...)`，`default` 帳本永遠有效），否則拒絕；沒有變更的既有參照（舊資料可能已懸空）照常放行。JSON 匯入時帳本參照必須能對應到匯入內容、`default` 或（merge 模式）雲端現有帳本。
+- **原子群組（v1.8.12，M4）**：帶有相同 `atomicGroupId` 的 mutation（帳戶互轉的兩邊與手續費、成對刪除）在同一個 D1 batch 寫入，每筆主寫入後的守衛語句在 0 列變更時讓整個 batch 失敗並回滾；舊版客戶端在同一請求中送出、`transferGroupId` 相同的存轉新增也視為一組。
 - **`auth_rate_limits.locked_until`**：自 v1.8.3 起限速改以固定時間窗計數，此欄位仍會寫入但已不再被讀取；保留欄位以免破壞既有資料，未來重建該表時可移除。
 

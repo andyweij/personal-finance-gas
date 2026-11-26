@@ -6,7 +6,7 @@ import {
   isAssetIncludedInNetWorth,
   isLedgerIncludedInNetWorth,
 } from '../shared/calculations';
-import { buildMonthlyDedupKey, shouldPostRecurringItem } from '../shared/recurring';
+import { buildMonthlyDedupKey, buildRecurringItemMonthKey, shouldPostRecurringItem } from '../shared/recurring';
 import { assertUserId, ensureAppSettings, exportFullSnapshot } from './sync';
 
 export function getTaiwanDateParts(date: Date): {
@@ -30,6 +30,27 @@ export function isTaiwanMonthEnd(date: Date): boolean {
   return tomorrowTw.day === 1;
 }
 
+/**
+ * M14 (v1.8.12): validates an explicitly requested posting period. Both values must be given together, as
+ * integers, with month 1–12 and a plausible year; omitting both means "the current Taipei month".
+ */
+export function validateRecurringPeriod(
+  year: unknown,
+  month: unknown
+): { ok: true; year?: number; month?: number } | { ok: false; error: string } {
+  const hasYear = year !== undefined && year !== null;
+  const hasMonth = month !== undefined && month !== null;
+  if (!hasYear && !hasMonth) return { ok: true };
+  if (!hasYear || !hasMonth) return { ok: false, error: '請同時指定入帳的年份與月份。' };
+  if (typeof year !== 'number' || !Number.isInteger(year) || year < 2000 || year > 2100) {
+    return { ok: false, error: '入帳年份需為 2000～2100 之間的整數。' };
+  }
+  if (typeof month !== 'number' || !Number.isInteger(month) || month < 1 || month > 12) {
+    return { ok: false, error: '入帳月份需為 1～12 之間的整數。' };
+  }
+  return { ok: true, year, month };
+}
+
 export async function runMonthlyRecurringD1(
   db: D1Database,
   userId: string,
@@ -43,6 +64,8 @@ export async function runMonthlyRecurringD1(
   fxRate: number;
 }> {
   const uid = assertUserId(userId);
+  const period = validateRecurringPeriod(targetYear, targetMonth);
+  if (!period.ok) throw new Error(period.error);
   const settings = await ensureAppSettings(db, uid);
   const nowParts = getTaiwanDateParts(new Date());
   const year = targetYear || nowParts.year;
@@ -64,22 +87,47 @@ export async function runMonthlyRecurringD1(
     .first<{ data_epoch: number }>();
   const expectedEpoch = Number(epochRow?.data_epoch ?? 1);
   const epochGuard = '(SELECT data_epoch FROM user_sync_state WHERE user_id = ?) = ?';
+  const epochChanged = async (): Promise<boolean> => {
+    const row = await db
+      .prepare('SELECT data_epoch FROM user_sync_state WHERE user_id = ?')
+      .bind(uid)
+      .first<{ data_epoch: number }>();
+    return Number(row?.data_epoch ?? 1) !== expectedEpoch;
+  };
 
   const existingRows = await db
     .prepare(
-      `SELECT type, item_name, recurring_dedup_key, ledger_id
+      `SELECT type, item_name, amount, currency, recurring_dedup_key, ledger_id
        FROM cashflow_logs
        WHERE user_id = ? AND year_month = ? AND source = '自動入帳' AND deleted_at IS NULL`
     )
     .bind(uid, yearMonth)
-    .all<{ type: string; item_name: string; recurring_dedup_key: string | null; ledger_id?: string | null }>();
+    .all<{
+      type: string;
+      item_name: string;
+      amount: number;
+      currency: string;
+      recurring_dedup_key: string | null;
+      ledger_id?: string | null;
+    }>();
 
+  // M5: new rows are keyed by recurring item id + month. Rows posted before v1.8.12 (or restored from a backup
+  // without a key) carry the legacy name-based key: each such row counts as "already posted" for exactly one
+  // matching item, preferring an item with the same amount and currency.
   const existingKeys = new Set<string>();
+  const legacyRows: Array<{ key: string; amount: number; currency: string; consumed: boolean }> = [];
   for (const r of existingRows.results) {
-    existingKeys.add(
-      r.recurring_dedup_key ||
-        buildMonthlyDedupKey(yearMonth, r.type, r.item_name, r.ledger_id || 'default')
-    );
+    const key = r.recurring_dedup_key || '';
+    if (key.startsWith('rec:')) {
+      existingKeys.add(key);
+    } else {
+      legacyRows.push({
+        key: key || buildMonthlyDedupKey(yearMonth, r.type, r.item_name, r.ledger_id || 'default'),
+        amount: Number(r.amount),
+        currency: String(r.currency || 'TWD'),
+        consumed: false,
+      });
+    }
   }
 
   const recurringRows = await db
@@ -103,13 +151,38 @@ export async function runMonthlyRecurringD1(
   let skippedCount = 0;
   let deactivatedOneTimeCount = 0;
 
-  for (const item of recurringRows.results) {
-    if (!item.item_name || !item.type || item.amount <= 0) continue;
-    if (!shouldPostRecurringItem(item.cycle, item.billing_spec, year, month)) continue;
+  const dueItems = recurringRows.results.filter(
+    (item) =>
+      item.item_name &&
+      item.type &&
+      item.amount > 0 &&
+      shouldPostRecurringItem(item.cycle, item.billing_spec, year, month)
+  );
+  const legacyCovered = new Set<string>();
+  const legacyKeyOf = (item: (typeof dueItems)[number]) =>
+    buildMonthlyDedupKey(yearMonth, item.type, item.item_name, String(item.ledger_id || 'default').trim() || 'default');
+  // Pass 1: exact matches (same amount & currency) consume legacy rows first; pass 2: any remaining same-key item
+  for (const exact of [true, false]) {
+    for (const item of dueItems) {
+      if (legacyCovered.has(item.id) || existingKeys.has(buildRecurringItemMonthKey(item.id, yearMonth))) continue;
+      const lk = legacyKeyOf(item);
+      const row = legacyRows.find(
+        (r) =>
+          !r.consumed &&
+          r.key === lk &&
+          (!exact || (r.amount === Number(item.amount) && r.currency === String(item.currency || 'TWD')))
+      );
+      if (row) {
+        row.consumed = true;
+        legacyCovered.add(item.id);
+      }
+    }
+  }
 
+  for (const item of dueItems) {
     const ledgerId = String(item.ledger_id || 'default').trim() || 'default';
-    const dedupKey = buildMonthlyDedupKey(yearMonth, item.type, item.item_name, ledgerId);
-    if (existingKeys.has(dedupKey)) {
+    const dedupKey = buildRecurringItemMonthKey(item.id, yearMonth);
+    if (existingKeys.has(dedupKey) || legacyCovered.has(item.id)) {
       skippedCount++;
       continue;
     }
@@ -134,7 +207,8 @@ export async function runMonthlyRecurringD1(
         `INSERT INTO cashflow_logs
           (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, NULL, 1, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
-         WHERE ${epochGuard}`
+         WHERE ${epochGuard}
+         ON CONFLICT DO NOTHING`
       )
       .bind(
         uid,
@@ -166,15 +240,25 @@ export async function runMonthlyRecurringD1(
         .prepare(
           `UPDATE recurring_items SET status = '停用', note = ?, updated_at = ?, version = version + 1,
               change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
-           WHERE user_id = ? AND id = ? AND ${epochGuard}`
+           WHERE user_id = ? AND id = ? AND ${epochGuard} AND changes() > 0`
         )
         .bind(updatedNote, nowIso, uid, uid, item.id, uid, expectedEpoch);
       const results = await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt, deactivateStmt]);
-      if (Number(results[2]?.meta?.changes ?? 0) === 0) break; // R-5: epoch changed — stop this run
+      if (Number(results[2]?.meta?.changes ?? 0) === 0) {
+        if (await epochChanged()) break; // R-5: epoch changed — stop this run
+        skippedCount++; // M5: a concurrent run posted it first (ON CONFLICT DO NOTHING)
+        existingKeys.add(dedupKey);
+        continue;
+      }
       deactivatedOneTimeCount++;
     } else {
       const results = await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt]);
-      if (Number(results[2]?.meta?.changes ?? 0) === 0) break; // R-5: epoch changed — stop this run
+      if (Number(results[2]?.meta?.changes ?? 0) === 0) {
+        if (await epochChanged()) break; // R-5: epoch changed — stop this run
+        skippedCount++; // M5: a concurrent run posted it first (ON CONFLICT DO NOTHING)
+        existingKeys.add(dedupKey);
+        continue;
+      }
     }
 
     existingKeys.add(dedupKey);

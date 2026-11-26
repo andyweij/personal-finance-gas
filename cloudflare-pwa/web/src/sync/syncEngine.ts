@@ -745,7 +745,16 @@ export class SyncEngine {
   private async applyAuthMetaPatch(patch: Partial<LocalMeta>): Promise<void> {
     const merged = await this.db.patchAuthMeta(patch);
     if (merged) {
-      this.meta = { ...this.meta, ...patch };
+      // M9: take every lock-screen field from the stored meta (another tab may have changed the ones not patched)
+      this.meta = {
+        ...this.meta,
+        pinEnabled: merged.pinEnabled,
+        pinSalt: merged.pinSalt,
+        pinHash: merged.pinHash,
+        biometricLockEnabled: merged.biometricLockEnabled,
+        passkeys: merged.passkeys,
+        ...patch,
+      };
     } else {
       // No stored meta yet (first run): write the full meta once
       const nextMeta: LocalMeta = { ...this.meta, ...patch };
@@ -753,6 +762,14 @@ export class SyncEngine {
       this.meta = nextMeta;
     }
     this.broadcastDbChanged();
+  }
+
+  /**
+   * M9: refresh only the cached passkey list (login / startup). The Face ID lock toggle is a per-device choice that
+   * may have been changed in another tab, so it is never written from a possibly stale in-memory copy.
+   */
+  async updateLocalPasskeysCache(passkeys: LocalMeta['passkeys']): Promise<void> {
+    await this.applyAuthMetaPatch({ passkeys: passkeys || [] });
   }
 
   async updateLocalBiometricCache(
@@ -1639,6 +1656,7 @@ export class SyncEngine {
       savingsAdjustments: this.snapshot.savingsAdjustments.filter((a) => !deleteIds.has(a.id)),
     };
 
+    const mutationsShareTransfer = deletePairedTransfer && targets.length > 1;
     const mutations: SyncMutation[] = (targets.length > 0 ? targets : [{ id, version: undefined }]).map(
       (t) => ({
         mutationId: crypto.randomUUID(),
@@ -1648,6 +1666,8 @@ export class SyncEngine {
         clientTimestamp: nowIso,
         baseVersion: t.version ?? null,
         isNewRecord: false,
+        // M4: deleting both sides of a transfer is all-or-nothing
+        ...(mutationsShareTransfer && existing?.transferGroupId ? { atomicGroupId: existing.transferGroupId } : {}),
       })
     );
     await this.commitAndMaybeSync(nextSnapshot, mutations);
@@ -1861,7 +1881,9 @@ export class SyncEngine {
         : this.snapshot.cashflowLogs,
     };
 
-    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    // M4: every leg (and the fee) of a transfer is applied by the server all-or-nothing and sent in one batch
+    const groupedMutations = mutations.map((m) => ({ ...m, atomicGroupId: transferGroupId }));
+    await this.commitAndMaybeSync(nextSnapshot, groupedMutations);
     return {
       transferGroupId,
       fromAdjustment,
@@ -2550,18 +2572,57 @@ export class SyncEngine {
    * the same record are never sent together and cause a self-conflict.
    */
   private selectSyncBatch(outbox: SyncMutation[], maxCount: number): SyncMutation[] {
+    return this.selectSyncUnits(outbox, maxCount).batch;
+  }
+
+  /**
+   * M4: the outbox is consumed in units. A unit is one mutation, or — when it belongs to an atomic group — the run of
+   * the outbox from it up to the last member of its group (transitively), so a group is never split across requests.
+   * `maxCount` counts mutations, but the first unit is always taken whole (single-item isolation sends one unit).
+   */
+  private selectSyncUnits(outbox: SyncMutation[], maxCount: number): { batch: SyncMutation[]; unitCount: number } {
+    const lastIndexOfGroup = new Map<string, number>();
+    outbox.forEach((m, i) => {
+      if (m.atomicGroupId) lastIndexOfGroup.set(m.atomicGroupId, i);
+    });
     const selected: SyncMutation[] = [];
     const seenKeys = new Set<string>();
-    for (const m of outbox) {
+    let unitCount = 0;
+    let i = 0;
+    while (i < outbox.length) {
+      let end = i;
+      for (let j = i; j <= end; j++) {
+        const g = outbox[j].atomicGroupId;
+        if (g) end = Math.max(end, lastIndexOfGroup.get(g) ?? j);
+      }
+      const unit = outbox.slice(i, end + 1);
+      const unitKeys: string[] = [];
+      let dupAt = -1;
+      for (let k = 0; k < unit.length; k++) {
+        const key = `${unit[k].entity}:${unit[k].recordId}`;
+        // V2: Stop at the first duplicate key so every batch is a strict prefix of the outbox.
+        if (seenKeys.has(key) || unitKeys.includes(key)) {
+          dupAt = k;
+          break;
+        }
+        unitKeys.push(key);
+      }
+      if (dupAt >= 0) {
+        if (selected.length === 0 && dupAt > 0) {
+          // Pathological: a duplicate key inside the first unit. Send the prefix up to it rather than stall.
+          selected.push(...unit.slice(0, dupAt));
+          unitCount += 1;
+        }
+        break;
+      }
+      if (selected.length > 0 && selected.length + unit.length > maxCount) break;
+      selected.push(...unit);
+      unitKeys.forEach((k) => seenKeys.add(k));
+      unitCount += 1;
+      i = end + 1;
       if (selected.length >= maxCount) break;
-      const key = `${m.entity}:${m.recordId}`;
-      // V2: Stop at the first duplicate key so every batch is a strict prefix of the outbox.
-      // Skipping (`continue`) would let later mutations that depend on the deferred one jump ahead of it.
-      if (seenKeys.has(key)) break;
-      seenKeys.add(key);
-      selected.push(m);
     }
-    return selected;
+    return { batch: selected, unitCount };
   }
 
   /**
@@ -2679,6 +2740,7 @@ export class SyncEngine {
       if (this.destroyed) return { ok: false, error: '同步已停止（帳號已切換或頁面已關閉）' };
       let outbox: SyncMutation[] = [];
       let batch: SyncMutation[] = [];
+      let batchUnitCount = 0;
       let hadMoreBatches = false;
       let reqSince: string | null = null;
       let reqSinceSeq: number | null = null;
@@ -2690,7 +2752,9 @@ export class SyncEngine {
         const effectiveBatchSize =
           this.consecutiveFailures >= 1 || this.poisonSearchActive ? 1 : this.maxBatchSize;
         // Q4 / N1 & V2: strict queue prefix, at most one mutation per entity:recordId per HTTP batch
-        batch = this.selectSyncBatch(outbox, effectiveBatchSize);
+        const selection = this.selectSyncUnits(outbox, effectiveBatchSize);
+        batch = selection.batch;
+        batchUnitCount = selection.unitCount;
         hadMoreBatches = outbox.length > batch.length;
         // P2-C2: Persist sentAt & attempts to IndexedDB BEFORE sending HTTP request so timeout/reload never coalesces sent mutations
         if (batch.length > 0) {
@@ -3151,7 +3215,7 @@ export class SyncEngine {
         }
 
         // R-3: Leave single-item isolation mode after a streak of healthy single-item writes
-        if (batch.length === 1 && this.poisonSearchActive && passOutcome.madeForwardProgress) {
+        if (batchUnitCount === 1 && this.poisonSearchActive && passOutcome.madeForwardProgress) {
           this.singleItemSuccessStreak += 1;
           if (this.singleItemSuccessStreak >= 5) {
             this.poisonSearchActive = false;
@@ -3218,29 +3282,35 @@ export class SyncEngine {
             return { ok: true, epochMismatch: true };
           }
 
-          const isDeterministicPayloadError = httpStatus === 400 || httpStatus === 413;
-          const isItemSpecificFailure =
-            isDeterministicPayloadError || (pullRes.ok && pullRes.writeProbeOk);
+          // M7: 400 / 413 are only item-specific when the read-only pull AND the write probe succeed. A request-level
+          // 400 / 413 (Worker regression, WAF, version skew) also fails the bare pull, so nothing is quarantined —
+          // we only back off and retry.
+          const isItemSpecificFailure = Boolean(pullRes.ok && pullRes.writeProbeOk);
 
           if (isItemSpecificFailure) {
             this.singleItemSuccessStreak = 0;
-            if (batch.length > 1) {
+            if (batchUnitCount > 1) {
               // Server is healthy (or rejected payload size/format), so a specific mutation in this batch is poison.
               // Switch to single-item isolation mode without penalizing innocent items in the batch.
               this.poisonSearchActive = true;
             } else {
+              // M4: a single unit may be an atomic group (e.g. both legs of a transfer) — it is isolated as a whole
               const updatedBatch = await this.db.incrementOutboxRetryCounts(
-                [batch[0].mutationId],
+                batch.map((m) => m.mutationId),
                 msg
               );
-              const singleFailed = updatedBatch[0] || batch[0];
+              const unitRetryCount = Math.max(
+                0,
+                ...batch.map((m) => updatedBatch.find((u) => u.mutationId === m.mutationId)?.retryCount ?? m.retryCount ?? 0)
+              );
+              const failedUnit = batch.map((m) => updatedBatch.find((u) => u.mutationId === m.mutationId) || m);
               if (
-                singleFailed &&
-                (singleFailed.retryCount ?? 0) >= this.maxPoisonRetries &&
+                failedUnit.length > 0 &&
+                unitRetryCount >= this.maxPoisonRetries &&
                 !quarantinedInThisSync
               ) {
                 // R2 & Q1: Confirmed item-specific poison-pill mutation hit retry ceiling — quarantine it!
-                const remainingAfterQuarantine = await this.quarantinePoisonMutation(singleFailed, msg);
+                const remainingAfterQuarantine = await this.quarantinePoisonMutations(failedUnit, msg);
 
                 // Q1: Do NOT reset consecutiveFailures to 0 on quarantine (keep backoff & single-item
                 // batching until a subsequent mutation actually succeeds), and cap at 1 quarantine per sync.
@@ -3295,57 +3365,85 @@ export class SyncEngine {
    * Moves a confirmed poison-pill mutation out of the outbox into the rejection list (keeping its payload).
    * Returns the number of mutations still queued afterwards.
    */
-  private async quarantinePoisonMutation(singleFailed: SyncMutation, msg: string): Promise<number> {
+  private async quarantinePoisonMutations(failedUnit: SyncMutation[], msg: string): Promise<number> {
     let remainingAfterQuarantine = 0;
     await this.runSerialized(async () => {
-                  const currentOutbox = await this.db.getOutbox();
-                  const isCreate =
-                    singleFailed.isNewRecord !== undefined
-                      ? singleFailed.isNewRecord
-                      : singleFailed.op === 'upsert' &&
-                        (singleFailed.baseVersion === null || singleFailed.baseVersion === 0);
-                  const idsToRemove = [singleFailed.mutationId];
-                  let preservedPayload = singleFailed.payload;
-                  if (isCreate) {
-                    const key = `${singleFailed.entity}:${singleFailed.recordId}`;
-                    for (const m of currentOutbox) {
-                      if (m.mutationId !== singleFailed.mutationId && `${m.entity}:${m.recordId}` === key) {
-                        idsToRemove.push(m.mutationId);
-                        if (m.op === 'upsert' && m.payload) {
-                          preservedPayload = m.payload;
-                        }
-                      }
-                    }
-                  }
-                  const nextSnap = isCreate
-                    ? this.removeRecordFromSnapshot(this.snapshot, singleFailed.entity, singleFailed.recordId)
-                    : this.snapshot;
-                  const nextMeta: LocalMeta = {
-                    ...this.meta,
-                    ...(!isCreate ? { pendingFullResync: true } : {}),
-                  };
-                  const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
-                  byMutId.set(singleFailed.mutationId, {
-                    mutationId: singleFailed.mutationId,
-                    entity: singleFailed.entity,
-                    op: singleFailed.op,
-                    recordId: singleFailed.recordId,
-                    isNewRecord: isCreate,
-                    resolutionStatus: 'quarantined',
-                    reason: `多次同步失敗已自動移出待上傳佇列：${msg}`,
-                    clientPayload: preservedPayload,
-                    rejectedAt: new Date().toISOString(),
-                  });
-                  const nextRejections = Array.from(byMutId.values());
-                  await this.db.quarantineOutboxMutation(idsToRemove, nextSnap, nextMeta, nextRejections);
-                  this.snapshot = nextSnap;
-                  this.meta = nextMeta;
-                  this.rejections = nextRejections;
-                  remainingAfterQuarantine = (await this.db.getOutbox()).length;
-                  this.emitSnapshot();
-                  this.broadcastDbChanged();
-                  this.updateStatus(this.computeStatus(remainingAfterQuarantine));
-                });
+      const currentOutbox = await this.db.getOutbox();
+      const unitIds = new Set(failedUnit.map((m) => m.mutationId));
+      const idsToRemove: string[] = [];
+      let nextSnap = this.snapshot;
+      let needsFullResync = false;
+      const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
+      const rejectedAt = new Date().toISOString();
+      for (const singleFailed of failedUnit) {
+        const isCreate =
+          singleFailed.isNewRecord !== undefined
+            ? singleFailed.isNewRecord
+            : singleFailed.op === 'upsert' &&
+              (singleFailed.baseVersion === null || singleFailed.baseVersion === 0);
+        idsToRemove.push(singleFailed.mutationId);
+        let preservedPayload = singleFailed.payload;
+        const heldFollowUps: SyncMutation[] = [];
+        const key = `${singleFailed.entity}:${singleFailed.recordId}`;
+        for (const m of currentOutbox) {
+          if (unitIds.has(m.mutationId) || `${m.entity}:${m.recordId}` !== key) continue;
+          if (idsToRemove.includes(m.mutationId)) continue;
+          idsToRemove.push(m.mutationId);
+          if (isCreate) {
+            if (m.op === 'upsert' && m.payload) {
+              preservedPayload = m.payload;
+            }
+          } else {
+            // M6 (same as R6): later edits of this record were built on top of the quarantined value;
+            // sending them would write it to the server. Hold them for review and re-pull the cloud copy.
+            heldFollowUps.push(m);
+          }
+        }
+        if (isCreate) {
+          nextSnap = this.removeRecordFromSnapshot(nextSnap, singleFailed.entity, singleFailed.recordId);
+        } else {
+          needsFullResync = true;
+        }
+        byMutId.set(singleFailed.mutationId, {
+          mutationId: singleFailed.mutationId,
+          entity: singleFailed.entity,
+          op: singleFailed.op,
+          recordId: singleFailed.recordId,
+          isNewRecord: isCreate,
+          resolutionStatus: 'quarantined',
+          reason: `多次同步失敗已自動移出待上傳佇列：${msg}`,
+          clientPayload: preservedPayload,
+          rejectedAt,
+        });
+        for (const dep of heldFollowUps) {
+          byMutId.set(dep.mutationId, {
+            mutationId: dep.mutationId,
+            entity: dep.entity,
+            op: dep.op,
+            recordId: dep.recordId,
+            isNewRecord: false,
+            resolutionStatus: 'held_after_reject',
+            reason:
+              '前一筆編輯多次同步失敗已移出佇列，這筆後續編輯包含該內容，已暫停送出並還原雲端資料；如仍需要請參考內容重新輸入',
+            ...(dep.payload ? { clientPayload: dep.payload } : {}),
+            rejectedAt,
+          });
+        }
+      }
+      const nextMeta: LocalMeta = {
+        ...this.meta,
+        ...(needsFullResync ? { pendingFullResync: true } : {}),
+      };
+      const nextRejections = Array.from(byMutId.values());
+      await this.db.quarantineOutboxMutation(idsToRemove, nextSnap, nextMeta, nextRejections);
+      this.snapshot = nextSnap;
+      this.meta = nextMeta;
+      this.rejections = nextRejections;
+      remainingAfterQuarantine = (await this.db.getOutbox()).length;
+      this.emitSnapshot();
+      this.broadcastDbChanged();
+      this.updateStatus(this.computeStatus(remainingAfterQuarantine));
+    });
     return remainingAfterQuarantine;
   }
 

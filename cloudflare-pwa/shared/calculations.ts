@@ -429,32 +429,66 @@ export function computeSavingsAccountSummary(
   adjustments: SavingsAdjustment[],
   usdTwdRate: number
 ): SavingsAccountSummary {
+  // M8 (v1.8.12): a non-TWD account is summed in its own currency and converted ONCE at the current rate, so the
+  // balance never drifts with the exchange rate each entry happened to be recorded at.
+  const isForeign = account.currency === 'USD';
+  const rate = isForeign ? usdTwdRate : 1;
+  const price = account.ticker ? account.unitPrice : account.unitPrice || 1;
+  const baseNative = isForeign ? account.quantityOrAmount * price : 0;
   const baseBalanceTwd = computeAssetTwdValue(account, usdTwdRate);
 
   let adjustmentsTotalTwd = 0;
+  let adjustmentsNative = 0;
   let adjustmentCount = 0;
   for (const adj of adjustments) {
     if (adj.deletedAt || adj.accountId !== account.id) continue;
     if (!isAfterSavingsAnchor(adj.date, adj.createdAt, account.balanceAnchorDate, account.balanceAnchorAt)) {
       continue;
     }
-    const twd =
-      account.currency === 'USD' ? Math.round(adj.amount * usdTwdRate) : Math.round(adj.twdAmount);
-    adjustmentsTotalTwd += twd;
+    if (isForeign) {
+      adjustmentsNative += Number(adj.amount) || 0;
+    } else {
+      adjustmentsTotalTwd += Math.round(adj.twdAmount);
+    }
     adjustmentCount++;
   }
 
   let cashflowNetTwd = 0;
+  let cashflowNative = 0;
   let linkedLogCount = 0;
   for (const log of logs) {
     if (log.deletedAt || log.linkedAccountId !== account.id) continue;
     if (!isAfterSavingsAnchor(log.date, log.createdAt, account.balanceAnchorDate, account.balanceAnchorAt)) {
       continue;
     }
-    cashflowNetTwd += isCashFlowIncome(log.type) ? log.twdAmount : -log.twdAmount;
+    const sign = isCashFlowIncome(log.type) ? 1 : -1;
+    if (isForeign) {
+      // Same-currency entries use their own amount; an entry in another currency has no rate to the account's
+      // currency other than the current one.
+      const native =
+        log.currency === account.currency ? Number(log.amount) || 0 : (Number(log.twdAmount) || 0) / (rate || 1);
+      cashflowNative += sign * native;
+    } else {
+      cashflowNetTwd += sign * log.twdAmount;
+    }
     linkedLogCount++;
   }
 
+  if (isForeign) {
+    const nativeTotal = round2(baseNative + adjustmentsNative + cashflowNative);
+    return {
+      account,
+      baseBalanceTwd,
+      adjustmentsTotalTwd: Math.round(adjustmentsNative * rate),
+      cashflowNetTwd: Math.round(cashflowNative * rate),
+      linkedLogCount,
+      adjustmentCount,
+      currentBalanceNative: nativeTotal,
+      currentBalanceTwd: Math.round(nativeTotal * rate),
+    };
+  }
+
+  const currentBalanceTwd = Math.round(baseBalanceTwd + adjustmentsTotalTwd + cashflowNetTwd);
   return {
     account,
     baseBalanceTwd,
@@ -462,7 +496,8 @@ export function computeSavingsAccountSummary(
     cashflowNetTwd: Math.round(cashflowNetTwd),
     linkedLogCount,
     adjustmentCount,
-    currentBalanceTwd: Math.round(baseBalanceTwd + adjustmentsTotalTwd + cashflowNetTwd),
+    currentBalanceNative: currentBalanceTwd,
+    currentBalanceTwd,
   };
 }
 

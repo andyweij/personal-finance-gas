@@ -50,6 +50,7 @@ import {
   runMonthEndSnapshotD1,
   runMonthlyRecurringAllUsersD1,
   runMonthlyRecurringD1,
+  validateRecurringPeriod,
 } from './automation';
 import { refreshMarketData } from './market';
 import {
@@ -690,8 +691,10 @@ export function createApp() {
     const user = c.get('authUser');
     const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
     if (mismatch) return c.json(mismatch, 409);
-    const body = (await c.req.json().catch(() => ({}))) as { year?: number; month?: number };
-    const result = await runMonthlyRecurringD1(c.env.DB, user.id, body.year, body.month);
+    const body = (await c.req.json().catch(() => ({}))) as { year?: unknown; month?: unknown };
+    const period = validateRecurringPeriod(body?.year, body?.month);
+    if (!period.ok) return c.json({ error: period.error }, 400);
+    const result = await runMonthlyRecurringD1(c.env.DB, user.id, period.year, period.month);
     return c.json({ ok: true, ...result });
   });
 

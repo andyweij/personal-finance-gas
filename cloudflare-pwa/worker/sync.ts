@@ -448,6 +448,67 @@ class EpochMismatchError extends Error {
   }
 }
 
+/**
+ * M3: Referential integrity for writes. A record may only point at a ledger / asset that exists for the same
+ * user and is not soft-deleted. Only references that this write changes are checked (a brand-new record checks
+ * all of them): legacy rows written before v1.8.12 may already hold a dangling reference, and an unrelated edit
+ * such as changing the note must not be rejected because of it. The `default` ledger always exists.
+ *
+ * The check is part of the primary write statement (`AND EXISTS (...)`), so a reference deleted by a concurrent
+ * request between our reads and the write cannot slip through (no TOCTOU). When the guarded write changes 0 rows
+ * we re-check the references and turn a missing one into a RejectError.
+ */
+type RefKind = 'ledger' | 'asset';
+interface RefCheck {
+  kind: RefKind;
+  id: string;
+  label: string;
+}
+
+function collectChangedRefs(
+  existing: Record<string, unknown> | null,
+  specs: Array<{ kind: RefKind; value: string | null | undefined; column: string; label: string }>
+): RefCheck[] {
+  const out: RefCheck[] = [];
+  for (const spec of specs) {
+    const id = spec.value === null || spec.value === undefined ? '' : String(spec.value);
+    if (!id) continue;
+    if (spec.kind === 'ledger' && id === DEFAULT_LEDGER_ID) continue;
+    if (existing) {
+      const prev = existing[spec.column];
+      const prevId =
+        spec.kind === 'ledger' ? normalizeLedgerId(prev) : prev === null || prev === undefined ? '' : String(prev);
+      if (prevId === id) continue;
+    }
+    out.push({ kind: spec.kind, id, label: spec.label });
+  }
+  return out;
+}
+
+function refGuardSql(uid: string, refs: RefCheck[]): { sql: string; binds: unknown[] } {
+  let sql = '';
+  const binds: unknown[] = [];
+  for (const ref of refs) {
+    const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
+    sql += ` AND EXISTS (SELECT 1 FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL)`;
+    binds.push(uid, ref.id);
+  }
+  return { sql, binds };
+}
+
+async function rejectMissingRefs(db: D1Database, uid: string, refs: RefCheck[]): Promise<void> {
+  for (const ref of refs) {
+    const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
+    const row = await db
+      .prepare(`SELECT id FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL`)
+      .bind(uid, ref.id)
+      .first();
+    if (!row) {
+      throw new RejectError(`${ref.label}不存在或已刪除，伺服器拒絕此筆異動。`);
+    }
+  }
+}
+
 function runValidation<T>(fn: () => T): T {
   try {
     return fn();
@@ -579,6 +640,119 @@ async function recordIdempotencyOnly(
   }
 }
 
+/**
+ * M4: atomic mutation groups (account transfers). Each member is evaluated normally (validation, version check,
+ * reference guards); instead of committing, commitAtomicMutation hands its statements to the collector. The
+ * executor then commits all members in ONE D1 batch, with a guard statement after each member's idempotency /
+ * change_seq statements that raises an error when that member's guarded write changed 0 rows. Any error rolls back
+ * the whole batch, so either every leg of the transfer is written or none is.
+ */
+const GROUP_COLLECTOR = Symbol('syncGroupCollector');
+interface GroupCollector {
+  items: Array<{ mutation: SyncMutation; statements: D1PreparedStatement[] }>;
+  groupMutations: SyncMutation[];
+}
+
+const GROUP_GUARD_MARKER = 'atomic_group_guard_failed';
+
+class GroupRejectError extends Error {
+  constructor(
+    public readonly failedMutationId: string | null,
+    message: string
+  ) {
+    super(message);
+    this.name = 'GroupRejectError';
+  }
+}
+
+function withGroupCollector(db: D1Database, collector: GroupCollector): D1Database {
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop === GROUP_COLLECTOR) return collector;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+function getGroupContext(db: D1Database): GroupCollector | undefined {
+  return (db as unknown as { [GROUP_COLLECTOR]?: GroupCollector })[GROUP_COLLECTOR];
+}
+
+async function applyMutationGroup(
+  db: D1Database,
+  uid: string,
+  group: SyncMutation[],
+  defaultFxRate: number,
+  serverTime: string,
+  expectedEpoch: number
+): Promise<void> {
+  const collector: GroupCollector = { items: [], groupMutations: group };
+  const collectingDb = withGroupCollector(db, collector);
+  for (const m of group) {
+    try {
+      await applySingleMutation(collectingDb, uid, m, defaultFxRate, serverTime, expectedEpoch);
+    } catch (err) {
+      if (err instanceof VersionConflictError) {
+        // Inside a transfer a conflict cannot be resolved for one leg alone: reject the whole group (the client
+        // restores the cloud copy and keeps the payloads in its rejection list).
+        throw new GroupRejectError(m.mutationId, '此筆資料已在其他裝置變更（版本衝突），整筆轉帳未套用並已還原雲端資料');
+      }
+      if (err instanceof RejectError) {
+        throw new GroupRejectError(m.mutationId, err.message);
+      }
+      throw err;
+    }
+  }
+  if (collector.items.length === 0) return;
+  const guardSql = `SELECT json(CASE WHEN changes() > 0 THEN '1' ELSE '${GROUP_GUARD_MARKER}' END) AS ok`;
+  const stmts: D1PreparedStatement[] = [];
+  for (const item of collector.items) {
+    // [primary write, idempotency (changes() > 0), change_seq bump (changes() > 0)] → guard → extras / post statements
+    stmts.push(...item.statements.slice(0, 3), db.prepare(guardSql), ...item.statements.slice(3));
+  }
+  try {
+    await db.batch(stmts);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const pending: string[] = [];
+    for (const item of collector.items) {
+      const done = await db
+        .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
+        .bind(uid, item.mutation.mutationId)
+        .first();
+      if (!done) pending.push(item.mutation.mutationId);
+    }
+    if (pending.length === 0) return; // an identical concurrent retry committed the whole group
+    if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+      throw new EpochMismatchError();
+    }
+    if (/malformed JSON/i.test(msg) || msg.includes(GROUP_GUARD_MARKER)) {
+      throw new GroupRejectError(null, '轉帳的部分資料已在其他裝置變更，整筆轉帳未套用並已還原雲端資料');
+    }
+    throw err;
+  }
+}
+
+/**
+ * Splits the request into units: a single mutation, or every mutation of the request sharing an atomic group id.
+ * Legacy clients (no atomicGroupId) still get atomicity for the two savings legs of a transfer sent in the same
+ * request: savings_adjustment upserts sharing `payload.transferGroupId` form an implicit group.
+ */
+function groupKeyOf(m: SyncMutation): string | null {
+  if (typeof m.atomicGroupId === 'string' && m.atomicGroupId.trim()) return `g:${m.atomicGroupId}`;
+  if (
+    m.entity === 'savings_adjustment' &&
+    m.op === 'upsert' &&
+    m.payload &&
+    typeof m.payload.transferGroupId === 'string' &&
+    m.payload.transferGroupId
+  ) {
+    return `legacy-transfer:${m.payload.transferGroupId}`;
+  }
+  return null;
+}
+
 async function commitAtomicMutation(
   db: D1Database,
   uid: string,
@@ -616,6 +790,12 @@ async function commitAtomicMutation(
   }
 
   const batchStmts = [primaryWriteStmt, idempStmt, bumpSeqStmt, ...extraStmts, ...postStatements];
+  const groupCollector = (db as unknown as { [GROUP_COLLECTOR]?: GroupCollector })[GROUP_COLLECTOR];
+  if (groupCollector) {
+    // M4: part of an atomic group — the group executor commits every member in one batch
+    groupCollector.items.push({ mutation, statements: batchStmts });
+    return;
+  }
   try {
     const results = await db.batch(batchStmts);
     const changed = Number(results[0]?.meta?.changes ?? 0);
@@ -1011,12 +1191,19 @@ async function applySingleMutation(
       )
     );
 
+    // M3: only references changed by this write are checked; the guard is part of the write statement
+    const changedRefs = collectChangedRefs(existing, [
+      { kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' },
+      { kind: 'asset', value: v.linkedAccountId, column: 'linked_account_id', label: '連動的活存帳戶' },
+    ]);
+    const refGuard = refGuardSql(uid, changedRefs);
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE cashflow_logs
              SET date = ?, year_month = ?, type = ?, category = ?, item_name = ?, amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, source = ?, note = ?, linked_account_id = ?, ledger_id = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
             v.date,
@@ -1039,14 +1226,15 @@ async function applySingleMutation(
             mutation.recordId,
             Number(existing.version ?? 1),
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           )
       : db
           .prepare(
             `INSERT INTO cashflow_logs
               (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
-             WHERE ${EPOCH_GUARD_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1070,10 +1258,22 @@ async function applySingleMutation(
             check.nextVersion,
             uid,
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchCashflow, check.legacyClientTs);
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      [],
+      refetchCashflow,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, changedRefs)
+    );
     return;
   }
 
@@ -1152,12 +1352,19 @@ async function applySingleMutation(
       })
     );
 
+    // M3: only references changed by this write are checked; the guard is part of the write statement
+    const changedRefs = collectChangedRefs(existing, [
+      { kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' },
+      { kind: 'asset', value: v.linkedAccountId, column: 'linked_account_id', label: '連動的活存帳戶' },
+    ]);
+    const refGuard = refGuardSql(uid, changedRefs);
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE recurring_items
              SET item_name = ?, category = ?, type = ?, amount = ?, currency = ?, cycle = ?, billing_spec = ?, status = ?, note = ?, linked_account_id = ?, ledger_id = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
             v.itemName,
@@ -1179,14 +1386,15 @@ async function applySingleMutation(
             mutation.recordId,
             Number(existing.version ?? 1),
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           )
       : db
           .prepare(
             `INSERT INTO recurring_items
               (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
-             WHERE ${EPOCH_GUARD_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1209,10 +1417,22 @@ async function applySingleMutation(
             check.nextVersion,
             uid,
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchRecurring, check.legacyClientTs);
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      [],
+      refetchRecurring,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, changedRefs)
+    );
     return;
   }
 
@@ -1535,12 +1755,16 @@ async function applySingleMutation(
         ? String(existing.price_updated_at)
         : null;
 
+    // M3: only references changed by this write are checked; the guard is part of the write statement
+    const changedRefs = collectChangedRefs(existing, [{ kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' }]);
+    const refGuard = refGuardSql(uid, changedRefs);
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE asset_items
              SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, price_updated_at = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
             v.updateMode,
@@ -1576,14 +1800,15 @@ async function applySingleMutation(
             mutation.recordId,
             Number(existing.version ?? 1),
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           )
       : db
           .prepare(
             `INSERT INTO asset_items
               (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version, change_seq)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
-             WHERE ${EPOCH_GUARD_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1619,10 +1844,22 @@ async function applySingleMutation(
             check.nextVersion,
             uid,
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, postStatements, refetchAsset, check.legacyClientTs);
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      postStatements,
+      refetchAsset,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, changedRefs)
+    );
     return;
   }
 
@@ -1701,12 +1938,39 @@ async function applySingleMutation(
       twdAmount = Math.round(parsedTwd);
     }
 
+    // M4: one leg of a transfer may not change its amount / account on its own (the pair would no longer balance).
+    // Note-only edits are fine; changing the money of a transfer requires every active leg in the same atomic group.
+    if (existing && existing.transfer_group_id && !existing.deleted_at) {
+      const moneyChanged =
+        Number(existing.amount) !== Number(v.amount) || String(existing.account_id) !== String(v.accountId);
+      if (moneyChanged) {
+        const siblings = await db
+          .prepare(
+            'SELECT id FROM savings_adjustments WHERE user_id = ? AND transfer_group_id = ? AND id != ? AND deleted_at IS NULL'
+          )
+          .bind(uid, String(existing.transfer_group_id), mutation.recordId)
+          .all<{ id: string }>();
+        const inGroup = new Set(
+          (getGroupContext(db)?.groupMutations || [])
+            .filter((m) => m.entity === 'savings_adjustment')
+            .map((m) => m.recordId)
+        );
+        if ((siblings.results || []).some((r) => !inGroup.has(String(r.id)))) {
+          throw new RejectError('帳戶互轉的其中一邊不可單獨修改金額或帳戶，請刪除整筆轉帳後重新建立。');
+        }
+      }
+    }
+
+    // M3: only references changed by this write are checked; the guard is part of the write statement
+    const changedRefs = collectChangedRefs(existing, [{ kind: 'asset', value: v.accountId, column: 'account_id', label: '對應的活存帳戶' }]);
+    const refGuard = refGuardSql(uid, changedRefs);
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE savings_adjustments
              SET account_id = ?, date = ?, amount = ?, twd_amount = ?, note = ?, transfer_group_id = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
             v.accountId,
@@ -1722,14 +1986,15 @@ async function applySingleMutation(
             mutation.recordId,
             Number(existing.version ?? 1),
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           )
       : db
           .prepare(
             `INSERT INTO savings_adjustments
               (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version, change_seq)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
-             WHERE ${EPOCH_GUARD_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1746,10 +2011,22 @@ async function applySingleMutation(
             check.nextVersion,
             uid,
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchAdj, check.legacyClientTs);
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      [],
+      refetchAdj,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, changedRefs)
+    );
     return;
   }
 
@@ -1819,12 +2096,16 @@ async function applySingleMutation(
       })
     );
 
+    // M3: only references changed by this write are checked; the guard is part of the write statement
+    const changedRefs = collectChangedRefs(existing, [{ kind: 'asset', value: v.assetId, column: 'asset_id', label: '對應的持股標的' }]);
+    const refGuard = refGuardSql(uid, changedRefs);
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE stock_transactions
              SET asset_id = ?, date = ?, tx_type = ?, shares = ?, total_amount = ?, fee = ?, linked_cashflow_id = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
             v.assetId,
@@ -1842,14 +2123,15 @@ async function applySingleMutation(
             mutation.recordId,
             Number(existing.version ?? 1),
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           )
       : db
           .prepare(
             `INSERT INTO stock_transactions
               (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version, change_seq)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
-             WHERE ${EPOCH_GUARD_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1868,10 +2150,22 @@ async function applySingleMutation(
             check.nextVersion,
             uid,
             uid,
-            expectedEpoch
+            expectedEpoch,
+            ...refGuard.binds
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchStockTx, check.legacyClientTs);
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      [],
+      refetchStockTx,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, changedRefs)
+    );
     return;
   }
 
@@ -2311,44 +2605,126 @@ export async function processSyncRequest(
 
   let epochChangedDuringMutations = false;
 
-  for (const mut of mutations) {
+  const envelopeError = (m: SyncMutation): string | null => {
+    const hasValidEnvelope =
+      Boolean(m && typeof m === 'object') &&
+      typeof m.mutationId === 'string' &&
+      m.mutationId.trim().length > 0 &&
+      typeof m.entity === 'string' &&
+      typeof m.recordId === 'string' &&
+      m.recordId.trim().length > 0 &&
+      typeof m.op === 'string' &&
+      (m.baseVersion === undefined ||
+        m.baseVersion === null ||
+        (typeof m.baseVersion === 'number' && Number.isInteger(m.baseVersion))) &&
+      (m.payload === undefined ||
+        m.payload === null ||
+        (typeof m.payload === 'object' && !Array.isArray(m.payload))) &&
+      (m.atomicGroupId === undefined || m.atomicGroupId === null || typeof m.atomicGroupId === 'string');
+    if (!hasValidEnvelope) return 'Invalid mutation format';
+    if (!ALLOWED_SYNC_ENTITIES.has(String(m.entity)) || !ALLOWED_SYNC_OPS.has(String(m.op))) {
+      return `不支援的同步類型或操作：${String(m.entity)}:${String(m.op)}`;
+    }
+    return null;
+  };
+
+  const isApplied = async (mutationId: string): Promise<boolean> =>
+    Boolean(
+      await db
+        .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
+        .bind(uid, mutationId)
+        .first()
+    );
+
+  /** M4: applies an atomic group; returns true when the request must stop (epoch changed). */
+  const processGroup = async (members: SyncMutation[]): Promise<boolean> => {
+    const pendingMembers: SyncMutation[] = [];
+    for (const m of members) {
+      if (await isApplied(m.mutationId)) ackedMutationIds.push(m.mutationId);
+      else pendingMembers.push(m);
+    }
+    if (pendingMembers.length === 0) return false;
+    try {
+      await applyMutationGroup(db, uid, pendingMembers, settings.usdTwdRate, serverTime, expectedEpoch);
+      for (const m of pendingMembers) ackedMutationIds.push(m.mutationId);
+      return false;
+    } catch (err) {
+      if (err instanceof EpochMismatchError) {
+        epochChangedDuringMutations = true;
+        return true;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isConstraint =
+        /SQLITE_CONSTRAINT|NOT NULL constraint|CHECK constraint|FOREIGN KEY constraint|D1_TYPE_ERROR/i.test(errMsg);
+      if (!(err instanceof GroupRejectError) && !isConstraint) {
+        console.error('[sync] transient group failure:', pendingMembers.map((m) => `${m.entity}:${m.recordId}`), err);
+        throw err;
+      }
+      // V4: a rejection evaluated against data restored by a concurrent replace import is meaningless
+      if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+        epochChangedDuringMutations = true;
+        return true;
+      }
+      // R1: an identical concurrent retry may have committed the whole group meanwhile
+      let allApplied = true;
+      for (const m of pendingMembers) {
+        if (!(await isApplied(m.mutationId))) {
+          allApplied = false;
+          break;
+        }
+      }
+      if (allApplied) {
+        for (const m of pendingMembers) ackedMutationIds.push(m.mutationId);
+        return false;
+      }
+      const baseReason = err instanceof GroupRejectError ? err.message : '資料格式或欄位約束不符合規範';
+      const failedId = err instanceof GroupRejectError ? err.failedMutationId : null;
+      for (const m of pendingMembers) {
+        rejected.push({
+          mutationId: m.mutationId,
+          reason:
+            failedId === null || failedId === m.mutationId
+              ? baseReason
+              : `同一筆轉帳的另一筆資料被拒絕（${baseReason}），整筆轉帳未套用`,
+        });
+      }
+      return false;
+    }
+  };
+
+  const handledIdx = new Set<number>();
+  for (let idx = 0; idx < mutations.length; idx++) {
+    if (handledIdx.has(idx)) continue;
+    handledIdx.add(idx);
+    const mut = mutations[idx];
     const rawId =
       mut && typeof mut === 'object' && typeof mut.mutationId === 'string' && mut.mutationId.trim()
         ? mut.mutationId
         : 'unknown';
-    const hasValidEnvelope =
-      Boolean(mut && typeof mut === 'object') &&
-      typeof mut.mutationId === 'string' &&
-      mut.mutationId.trim().length > 0 &&
-      typeof mut.entity === 'string' &&
-      typeof mut.recordId === 'string' &&
-      mut.recordId.trim().length > 0 &&
-      typeof mut.op === 'string' &&
-      (mut.baseVersion === undefined ||
-        mut.baseVersion === null ||
-        (typeof mut.baseVersion === 'number' && Number.isInteger(mut.baseVersion))) &&
-      (mut.payload === undefined ||
-        mut.payload === null ||
-        (typeof mut.payload === 'object' && !Array.isArray(mut.payload)));
-
-    if (!hasValidEnvelope) {
-      rejected.push({ mutationId: rawId, reason: 'Invalid mutation format' });
-      continue;
-    }
-    if (!ALLOWED_SYNC_ENTITIES.has(String(mut.entity)) || !ALLOWED_SYNC_OPS.has(String(mut.op))) {
-      rejected.push({
-        mutationId: mut.mutationId,
-        reason: `不支援的同步類型或操作：${String(mut.entity)}:${String(mut.op)}`,
-      });
+    const envErr = envelopeError(mut);
+    if (envErr) {
+      rejected.push({ mutationId: rawId, reason: envErr });
       continue;
     }
 
-    const already = await db
-      .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
-      .bind(uid, mut.mutationId)
-      .first();
+    const groupKey = groupKeyOf(mut);
+    if (groupKey) {
+      const members: SyncMutation[] = [mut];
+      for (let j = idx + 1; j < mutations.length; j++) {
+        if (handledIdx.has(j)) continue;
+        const other = mutations[j];
+        if (!envelopeError(other) && groupKeyOf(other) === groupKey) {
+          members.push(other);
+          handledIdx.add(j);
+        }
+      }
+      if (members.length > 1) {
+        if (await processGroup(members)) break;
+        continue;
+      }
+    }
 
-    if (already) {
+    if (await isApplied(mut.mutationId)) {
       ackedMutationIds.push(mut.mutationId);
       continue;
     }
@@ -2606,6 +2982,34 @@ export async function importFullSnapshot(
       v: validateUtilityRecordInput(u),
       createdAt: u.createdAt || nowIso,
     });
+  }
+
+  // M3: every ledger reference must resolve to the default ledger, a ledger in this import, or (merge mode) an
+  // active ledger already on the server — otherwise the money would silently drop out of every total.
+  // Asset references (linked account / adjustment account / stock asset) are not rejected here: exports legitimately
+  // contain records whose account was deleted earlier (those rows are inert), and refusing them would make such
+  // backups impossible to restore. New dangling asset references are blocked on the sync write path instead.
+  {
+    const knownLedgers = new Set<string>([DEFAULT_LEDGER_ID, ...validatedLedgers.map((l) => l.id)]);
+    if (mode === 'merge') {
+      const existingLedgers = await db
+        .prepare('SELECT id FROM ledgers WHERE user_id = ? AND deleted_at IS NULL')
+        .bind(uid)
+        .all<{ id: string }>();
+      for (const r of existingLedgers.results || []) knownLedgers.add(String(r.id));
+    }
+    const dangling: string[] = [];
+    const checkLedger = (kind: string, id: string, ledgerId: string) => {
+      if (!knownLedgers.has(normalizeLedgerId(ledgerId))) dangling.push(`${kind} ${id} → ${ledgerId}`);
+    };
+    for (const r of validatedLogs) checkLedger('流水帳', r.id, r.v.ledgerId);
+    for (const r of validatedRecurring) checkLedger('常態收支', r.id, r.v.ledgerId);
+    for (const r of validatedAssets) checkLedger('資產', r.id, r.v.ledgerId);
+    if (dangling.length > 0) {
+      throw new Error(
+        `匯入資料中有 ${dangling.length} 筆紀錄指向不存在的帳本（例如：${dangling.slice(0, 3).join('、')}），請先確認帳本資料後再匯入。`
+      );
+    }
   }
 
   await ensureUserSyncState(db, uid);

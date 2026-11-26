@@ -31,6 +31,7 @@ import {
 } from './helpers';
 import { APP_VERSION, BUILD_COMMIT, DB_SCHEMA_VERSION } from '../version';
 import type { UiContext } from './state';
+import { applyAuthMetaToState } from './state';
 
 let pinInput = '';
 let pinVerifySeq = 0;
@@ -190,13 +191,10 @@ export function openAuthScreen(
         }
         ctx.state.currentUser = status.user;
         setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
-        ctx.state.pinEnabled = Boolean(status.pinEnabled);
-        ctx.state.pinSalt = status.pinSalt || null;
-        ctx.state.pinHash = status.pinHash || null;
-        ctx.state.passkeys = status.passkeys || [];
-        ctx.state.passkeyCount = status.passkeyCount || 0;
-        await ctx.engine.updateLocalPinCache(ctx.state.pinEnabled, ctx.state.pinSalt, ctx.state.pinHash);
-        await ctx.engine.updateLocalBiometricCache(ctx.state.biometricLockEnabled, ctx.state.passkeys);
+        // M9: store the server's PIN / passkeys, then read all lock settings back from the shared meta
+        await ctx.engine.updateLocalPinCache(Boolean(status.pinEnabled), status.pinSalt || null, status.pinHash || null);
+        await ctx.engine.updateLocalPasskeysCache(status.passkeys || []);
+        applyAuthMetaToState(ctx.state, ctx.engine.getMeta());
         ctx.applyUtilityTabVisibility();
         showSecurityNotices(status.securityNotices);
         updateSecurityButtons(ctx);
