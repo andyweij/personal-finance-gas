@@ -3,8 +3,10 @@ import type { SyncEngine } from '../sync/syncEngine';
 
 export type StockChartType = 'donut' | 'pie' | 'hbar' | 'treemap';
 export type StockChartDimension = 'value' | 'category' | 'cost' | 'market';
+export type StockCardDisplayMode = 'list' | 'flip';
 export type ReorderSectionKey =
   | 'stocks'
+  | 'watchlist'
   | 'recurring'
   | 'sinking'
   | 'assets_savings'
@@ -26,7 +28,10 @@ export interface AppUiState {
   recurringFilter: 'all' | 'income' | 'invest' | 'fixed' | 'sub';
   allocMode: 'both' | 'pct' | 'amt';
   allocHighlight: string | null;
+  stocksSubtab: 'holdings' | 'watchlist';
   stockPriceViewMode: 'unit' | 'total';
+  stockCardDisplayMode: StockCardDisplayMode;
+  flippedStockIds: string[];
   stockChartType: StockChartType;
   stockChartDimension: StockChartDimension;
   stockChartHighlight: string | null;
@@ -35,6 +40,10 @@ export interface AppUiState {
   reorderDraftIds: string[];
   selectedYear: number;
   selectedMonth: number;
+  activeLedgerId: string;
+  assetsLedgerScope: string;
+  overviewLedgerScope: string;
+  recurringLedgerScope: string;
   logType: string;
   logCurrency: string;
   logCategory: string;

@@ -1,13 +1,15 @@
-import { WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
+import { DEFAULT_LEDGER_ID, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
 import {
   aggregatePeriodMetrics,
   computeAllSavingsSummary,
   computeSinkingMonthlyReserve,
+  getEffectiveLedgerId,
   isCashFlowIncome,
 } from '../../../shared/calculations';
 import type { CashFlowLog } from '../../../shared/types';
 import { openSavingsAccountModal } from './assetsTab';
 import { el, fmtMoney, fmtNum, showToast, TRASH_SVG } from './helpers';
+import { renderLedgerSwitcherBar, resolveActiveLedger } from './ledgerUi';
 import type { UiContext } from './state';
 
 export function getSelectedYearMonth(year: number, month: number): string {
@@ -56,11 +58,13 @@ export function updateSavingsPreview(ctx: UiContext): void {
   const preview = el('savingsDeltaPreview');
   const snap = ctx.engine.getSnapshot();
   const rate = snap.settings.usdTwdRate || 32.5;
+  const activeLedger = resolveActiveLedger(ctx);
   const savings = computeAllSavingsSummary(
     snap.assetItems,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],
-    rate
+    rate,
+    activeLedger.id
   );
   const selected = savings.accounts.find((a) => a.account.id === ctx.state.logLinkedAccountId);
   if (!selected) {
@@ -124,14 +128,16 @@ export function updateSavingsPreview(ctx: UiContext): void {
 function renderSavingsStripAndChips(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
   const rate = snap.settings.usdTwdRate || 32.5;
+  const activeLedger = resolveActiveLedger(ctx);
   const savings = computeAllSavingsSummary(
     snap.assetItems,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],
-    rate
+    rate,
+    activeLedger.id
   );
 
-  // Keep selected linked savings account in sync with available accounts
+  // Keep selected linked savings account in sync with available accounts in this ledger
   if (!ctx.state.logLinkedAccountTouched) {
     ctx.state.logLinkedAccountId = savings.defaultAccountId;
   } else if (
@@ -167,14 +173,15 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
     if (!savings.accounts.length) {
       const hint = document.createElement('div');
       hint.className = 'muted';
-      hint.textContent = '建立活存帳戶後，記帳與投資扣款將即時加減活存餘額，並同步反映至資產負債。';
+      hint.textContent = `在「${activeLedger.name}」建立活存帳戶後，此帳本的記帳將即時加減該帳戶餘額。`;
       const createBtn = document.createElement('button');
       createBtn.type = 'button';
       createBtn.className = 'btn btn-tinted btn-sm';
-      createBtn.textContent = '+ 建立第一個活存帳戶';
+      createBtn.textContent = `+ 建立「${activeLedger.name}」活存帳戶`;
       createBtn.addEventListener('click', () => {
+        ctx.state.assetsLedgerScope = activeLedger.includeInNetWorth ? 'net_worth' : activeLedger.id;
         ctx.navigateToTab('assets');
-        openSavingsAccountModal(ctx, null);
+        openSavingsAccountModal(ctx, null, activeLedger.id);
       });
       bodyEl.appendChild(hint);
       bodyEl.appendChild(createBtn);
@@ -197,7 +204,10 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
       manageBtn.className = 'btn btn-outline btn-sm';
       manageBtn.style.marginTop = '2px';
       manageBtn.textContent = '前往資產頁管理活存 / 存入款項';
-      manageBtn.addEventListener('click', () => ctx.navigateToTab('assets'));
+      manageBtn.addEventListener('click', () => {
+        ctx.state.assetsLedgerScope = activeLedger.includeInNetWorth ? 'net_worth' : activeLedger.id;
+        ctx.navigateToTab('assets');
+      });
       bodyEl.appendChild(manageBtn);
     }
   }
@@ -209,10 +219,11 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
     const setupBtn = document.createElement('button');
     setupBtn.type = 'button';
     setupBtn.className = 'chip-btn sm';
-    setupBtn.textContent = '+ 建立活存帳戶以即時連動';
+    setupBtn.textContent = `+ 建立「${activeLedger.name}」活存帳戶`;
     setupBtn.addEventListener('click', () => {
+      ctx.state.assetsLedgerScope = activeLedger.includeInNetWorth ? 'net_worth' : activeLedger.id;
       ctx.navigateToTab('assets');
-      openSavingsAccountModal(ctx, null);
+      openSavingsAccountModal(ctx, null, activeLedger.id);
     });
     chipsBox.appendChild(setupBtn);
   } else {
@@ -306,30 +317,88 @@ function createLedgerRow(
 
 export function renderLogTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
+  const activeLedger = resolveActiveLedger(ctx);
   const ym = getSelectedYearMonth(ctx.state.selectedYear, ctx.state.selectedMonth);
-  const monthLogs = snap.cashflowLogs.filter((l) => !l.deletedAt && l.yearMonth === ym);
-  const monthlySinking = snap.sinkingItems
-    .filter((s) => !s.deletedAt)
-    .reduce((sum, s) => sum + computeSinkingMonthlyReserve(s), 0);
-  const monthly = aggregatePeriodMetrics(monthLogs, monthlySinking, true);
 
-  const budget = snap.settings.monthlyDailyBudget;
-  const remaining = Math.round(budget - monthly.dailyExpense);
-  const usagePct = budget > 0 ? Math.round((monthly.dailyExpense / budget) * 1000) / 10 : 0;
+  renderLedgerSwitcherBar(ctx, el('logLedgerBar'), {
+    mode: 'single',
+    selectedValue: activeLedger.id,
+    onSelect: (nextId) => {
+      ctx.state.activeLedgerId = nextId;
+      localStorage.setItem('finance_active_ledger_id', nextId);
+      ctx.state.logLinkedAccountTouched = false;
+      ctx.state.ledgerPage = 1;
+      renderLogTab(ctx);
+    },
+  });
+
+  const isolatedBanner = el('logIsolatedBanner');
+  if (!activeLedger.includeInNetWorth) {
+    isolatedBanner.style.display = 'flex';
+    isolatedBanner.textContent = `獨立帳本「${activeLedger.name}」：此帳本流水帳與活存完全隔離，不計入個人總資產與儲蓄率`;
+  } else {
+    isolatedBanner.style.display = 'none';
+  }
+
+  const monthLogs = snap.cashflowLogs.filter(
+    (l) => !l.deletedAt && l.yearMonth === ym && getEffectiveLedgerId(l) === activeLedger.id
+  );
+  const isDefaultLedger = activeLedger.id === DEFAULT_LEDGER_ID;
+  const monthlySinking = isDefaultLedger
+    ? snap.sinkingItems
+        .filter((s) => !s.deletedAt)
+        .reduce((sum, s) => sum + computeSinkingMonthlyReserve(s), 0)
+    : 0;
+  const monthly = aggregatePeriodMetrics(monthLogs, monthlySinking, isDefaultLedger);
+
+  const hasBudgetLimit =
+    isDefaultLedger ||
+    (activeLedger.monthlyDailyBudget !== null &&
+      activeLedger.monthlyDailyBudget !== undefined &&
+      activeLedger.monthlyDailyBudget > 0);
+  const budget = isDefaultLedger
+    ? snap.settings.monthlyDailyBudget
+    : Number(activeLedger.monthlyDailyBudget || 0);
 
   el('logMonthBadge').textContent = ym;
   el('ledgerMonthLabel').textContent = ym;
   el('ledgerCountBadge').textContent = String(monthLogs.length);
-  el('remainingBudget').textContent = fmtMoney(remaining, ctx.state.masked);
-  el('remainingBudget').style.color = remaining < 0 ? 'var(--neg)' : 'var(--text)';
-  el('spentText').textContent = '已花費 ' + fmtMoney(monthly.dailyExpense, ctx.state.masked);
-  el('budgetLimitText').textContent = '上限 ' + fmtMoney(budget, ctx.state.masked);
-  el('usagePctText').textContent = `使用率：${usagePct.toFixed(1)}%`;
-  el('quickFreeCashText').textContent = '自由現金流：' + fmtMoney(monthly.freeCashFlow, ctx.state.masked);
 
-  const bar = el('budgetProgress');
-  bar.style.width = Math.min(100, Math.max(0, usagePct)) + '%';
-  bar.className = 'progress-fill' + (usagePct >= 100 ? ' over' : usagePct >= 80 ? ' warn' : '');
+  const progressTrack = el('budgetProgressTrack');
+  if (hasBudgetLimit) {
+    const remaining = Math.round(budget - monthly.dailyExpense);
+    const usagePct = budget > 0 ? Math.round((monthly.dailyExpense / budget) * 1000) / 10 : 0;
+
+    el('logBudgetCardTitle').textContent = isDefaultLedger
+      ? '當月日常消費預算'
+      : `${activeLedger.name} · 當月消費預算`;
+    el('remainingBudgetLabel').textContent = '剩餘可用';
+    el('remainingBudget').textContent = fmtMoney(remaining, ctx.state.masked);
+    el('remainingBudget').style.color = remaining < 0 ? 'var(--neg)' : 'var(--text)';
+    el('spentText').textContent = '已花費 ' + fmtMoney(monthly.dailyExpense, ctx.state.masked);
+    el('budgetLimitText').textContent = '上限 ' + fmtMoney(budget, ctx.state.masked);
+    el('usagePctText').textContent = `使用率：${usagePct.toFixed(1)}%`;
+    el('quickFreeCashText').textContent = '自由現金流：' + fmtMoney(monthly.freeCashFlow, ctx.state.masked);
+
+    progressTrack.style.display = '';
+    const bar = el('budgetProgress');
+    bar.style.width = Math.min(100, Math.max(0, usagePct)) + '%';
+    bar.className = 'progress-fill' + (usagePct >= 100 ? ' over' : usagePct >= 80 ? ' warn' : '');
+  } else {
+    const totalOutflow = Math.round(monthly.totalConsumption + monthly.investment);
+    const netFlow = Math.round(monthly.totalIncome - totalOutflow);
+    el('logBudgetCardTitle').textContent = `${activeLedger.name} · 本月收支摘要`;
+    el('remainingBudgetLabel').textContent = '本月淨結餘';
+    el('remainingBudget').textContent = fmtMoney(netFlow, ctx.state.masked);
+    el('remainingBudget').style.color = netFlow < 0 ? 'var(--neg)' : netFlow > 0 ? 'var(--pos)' : 'var(--text)';
+    el('spentText').textContent = '本月收入 ' + fmtMoney(monthly.totalIncome, ctx.state.masked);
+    el('budgetLimitText').textContent = '本月支出 ' + fmtMoney(totalOutflow, ctx.state.masked);
+    progressTrack.style.display = 'none';
+    el('usagePctText').textContent = `本月共 ${monthLogs.length} 筆紀錄`;
+    el('quickFreeCashText').textContent = activeLedger.includeInNetWorth
+      ? '納入個人總資產'
+      : '獨立帳本（不計總資產）';
+  }
 
   renderSavingsStripAndChips(ctx);
 

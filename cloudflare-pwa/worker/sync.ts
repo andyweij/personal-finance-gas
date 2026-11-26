@@ -1,5 +1,7 @@
 import {
   DEFAULT_EMERGENCY_MONTHS,
+  DEFAULT_LEDGER_ID,
+  DEFAULT_LEDGER_NAME,
   DEFAULT_MONTHLY_DAILY_BUDGET,
   DEFAULT_PNL_COLOR_SCHEME,
   DEFAULT_USD_TWD_RATE,
@@ -9,6 +11,7 @@ import type {
   AssetItem,
   CashFlowLog,
   FinanceSnapshot,
+  Ledger,
   NetWorthHistory,
   RecurringItem,
   RentUtilityRecord,
@@ -29,12 +32,14 @@ import {
 } from '../shared/rentUtility';
 import {
   normalizeCustomStockCategories,
+  normalizeLedgerId,
   normalizePnlColorScheme,
   normalizeSortOrder,
   normalizeStockCategory,
   toSafeNumber,
   validateAssetInput,
   validateCashFlowInput,
+  validateLedgerInput,
   validateRecurringInput,
   validateSavingsAdjustmentInput,
   validateSinkingInput,
@@ -106,6 +111,49 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
   };
 }
 
+export async function ensureDefaultLedger(db: D1Database, userId: string): Promise<void> {
+  const uid = assertUserId(userId);
+  const existing = await db
+    .prepare('SELECT id FROM ledgers WHERE user_id = ? AND id = ?')
+    .bind(uid, DEFAULT_LEDGER_ID)
+    .first();
+  if (existing) return;
+  const nowIso = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO ledgers
+        (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
+       VALUES (?, ?, ?, 1, NULL, ?, 1, ?, ?, NULL, 1)`
+    )
+    .bind(
+      uid,
+      DEFAULT_LEDGER_ID,
+      DEFAULT_LEDGER_NAME,
+      '預設個人帳本（納入總資產與淨值統計）',
+      nowIso,
+      nowIso
+    )
+    .run();
+}
+
+function mapLedgerRow(r: Record<string, unknown>): Ledger {
+  return {
+    id: String(r.id),
+    name: String(r.name || DEFAULT_LEDGER_NAME),
+    includeInNetWorth: Number(r.include_in_net_worth ?? 1) === 1,
+    monthlyDailyBudget:
+      r.monthly_daily_budget !== null && r.monthly_daily_budget !== undefined
+        ? Number(r.monthly_daily_budget)
+        : null,
+    note: String(r.note || ''),
+    sortOrder: Number(r.sort_order ?? 0),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+    version: Number(r.version ?? 1),
+  };
+}
+
 function mapCashFlowRow(r: Record<string, unknown>): CashFlowLog {
   return {
     id: String(r.id),
@@ -122,6 +170,7 @@ function mapCashFlowRow(r: Record<string, unknown>): CashFlowLog {
     note: String(r.note || ''),
     recurringDedupKey: r.recurring_dedup_key ? String(r.recurring_dedup_key) : null,
     linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
+    ledgerId: normalizeLedgerId(r.ledger_id),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -142,6 +191,7 @@ function mapRecurringRow(r: Record<string, unknown>): RecurringItem {
     status: String(r.status),
     note: String(r.note || ''),
     linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
+    ledgerId: normalizeLedgerId(r.ledger_id),
     sortOrder: Number(r.sort_order ?? 0),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
@@ -180,6 +230,8 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
     quantityOrAmount: Number(r.quantity_or_amount),
     currency: String(r.currency),
     unitPrice: Number(r.unit_price),
+    previousClose:
+      r.previous_close !== null && r.previous_close !== undefined ? Number(r.previous_close) : null,
     costBasis: r.cost_basis !== null && r.cost_basis !== undefined ? Number(r.cost_basis) : null,
     priceUpdatedAt: r.price_updated_at ? String(r.price_updated_at) : null,
     note: String(r.note || ''),
@@ -197,6 +249,9 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
     loanBillingDay:
       r.loan_billing_day !== null && r.loan_billing_day !== undefined ? Number(r.loan_billing_day) : null,
     stockCategory: String(r.stock_category || ''),
+    isWatchlist: Number(r.is_watchlist || 0) === 1,
+    ledgerId: normalizeLedgerId(r.ledger_id),
+    excludeFromNetWorth: Number(r.exclude_from_net_worth || 0) === 1,
     sortOrder: Number(r.sort_order ?? 0),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
@@ -441,6 +496,107 @@ async function applySingleMutation(
     return;
   }
 
+  if (mutation.entity === 'ledger') {
+    await ensureDefaultLedger(db, uid);
+    const existing = await db
+      .prepare('SELECT * FROM ledgers WHERE user_id = ? AND id = ?')
+      .bind(uid, mutation.recordId)
+      .first<Record<string, unknown>>();
+    const check = checkVersionOrThrow(
+      mutation,
+      existing,
+      existing ? (mapLedgerRow(existing) as unknown as Record<string, unknown>) : null,
+      serverTime
+    );
+    if (!check.shouldApply) return;
+
+    if (mutation.op === 'delete') {
+      if (mutation.recordId === DEFAULT_LEDGER_ID) {
+        throw new Error('不可刪除預設個人主帳本。');
+      }
+      if (!existing) return;
+      const [cfCnt, asCnt, recCnt] = await Promise.all([
+        db
+          .prepare('SELECT COUNT(*) AS cnt FROM cashflow_logs WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
+          .bind(uid, mutation.recordId)
+          .first<{ cnt: number }>(),
+        db
+          .prepare('SELECT COUNT(*) AS cnt FROM asset_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
+          .bind(uid, mutation.recordId)
+          .first<{ cnt: number }>(),
+        db
+          .prepare('SELECT COUNT(*) AS cnt FROM recurring_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
+          .bind(uid, mutation.recordId)
+          .first<{ cnt: number }>(),
+      ]);
+      const remaining = Number(cfCnt?.cnt || 0) + Number(asCnt?.cnt || 0) + Number(recCnt?.cnt || 0);
+      if (remaining > 0) {
+        throw new Error(`此帳本仍有 ${remaining} 筆關聯紀錄，請先轉移至其他帳本或刪除紀錄後再移除帳本。`);
+      }
+      await db
+        .prepare('UPDATE ledgers SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
+        .run();
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = validateLedgerInput({
+      name: String(p.name || ''),
+      includeInNetWorth:
+        mutation.recordId === DEFAULT_LEDGER_ID
+          ? true
+          : p.includeInNetWorth !== undefined
+            ? Boolean(p.includeInNetWorth)
+            : existing
+              ? Number(existing.include_in_net_worth ?? 1) === 1
+              : false,
+      monthlyDailyBudget:
+        p.monthlyDailyBudget !== undefined
+          ? (p.monthlyDailyBudget as number | null)
+          : existing?.monthly_daily_budget !== undefined && existing?.monthly_daily_budget !== null
+            ? Number(existing.monthly_daily_budget)
+            : null,
+      note: String(p.note || ''),
+      sortOrder:
+        p.sortOrder !== undefined
+          ? normalizeSortOrder(p.sortOrder, 0)
+          : existing?.sort_order !== undefined
+            ? Number(existing.sort_order)
+            : 0,
+    });
+
+    await db
+      .prepare(
+        `INSERT INTO ledgers
+          (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, id) DO UPDATE SET
+           name = excluded.name,
+           include_in_net_worth = excluded.include_in_net_worth,
+           monthly_daily_budget = excluded.monthly_daily_budget,
+           note = excluded.note,
+           sort_order = excluded.sort_order,
+           updated_at = excluded.updated_at,
+           deleted_at = NULL,
+           version = excluded.version`
+      )
+      .bind(
+        uid,
+        mutation.recordId,
+        v.name,
+        v.includeInNetWorth ? 1 : 0,
+        v.monthlyDailyBudget,
+        v.note,
+        v.sortOrder,
+        String(p.createdAt || check.writeTs),
+        check.writeTs,
+        check.nextVersion
+      )
+      .run();
+    return;
+  }
+
   if (mutation.entity === 'cashflow') {
     const existing = await db
       .prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND id = ?')
@@ -476,6 +632,10 @@ async function applySingleMutation(
         source: String(p.source || '手機記帳'),
         note: String(p.note || ''),
         linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
+        ledgerId:
+          p.ledgerId !== undefined
+            ? normalizeLedgerId(p.ledgerId)
+            : normalizeLedgerId(existing?.ledger_id),
       },
       defaultFxRate
     );
@@ -483,8 +643,8 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO cashflow_logs
-          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET
            date = excluded.date,
            year_month = excluded.year_month,
@@ -498,6 +658,7 @@ async function applySingleMutation(
            source = excluded.source,
            note = excluded.note,
            linked_account_id = excluded.linked_account_id,
+           ledger_id = excluded.ledger_id,
            updated_at = excluded.updated_at,
            deleted_at = NULL,
            version = excluded.version`
@@ -517,6 +678,7 @@ async function applySingleMutation(
         v.source,
         v.note,
         v.linkedAccountId,
+        v.ledgerId,
         String(p.createdAt || check.writeTs),
         check.writeTs,
         check.nextVersion
@@ -559,6 +721,10 @@ async function applySingleMutation(
       status: String(p.status || '啟用'),
       note: String(p.note || ''),
       linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
+      ledgerId:
+        p.ledgerId !== undefined
+          ? normalizeLedgerId(p.ledgerId)
+          : normalizeLedgerId(existing?.ledger_id),
       sortOrder:
         p.sortOrder !== undefined
           ? normalizeSortOrder(p.sortOrder, 0)
@@ -570,8 +736,8 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO recurring_items
-          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET
            item_name = excluded.item_name,
            category = excluded.category,
@@ -583,6 +749,7 @@ async function applySingleMutation(
            status = excluded.status,
            note = excluded.note,
            linked_account_id = excluded.linked_account_id,
+           ledger_id = excluded.ledger_id,
            sort_order = excluded.sort_order,
            updated_at = excluded.updated_at,
            deleted_at = NULL,
@@ -601,6 +768,7 @@ async function applySingleMutation(
         v.status,
         v.note,
         v.linkedAccountId,
+        v.ledgerId,
         v.sortOrder,
         String(p.createdAt || check.writeTs),
         check.writeTs,
@@ -724,6 +892,12 @@ async function applySingleMutation(
           : existing?.unit_price !== undefined
             ? Number(existing.unit_price)
             : 1,
+      previousClose:
+        p.previousClose !== undefined
+          ? (p.previousClose as number | null)
+          : existing?.previous_close !== undefined && existing?.previous_close !== null
+            ? Number(existing.previous_close)
+            : null,
       costBasis:
         p.costBasis !== undefined
           ? (p.costBasis as number | null)
@@ -750,6 +924,18 @@ async function applySingleMutation(
           : existing?.stock_category !== undefined
             ? String(existing.stock_category || '')
             : '',
+      isWatchlist:
+        p.isWatchlist !== undefined
+          ? Boolean(p.isWatchlist)
+          : Number(existing?.is_watchlist || 0) === 1,
+      ledgerId:
+        p.ledgerId !== undefined
+          ? normalizeLedgerId(p.ledgerId)
+          : normalizeLedgerId(existing?.ledger_id),
+      excludeFromNetWorth:
+        p.excludeFromNetWorth !== undefined
+          ? Boolean(p.excludeFromNetWorth)
+          : Number(existing?.exclude_from_net_worth || 0) === 1,
       sortOrder:
         p.sortOrder !== undefined
           ? normalizeSortOrder(p.sortOrder, 0)
@@ -761,17 +947,17 @@ async function applySingleMutation(
     if (v.isDefaultSavings) {
       await db
         .prepare(
-          'UPDATE asset_items SET is_default_savings = 0, updated_at = ?, version = version + 1 WHERE user_id = ? AND is_default_savings = 1 AND id != ?'
+          'UPDATE asset_items SET is_default_savings = 0, updated_at = ?, version = version + 1 WHERE user_id = ? AND ledger_id = ? AND is_default_savings = 1 AND id != ?'
         )
-        .bind(check.writeTs, uid, mutation.recordId)
+        .bind(check.writeTs, uid, v.ledgerId, mutation.recordId)
         .run();
     }
 
     await db
       .prepare(
         `INSERT INTO asset_items
-          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET
            update_mode = excluded.update_mode,
            major_type = excluded.major_type,
@@ -782,6 +968,7 @@ async function applySingleMutation(
            quantity_or_amount = excluded.quantity_or_amount,
            currency = excluded.currency,
            unit_price = excluded.unit_price,
+           previous_close = excluded.previous_close,
            cost_basis = excluded.cost_basis,
            note = excluded.note,
            is_linked_savings = excluded.is_linked_savings,
@@ -793,6 +980,9 @@ async function applySingleMutation(
            loan_monthly_payment = excluded.loan_monthly_payment,
            loan_billing_day = excluded.loan_billing_day,
            stock_category = excluded.stock_category,
+           is_watchlist = excluded.is_watchlist,
+           ledger_id = excluded.ledger_id,
+           exclude_from_net_worth = excluded.exclude_from_net_worth,
            sort_order = excluded.sort_order,
            updated_at = excluded.updated_at,
            deleted_at = NULL,
@@ -810,6 +1000,7 @@ async function applySingleMutation(
         v.quantityOrAmount,
         v.currency,
         v.unitPrice,
+        v.previousClose,
         v.costBasis,
         v.note,
         v.isLinkedSavings ? 1 : 0,
@@ -821,6 +1012,9 @@ async function applySingleMutation(
         v.loanMonthlyPayment,
         v.loanBillingDay,
         v.stockCategory,
+        v.isWatchlist ? 1 : 0,
+        v.ledgerId,
+        v.excludeFromNetWorth ? 1 : 0,
         v.sortOrder,
         String(p.createdAt || check.writeTs),
         check.writeTs,
@@ -1088,10 +1282,12 @@ export async function querySyncDelta(
   const [settings, utilityRents] = await Promise.all([
     ensureAppSettings(db, uid),
     ensureRentUtilitySettings(db, uid),
+    ensureDefaultLedger(db, uid),
   ]);
 
   if (since) {
-    const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
+    const [ledgers, logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
+      db.prepare('SELECT * FROM ledgers WHERE user_id = ? AND updated_at > ? ORDER BY sort_order ASC, created_at ASC').bind(uid, since).all(),
       db.prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND updated_at > ? ORDER BY date DESC').bind(uid, since).all(),
       db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND updated_at > ? ORDER BY sort_order ASC, created_at ASC').bind(uid, since).all(),
       db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND updated_at > ? ORDER BY sort_order ASC, created_at ASC').bind(uid, since).all(),
@@ -1104,6 +1300,7 @@ export async function querySyncDelta(
 
     return {
       settings: settings.updatedAt > since ? settings : null,
+      ledgers: ledgers.results.map(mapLedgerRow),
       cashflowLogs: logs.results.map(mapCashFlowRow),
       recurringItems: rec.results.map(mapRecurringRow),
       sinkingItems: sink.results.map(mapSinkingRow),
@@ -1116,7 +1313,8 @@ export async function querySyncDelta(
     };
   }
 
-  const [logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
+  const [ledgers, logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
+    db.prepare('SELECT * FROM ledgers WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC').bind(uid).all(),
     db.prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND deleted_at IS NULL ORDER BY date DESC').bind(uid).all(),
     db.prepare('SELECT * FROM recurring_items WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC').bind(uid).all(),
     db.prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC').bind(uid).all(),
@@ -1129,6 +1327,7 @@ export async function querySyncDelta(
 
   return {
     settings,
+    ledgers: ledgers.results.map(mapLedgerRow),
     cashflowLogs: logs.results.map(mapCashFlowRow),
     recurringItems: rec.results.map(mapRecurringRow),
     sinkingItems: sink.results.map(mapSinkingRow),
@@ -1149,6 +1348,7 @@ export async function processSyncRequest(
   const uid = assertUserId(userId);
   const serverTime = new Date().toISOString();
   const settings = await ensureAppSettings(db, uid);
+  await ensureDefaultLedger(db, uid);
   const mutations = Array.isArray(req.mutations) ? req.mutations : [];
   const ackedMutationIds: string[] = [];
   const rejected: Array<{ mutationId: string; reason: string }> = [];
@@ -1208,6 +1408,7 @@ export async function exportFullSnapshot(
   const delta = await querySyncDelta(db, uid, null);
   return {
     settings: delta.settings || (await ensureAppSettings(db, uid)),
+    ledgers: delta.ledgers || [],
     cashflowLogs: delta.cashflowLogs,
     recurringItems: delta.recurringItems,
     sinkingItems: delta.sinkingItems,
@@ -1230,6 +1431,7 @@ export async function importFullSnapshot(
   const nowIso = new Date().toISOString();
 
   if (mode === 'replace') {
+    await db.prepare('DELETE FROM ledgers WHERE user_id = ?').bind(uid).run();
     await db.prepare('DELETE FROM cashflow_logs WHERE user_id = ?').bind(uid).run();
     await db.prepare('DELETE FROM recurring_items WHERE user_id = ?').bind(uid).run();
     await db.prepare('DELETE FROM sinking_fund_items WHERE user_id = ?').bind(uid).run();
@@ -1240,6 +1442,31 @@ export async function importFullSnapshot(
     if (Array.isArray(data.rentUtilityRecords) && data.rentUtilityRecords.length > 0) {
       await db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid).run();
     }
+  }
+
+  await ensureDefaultLedger(db, uid);
+  for (const lg of data.ledgers || []) {
+    if (!lg || lg.deletedAt) continue;
+    const v = validateLedgerInput(lg);
+    const lid = normalizeLedgerId(lg.id);
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO ledgers
+          (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+      )
+      .bind(
+        uid,
+        lid,
+        v.name,
+        lid === DEFAULT_LEDGER_ID ? 1 : v.includeInNetWorth ? 1 : 0,
+        v.monthlyDailyBudget,
+        v.note,
+        v.sortOrder,
+        lg.createdAt || nowIso,
+        nowIso
+      )
+      .run();
   }
 
   const currentSettings = await ensureAppSettings(db, uid);
@@ -1271,8 +1498,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO cashflow_logs
-          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -1289,6 +1516,7 @@ export async function importFullSnapshot(
         v.source,
         v.note,
         v.linkedAccountId,
+        v.ledgerId,
         log.createdAt || nowIso,
         nowIso
       )
@@ -1302,8 +1530,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO recurring_items
-          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -1318,6 +1546,7 @@ export async function importFullSnapshot(
         v.status,
         v.note,
         v.linkedAccountId,
+        v.ledgerId,
         v.sortOrder,
         r.createdAt || nowIso,
         nowIso
@@ -1359,8 +1588,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO asset_items
-          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -1374,7 +1603,9 @@ export async function importFullSnapshot(
         v.quantityOrAmount,
         v.currency,
         v.unitPrice,
+        v.previousClose,
         v.costBasis,
+        a.priceUpdatedAt || null,
         v.note,
         v.isLinkedSavings ? 1 : 0,
         v.balanceAnchorDate,
@@ -1386,6 +1617,9 @@ export async function importFullSnapshot(
         v.loanBillingDay,
         v.sortOrder,
         v.stockCategory,
+        v.isWatchlist ? 1 : 0,
+        v.ledgerId,
+        v.excludeFromNetWorth ? 1 : 0,
         a.createdAt || nowIso,
         nowIso
       )

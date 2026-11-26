@@ -1,4 +1,4 @@
-import { ASSET_SUB_CATEGORIES } from '../../../shared/constants';
+import { ASSET_SUB_CATEGORIES, DEFAULT_LEDGER_ID } from '../../../shared/constants';
 import {
   compareBySortOrder,
   computeAllSavingsSummary,
@@ -8,6 +8,8 @@ import {
   computeNetWorthSummary,
   computeSavingsAccountSummary,
   computeStockPositionSummary,
+  filterAssetsByLedgerScope,
+  getEffectiveLedgerId,
   isStockAsset,
   solveImpliedLoanAnnualRate,
 } from '../../../shared/calculations';
@@ -24,16 +26,27 @@ import {
   showToast,
   TRASH_SVG,
 } from './helpers';
+import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
+
+function resolveAssetsScope(ctx: UiContext): string {
+  const ledgers = getActiveLedgers(ctx);
+  const scope = ctx.state.assetsLedgerScope || 'net_worth';
+  if (scope === 'net_worth' || scope === 'all') return scope;
+  if (ledgers.some((l) => l.id === scope)) return scope;
+  ctx.state.assetsLedgerScope = 'net_worth';
+  return 'net_worth';
+}
 
 export function getAssetSectionIds(
   ctx: UiContext,
   section: 'assets_savings' | 'assets_auto' | 'assets_manual'
 ): string[] {
-  const active = ctx.engine
-    .getSnapshot()
-    .assetItems.filter((a) => !a.deletedAt)
+  const snap = ctx.engine.getSnapshot();
+  const ledgers = getActiveLedgers(ctx);
+  const scope = resolveAssetsScope(ctx);
+  const active = filterAssetsByLedgerScope(snap.assetItems, scope, ledgers)
     .slice()
     .sort(compareBySortOrder);
   if (section === 'assets_savings') {
@@ -65,13 +78,54 @@ function fmtSignedMoney(n: number, masked: boolean): string {
 export function renderAssetsTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
   const rate = snap.settings.usdTwdRate;
-  const activeAssets = snap.assetItems
-    .filter((a) => !a.deletedAt)
+  const ledgers = getActiveLedgers(ctx);
+  const scope = resolveAssetsScope(ctx);
+
+  renderLedgerSwitcherBar(ctx, el('assetsLedgerBar'), {
+    mode: 'scope',
+    selectedValue: scope,
+    onSelect: (nextScope) => {
+      ctx.state.assetsLedgerScope = nextScope;
+      renderAssetsTab(ctx);
+    },
+  });
+
+  const selectedLedger = ledgers.find((l) => l.id === scope) || null;
+  const heroTitleEl = el('assetsHeroTitle');
+  const bannerEl = el('assetsIsolatedBanner');
+  if (scope === 'net_worth') {
+    heroTitleEl.textContent = '整合淨資產 (TWD)';
+    bannerEl.style.display = 'none';
+  } else if (scope === 'all') {
+    heroTitleEl.textContent = '全部帳本合併淨資產 (TWD)';
+    bannerEl.style.display = 'flex';
+    bannerEl.textContent = '目前為「全部合併」檢視（包含獨立帳本與單獨排除項目），僅供盤點參考，不影響個人總淨值快照';
+  } else if (selectedLedger) {
+    heroTitleEl.textContent = `${selectedLedger.name} · 帳本淨值 (TWD)`;
+    if (!selectedLedger.includeInNetWorth) {
+      bannerEl.style.display = 'flex';
+      bannerEl.textContent = `獨立帳本「${selectedLedger.name}」：此帳本所有資產與活存皆不計入個人總資產與淨值`;
+    } else {
+      bannerEl.style.display = 'none';
+    }
+  }
+
+  const activeAssets = filterAssetsByLedgerScope(snap.assetItems, scope, ledgers)
     .slice()
     .sort(compareBySortOrder);
   const adjustments = snap.savingsAdjustments || [];
   const stockTxs = snap.stockTransactions || [];
-  const nw = computeNetWorthSummary(activeAssets, rate, 0, snap.cashflowLogs, adjustments, stockTxs);
+  const nw = computeNetWorthSummary(
+    snap.assetItems,
+    rate,
+    0,
+    snap.cashflowLogs,
+    adjustments,
+    stockTxs,
+    undefined,
+    ledgers,
+    scope
+  );
 
   el('netWorthHero').textContent = fmtMoney(nw.netWorth, ctx.state.masked);
   el('totalAssetsText').textContent = fmtMoney(nw.totalAssets, ctx.state.masked);
@@ -548,6 +602,119 @@ export function renderAssetsTab(ctx: UiContext): void {
     }
   }
 
+  // Render independent ledgers summary when viewing personal net_worth scope
+  const indepSec = document.getElementById('independentLedgersSection');
+  const indepList = document.getElementById('independentLedgersList');
+  if (indepSec && indepList) {
+    const independentLedgers = ledgers.filter((l) => !l.includeInNetWorth);
+    const individuallyExcluded = snap.assetItems.filter(
+      (a) =>
+        !a.deletedAt &&
+        !a.isWatchlist &&
+        a.excludeFromNetWorth &&
+        ledgers.some((l) => l.id === getEffectiveLedgerId(a) && l.includeInNetWorth)
+    );
+    if (scope === 'net_worth' && (independentLedgers.length > 0 || individuallyExcluded.length > 0)) {
+      indepSec.style.display = 'block';
+      indepList.innerHTML = '';
+      for (const lg of independentLedgers) {
+        const lgNw = computeNetWorthSummary(
+          snap.assetItems,
+          rate,
+          0,
+          snap.cashflowLogs,
+          adjustments,
+          stockTxs,
+          todayYmd,
+          ledgers,
+          lg.id
+        );
+        const lgCount = snap.assetItems.filter(
+          (a) => !a.deletedAt && !a.isWatchlist && getEffectiveLedgerId(a) === lg.id
+        ).length;
+        const row = document.createElement('div');
+        row.className = 'list-row';
+        row.style.cursor = 'pointer';
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const t = document.createElement('div');
+        t.className = 'item-title';
+        t.textContent = lg.name;
+        const sub = document.createElement('div');
+        sub.className = 'item-sub tnum';
+        sub.textContent = `${lgCount} 項資產/活存 · 總資產 ${fmtMoney(lgNw.totalAssets, ctx.state.masked)}${lgNw.totalLiabilities > 0 ? ` · 負債 ${fmtMoney(lgNw.totalLiabilities, ctx.state.masked)}` : ''}`;
+        main.appendChild(t);
+        main.appendChild(sub);
+
+        const right = document.createElement('div');
+        right.className = 'item-right';
+        const amt = document.createElement('div');
+        amt.className = 'item-amount';
+        amt.textContent = fmtMoney(lgNw.netWorth, ctx.state.masked);
+        const goBtn = document.createElement('button');
+        goBtn.type = 'button';
+        goBtn.className = 'btn btn-outline btn-sm';
+        goBtn.textContent = '檢視';
+        goBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          ctx.state.assetsLedgerScope = lg.id;
+          renderAssetsTab(ctx);
+        });
+        right.appendChild(amt);
+        right.appendChild(goBtn);
+        row.appendChild(main);
+        row.appendChild(right);
+        row.addEventListener('click', () => {
+          ctx.state.assetsLedgerScope = lg.id;
+          renderAssetsTab(ctx);
+        });
+        indepList.appendChild(row);
+      }
+
+      if (individuallyExcluded.length > 0) {
+        const exclTotal = individuallyExcluded.reduce(
+          (sum, a) =>
+            sum +
+            computeAssetEffectiveTwdValue(a, rate, snap.cashflowLogs, adjustments, stockTxs, todayYmd) *
+              (a.majorType === '負債' ? -1 : 1),
+          0
+        );
+        const row = document.createElement('div');
+        row.className = 'list-row';
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const t = document.createElement('div');
+        t.className = 'item-title';
+        t.textContent = `單筆排除不計入總資產 (${individuallyExcluded.length} 項)`;
+        const sub = document.createElement('div');
+        sub.className = 'item-sub';
+        sub.textContent = '切換至上方「全部合併」可編輯這些項目';
+        main.appendChild(t);
+        main.appendChild(sub);
+        const right = document.createElement('div');
+        right.className = 'item-right';
+        const amt = document.createElement('div');
+        amt.className = 'item-amount';
+        amt.textContent = fmtMoney(Math.round(exclTotal), ctx.state.masked);
+        const goBtn = document.createElement('button');
+        goBtn.type = 'button';
+        goBtn.className = 'btn btn-outline btn-sm';
+        goBtn.textContent = '檢視';
+        goBtn.addEventListener('click', () => {
+          ctx.state.assetsLedgerScope = 'all';
+          renderAssetsTab(ctx);
+        });
+        right.appendChild(amt);
+        right.appendChild(goBtn);
+        row.appendChild(main);
+        row.appendChild(right);
+        indepList.appendChild(row);
+      }
+    } else {
+      indepSec.style.display = 'none';
+    }
+  }
+
   const hList = el('historyList');
   hList.innerHTML = '';
   const history = snap.netWorthHistory.slice(0, 12);
@@ -582,14 +749,26 @@ export function renderAssetsTab(ctx: UiContext): void {
   }
 }
 
-export function openSavingsAccountModal(ctx: UiContext, existing: AssetItem | null): void {
+export function openSavingsAccountModal(
+  ctx: UiContext,
+  existing: AssetItem | null,
+  defaultLedgerId?: string
+): void {
   const body = openModal(existing ? '編輯活存帳戶' : '新增連動活存帳戶');
   const form = document.createElement('form');
   const today = todayYmdLocal();
+  const initialLedgerId = existing
+    ? getEffectiveLedgerId(existing)
+    : defaultLedgerId ||
+      (ctx.state.assetsLedgerScope !== 'net_worth' && ctx.state.assetsLedgerScope !== 'all'
+        ? ctx.state.assetsLedgerScope
+        : DEFAULT_LEDGER_ID);
 
   form.appendChild(
     makeInputField('活存帳戶名稱', 'svName', 'text', existing?.itemName || '', '例如：中信活存、台新 Richart', true)
   );
+
+  form.appendChild(buildLedgerSelectField(ctx, 'svLedger', initialLedgerId, '所屬帳本'));
 
   const r1 = document.createElement('div');
   r1.className = 'row-2';
@@ -605,21 +784,42 @@ export function openSavingsAccountModal(ctx: UiContext, existing: AssetItem | nu
 
   const defLabel = document.createElement('label');
   defLabel.style.cssText =
-    'display:flex;align-items:center;gap:10px;padding:11px 13px;margin-bottom:14px;border-radius:12px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;';
+    'display:flex;align-items:center;gap:10px;padding:11px 13px;margin-bottom:10px;border-radius:12px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;';
   const defCb = document.createElement('input');
   defCb.id = 'svDefault';
   defCb.type = 'checkbox';
   defCb.style.cssText = 'width:18px;height:18px;accent-color:var(--primary)';
-  const hasOtherSavings = ctx.engine
+  const hasOtherSavingsInLedger = ctx.engine
     .getSnapshot()
-    .assetItems.some((a) => !a.deletedAt && a.isLinkedSavings && a.id !== existing?.id);
-  defCb.checked = existing ? Boolean(existing.isDefaultSavings) : !hasOtherSavings;
+    .assetItems.some(
+      (a) =>
+        !a.deletedAt &&
+        a.isLinkedSavings &&
+        a.id !== existing?.id &&
+        getEffectiveLedgerId(a) === initialLedgerId
+    );
+  defCb.checked = existing ? Boolean(existing.isDefaultSavings) : !hasOtherSavingsInLedger;
   const defText = document.createElement('span');
   defText.innerHTML =
-    '<strong>設為快速記帳預設連動帳戶</strong><small style="display:block;color:var(--text-secondary);font-size:11px">記帳時自動預選此帳戶，仍可隨時切換其他帳戶或不連動</small>';
+    '<strong>設為此帳本的預設連動帳戶</strong><small style="display:block;color:var(--text-secondary);font-size:11px">在該帳本記帳時自動預選此帳戶，不同帳本各自獨立預設</small>';
   defLabel.appendChild(defCb);
   defLabel.appendChild(defText);
   form.appendChild(defLabel);
+
+  const exclLabel = document.createElement('label');
+  exclLabel.style.cssText =
+    'display:flex;align-items:center;gap:10px;padding:11px 13px;margin-bottom:14px;border-radius:12px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;';
+  const exclCb = document.createElement('input');
+  exclCb.id = 'svExcludeNw';
+  exclCb.type = 'checkbox';
+  exclCb.style.cssText = 'width:18px;height:18px;accent-color:var(--primary)';
+  exclCb.checked = Boolean(existing?.excludeFromNetWorth);
+  const exclText = document.createElement('span');
+  exclText.innerHTML =
+    '<strong>單獨不計入個人總資產</strong><small style="display:block;color:var(--text-secondary);font-size:11px">即使歸屬在主帳本，也不納入整合淨資產計算（若已選獨立帳本則本來就不計入）</small>';
+  exclLabel.appendChild(exclCb);
+  exclLabel.appendChild(exclText);
+  form.appendChild(exclLabel);
 
   form.appendChild(makeInputField('備註（選填）', 'svNote', 'text', existing?.note || '', '例如：薪轉戶、緊急預備金'));
 
@@ -681,6 +881,8 @@ export function openSavingsAccountModal(ctx: UiContext, existing: AssetItem | nu
         unitPrice: 1,
         isLinkedSavings: true,
         isDefaultSavings: el<HTMLInputElement>('svDefault').checked,
+        ledgerId: el<HTMLSelectElement>('svLedger').value || DEFAULT_LEDGER_ID,
+        excludeFromNetWorth: el<HTMLInputElement>('svExcludeNw').checked,
         balanceAnchorDate: anchorDate,
         balanceAnchorAt,
         note: el<HTMLInputElement>('svNote').value.trim(),
@@ -1112,11 +1314,23 @@ export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
   body.appendChild(footer);
 }
 
-export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void {
+export function openAssetModal(
+  ctx: UiContext,
+  existing: AssetItem | null,
+  defaultLedgerId?: string
+): void {
   const body = openModal(existing ? '更新資產 / 負債餘額' : '新增資產 / 負債');
   const form = document.createElement('form');
   const today = todayYmdLocal();
+  const initialLedgerId = existing
+    ? getEffectiveLedgerId(existing)
+    : defaultLedgerId ||
+      (ctx.state.assetsLedgerScope !== 'net_worth' && ctx.state.assetsLedgerScope !== 'all'
+        ? ctx.state.assetsLedgerScope
+        : DEFAULT_LEDGER_ID);
+
   form.appendChild(makeInputField('項目名稱', 'asName', 'text', existing?.itemName || '', '如：0050、台幣定存、房貸餘額', true));
+  form.appendChild(buildLedgerSelectField(ctx, 'asLedger', initialLedgerId, '所屬帳本'));
 
   const r1 = document.createElement('div');
   r1.className = 'row-2';
@@ -1249,6 +1463,21 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
   loanBox.appendChild(loanFields);
   form.appendChild(loanBox);
 
+  const exclLabel = document.createElement('label');
+  exclLabel.style.cssText =
+    'display:flex;align-items:center;gap:10px;padding:11px 13px;margin-bottom:14px;border-radius:12px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;';
+  const exclCb = document.createElement('input');
+  exclCb.id = 'asExcludeNw';
+  exclCb.type = 'checkbox';
+  exclCb.style.cssText = 'width:18px;height:18px;accent-color:var(--primary)';
+  exclCb.checked = Boolean(existing?.excludeFromNetWorth);
+  const exclText = document.createElement('span');
+  exclText.innerHTML =
+    '<strong>單獨不計入個人總資產</strong><small style="display:block;color:var(--text-secondary);font-size:11px">即使歸屬在主帳本，也不納入整合淨資產計算（若已選獨立帳本則本來就不計入）</small>';
+  exclLabel.appendChild(exclCb);
+  exclLabel.appendChild(exclText);
+  form.appendChild(exclLabel);
+
   form.appendChild(makeInputField('備註（選填）', 'asNote', 'text', existing?.note || ''));
 
   const btns = document.createElement('div');
@@ -1309,6 +1538,8 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
         currency: el<HTMLSelectElement>('asCurr').value,
         ticker: el<HTMLInputElement>('asTicker').value.trim(),
         unitPrice: parseFloat(el<HTMLInputElement>('asPrice').value) || 1,
+        ledgerId: el<HTMLSelectElement>('asLedger').value || DEFAULT_LEDGER_ID,
+        excludeFromNetWorth: el<HTMLInputElement>('asExcludeNw').checked,
         note: el<HTMLInputElement>('asNote').value.trim(),
         isAmortizingLoan,
         balanceAnchorDate: isAmortizingLoan ? anchorVal || today : anchorVal || null,

@@ -5,6 +5,7 @@ import {
   ASSET_UPDATE_MODES,
   BILLING_CYCLES,
   CURRENCIES,
+  DEFAULT_LEDGER_ID,
   DEFAULT_PNL_COLOR_SCHEME,
   DEFAULT_STOCK_CATEGORIES,
   LIQUIDITY_LEVELS,
@@ -26,6 +27,41 @@ export interface ParsedLocalDate {
 export function toSafeNumber(value: unknown, fallback = 0): number {
   const num = Number(value);
   return Number.isNaN(num) || !Number.isFinite(num) ? fallback : num;
+}
+
+export function normalizeLedgerId(value: unknown): string {
+  const s = String(value ?? '').trim().slice(0, 64);
+  return s || DEFAULT_LEDGER_ID;
+}
+
+export interface LedgerInputPayload {
+  name: string;
+  includeInNetWorth?: boolean;
+  monthlyDailyBudget?: number | string | null;
+  note?: string;
+  sortOrder?: number;
+}
+
+export function validateLedgerInput(payload: LedgerInputPayload) {
+  const name = String(payload.name || '').trim().slice(0, 30);
+  if (!name) throw new Error('請輸入帳本名稱。');
+  const includeInNetWorth =
+    payload.includeInNetWorth !== undefined ? Boolean(payload.includeInNetWorth) : true;
+  let monthlyDailyBudget: number | null = null;
+  if (
+    payload.monthlyDailyBudget !== undefined &&
+    payload.monthlyDailyBudget !== null &&
+    String(payload.monthlyDailyBudget).trim() !== ''
+  ) {
+    const parsed = Math.round(Number(payload.monthlyDailyBudget));
+    if (Number.isNaN(parsed) || !Number.isFinite(parsed) || parsed < 0) {
+      throw new Error('帳本每月預算需大於等於 0。');
+    }
+    monthlyDailyBudget = parsed;
+  }
+  const note = String(payload.note || '').trim().slice(0, 120);
+  const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
+  return { name, includeInNetWorth, monthlyDailyBudget, note, sortOrder };
 }
 
 export function normalizePnlColorScheme(value: unknown): PnlColorScheme {
@@ -109,6 +145,7 @@ export interface CashFlowInputPayload {
   note?: string;
   makeRecurring?: boolean;
   linkedAccountId?: string | null;
+  ledgerId?: string;
 }
 
 export interface ValidatedCashFlowInput {
@@ -124,6 +161,7 @@ export interface ValidatedCashFlowInput {
   source: string;
   note: string;
   linkedAccountId: string | null;
+  ledgerId: string;
 }
 
 export function validateCashFlowInput(
@@ -143,6 +181,7 @@ export function validateCashFlowInput(
   const source = SOURCE_OPTIONS.includes(sourceRaw) ? sourceRaw : '手機記帳';
   const note = String(payload.note || '').trim().slice(0, 200);
   const linkedAccountId = payload.linkedAccountId ? String(payload.linkedAccountId).trim() : null;
+  const ledgerId = normalizeLedgerId(payload.ledgerId);
 
   if (!ALL_CASHFLOW_TYPES.includes(type)) {
     throw new Error(`不支援的收支類型：${type}`);
@@ -175,6 +214,7 @@ export function validateCashFlowInput(
     source,
     note,
     linkedAccountId,
+    ledgerId,
   };
 }
 
@@ -189,6 +229,7 @@ export interface RecurringInputPayload {
   status?: string;
   note?: string;
   linkedAccountId?: string | null;
+  ledgerId?: string;
   sortOrder?: number;
 }
 
@@ -203,6 +244,7 @@ export function validateRecurringInput(payload: RecurringInputPayload) {
   const status = String(payload.status || '啟用').trim();
   const note = String(payload.note || '').trim().slice(0, 200);
   const linkedAccountId = payload.linkedAccountId ? String(payload.linkedAccountId).trim() : null;
+  const ledgerId = normalizeLedgerId(payload.ledgerId);
   const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
 
   if (!itemName) throw new Error('請輸入項目名稱。');
@@ -212,7 +254,7 @@ export function validateRecurringInput(payload: RecurringInputPayload) {
   if (!BILLING_CYCLES.includes(cycle)) throw new Error(`不支援的週期：${cycle}`);
   if (!STATUS_OPTIONS.includes(status)) throw new Error(`不支援的狀態：${status}`);
 
-  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note, linkedAccountId, sortOrder };
+  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note, linkedAccountId, ledgerId, sortOrder };
 }
 
 export interface SinkingInputPayload {
@@ -254,6 +296,7 @@ export interface AssetInputPayload {
   quantityOrAmount: number | string;
   currency?: string;
   unitPrice?: number | string;
+  previousClose?: number | string | null;
   costBasis?: number | string | null;
   note?: string;
   isLinkedSavings?: boolean;
@@ -265,17 +308,28 @@ export interface AssetInputPayload {
   loanMonthlyPayment?: number | string | null;
   loanBillingDay?: number | string | null;
   stockCategory?: string;
+  isWatchlist?: boolean;
+  ledgerId?: string;
+  excludeFromNetWorth?: boolean;
   sortOrder?: number;
 }
 
 export function validateAssetInput(payload: AssetInputPayload) {
-  const isLinkedSavings = Boolean(payload.isLinkedSavings);
-  const updateMode = isLinkedSavings ? '手動快照' : String(payload.updateMode || '手動快照').trim();
-  const majorType = isLinkedSavings ? '資產' : String(payload.majorType || '資產').trim();
+  const isWatchlist = Boolean(payload.isWatchlist);
+  const isLinkedSavings = !isWatchlist && Boolean(payload.isLinkedSavings);
+  const ticker = isLinkedSavings ? '' : String(payload.ticker || '').trim().toUpperCase().slice(0, 30);
+  const updateMode = isLinkedSavings
+    ? '手動快照'
+    : isWatchlist
+      ? ticker
+        ? '自動更新'
+        : '手動快照'
+      : String(payload.updateMode || '手動快照').trim();
+  const majorType = isLinkedSavings || isWatchlist ? '資產' : String(payload.majorType || '資產').trim();
   const subCategory = isLinkedSavings
     ? '活存'
-    : String(payload.subCategory || '其他資產').trim().slice(0, 40);
-  const rawLiquidity = isLinkedSavings ? '高流動' : String(payload.liquidity || '中流動').trim();
+    : String(payload.subCategory || (isWatchlist ? '台股' : '其他資產')).trim().slice(0, 40);
+  const rawLiquidity = isLinkedSavings || isWatchlist ? '高流動' : String(payload.liquidity || '中流動').trim();
   const liquidity =
     majorType === '負債'
       ? '負債'
@@ -283,12 +337,36 @@ export function validateAssetInput(payload: AssetInputPayload) {
         ? rawLiquidity
         : '中流動';
   const itemName = String(payload.itemName || '').trim().slice(0, 80);
-  const ticker = isLinkedSavings ? '' : String(payload.ticker || '').trim().toUpperCase().slice(0, 30);
-  const quantityOrAmount = Number(payload.quantityOrAmount);
+  const quantityOrAmount = isWatchlist ? 0 : Number(payload.quantityOrAmount);
   const currency = String(payload.currency || 'TWD').trim().toUpperCase();
-  const unitPrice = isLinkedSavings ? 1 : payload.unitPrice !== undefined ? Number(payload.unitPrice) : 1;
+  const unitPrice = isLinkedSavings
+    ? 1
+    : payload.unitPrice !== undefined && payload.unitPrice !== ''
+      ? Number(payload.unitPrice)
+      : isWatchlist
+        ? 0
+        : 1;
+  let previousClose: number | null = null;
+  if (
+    !isLinkedSavings &&
+    payload.previousClose !== undefined &&
+    payload.previousClose !== null &&
+    String(payload.previousClose).trim() !== ''
+  ) {
+    const parsedPrev = Number(payload.previousClose);
+    if (Number.isNaN(parsedPrev) || !Number.isFinite(parsedPrev) || parsedPrev < 0) {
+      throw new Error('昨收價需大於等於 0。');
+    }
+    previousClose = parsedPrev > 0 ? Math.round(parsedPrev * 10000) / 10000 : null;
+  }
   let costBasis: number | null = null;
-  if (!isLinkedSavings && payload.costBasis !== undefined && payload.costBasis !== null && String(payload.costBasis).trim() !== '') {
+  if (
+    !isLinkedSavings &&
+    !isWatchlist &&
+    payload.costBasis !== undefined &&
+    payload.costBasis !== null &&
+    String(payload.costBasis).trim() !== ''
+  ) {
     const parsedCost = Number(payload.costBasis);
     if (Number.isNaN(parsedCost) || !Number.isFinite(parsedCost) || parsedCost < 0) {
       throw new Error('期初成本需大於等於 0。');
@@ -296,15 +374,23 @@ export function validateAssetInput(payload: AssetInputPayload) {
     costBasis = Math.round(parsedCost * 100) / 100;
   }
   const note = String(payload.note || '').trim().slice(0, 200);
-  const balanceAnchorDate = payload.balanceAnchorDate
-    ? (parseLocalDate(String(payload.balanceAnchorDate)), String(payload.balanceAnchorDate).trim())
-    : null;
-  const balanceAnchorAt = payload.balanceAnchorAt ? String(payload.balanceAnchorAt).trim() : null;
+  const balanceAnchorDate = isWatchlist
+    ? null
+    : payload.balanceAnchorDate
+      ? (parseLocalDate(String(payload.balanceAnchorDate)), String(payload.balanceAnchorDate).trim())
+      : null;
+  const balanceAnchorAt = isWatchlist
+    ? null
+    : payload.balanceAnchorAt
+      ? String(payload.balanceAnchorAt).trim()
+      : null;
   const isDefaultSavings = isLinkedSavings && Boolean(payload.isDefaultSavings);
   const stockCategory = isLinkedSavings ? '' : normalizeStockCategory(payload.stockCategory);
+  const ledgerId = isWatchlist ? DEFAULT_LEDGER_ID : normalizeLedgerId(payload.ledgerId);
+  const excludeFromNetWorth = isWatchlist ? false : Boolean(payload.excludeFromNetWorth);
   const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
 
-  const isAmortizingLoan = !isLinkedSavings && majorType === '負債' && Boolean(payload.isAmortizingLoan);
+  const isAmortizingLoan = !isLinkedSavings && !isWatchlist && majorType === '負債' && Boolean(payload.isAmortizingLoan);
   let loanAnnualRate: number | null = null;
   let loanMonthlyPayment: number | null = null;
   let loanBillingDay: number | null = null;
@@ -366,6 +452,7 @@ export function validateAssetInput(payload: AssetInputPayload) {
     quantityOrAmount,
     currency,
     unitPrice,
+    previousClose,
     costBasis,
     note,
     isLinkedSavings,
@@ -377,6 +464,9 @@ export function validateAssetInput(payload: AssetInputPayload) {
     loanMonthlyPayment,
     loanBillingDay,
     stockCategory,
+    isWatchlist,
+    ledgerId,
+    excludeFromNetWorth,
     sortOrder,
   };
 }

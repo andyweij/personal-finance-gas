@@ -5,6 +5,8 @@ export const DEFAULT_EMERGENCY_MONTHS = 6;
 export const DEFAULT_PNL_COLOR_SCHEME = 'intl' as const;
 export const PNL_COLOR_SCHEMES = ['intl', 'tw', 'tw_stocks'] as const;
 export const DEFAULT_STOCK_CATEGORIES: string[] = ['個股', 'ETF', '特別股'];
+export const DEFAULT_LEDGER_ID = 'default';
+export const DEFAULT_LEDGER_NAME = '個人主帳本';
 
 export const CASHFLOW_TYPES = {
   FIXED_INCOME: '固定收入',

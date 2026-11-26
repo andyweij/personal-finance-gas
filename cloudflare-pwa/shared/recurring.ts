@@ -50,6 +50,13 @@ export function buildRecurringDedupKey(type: string, itemName: string): string {
   return `${type.trim()}||${itemName.trim()}`;
 }
 
-export function buildMonthlyDedupKey(yearMonth: string, type: string, itemName: string): string {
-  return `${yearMonth.trim()}||${buildRecurringDedupKey(type, itemName)}`;
+export function buildMonthlyDedupKey(
+  yearMonth: string,
+  type: string,
+  itemName: string,
+  ledgerId = 'default'
+): string {
+  const base = `${yearMonth.trim()}||${buildRecurringDedupKey(type, itemName)}`;
+  const lid = String(ledgerId || 'default').trim() || 'default';
+  return lid === 'default' ? base : `${lid}||${base}`;
 }

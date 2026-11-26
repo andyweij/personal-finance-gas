@@ -1,15 +1,31 @@
 import {
   DEFAULT_EMERGENCY_MONTHS,
+  DEFAULT_LEDGER_ID,
+  DEFAULT_LEDGER_NAME,
   DEFAULT_MONTHLY_DAILY_BUDGET,
   DEFAULT_PNL_COLOR_SCHEME,
   DEFAULT_USD_TWD_RATE,
 } from '../../../shared/constants';
 import { DEFAULT_UTILITY_RENTS } from '../../../shared/rentUtility';
-import type { CachedPasskeyDto, FinanceSnapshot, SyncConflict, SyncMutation } from '../../../shared/types';
+import type { CachedPasskeyDto, FinanceSnapshot, Ledger, SyncConflict, SyncMutation } from '../../../shared/types';
 
 const DB_VERSION = 1;
 const STORE_KV = 'kv';
 const STORE_OUTBOX = 'outbox';
+
+export function createDefaultLedger(): Ledger {
+  return {
+    id: DEFAULT_LEDGER_ID,
+    name: DEFAULT_LEDGER_NAME,
+    includeInNetWorth: true,
+    monthlyDailyBudget: null,
+    note: '預設個人帳本（納入總資產與淨值統計）',
+    sortOrder: 1,
+    createdAt: '',
+    updatedAt: '',
+    deletedAt: null,
+  };
+}
 
 export function createEmptySnapshot(): FinanceSnapshot {
   return {
@@ -22,6 +38,7 @@ export function createEmptySnapshot(): FinanceSnapshot {
       customStockCategories: [],
       updatedAt: '',
     },
+    ledgers: [createDefaultLedger()],
     cashflowLogs: [],
     recurringItems: [],
     sinkingItems: [],
@@ -103,6 +120,7 @@ export class LocalFinanceDB {
           return;
         }
         const empty = createEmptySnapshot();
+        const rawLedgers = Array.isArray(raw.ledgers) && raw.ledgers.length > 0 ? raw.ledgers : empty.ledgers;
         resolve({
           ...empty,
           ...raw,
@@ -115,6 +133,7 @@ export class LocalFinanceDB {
                   : [],
               }
             : empty.settings,
+          ledgers: rawLedgers,
           cashflowLogs: Array.isArray(raw.cashflowLogs) ? raw.cashflowLogs : [],
           recurringItems: Array.isArray(raw.recurringItems) ? raw.recurringItems : [],
           sinkingItems: Array.isArray(raw.sinkingItems) ? raw.sinkingItems : [],

@@ -188,7 +188,23 @@ export async function fetchUsdTwdRate(fetchImpl: FetchLike = fetch): Promise<num
   return null;
 }
 
-async function fetchYahooChartPrice(symbol: string, fetchImpl: FetchLike): Promise<number | null> {
+export interface StockQuoteResult {
+  price: number;
+  previousClose: number | null;
+}
+
+function formatUtcOffsetDateKey(epochSec: number, gmtOffsetSec: number): string {
+  const shifted = new Date((epochSec + gmtOffsetSec) * 1000);
+  const y = shifted.getUTCFullYear();
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(shifted.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+async function fetchYahooChartQuote(
+  symbol: string,
+  fetchImpl: FetchLike
+): Promise<StockQuoteResult | null> {
   for (const host of ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']) {
     try {
       const yfUrl = `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
@@ -201,9 +217,12 @@ async function fetchYahooChartPrice(symbol: string, fetchImpl: FetchLike): Promi
           result?: Array<{
             meta?: {
               regularMarketPrice?: number;
+              regularMarketTime?: number;
+              gmtoffset?: number;
               chartPreviousClose?: number;
               previousClose?: number;
             };
+            timestamp?: Array<number | null>;
             indicators?: {
               quote?: Array<{ close?: Array<number | null> }>;
             };
@@ -212,22 +231,72 @@ async function fetchYahooChartPrice(symbol: string, fetchImpl: FetchLike): Promi
       };
       const result = json?.chart?.result?.[0];
       const meta = result?.meta;
+      const timestamps = result?.timestamp || [];
+      const closes = result?.indicators?.quote?.[0]?.close || [];
+      const validPairs: Array<{ ts: number | null; close: number }> = [];
+      for (let i = 0; i < closes.length; i++) {
+        const val = Number(closes[i]);
+        if (Number.isFinite(val) && val > 0) {
+          const tsVal = Number(timestamps[i]);
+          validPairs.push({ ts: Number.isFinite(tsVal) ? tsVal : null, close: val });
+        }
+      }
+
       let candidate = Number(meta?.regularMarketPrice);
       if (!Number.isFinite(candidate) || candidate <= 0) {
-        const closes = result?.indicators?.quote?.[0]?.close || [];
-        for (let i = closes.length - 1; i >= 0; i--) {
-          const val = Number(closes[i]);
-          if (Number.isFinite(val) && val > 0) {
-            candidate = val;
-            break;
-          }
+        if (validPairs.length > 0) {
+          candidate = validPairs[validPairs.length - 1].close;
         }
       }
       if (!Number.isFinite(candidate) || candidate <= 0) {
         candidate = Number(meta?.previousClose ?? meta?.chartPreviousClose);
       }
+
       if (Number.isFinite(candidate) && candidate > 0) {
-        return roundStockPrice(candidate);
+        let prevClose: number | null = null;
+        const gmtOffset = Number.isFinite(Number(meta?.gmtoffset)) ? Number(meta?.gmtoffset) : 0;
+        const marketTime = Number(meta?.regularMarketTime);
+
+        if (validPairs.length >= 2) {
+          const lastPair = validPairs[validPairs.length - 1];
+          if (Number.isFinite(marketTime) && marketTime > 0 && lastPair.ts !== null) {
+            const marketDay = formatUtcOffsetDateKey(marketTime, gmtOffset);
+            const lastBarDay = formatUtcOffsetDateKey(lastPair.ts, gmtOffset);
+            prevClose =
+              marketDay > lastBarDay
+                ? lastPair.close
+                : validPairs[validPairs.length - 2].close;
+          } else {
+            prevClose = validPairs[validPairs.length - 2].close;
+          }
+        } else if (validPairs.length === 1) {
+          const lastPair = validPairs[0];
+          if (
+            Number.isFinite(marketTime) &&
+            marketTime > 0 &&
+            lastPair.ts !== null &&
+            formatUtcOffsetDateKey(marketTime, gmtOffset) > formatUtcOffsetDateKey(lastPair.ts, gmtOffset)
+          ) {
+            prevClose = lastPair.close;
+          }
+        }
+
+        if (prevClose === null) {
+          const metaPrev = Number(meta?.previousClose);
+          if (Number.isFinite(metaPrev) && metaPrev > 0) {
+            prevClose = metaPrev;
+          } else if (validPairs.length <= 1) {
+            const chartPrev = Number(meta?.chartPreviousClose);
+            if (Number.isFinite(chartPrev) && chartPrev > 0) {
+              prevClose = chartPrev;
+            }
+          }
+        }
+
+        return {
+          price: roundStockPrice(candidate),
+          previousClose: prevClose !== null && prevClose > 0 ? roundStockPrice(prevClose) : null,
+        };
       }
     } catch {
       // Try next Yahoo host
@@ -238,9 +307,56 @@ async function fetchYahooChartPrice(symbol: string, fetchImpl: FetchLike): Promi
 
 /**
  * Free no-API-key fallback for US equities & ETFs via Stooq CSV endpoint.
- * Format: Symbol,Date,Time,Open,High,Low,Close,Volume
+ * Tries daily history (last 14 days) first to obtain both close & previousClose,
+ * then falls back to latest single-row quote (/q/l/).
  */
-async function fetchStooqUsPrice(stooqSymbol: string, fetchImpl: FetchLike): Promise<number | null> {
+async function fetchStooqUsQuote(
+  stooqSymbol: string,
+  fetchImpl: FetchLike
+): Promise<StockQuoteResult | null> {
+  // 1. Try compact daily history for latest 2 trading days
+  try {
+    const now = new Date();
+    const from = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+    const fmt = (d: Date) =>
+      `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+    const histUrl = `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSymbol)}&d1=${fmt(from)}&d2=${fmt(now)}&i=d`;
+    const res = await fetchImpl(histUrl, {
+      headers: { Accept: 'text/csv,text/plain,*/*', 'User-Agent': MARKET_USER_AGENT },
+    });
+    if (res.ok) {
+      const text = (await res.text()).trim();
+      const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+      if (lines.length >= 2) {
+        const headerCols = lines[0].split(',').map((h) => h.trim().toLowerCase());
+        const closeIdx = headerCols.indexOf('close');
+        if (closeIdx >= 0) {
+          const closes: number[] = [];
+          for (let i = 1; i < lines.length; i++) {
+            const cols = lines[i].split(',');
+            if (cols.length > closeIdx) {
+              const c = Number(cols[closeIdx]);
+              if (Number.isFinite(c) && c > 0) {
+                closes.push(c);
+              }
+            }
+          }
+          if (closes.length >= 1) {
+            const latest = closes[closes.length - 1];
+            const prev = closes.length >= 2 ? closes[closes.length - 2] : null;
+            return {
+              price: roundStockPrice(latest),
+              previousClose: prev !== null ? roundStockPrice(prev) : null,
+            };
+          }
+        }
+      }
+    }
+  } catch {
+    // Fall through to single-row quote
+  }
+
+  // 2. Fallback: latest single-row quote Format: Symbol,Date,Time,Open,High,Low,Close,Volume
   try {
     const url = `https://stooq.com/q/l/?s=${encodeURIComponent(stooqSymbol)}&f=sd2t2ohlcv&h&e=csv`;
     const res = await fetchImpl(url, {
@@ -254,7 +370,7 @@ async function fetchStooqUsPrice(stooqSymbol: string, fetchImpl: FetchLike): Pro
     if (cols.length < 7) return null;
     const close = Number(cols[6]);
     if (Number.isFinite(close) && close > 0) {
-      return roundStockPrice(close);
+      return { price: roundStockPrice(close), previousClose: null };
     }
   } catch {
     // Ignore fallback failure
@@ -262,11 +378,11 @@ async function fetchStooqUsPrice(stooqSymbol: string, fetchImpl: FetchLike): Pro
   return null;
 }
 
-async function fetchTwseMisPrice(
+async function fetchTwseMisQuote(
   code: string,
   preferredExchange: 'tse' | 'otc' | undefined,
   fetchImpl: FetchLike
-): Promise<number | null> {
+): Promise<StockQuoteResult | null> {
   const exCh =
     preferredExchange === 'tse'
       ? `tse_${code}.tw`
@@ -282,9 +398,16 @@ async function fetchTwseMisPrice(
     const json = (await res.json()) as { msgArray?: Array<{ z?: string; y?: string }> };
     const entries = json?.msgArray || [];
     for (const entry of entries) {
-      const price = Number(entry?.z && entry.z !== '-' ? entry.z : entry?.y);
-      if (Number.isFinite(price) && price > 0) {
-        return roundStockPrice(price);
+      const yNum = Number(entry?.y);
+      const validY = Number.isFinite(yNum) && yNum > 0 ? roundStockPrice(yNum) : null;
+      const zNum = entry?.z && entry.z !== '-' ? Number(entry.z) : NaN;
+      const validZ = Number.isFinite(zNum) && zNum > 0 ? roundStockPrice(zNum) : null;
+      const price = validZ ?? validY;
+      if (price !== null && price > 0) {
+        return {
+          price,
+          previousClose: validY,
+        };
       }
     }
   } catch {
@@ -293,24 +416,49 @@ async function fetchTwseMisPrice(
   return null;
 }
 
+export async function fetchStockQuote(
+  rawTicker: string,
+  fetchImpl: FetchLike = fetch,
+  hint?: TickerHint
+): Promise<StockQuoteResult | null> {
+  const norm = normalizeMarketTicker(rawTicker, hint);
+  if (!norm) return null;
+
+  if (norm.market === 'US') {
+    const yfQuote = await fetchYahooChartQuote(norm.yahooSymbol, fetchImpl);
+    if (yfQuote !== null) return yfQuote;
+    if (norm.stooqSymbol) {
+      return fetchStooqUsQuote(norm.stooqSymbol, fetchImpl);
+    }
+    return null;
+  }
+
+  // Taiwan market: Primary TWSE/TPEx MIS -> Fallback Yahoo Finance (.TW / .TWO)
+  if (TW_NUMERIC_CODE_RE.test(norm.code)) {
+    const twseQuote = await fetchTwseMisQuote(norm.code, norm.twseExchange, fetchImpl);
+    if (twseQuote !== null) return twseQuote;
+  }
+
+  const yfPrimary = await fetchYahooChartQuote(norm.yahooSymbol, fetchImpl);
+  if (yfPrimary !== null) return yfPrimary;
+
+  if (norm.yahooFallbackSymbol && norm.yahooFallbackSymbol !== norm.yahooSymbol) {
+    const yfFallback = await fetchYahooChartQuote(norm.yahooFallbackSymbol, fetchImpl);
+    if (yfFallback !== null) return yfFallback;
+  }
+
+  return null;
+}
+
 export async function fetchUsStockPrice(
   rawTicker: string,
   fetchImpl: FetchLike = fetch
 ): Promise<number | null> {
-  const norm = normalizeMarketTicker(rawTicker, { currency: 'USD', subCategory: '美股/ETF' });
-  if (!norm) return null;
-
-  // Primary: Yahoo Finance Chart API (query1 -> query2)
-  const yfPrice = await fetchYahooChartPrice(norm.yahooSymbol, fetchImpl);
-  if (yfPrice !== null) return yfPrice;
-
-  // Fallback: Stooq free CSV quote
-  if (norm.stooqSymbol) {
-    const stooqPrice = await fetchStooqUsPrice(norm.stooqSymbol, fetchImpl);
-    if (stooqPrice !== null) return stooqPrice;
-  }
-
-  return null;
+  const quote = await fetchStockQuote(rawTicker, fetchImpl, {
+    currency: 'USD',
+    subCategory: '美股/ETF',
+  });
+  return quote ? quote.price : null;
 }
 
 export async function fetchStockPrice(
@@ -318,33 +466,8 @@ export async function fetchStockPrice(
   fetchImpl: FetchLike = fetch,
   hint?: TickerHint
 ): Promise<number | null> {
-  const norm = normalizeMarketTicker(rawTicker, hint);
-  if (!norm) return null;
-
-  if (norm.market === 'US') {
-    const yfPrice = await fetchYahooChartPrice(norm.yahooSymbol, fetchImpl);
-    if (yfPrice !== null) return yfPrice;
-    if (norm.stooqSymbol) {
-      return fetchStooqUsPrice(norm.stooqSymbol, fetchImpl);
-    }
-    return null;
-  }
-
-  // Taiwan market: Primary TWSE/TPEx MIS -> Fallback Yahoo Finance (.TW / .TWO)
-  if (TW_NUMERIC_CODE_RE.test(norm.code)) {
-    const twsePrice = await fetchTwseMisPrice(norm.code, norm.twseExchange, fetchImpl);
-    if (twsePrice !== null) return twsePrice;
-  }
-
-  const yfPrimary = await fetchYahooChartPrice(norm.yahooSymbol, fetchImpl);
-  if (yfPrimary !== null) return yfPrimary;
-
-  if (norm.yahooFallbackSymbol && norm.yahooFallbackSymbol !== norm.yahooSymbol) {
-    const yfFallback = await fetchYahooChartPrice(norm.yahooFallbackSymbol, fetchImpl);
-    if (yfFallback !== null) return yfFallback;
-  }
-
-  return null;
+  const quote = await fetchStockQuote(rawTicker, fetchImpl, hint);
+  return quote ? quote.price : null;
 }
 
 /**
@@ -364,7 +487,8 @@ export async function refreshMarketData(
 ): Promise<{
   usdTwdRate: number;
   fxUpdated: boolean;
-  updatedTickers: Array<{ id: string; ticker: string; price: number }>;
+  updatedAt: string;
+  updatedTickers: Array<{ id: string; ticker: string; price: number; previousClose?: number }>;
   failedTickers: string[];
 }> {
   const nowIso = new Date().toISOString();
@@ -413,9 +537,9 @@ export async function refreshMarketData(
         )
         .all<{ user_id: string; id: string; ticker: string; sub_category?: string; currency?: string }>();
 
-  // Deduplicate price lookups across users/holdings using canonical market:symbol key
-  const priceCache = new Map<string, number | null>();
-  const updatedTickers: Array<{ id: string; ticker: string; price: number }> = [];
+  // Deduplicate quote lookups across users/holdings/watchlist using canonical market:symbol key
+  const quoteCache = new Map<string, StockQuoteResult | null>();
+  const updatedTickers: Array<{ id: string; ticker: string; price: number; previousClose?: number }> = [];
   const failedTickers: string[] = [];
 
   for (const item of autoAssets.results) {
@@ -426,26 +550,33 @@ export async function refreshMarketData(
     const norm = normalizeMarketTicker(item.ticker, hint);
     const cacheKey = norm ? `${norm.market}:${norm.yahooSymbol}` : item.ticker.trim().toUpperCase();
 
-    let price: number | null;
-    if (priceCache.has(cacheKey)) {
-      price = priceCache.get(cacheKey) ?? null;
+    let quote: StockQuoteResult | null;
+    if (quoteCache.has(cacheKey)) {
+      quote = quoteCache.get(cacheKey) ?? null;
     } else {
-      price = await fetchStockPrice(item.ticker, fetchImpl, hint);
-      priceCache.set(cacheKey, price);
+      quote = await fetchStockQuote(item.ticker, fetchImpl, hint);
+      quoteCache.set(cacheKey, quote);
     }
 
-    if (price !== null) {
+    if (quote !== null) {
       await db
         .prepare(
-          'UPDATE asset_items SET unit_price = ?, price_updated_at = ?, updated_at = ? WHERE user_id = ? AND id = ?'
+          `UPDATE asset_items
+           SET unit_price = ?, previous_close = COALESCE(?, previous_close), price_updated_at = ?, updated_at = ?
+           WHERE user_id = ? AND id = ?`
         )
-        .bind(price, nowIso, nowIso, item.user_id, item.id)
+        .bind(quote.price, quote.previousClose, nowIso, nowIso, item.user_id, item.id)
         .run();
-      updatedTickers.push({ id: item.id, ticker: item.ticker, price });
+      updatedTickers.push({
+        id: item.id,
+        ticker: item.ticker,
+        price: quote.price,
+        ...(quote.previousClose !== null ? { previousClose: quote.previousClose } : {}),
+      });
     } else {
       failedTickers.push(item.ticker);
     }
   }
 
-  return { usdTwdRate, fxUpdated, updatedTickers, failedTickers };
+  return { usdTwdRate, fxUpdated, updatedAt: nowIso, updatedTickers, failedTickers };
 }

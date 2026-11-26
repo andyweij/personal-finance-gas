@@ -1,6 +1,7 @@
 import {
   BILLING_CYCLES,
   CASHFLOW_TYPES,
+  DEFAULT_LEDGER_ID,
   RECURRING_CASHFLOW_TYPES,
   SINKING_FUND_CATEGORIES,
 } from '../../../shared/constants';
@@ -9,6 +10,7 @@ import {
   computeRecurringMonthlyTwd,
   computeSinkingMonthlyReserve,
   computeSinkingYtdSpent,
+  getEffectiveLedgerId,
 } from '../../../shared/calculations';
 import type { RecurringItem, SinkingFundItem } from '../../../shared/types';
 import {
@@ -22,14 +24,19 @@ import {
   openModal,
   showToast,
 } from './helpers';
+import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
 
 export function getFilteredRecurringItems(ctx: UiContext): RecurringItem[] {
   const snap = ctx.engine.getSnapshot();
+  const ledgerScope = ctx.state.recurringLedgerScope || 'all';
   return snap.recurringItems
     .filter((item) => {
       if (item.deletedAt) return false;
+      if (ledgerScope !== 'all' && ledgerScope !== 'net_worth') {
+        if (getEffectiveLedgerId(item) !== ledgerScope) return false;
+      }
       const f = ctx.state.recurringFilter;
       if (f === 'all') return true;
       if (f === 'income') return item.type.includes('收入');
@@ -53,6 +60,31 @@ export function getActiveSinkingItems(ctx: UiContext): SinkingFundItem[] {
 export function renderConfigTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
   const rate = snap.settings.usdTwdRate;
+  const ledgers = getActiveLedgers(ctx);
+  const ledgerNameMap = new Map(ledgers.map((l) => [l.id, l.name]));
+
+  const recLedgerBar = document.getElementById('recurringLedgerBar');
+  if (recLedgerBar) {
+    if (ledgers.length > 1) {
+      recLedgerBar.style.display = 'flex';
+      const curScope =
+        ctx.state.recurringLedgerScope === 'all' ||
+        ledgers.some((l) => l.id === ctx.state.recurringLedgerScope)
+          ? ctx.state.recurringLedgerScope
+          : 'all';
+      ctx.state.recurringLedgerScope = curScope;
+      renderLedgerSwitcherBar(ctx, recLedgerBar, {
+        mode: 'scope',
+        selectedValue: curScope,
+        onSelect: (nextScope) => {
+          ctx.state.recurringLedgerScope = nextScope === 'net_worth' ? 'all' : nextScope;
+          renderConfigTab(ctx);
+        },
+      });
+    } else {
+      recLedgerBar.style.display = 'none';
+    }
+  }
 
   const recList = el('recurringList');
   recList.innerHTML = '';
@@ -104,6 +136,13 @@ export function renderConfigTab(ctx: UiContext): void {
       badge.className = 'badge' + (item.type.includes('收入') ? ' green' : '');
       badge.textContent = item.type;
       sub.appendChild(badge);
+      const itemLedgerId = getEffectiveLedgerId(item);
+      if (ledgers.length > 1 && itemLedgerId !== DEFAULT_LEDGER_ID) {
+        const lgBadge = document.createElement('span');
+        lgBadge.className = 'badge warn';
+        lgBadge.textContent = ledgerNameMap.get(itemLedgerId) || '獨立帳本';
+        sub.appendChild(lgBadge);
+      }
       const specText = item.billingSpec ? ` (${item.billingSpec})` : '';
       const monthlyTwd = computeRecurringMonthlyTwd(item, rate);
       const linkedName = item.linkedAccountId ? savingsMap.get(item.linkedAccountId) : null;
@@ -226,7 +265,15 @@ export function renderConfigTab(ctx: UiContext): void {
 export function openRecurringModal(ctx: UiContext, existing: RecurringItem | null): void {
   const body = openModal(existing ? '編輯固定收支 / 訂閱' : '新增固定收支 / 訂閱');
   const form = document.createElement('form');
+  const initialLedgerId = existing
+    ? getEffectiveLedgerId(existing)
+    : ctx.state.recurringLedgerScope !== 'all' && ctx.state.recurringLedgerScope !== 'net_worth'
+      ? ctx.state.recurringLedgerScope
+      : DEFAULT_LEDGER_ID;
+
   form.appendChild(makeInputField('項目名稱', 'recName', 'text', existing?.itemName || '', '例如：本業月薪、Claude Pro', true));
+
+  form.appendChild(buildLedgerSelectField(ctx, 'recLedger', initialLedgerId, '所屬帳本'));
 
   const r1 = document.createElement('div');
   r1.className = 'row-2';
@@ -256,10 +303,7 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
     )
   );
 
-  // Linked savings account selector
-  const savingsAccounts = ctx.engine
-    .getSnapshot()
-    .assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings);
+  // Linked savings account selector (scoped to selected ledger)
   const linkWrap = document.createElement('div');
   linkWrap.className = 'field';
   const linkLbl = document.createElement('label');
@@ -268,17 +312,28 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
   linkLbl.textContent = '自動入帳連動活存帳戶（選填）';
   const linkSel = document.createElement('select');
   linkSel.id = 'recLinkedAccount';
-  const noneOpt = document.createElement('option');
-  noneOpt.value = '';
-  noneOpt.textContent = '不連動活存';
-  linkSel.appendChild(noneOpt);
-  for (const acc of savingsAccounts) {
-    const opt = document.createElement('option');
-    opt.value = acc.id;
-    opt.textContent = `${acc.isDefaultSavings ? '★ ' : ''}${acc.itemName}`;
-    if (existing?.linkedAccountId === acc.id) opt.selected = true;
-    linkSel.appendChild(opt);
-  }
+
+  const populateSavingsForLedger = (ledgerId: string, preferredAccId: string | null) => {
+    linkSel.innerHTML = '';
+    const noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = '不連動活存';
+    linkSel.appendChild(noneOpt);
+    const savingsAccounts = ctx.engine
+      .getSnapshot()
+      .assetItems.filter(
+        (a) => !a.deletedAt && a.isLinkedSavings && getEffectiveLedgerId(a) === ledgerId
+      );
+    for (const acc of savingsAccounts) {
+      const opt = document.createElement('option');
+      opt.value = acc.id;
+      opt.textContent = `${acc.isDefaultSavings ? '★ ' : ''}${acc.itemName}`;
+      if (preferredAccId === acc.id) opt.selected = true;
+      linkSel.appendChild(opt);
+    }
+  };
+  populateSavingsForLedger(initialLedgerId, existing?.linkedAccountId ?? null);
+
   linkWrap.appendChild(linkLbl);
   linkWrap.appendChild(linkSel);
   form.appendChild(linkWrap);
@@ -330,6 +385,7 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
         billingSpec: el<HTMLInputElement>('recSpec').value.trim(),
         status: el<HTMLSelectElement>('recStatus').value,
         linkedAccountId: el<HTMLSelectElement>('recLinkedAccount').value || null,
+        ledgerId: el<HTMLSelectElement>('recLedger').value || DEFAULT_LEDGER_ID,
         note: el<HTMLInputElement>('recNote').value.trim(),
       });
       closeModal();
@@ -341,6 +397,10 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
   });
 
   body.appendChild(form);
+  const ledgerSel = el<HTMLSelectElement>('recLedger');
+  ledgerSel.addEventListener('change', () => {
+    populateSavingsForLedger(ledgerSel.value || DEFAULT_LEDGER_ID, null);
+  });
 }
 
 export function openSinkingModal(ctx: UiContext, existing: SinkingFundItem | null): void {

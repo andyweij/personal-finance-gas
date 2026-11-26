@@ -1,5 +1,15 @@
-import { applySubsetReorder, compareBySortOrder } from '../../../shared/calculations';
-import { CASHFLOW_TYPES, RECURRING_CASHFLOW_TYPES, STOCK_TX_TYPES } from '../../../shared/constants';
+import {
+  applySubsetReorder,
+  compareBySortOrder,
+  ensureActiveLedgers,
+  getEffectiveLedgerId,
+} from '../../../shared/calculations';
+import {
+  CASHFLOW_TYPES,
+  DEFAULT_LEDGER_ID,
+  RECURRING_CASHFLOW_TYPES,
+  STOCK_TX_TYPES,
+} from '../../../shared/constants';
 import {
   sortUtilityRecords,
   validateUtilityRecordInput,
@@ -11,6 +21,7 @@ import type {
   AssetItem,
   CashFlowLog,
   FinanceSnapshot,
+  Ledger,
   PnlColorScheme,
   RecurringItem,
   RentUtilityRecord,
@@ -25,22 +36,25 @@ import type {
 } from '../../../shared/types';
 import {
   normalizeCustomStockCategories,
+  normalizeLedgerId,
   normalizePnlColorScheme,
   normalizeStockCategory,
   validateAssetInput,
   validateCashFlowInput,
+  validateLedgerInput,
   validateRecurringInput,
   validateSavingsAdjustmentInput,
   validateSinkingInput,
   validateStockTransactionInput,
   type AssetInputPayload,
   type CashFlowInputPayload,
+  type LedgerInputPayload,
   type RecurringInputPayload,
   type SavingsAdjustmentInputPayload,
   type SinkingInputPayload,
   type StockTransactionInputPayload,
 } from '../../../shared/validation';
-import { createEmptySnapshot, type LocalFinanceDB, type LocalMeta } from '../db/localDb';
+import { createDefaultLedger, createEmptySnapshot, type LocalFinanceDB, type LocalMeta } from '../db/localDb';
 
 export type SyncStateKind = 'synced' | 'syncing' | 'pending' | 'offline' | 'auth_required' | 'conflict';
 
@@ -224,6 +238,170 @@ export class SyncEngine {
 
   /* ==================== Local Optimistic CRUD (0ms) ==================== */
 
+  async saveLedger(payload: LedgerInputPayload & { id?: string }): Promise<Ledger> {
+    const v = validateLedgerInput(payload);
+    const nowIso = new Date().toISOString();
+    const id = payload.id ? normalizeLedgerId(payload.id) : crypto.randomUUID();
+    const currentLedgers = ensureActiveLedgers(this.snapshot.ledgers);
+    const existing = currentLedgers.find((l) => l.id === id);
+    const includeInNetWorth = id === DEFAULT_LEDGER_ID ? true : v.includeInNetWorth;
+    const sortOrder =
+      payload.sortOrder !== undefined
+        ? v.sortOrder
+        : existing
+          ? existing.sortOrder ?? 0
+          : this.nextSortOrderFor(currentLedgers);
+
+    const ledger: Ledger = {
+      id,
+      name: v.name,
+      includeInNetWorth,
+      monthlyDailyBudget: v.monthlyDailyBudget,
+      note: v.note,
+      sortOrder,
+      createdAt: existing?.createdAt || nowIso,
+      updatedAt: nowIso,
+      deletedAt: null,
+      ...(existing?.version !== undefined ? { version: existing.version } : {}),
+    };
+
+    this.snapshot = {
+      ...this.snapshot,
+      ledgers: mergeById(currentLedgers, [ledger]).sort(compareBySortOrder),
+    };
+
+    await this.commitAndMaybeSync([
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'ledger',
+        op: 'upsert',
+        recordId: id,
+        clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
+        payload: { ...ledger },
+      },
+    ]);
+    return ledger;
+  }
+
+  async deleteLedger(
+    id: string,
+    opts?: { migrateToLedgerId?: string }
+  ): Promise<{ migratedCount: number }> {
+    const lid = normalizeLedgerId(id);
+    if (lid === DEFAULT_LEDGER_ID) {
+      throw new Error('不可刪除預設個人主帳本。');
+    }
+    const nowIso = new Date().toISOString();
+    const currentLedgers = ensureActiveLedgers(this.snapshot.ledgers);
+    const existing = currentLedgers.find((l) => l.id === lid);
+    if (!existing) return { migratedCount: 0 };
+
+    const matchingLogs = this.snapshot.cashflowLogs.filter(
+      (l) => !l.deletedAt && getEffectiveLedgerId(l) === lid
+    );
+    const matchingAssets = this.snapshot.assetItems.filter(
+      (a) => !a.deletedAt && getEffectiveLedgerId(a) === lid
+    );
+    const matchingRecurring = this.snapshot.recurringItems.filter(
+      (r) => !r.deletedAt && getEffectiveLedgerId(r) === lid
+    );
+    const totalLinked = matchingLogs.length + matchingAssets.length + matchingRecurring.length;
+
+    const mutations: SyncMutation[] = [];
+    let nextLogs = this.snapshot.cashflowLogs;
+    let nextAssets = this.snapshot.assetItems;
+    let nextRecurring = this.snapshot.recurringItems;
+
+    if (totalLinked > 0) {
+      if (!opts?.migrateToLedgerId) {
+        throw new Error(
+          `此帳本仍有 ${totalLinked} 筆關聯紀錄（${matchingAssets.length} 資產、${matchingLogs.length} 流水帳、${matchingRecurring.length} 固定收支），請先轉移或清除後再刪除。`
+        );
+      }
+      const targetLedgerId = normalizeLedgerId(opts.migrateToLedgerId);
+      if (targetLedgerId === lid) {
+        throw new Error('轉移目標帳本不可為即將刪除的帳本。');
+      }
+
+      nextLogs = this.snapshot.cashflowLogs.map((l) => {
+        if (!l.deletedAt && getEffectiveLedgerId(l) === lid) {
+          const updated: CashFlowLog = { ...l, ledgerId: targetLedgerId, updatedAt: nowIso };
+          mutations.push({
+            mutationId: crypto.randomUUID(),
+            entity: 'cashflow',
+            op: 'upsert',
+            recordId: updated.id,
+            clientTimestamp: nowIso,
+            baseVersion: l.version ?? null,
+            payload: { ...updated },
+          });
+          return updated;
+        }
+        return l;
+      });
+
+      nextAssets = this.snapshot.assetItems.map((a) => {
+        if (!a.deletedAt && getEffectiveLedgerId(a) === lid) {
+          const updated: AssetItem = {
+            ...a,
+            ledgerId: targetLedgerId,
+            isDefaultSavings: false,
+            updatedAt: nowIso,
+          };
+          mutations.push({
+            mutationId: crypto.randomUUID(),
+            entity: 'asset',
+            op: 'upsert',
+            recordId: updated.id,
+            clientTimestamp: nowIso,
+            baseVersion: a.version ?? null,
+            payload: { ...updated },
+          });
+          return updated;
+        }
+        return a;
+      });
+
+      nextRecurring = this.snapshot.recurringItems.map((r) => {
+        if (!r.deletedAt && getEffectiveLedgerId(r) === lid) {
+          const updated: RecurringItem = { ...r, ledgerId: targetLedgerId, updatedAt: nowIso };
+          mutations.push({
+            mutationId: crypto.randomUUID(),
+            entity: 'recurring',
+            op: 'upsert',
+            recordId: updated.id,
+            clientTimestamp: nowIso,
+            baseVersion: r.version ?? null,
+            payload: { ...updated },
+          });
+          return updated;
+        }
+        return r;
+      });
+    }
+
+    mutations.push({
+      mutationId: crypto.randomUUID(),
+      entity: 'ledger',
+      op: 'delete',
+      recordId: lid,
+      clientTimestamp: nowIso,
+      baseVersion: existing.version ?? null,
+    });
+
+    this.snapshot = {
+      ...this.snapshot,
+      ledgers: currentLedgers.filter((l) => l.id !== lid),
+      cashflowLogs: nextLogs,
+      assetItems: nextAssets,
+      recurringItems: nextRecurring,
+    };
+
+    await this.commitAndMaybeSync(mutations);
+    return { migratedCount: totalLinked };
+  }
+
   async addCashFlow(payload: CashFlowInputPayload): Promise<CashFlowLog> {
     const validated = validateCashFlowInput(payload, this.snapshot.settings.usdTwdRate);
     const nowIso = new Date().toISOString();
@@ -263,6 +441,7 @@ export class SyncEngine {
         status: '啟用',
         note: record.note ? `[手機加入每月常態] ${record.note}` : '手機記帳加入每月常態',
         linkedAccountId: record.linkedAccountId,
+        ledgerId: record.ledgerId,
         sortOrder: this.nextSortOrderFor(nextRecurring),
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -580,9 +759,14 @@ export class SyncEngine {
     const id = payload.id || crypto.randomUUID();
     const existing = this.snapshot.assetItems.find((a) => a.id === id);
 
-    // If this is the first linked savings account, auto-promote as default
+    // If this is the first linked savings account in this ledger, auto-promote as default for this ledger
+    const targetLedgerId = v.ledgerId;
     const otherSavings = this.snapshot.assetItems.filter(
-      (a) => !a.deletedAt && a.isLinkedSavings && a.id !== id
+      (a) =>
+        !a.deletedAt &&
+        a.isLinkedSavings &&
+        a.id !== id &&
+        getEffectiveLedgerId(a) === targetLedgerId
     );
     const isDefaultSavings = v.isLinkedSavings
       ? v.isDefaultSavings || otherSavings.length === 0
@@ -605,10 +789,23 @@ export class SyncEngine {
     const item: AssetItem = {
       id,
       ...v,
-      unitPrice: payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? 1,
-      costBasis: payload.costBasis !== undefined ? v.costBasis : existing?.costBasis ?? null,
+      unitPrice: payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? (v.isWatchlist ? 0 : 1),
+      previousClose:
+        payload.previousClose !== undefined ? v.previousClose : existing?.previousClose ?? null,
+      costBasis:
+        v.isWatchlist
+          ? null
+          : payload.costBasis !== undefined
+            ? v.costBasis
+            : existing?.costBasis ?? null,
       stockCategory:
         payload.stockCategory !== undefined ? v.stockCategory : existing?.stockCategory ?? '',
+      isWatchlist: v.isWatchlist,
+      ledgerId: targetLedgerId,
+      excludeFromNetWorth:
+        payload.excludeFromNetWorth !== undefined
+          ? v.excludeFromNetWorth
+          : existing?.excludeFromNetWorth ?? false,
       priceUpdatedAt: existing?.priceUpdatedAt ?? null,
       balanceAnchorDate,
       balanceAnchorAt,
@@ -621,7 +818,10 @@ export class SyncEngine {
     };
 
     const updatedAssets = this.snapshot.assetItems.map((a) =>
-      isDefaultSavings && a.id !== id && a.isDefaultSavings
+      isDefaultSavings &&
+      a.id !== id &&
+      a.isDefaultSavings &&
+      getEffectiveLedgerId(a) === targetLedgerId
         ? { ...a, isDefaultSavings: false, updatedAt: nowIso }
         : a
     );
@@ -838,6 +1038,11 @@ export class SyncEngine {
             ? `${asset.itemName} 現金配息`
             : `${asset.itemName} 賣出 ${v.shares}股`;
 
+      const linkedAcc = payload.linkedAccountId
+        ? this.snapshot.assetItems.find((a) => !a.deletedAt && a.id === payload.linkedAccountId)
+        : undefined;
+      const cfLedgerId = linkedAcc?.ledgerId || asset.ledgerId || DEFAULT_LEDGER_ID;
+
       const validatedCf = validateCashFlowInput(
         {
           date: v.date,
@@ -849,6 +1054,7 @@ export class SyncEngine {
           source: '手機記帳',
           note: v.note ? `[持股連動] ${v.note}` : '[持股連動]',
           linkedAccountId: payload.linkedAccountId || null,
+          ledgerId: cfLedgerId,
         },
         this.snapshot.settings.usdTwdRate
       );
@@ -1093,6 +1299,16 @@ export class SyncEngine {
       if (record) this.snapshot = { ...this.snapshot, settings: record as unknown as AppSettings };
       return;
     }
+    if (entity === 'ledger') {
+      const current = ensureActiveLedgers(this.snapshot.ledgers);
+      const filtered = current.filter((l) => l.id !== recordId);
+      const next =
+        !isDelete && record && !record.deletedAt
+          ? [...filtered, record as unknown as Ledger]
+          : filtered;
+      this.snapshot = { ...this.snapshot, ledgers: ensureActiveLedgers(next) };
+      return;
+    }
     if (entity === 'utility_rents') {
       if (record) this.snapshot = { ...this.snapshot, rentUtilityRents: record as unknown as RentUtilityRents };
       return;
@@ -1331,13 +1547,18 @@ export class SyncEngine {
   }
 
   private mergeDelta(current: FinanceSnapshot, delta: SyncDelta, isFull: boolean): FinanceSnapshot {
+    const incomingLedgers = Array.isArray(delta.ledgers) ? delta.ledgers : [];
     const incomingUtilityRecords = Array.isArray(delta.rentUtilityRecords) ? delta.rentUtilityRecords : [];
     const incomingUtilityRents = delta.rentUtilityRents || current.rentUtilityRents;
     const incomingAdjs = delta.savingsAdjustments || [];
     const incomingStockTxs = delta.stockTransactions || [];
     if (isFull) {
+      const fullLedgers = ensureActiveLedgers(
+        incomingLedgers.length > 0 ? incomingLedgers.filter((l) => !l.deletedAt) : [createDefaultLedger()]
+      );
       return {
         settings: delta.settings || current.settings,
+        ledgers: fullLedgers,
         cashflowLogs: this.sortCashFlows(delta.cashflowLogs.filter((l) => !l.deletedAt)),
         recurringItems: delta.recurringItems.filter((r) => !r.deletedAt).sort(compareBySortOrder),
         sinkingItems: delta.sinkingItems.filter((s) => !s.deletedAt).sort(compareBySortOrder),
@@ -1361,8 +1582,13 @@ export class SyncEngine {
       historyMap.set(h.yearMonth, h);
     }
 
+    const mergedLedgers = ensureActiveLedgers(
+      mergeById(ensureActiveLedgers(current.ledgers), incomingLedgers).sort(compareBySortOrder)
+    );
+
     return {
       settings: delta.settings || current.settings,
+      ledgers: mergedLedgers,
       cashflowLogs: this.sortCashFlows(mergeById(current.cashflowLogs, delta.cashflowLogs)),
       recurringItems: mergeById(current.recurringItems, delta.recurringItems).sort(compareBySortOrder),
       sinkingItems: mergeById(current.sinkingItems, delta.sinkingItems).sort(compareBySortOrder),

@@ -3,8 +3,14 @@ import {
   computeAllSavingsSummary,
   computeStockPortfolioSummary,
   computeStockPositionSummary,
+  computeWatchlistSummary,
 } from '../../../shared/calculations';
-import type { AssetItem, StockPositionSummary, StockTransaction } from '../../../shared/types';
+import type {
+  AssetItem,
+  StockPositionSummary,
+  StockTransaction,
+  WatchlistItemSummary,
+} from '../../../shared/types';
 import { normalizeStockCategory } from '../../../shared/validation';
 import {
   closeModal,
@@ -49,10 +55,33 @@ export function getOrderedStockIds(ctx: UiContext): string[] {
   return portfolio.positions.map((p) => p.asset.id);
 }
 
+export function getOrderedWatchlistIds(ctx: UiContext): string[] {
+  const snap = ctx.engine.getSnapshot();
+  return computeWatchlistSummary(snap.assetItems).items.map((w) => w.asset.id);
+}
+
 function todayYmdLocal(): string {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+export function fmtQuoteTimestamp(iso?: string | null): string {
+  if (!iso) return '尚未更新';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '尚未更新';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const now = new Date();
+  const isToday =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const diffMin = Math.floor((now.getTime() - d.getTime()) / 60000);
+  if (diffMin >= 0 && diffMin < 1) return `剛剛 (${hm})`;
+  if (diffMin >= 1 && diffMin < 60) return `${diffMin} 分鐘前 (${hm})`;
+  if (isToday) return `今日 ${hm}`;
+  return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${hm}`;
 }
 
 function fmtPrice(n: number, masked: boolean, currency = 'TWD'): string {
@@ -81,15 +110,55 @@ function fmtSignedCurrency(n: number, currency: string, masked: boolean): string
   return fmtCurrencyAmount(0, currency, false);
 }
 
-function fmtSignedPct(pct: number, masked: boolean): string {
+function fmtSignedPct(pct: number, masked: boolean, decimals = 1): string {
   if (masked) return '••%';
   const num = Number(pct || 0);
   const sign = num > 0 ? '+' : '';
-  return `${sign}${num.toFixed(1)}%`;
+  return `${sign}${num.toFixed(decimals)}%`;
 }
 
 function fmtShares(shares: number): string {
   return Number(shares || 0).toLocaleString('zh-TW', { maximumFractionDigits: 4 });
+}
+
+function createDailyChangeBadge(
+  dailyChange: number | null,
+  dailyChangePct: number | null,
+  currency: string,
+  masked: boolean,
+  compact = false
+): HTMLSpanElement {
+  const pill = document.createElement('span');
+  if (dailyChange === null || dailyChangePct === null) {
+    pill.className = 'daily-change-pill flat tnum';
+    pill.textContent = '昨收待更新';
+    return pill;
+  }
+  const dirCls = dailyChange > 0 ? 'pos' : dailyChange < 0 ? 'neg' : 'flat';
+  pill.className = `daily-change-pill ${dirCls} tnum`;
+  if (masked) {
+    pill.textContent = dailyChange > 0 ? '▲ ••%' : dailyChange < 0 ? '▼ ••%' : '0.00%';
+    return pill;
+  }
+  const arrow = dailyChange > 0 ? '▲' : dailyChange < 0 ? '▼' : '▬';
+  const sign = dailyChange > 0 ? '+' : '';
+  const absDec = Math.abs(dailyChange) < 1 && dailyChange !== 0 ? 3 : 2;
+  const prefix = currency === 'USD' ? 'US$' : '';
+  const diffStr = `${sign}${prefix}${dailyChange.toFixed(absDec)}`;
+  const pctStr = fmtSignedPct(dailyChangePct, false, 2);
+  pill.textContent = compact ? `${arrow} ${pctStr}` : `${arrow} ${diffStr} (${pctStr})`;
+  return pill;
+}
+
+function toggleStockFlip(ctx: UiContext, assetId: string, innerEl: HTMLElement): void {
+  const idx = ctx.state.flippedStockIds.indexOf(assetId);
+  if (idx >= 0) {
+    ctx.state.flippedStockIds.splice(idx, 1);
+    innerEl.classList.remove('is-flipped');
+  } else {
+    ctx.state.flippedStockIds.push(assetId);
+    innerEl.classList.add('is-flipped');
+  }
 }
 
 function isUnitPriceSuspicious(impliedUnitPrice: number, marketPrice: number): boolean {
@@ -176,15 +245,58 @@ export function renderStocksTab(ctx: UiContext): void {
     snap.stockTransactions || [],
     rate
   );
+  const watchlist = computeWatchlistSummary(snap.assetItems);
   const masked = ctx.state.masked;
   const viewMode = ctx.state.stockPriceViewMode;
+  const cardMode = ctx.state.stockCardDisplayMode;
+  const subtab = ctx.state.stocksSubtab;
 
   document.querySelectorAll<HTMLButtonElement>('#stockViewModeToggle .mini-seg-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.stockView === viewMode);
   });
+  document.querySelectorAll<HTMLButtonElement>('#stockCardModeToggle .mini-seg-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.cardMode === cardMode);
+  });
+  document.querySelectorAll<HTMLButtonElement>('#stocksSubtabBar [data-stocks-sub]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.stocksSub === subtab);
+  });
 
   el('stocksCountBadge').textContent = `${portfolio.positions.length} 檔`;
+  el('stocksHoldingsSubBadge').textContent = String(portfolio.positions.length);
+  el('stocksWatchlistSubBadge').textContent = String(watchlist.items.length);
   el('stocksMarketValueHero').textContent = fmtMoney(portfolio.totalMarketValueTwd, masked);
+
+  // Hero today's total daily PnL badge
+  const heroDailyBadge = el('stocksHeroDailyBadge');
+  if (portfolio.totalDailyPnlTwd !== null && portfolio.totalDailyChangePct !== null) {
+    heroDailyBadge.style.display = 'inline-flex';
+    const dirCls =
+      portfolio.totalDailyPnlTwd > 0 ? 'pos' : portfolio.totalDailyPnlTwd < 0 ? 'neg' : 'flat';
+    heroDailyBadge.className = `daily-change-pill ${dirCls} tnum`;
+    const arrow =
+      portfolio.totalDailyPnlTwd > 0 ? '▲' : portfolio.totalDailyPnlTwd < 0 ? '▼' : '▬';
+    heroDailyBadge.textContent = masked
+      ? `今日 ${arrow} •••`
+      : `今日 ${arrow} ${fmtSignedCurrency(portfolio.totalDailyPnlTwd, 'TWD', false)} (${fmtSignedPct(portfolio.totalDailyChangePct, false, 2)})`;
+  } else {
+    heroDailyBadge.style.display = 'none';
+  }
+
+  // Latest stock quote & FX updated timestamp bar
+  const latestStockTs = [portfolio.latestPriceUpdatedAt, watchlist.latestPriceUpdatedAt]
+    .filter((v): v is string => Boolean(v))
+    .sort()
+    .pop() || null;
+  const fxTs = snap.settings.fxUpdatedAt || null;
+  const updatedBar = el('stocksQuoteUpdatedBar');
+  if (latestStockTs || fxTs) {
+    const parts: string[] = [];
+    if (latestStockTs) parts.push(`股價更新：${fmtQuoteTimestamp(latestStockTs)}`);
+    if (fxTs) parts.push(`匯率更新：${fmtQuoteTimestamp(fxTs)}`);
+    updatedBar.textContent = parts.join(' · ');
+  } else {
+    updatedBar.textContent = '股價尚未自動更新 · 點下方「更新股價匯率」同步最新行情與昨收';
+  }
 
   const priceOnlyEl = el('stocksPricePnlText');
   const priceOnlySubEl = el('stocksPricePnlSub');
@@ -247,72 +359,295 @@ export function renderStocksTab(ctx: UiContext): void {
     unrecoveredText.textContent = `未回本成本 ${fmtMoney(portfolio.totalUnrecoveredCostTwd, masked)}`;
   }
 
-  // Render stock allocation chart card
-  renderStockChartCard(ctx, portfolio, el('stocksChartCard'), {
-    onManageCategories: () => openStockCategoryManagerModal(ctx),
-  });
+  // Render stock allocation chart card (holdings only; hide when on watchlist subtab)
+  const chartCard = el('stocksChartCard');
+  if (subtab === 'holdings') {
+    renderStockChartCard(ctx, portfolio, chartCard, {
+      onManageCategories: () => openStockCategoryManagerModal(ctx),
+    });
+  } else {
+    chartCard.style.display = 'none';
+  }
 
-  // Reorder button visibility
+  // Action button label & reorder button visibility
+  const addBtn = el<HTMLButtonElement>('addStockBtn');
+  addBtn.textContent = subtab === 'watchlist' ? '+ 新增觀察' : '+ 新增持股';
+
   const reorderBtn = el<HTMLButtonElement>('reorderStocksBtn');
-  const isReordering = ctx.state.reorderSection === 'stocks';
-  reorderBtn.style.display = portfolio.positions.length >= 2 && !isReordering ? '' : 'none';
+  const isReorderingHoldings = ctx.state.reorderSection === 'stocks';
+  const isReorderingWatchlist = ctx.state.reorderSection === 'watchlist';
+  if (subtab === 'holdings') {
+    reorderBtn.style.display = portfolio.positions.length >= 2 && !isReorderingHoldings ? '' : 'none';
+  } else {
+    reorderBtn.style.display = watchlist.items.length >= 2 && !isReorderingWatchlist ? '' : 'none';
+  }
 
-  // Render stock cards list (or reorder editor)
-  const list = el('stocksPortfolioList');
-  list.innerHTML = '';
+  const portfolioList = el('stocksPortfolioList');
+  const watchlistList = el('stocksWatchlistList');
+  portfolioList.style.display = subtab === 'holdings' ? 'flex' : 'none';
+  watchlistList.style.display = subtab === 'watchlist' ? 'flex' : 'none';
 
-  if (!portfolio.positions.length) {
+  // ---- Render Holdings Subtab ----
+  if (subtab === 'holdings') {
+    portfolioList.innerHTML = '';
+
+    if (!portfolio.positions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'card';
+      empty.style.cssText = 'text-align:center;padding:28px 18px;display:flex;flex-direction:column;align-items:center;gap:10px';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-size:15px;font-weight:700';
+      title.textContent = '尚無股票持股紀錄';
+      const desc = document.createElement('div');
+      desc.className = 'muted';
+      desc.textContent = '可直接建立持股並填入平均成本（支援單價 39 或總額 39,000），之後隨時加碼與登錄配息配股';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-primary btn-sm';
+      btn.textContent = '+ 建立第一檔持股';
+      btn.addEventListener('click', () => openStockBaselineModal(ctx, null));
+      empty.appendChild(title);
+      empty.appendChild(desc);
+      empty.appendChild(btn);
+      portfolioList.appendChild(empty);
+      return;
+    }
+
+    if (isReorderingHoldings && portfolio.positions.length >= 2) {
+      renderReorderList(ctx, {
+        container: portfolioList,
+        section: 'stocks',
+        wrapInCard: true,
+        items: portfolio.positions.map((pos) => {
+          const weightPct =
+            portfolio.totalMarketValueTwd > 0
+              ? ((pos.marketValueTwd / portfolio.totalMarketValueTwd) * 100).toFixed(1)
+              : '0.0';
+          return {
+            id: pos.asset.id,
+            title: pos.asset.itemName,
+            badge: pos.asset.ticker || pos.asset.subCategory,
+            subtitle: `${fmtShares(pos.currentShares)} 股 · 市值 ${fmtMoney(pos.marketValueTwd, masked)} (${weightPct}%)`,
+          };
+        }),
+        onSave: (orderedIds) => ctx.engine.reorderAssets(orderedIds),
+        onReRender: () => renderStocksTab(ctx),
+      });
+      return;
+    }
+
+    for (const pos of portfolio.positions) {
+      const weightPct =
+        portfolio.totalMarketValueTwd > 0
+          ? (pos.marketValueTwd / portfolio.totalMarketValueTwd) * 100
+          : 0;
+      portfolioList.appendChild(
+        cardMode === 'flip'
+          ? renderStockFlipCard(ctx, pos, weightPct)
+          : renderStockPositionCard(ctx, pos, weightPct)
+      );
+    }
+    return;
+  }
+
+  // ---- Render Watchlist Subtab ----
+  watchlistList.innerHTML = '';
+
+  if (!watchlist.items.length) {
     const empty = document.createElement('div');
     empty.className = 'card';
     empty.style.cssText = 'text-align:center;padding:28px 18px;display:flex;flex-direction:column;align-items:center;gap:10px';
     const title = document.createElement('div');
     title.style.cssText = 'font-size:15px;font-weight:700';
-    title.textContent = '尚無股票持股紀錄';
+    title.textContent = '觀察清單目前是空的';
     const desc = document.createElement('div');
     desc.className = 'muted';
-    desc.textContent = '可直接建立持股並填入平均成本（支援單價 39 或總額 39,000），之後隨時加碼與登錄配息配股';
+    desc.textContent = '加入想追蹤的台股或美股／ETF，系統會自動同步現價與昨收漲跌，但不會計入你的總資產與持股損益';
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'btn btn-primary btn-sm';
-    btn.textContent = '+ 建立第一檔持股';
-    btn.addEventListener('click', () => openStockBaselineModal(ctx, null));
+    btn.textContent = '+ 加入第一檔觀察標的';
+    btn.addEventListener('click', () => openWatchlistModal(ctx, null));
     empty.appendChild(title);
     empty.appendChild(desc);
     empty.appendChild(btn);
-    list.appendChild(empty);
+    watchlistList.appendChild(empty);
     return;
   }
 
-  if (isReordering && portfolio.positions.length >= 2) {
+  if (isReorderingWatchlist && watchlist.items.length >= 2) {
     renderReorderList(ctx, {
-      container: list,
-      section: 'stocks',
+      container: watchlistList,
+      section: 'watchlist',
       wrapInCard: true,
-      items: portfolio.positions.map((pos) => {
-        const weightPct =
-          portfolio.totalMarketValueTwd > 0
-            ? ((pos.marketValueTwd / portfolio.totalMarketValueTwd) * 100).toFixed(1)
-            : '0.0';
-        return {
-          id: pos.asset.id,
-          title: pos.asset.itemName,
-          badge: pos.asset.ticker || pos.asset.subCategory,
-          subtitle: `${fmtShares(pos.currentShares)} 股 · 市值 ${fmtMoney(pos.marketValueTwd, masked)} (${weightPct}%)`,
-        };
-      }),
+      items: watchlist.items.map((w) => ({
+        id: w.asset.id,
+        title: w.asset.itemName,
+        badge: w.asset.ticker || w.asset.subCategory,
+        subtitle:
+          w.marketPrice > 0
+            ? `現價 ${fmtPrice(w.marketPrice, masked, w.asset.currency)}`
+            : '尚未取得報價',
+      })),
       onSave: (orderedIds) => ctx.engine.reorderAssets(orderedIds),
       onReRender: () => renderStocksTab(ctx),
     });
     return;
   }
 
-  for (const pos of portfolio.positions) {
-    const weightPct =
-      portfolio.totalMarketValueTwd > 0
-        ? (pos.marketValueTwd / portfolio.totalMarketValueTwd) * 100
-        : 0;
-    list.appendChild(renderStockPositionCard(ctx, pos, weightPct));
+  for (const item of watchlist.items) {
+    watchlistList.appendChild(
+      cardMode === 'flip' ? renderWatchlistFlipCard(ctx, item) : renderWatchlistCard(ctx, item)
+    );
   }
+}
+
+function renderStockMetricsGrid(
+  pos: StockPositionSummary,
+  viewMode: 'unit' | 'total',
+  masked: boolean,
+  curr: string
+): HTMLElement {
+  const grid = document.createElement('div');
+  grid.className = 'stock-metrics-grid';
+
+  // Box 1: 帳面價差（不含息）
+  const box1 = document.createElement('div');
+  box1.className = 'stock-metric-box';
+  const b1Head = document.createElement('div');
+  b1Head.className = 'stock-metric-label';
+  b1Head.textContent = '帳面價差（不含息）';
+
+  const b1Cost = document.createElement('div');
+  b1Cost.className = 'stock-metric-cost tnum';
+  b1Cost.textContent =
+    viewMode === 'unit'
+      ? `原均價 ${fmtPrice(pos.avgCostPerShare, masked, curr)} /股`
+      : `投入成本 ${fmtCurrencyAmount(pos.costBasis, curr, masked)}`;
+
+  const b1Pnl = document.createElement('div');
+  b1Pnl.className =
+    'stock-metric-pnl tnum' +
+    (pos.unrealizedPnl > 0 ? ' pos' : pos.unrealizedPnl < 0 ? ' neg' : '');
+  if (viewMode === 'unit' && pos.currentShares > 0) {
+    const unitDiff = pos.marketPrice - pos.avgCostPerShare;
+    const uSign = unitDiff > 0 ? '+' : '';
+    b1Pnl.textContent = masked
+      ? '•••••'
+      : `${uSign}${unitDiff.toFixed(2)}/股 (${fmtSignedPct(pos.unrealizedRoiPct, false)})`;
+  } else {
+    b1Pnl.textContent = masked
+      ? '•••••'
+      : `${fmtSignedCurrency(pos.unrealizedPnl, curr, false)} (${fmtSignedPct(pos.unrealizedRoiPct, false)})`;
+  }
+
+  const b1Sub = document.createElement('div');
+  b1Sub.className = 'stock-metric-sub tnum';
+  b1Sub.textContent =
+    viewMode === 'unit'
+      ? `帳面淨利 ${fmtSignedCurrency(pos.unrealizedPnl, curr, masked)}`
+      : `原均價 ${fmtPrice(pos.avgCostPerShare, masked, curr)} /股`;
+
+  box1.appendChild(b1Head);
+  box1.appendChild(b1Cost);
+  box1.appendChild(b1Pnl);
+  box1.appendChild(b1Sub);
+
+  // Box 2: 配息降成本（含息總報酬）
+  const box2 = document.createElement('div');
+  box2.className = 'stock-metric-box tinted';
+  const b2Head = document.createElement('div');
+  b2Head.className = 'stock-metric-label';
+  b2Head.textContent = '配息扣成本（含息）';
+
+  const b2Cost = document.createElement('div');
+  b2Cost.className = 'stock-metric-cost tnum';
+  if (pos.isCostRecovered) {
+    b2Cost.textContent =
+      viewMode === 'unit'
+        ? `未回本 ${fmtPrice(0, masked, curr)} /股（歸零）`
+        : `未回本 ${fmtCurrencyAmount(0, curr, masked)}（歸零）`;
+  } else {
+    b2Cost.textContent =
+      viewMode === 'unit'
+        ? `未回本 ${fmtPrice(pos.unrecoveredCostPerShare, masked, curr)} /股`
+        : `未回本 ${fmtCurrencyAmount(pos.unrecoveredCost, curr, masked)}`;
+  }
+
+  const b2Pnl = document.createElement('div');
+  b2Pnl.className =
+    'stock-metric-pnl tnum' +
+    (pos.totalReturnPnl > 0 ? ' pos' : pos.totalReturnPnl < 0 ? ' neg' : '');
+  b2Pnl.textContent = masked
+    ? '•••••'
+    : `${fmtSignedCurrency(pos.totalReturnPnl, curr, false)} (${fmtSignedPct(pos.totalReturnRoiPct, false)})`;
+
+  const b2Sub = document.createElement('div');
+  b2Sub.className = 'stock-metric-sub tnum';
+  if (pos.excessRecoveredCash > 0) {
+    b2Sub.textContent = `超額回收 +${fmtCurrencyAmount(pos.excessRecoveredCash, curr, masked)}`;
+  } else {
+    b2Sub.textContent = `累計配息 ${fmtCurrencyAmount(pos.cumulativeCashDividends, curr, masked)}`;
+  }
+
+  box2.appendChild(b2Head);
+  box2.appendChild(b2Cost);
+  box2.appendChild(b2Pnl);
+  box2.appendChild(b2Sub);
+
+  grid.appendChild(box1);
+  grid.appendChild(box2);
+  return grid;
+}
+
+function renderStockCardActions(
+  ctx: UiContext,
+  pos: StockPositionSummary,
+  stopProp = false
+): HTMLElement {
+  const actions = document.createElement('div');
+  actions.className = 'stock-card-actions';
+
+  const wire = (btn: HTMLButtonElement, fn: () => void) => {
+    btn.addEventListener('click', (e) => {
+      if (stopProp) e.stopPropagation();
+      fn();
+    });
+  };
+
+  const buyBtn = document.createElement('button');
+  buyBtn.type = 'button';
+  buyBtn.className = 'btn btn-tinted btn-sm';
+  buyBtn.textContent = '+ 加碼';
+  wire(buyBtn, () => openStockTradeModal(ctx, pos.asset, 'buy'));
+
+  const divBtn = document.createElement('button');
+  divBtn.type = 'button';
+  divBtn.className = 'btn btn-tinted btn-sm';
+  divBtn.textContent = '配息/配股';
+  wire(divBtn, () => openStockDividendModal(ctx, pos.asset));
+
+  const sellBtn = document.createElement('button');
+  sellBtn.type = 'button';
+  sellBtn.className = 'btn btn-outline btn-sm';
+  sellBtn.textContent = '賣出';
+  wire(sellBtn, () => openStockTradeModal(ctx, pos.asset, 'sell'));
+
+  const histBtn = document.createElement('button');
+  histBtn.type = 'button';
+  histBtn.className = 'btn btn-outline btn-sm';
+  histBtn.textContent = pos.transactionCount > 0 ? `明細 (${pos.transactionCount})` : '設成本';
+  wire(histBtn, () =>
+    pos.transactionCount > 0
+      ? openStockHistoryModal(ctx, pos.asset)
+      : openStockBaselineModal(ctx, pos.asset)
+  );
+
+  actions.appendChild(buyBtn);
+  actions.appendChild(divBtn);
+  actions.appendChild(sellBtn);
+  actions.appendChild(histBtn);
+  return actions;
 }
 
 function renderStockPositionCard(
@@ -383,10 +718,12 @@ function renderStockPositionCard(
     curr === 'TWD' && pos.currentShares >= 1000 && pos.currentShares % 1000 === 0
       ? ` (${pos.currentShares / 1000} 張)`
       : '';
+  const prevCloseStr =
+    pos.previousClose !== null ? ` · 昨收 ${fmtPrice(pos.previousClose, masked, curr)}` : '';
   subRow.textContent =
     viewMode === 'unit'
-      ? `持有 ${fmtShares(pos.currentShares)} 股${lotsHint} · 市值 ${fmtCurrencyAmount(pos.marketValue, curr, masked)}`
-      : `持有 ${fmtShares(pos.currentShares)} 股${lotsHint} · 現價 ${fmtPrice(pos.marketPrice, masked, curr)}`;
+      ? `持有 ${fmtShares(pos.currentShares)} 股${lotsHint} · 市值 ${fmtCurrencyAmount(pos.marketValue, curr, masked)}${prevCloseStr}`
+      : `持有 ${fmtShares(pos.currentShares)} 股${lotsHint} · 現價 ${fmtPrice(pos.marketPrice, masked, curr)}${prevCloseStr}`;
 
   left.appendChild(titleRow);
   left.appendChild(subRow);
@@ -395,6 +732,9 @@ function renderStockPositionCard(
   right.className = 'stock-head-right tnum';
   const primaryVal = document.createElement('div');
   primaryVal.className = 'stock-head-val';
+  if (pos.dailyChange !== null && pos.dailyChange !== 0) {
+    primaryVal.style.color = pos.dailyChange > 0 ? 'var(--stock-pos)' : 'var(--stock-neg)';
+  }
   primaryVal.textContent =
     viewMode === 'unit'
       ? fmtPrice(pos.marketPrice, masked, curr)
@@ -414,6 +754,29 @@ function renderStockPositionCard(
   head.appendChild(right);
   card.appendChild(head);
 
+  // Daily change strip (yesterday close vs today + per-stock updated time)
+  const quoteStrip = document.createElement('div');
+  quoteStrip.className = 'stock-quote-strip tnum';
+  const stripLeft = document.createElement('div');
+  stripLeft.className = 'stock-quote-strip-left';
+  stripLeft.appendChild(createDailyChangeBadge(pos.dailyChange, pos.dailyChangePct, curr, masked));
+  if (pos.dailyPnlTwd !== null && pos.currentShares > 0) {
+    const dpSpan = document.createElement('span');
+    dpSpan.className =
+      'stock-daily-pnl ' +
+      (pos.dailyPnlTwd > 0 ? 'pos' : pos.dailyPnlTwd < 0 ? 'neg' : '');
+    dpSpan.textContent = `今日 ${fmtSignedCurrency(pos.dailyPnlTwd, 'TWD', masked)}`;
+    stripLeft.appendChild(dpSpan);
+  }
+  const stripTime = document.createElement('span');
+  stripTime.className = 'stock-quote-time';
+  stripTime.textContent = pos.asset.priceUpdatedAt
+    ? fmtQuoteTimestamp(pos.asset.priceUpdatedAt)
+    : pos.asset.updateMode;
+  quoteStrip.appendChild(stripLeft);
+  quoteStrip.appendChild(stripTime);
+  card.appendChild(quoteStrip);
+
   // Metrics section (Price-only vs Dividend-adjusted coexisting side-by-side)
   if (!pos.hasCostBasis) {
     const prompt = document.createElement('div');
@@ -429,96 +792,7 @@ function renderStockPositionCard(
     prompt.appendChild(setBtn);
     card.appendChild(prompt);
   } else {
-    const grid = document.createElement('div');
-    grid.className = 'stock-metrics-grid';
-
-    // Box 1: 帳面價差（不含息）
-    const box1 = document.createElement('div');
-    box1.className = 'stock-metric-box';
-    const b1Head = document.createElement('div');
-    b1Head.className = 'stock-metric-label';
-    b1Head.textContent = '帳面價差（不含息）';
-
-    const b1Cost = document.createElement('div');
-    b1Cost.className = 'stock-metric-cost tnum';
-    b1Cost.textContent =
-      viewMode === 'unit'
-        ? `原均價 ${fmtPrice(pos.avgCostPerShare, masked, curr)} /股`
-        : `投入成本 ${fmtCurrencyAmount(pos.costBasis, curr, masked)}`;
-
-    const b1Pnl = document.createElement('div');
-    b1Pnl.className =
-      'stock-metric-pnl tnum' +
-      (pos.unrealizedPnl > 0 ? ' pos' : pos.unrealizedPnl < 0 ? ' neg' : '');
-    if (viewMode === 'unit' && pos.currentShares > 0) {
-      const unitDiff = pos.marketPrice - pos.avgCostPerShare;
-      const uSign = unitDiff > 0 ? '+' : '';
-      b1Pnl.textContent = masked
-        ? '•••••'
-        : `${uSign}${unitDiff.toFixed(2)}/股 (${fmtSignedPct(pos.unrealizedRoiPct, false)})`;
-    } else {
-      b1Pnl.textContent = masked
-        ? '•••••'
-        : `${fmtSignedCurrency(pos.unrealizedPnl, curr, false)} (${fmtSignedPct(pos.unrealizedRoiPct, false)})`;
-    }
-
-    const b1Sub = document.createElement('div');
-    b1Sub.className = 'stock-metric-sub tnum';
-    b1Sub.textContent =
-      viewMode === 'unit'
-        ? `帳面淨利 ${fmtSignedCurrency(pos.unrealizedPnl, curr, masked)}`
-        : `原均價 ${fmtPrice(pos.avgCostPerShare, masked, curr)} /股`;
-
-    box1.appendChild(b1Head);
-    box1.appendChild(b1Cost);
-    box1.appendChild(b1Pnl);
-    box1.appendChild(b1Sub);
-
-    // Box 2: 配息降成本（含息總報酬）
-    const box2 = document.createElement('div');
-    box2.className = 'stock-metric-box tinted';
-    const b2Head = document.createElement('div');
-    b2Head.className = 'stock-metric-label';
-    b2Head.textContent = '配息扣成本（含息）';
-
-    const b2Cost = document.createElement('div');
-    b2Cost.className = 'stock-metric-cost tnum';
-    if (pos.isCostRecovered) {
-      b2Cost.textContent =
-        viewMode === 'unit'
-          ? `未回本 ${fmtPrice(0, masked, curr)} /股（歸零）`
-          : `未回本 ${fmtCurrencyAmount(0, curr, masked)}（歸零）`;
-    } else {
-      b2Cost.textContent =
-        viewMode === 'unit'
-          ? `未回本 ${fmtPrice(pos.unrecoveredCostPerShare, masked, curr)} /股`
-          : `未回本 ${fmtCurrencyAmount(pos.unrecoveredCost, curr, masked)}`;
-    }
-
-    const b2Pnl = document.createElement('div');
-    b2Pnl.className =
-      'stock-metric-pnl tnum' +
-      (pos.totalReturnPnl > 0 ? ' pos' : pos.totalReturnPnl < 0 ? ' neg' : '');
-    b2Pnl.textContent = masked
-      ? '•••••'
-      : `${fmtSignedCurrency(pos.totalReturnPnl, curr, false)} (${fmtSignedPct(pos.totalReturnRoiPct, false)})`;
-
-    const b2Sub = document.createElement('div');
-    b2Sub.className = 'stock-metric-sub tnum';
-    if (pos.excessRecoveredCash > 0) {
-      b2Sub.textContent = `超額回收 +${fmtCurrencyAmount(pos.excessRecoveredCash, curr, masked)}`;
-    } else {
-      b2Sub.textContent = `累計配息 ${fmtCurrencyAmount(pos.cumulativeCashDividends, curr, masked)}`;
-    }
-
-    box2.appendChild(b2Head);
-    box2.appendChild(b2Cost);
-    box2.appendChild(b2Pnl);
-    box2.appendChild(b2Sub);
-
-    grid.appendChild(box1);
-    grid.appendChild(box2);
-    card.appendChild(grid);
+    card.appendChild(renderStockMetricsGrid(pos, viewMode, masked, curr));
 
     // Mini recovery bar & badges
     if (
@@ -557,60 +831,719 @@ function renderStockPositionCard(
     }
   }
 
-  // Action buttons row
+  card.appendChild(renderStockCardActions(ctx, pos, false));
+  return card;
+}
+
+function renderStockFlipCard(
+  ctx: UiContext,
+  pos: StockPositionSummary,
+  weightPct = 0
+): HTMLElement {
+  const masked = ctx.state.masked;
+  const viewMode = ctx.state.stockPriceViewMode;
+  const curr = pos.asset.currency || 'TWD';
+  const isFlipped = ctx.state.flippedStockIds.includes(pos.asset.id);
+  const accentCls =
+    pos.dailyChange !== null && pos.dailyChange > 0
+      ? ' accent-pos'
+      : pos.dailyChange !== null && pos.dailyChange < 0
+        ? ' accent-neg'
+        : '';
+
+  const scene = document.createElement('div');
+  scene.className = 'stock-flip-scene';
+
+  const inner = document.createElement('div');
+  inner.className = 'stock-flip-inner' + (isFlipped ? ' is-flipped' : '');
+
+  // ==================== FRONT FACE ====================
+  const front = document.createElement('div');
+  front.className = 'card stock-card stock-flip-face stock-flip-front' + accentCls;
+
+  const frontTop = document.createElement('div');
+  frontTop.className = 'flip-top-row';
+
+  const titleRow = document.createElement('div');
+  titleRow.className = 'stock-title-row';
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'stock-name';
+  nameSpan.textContent = pos.asset.itemName;
+  titleRow.appendChild(nameSpan);
+  if (pos.asset.ticker) {
+    const tickerBadge = document.createElement('span');
+    tickerBadge.className = 'badge';
+    tickerBadge.style.marginRight = '0';
+    tickerBadge.textContent = pos.asset.ticker;
+    titleRow.appendChild(tickerBadge);
+  }
+  const catBtn = document.createElement('button');
+  catBtn.type = 'button';
+  catBtn.className = pos.asset.stockCategory ? 'stock-cat-btn set' : 'stock-cat-btn unset';
+  catBtn.textContent = pos.asset.stockCategory || '+ 分類';
+  catBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openQuickStockCategoryPicker(ctx, pos.asset);
+  });
+  titleRow.appendChild(catBtn);
+  if (weightPct > 0) {
+    const wtBadge = document.createElement('span');
+    wtBadge.className = 'badge';
+    wtBadge.style.cssText = 'margin-right:0;background:var(--fill);color:var(--text-secondary)';
+    wtBadge.textContent = `佔 ${weightPct.toFixed(1)}%`;
+    titleRow.appendChild(wtBadge);
+  }
+  if (pos.isCostRecovered) {
+    const recBadge = document.createElement('span');
+    recBadge.className = 'badge stock-recovered';
+    recBadge.style.marginRight = '0';
+    recBadge.textContent = '✓ 已回本';
+    titleRow.appendChild(recBadge);
+  }
+
+  const flipCue = document.createElement('span');
+  flipCue.className = 'flip-cue';
+  flipCue.textContent = '↻ 翻面';
+
+  frontTop.appendChild(titleRow);
+  frontTop.appendChild(flipCue);
+  front.appendChild(frontTop);
+
+  // Main price & market value hero
+  const hero = document.createElement('div');
+  hero.className = 'flip-price-hero tnum';
+
+  const priceBlock = document.createElement('div');
+  priceBlock.className = 'flip-price-left';
+  const priceMain = document.createElement('div');
+  priceMain.className = 'flip-big-price';
+  if (pos.dailyChange !== null && pos.dailyChange !== 0) {
+    priceMain.style.color = pos.dailyChange > 0 ? 'var(--stock-pos)' : 'var(--stock-neg)';
+  }
+  priceMain.textContent = fmtPrice(pos.marketPrice, masked, curr);
+
+  const changeRow = document.createElement('div');
+  changeRow.className = 'flip-change-row';
+  changeRow.appendChild(createDailyChangeBadge(pos.dailyChange, pos.dailyChangePct, curr, masked));
+  if (pos.previousClose !== null) {
+    const prevSpan = document.createElement('span');
+    prevSpan.className = 'flip-prev-close';
+    prevSpan.textContent = `昨收 ${fmtPrice(pos.previousClose, masked, curr)}`;
+    changeRow.appendChild(prevSpan);
+  }
+  priceBlock.appendChild(priceMain);
+  priceBlock.appendChild(changeRow);
+
+  const valueBlock = document.createElement('div');
+  valueBlock.className = 'flip-value-right';
+  const valMain = document.createElement('div');
+  valMain.className = 'flip-val-num';
+  valMain.textContent = fmtCurrencyAmount(pos.marketValue, curr, masked);
+  const valSub = document.createElement('div');
+  valSub.className = 'flip-val-sub';
+  const lotsHint =
+    curr === 'TWD' && pos.currentShares >= 1000 && pos.currentShares % 1000 === 0
+      ? ` (${pos.currentShares / 1000}張)`
+      : '';
+  valSub.textContent = `${fmtShares(pos.currentShares)} 股${lotsHint}`;
+  valueBlock.appendChild(valMain);
+  valueBlock.appendChild(valSub);
+  if (pos.dailyPnlTwd !== null && pos.currentShares > 0) {
+    const dpEl = document.createElement('div');
+    dpEl.className =
+      'flip-daily-pnl ' +
+      (pos.dailyPnlTwd > 0 ? 'pos' : pos.dailyPnlTwd < 0 ? 'neg' : '');
+    dpEl.textContent = `今日 ${fmtSignedCurrency(pos.dailyPnlTwd, 'TWD', masked)}`;
+    valueBlock.appendChild(dpEl);
+  }
+
+  hero.appendChild(priceBlock);
+  hero.appendChild(valueBlock);
+  front.appendChild(hero);
+
+  // Bottom quick summary strip
+  const summaryRow = document.createElement('div');
+  summaryRow.className = 'flip-summary-strip tnum';
+  if (pos.hasCostBasis) {
+    const pChip = document.createElement('span');
+    pChip.className =
+      'flip-stat-chip ' +
+      (pos.unrealizedPnl > 0 ? 'pos' : pos.unrealizedPnl < 0 ? 'neg' : '');
+    pChip.textContent = `價差 ${fmtSignedPct(pos.unrealizedRoiPct, masked)}`;
+
+    const dChip = document.createElement('span');
+    dChip.className =
+      'flip-stat-chip ' +
+      (pos.totalReturnPnl > 0 ? 'pos' : pos.totalReturnPnl < 0 ? 'neg' : '');
+    dChip.textContent = `含息 ${fmtSignedPct(pos.totalReturnRoiPct, masked)}`;
+
+    const recChip = document.createElement('span');
+    recChip.className = 'flip-stat-chip neutral';
+    recChip.textContent = `回本 ${pos.costRecoveryPct.toFixed(0)}%`;
+
+    summaryRow.appendChild(pChip);
+    summaryRow.appendChild(dChip);
+    summaryRow.appendChild(recChip);
+  } else {
+    const unsetChip = document.createElement('span');
+    unsetChip.className = 'flip-stat-chip neutral';
+    unsetChip.textContent = '點擊翻面設定成本與紀錄交易';
+    summaryRow.appendChild(unsetChip);
+  }
+  front.appendChild(summaryRow);
+
+  // ==================== BACK FACE ====================
+  const back = document.createElement('div');
+  back.className = 'card stock-card stock-flip-face stock-flip-back' + accentCls;
+
+  const backTop = document.createElement('div');
+  backTop.className = 'flip-top-row';
+  const backTitle = document.createElement('div');
+  backTitle.className = 'stock-title-row';
+  const bName = document.createElement('span');
+  bName.className = 'stock-name';
+  bName.textContent = pos.asset.itemName;
+  backTitle.appendChild(bName);
+  if (pos.asset.ticker) {
+    const bTick = document.createElement('span');
+    bTick.className = 'badge';
+    bTick.style.marginRight = '0';
+    bTick.textContent = pos.asset.ticker;
+    backTitle.appendChild(bTick);
+  }
+  const backCue = document.createElement('span');
+  backCue.className = 'flip-cue';
+  backCue.textContent = '↺ 翻回行情';
+  backTop.appendChild(backTitle);
+  backTop.appendChild(backCue);
+  back.appendChild(backTop);
+
+  const backMeta = document.createElement('div');
+  backMeta.className = 'flip-back-meta tnum';
+  const metaBits: string[] = [];
+  if (pos.previousClose !== null) {
+    metaBits.push(`昨收 ${fmtPrice(pos.previousClose, masked, curr)}`);
+  }
+  metaBits.push(
+    pos.asset.priceUpdatedAt
+      ? `更新 ${fmtQuoteTimestamp(pos.asset.priceUpdatedAt)}`
+      : pos.asset.updateMode
+  );
+  if (curr === 'USD') {
+    metaBits.push(`市值約 ${fmtMoney(pos.marketValueTwd, masked)}`);
+  }
+  backMeta.textContent = metaBits.join(' · ');
+  back.appendChild(backMeta);
+
+  if (!pos.hasCostBasis) {
+    const prompt = document.createElement('div');
+    prompt.className = 'stock-unset-banner';
+    const txt = document.createElement('span');
+    txt.textContent = '尚未設定成本價，設定後即可檢視價差淨利與配息回本';
+    const setBtn = document.createElement('button');
+    setBtn.type = 'button';
+    setBtn.className = 'btn btn-tinted btn-sm';
+    setBtn.textContent = '設定成本';
+    setBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openStockBaselineModal(ctx, pos.asset);
+    });
+    prompt.appendChild(txt);
+    prompt.appendChild(setBtn);
+    back.appendChild(prompt);
+  } else {
+    back.appendChild(renderStockMetricsGrid(pos, viewMode, masked, curr));
+  }
+
+  back.appendChild(renderStockCardActions(ctx, pos, true));
+
+  inner.appendChild(front);
+  inner.appendChild(back);
+  scene.appendChild(inner);
+
+  scene.addEventListener('click', () => toggleStockFlip(ctx, pos.asset.id, inner));
+  return scene;
+}
+
+function renderWatchlistActions(
+  ctx: UiContext,
+  asset: AssetItem,
+  stopProp = false
+): HTMLElement {
   const actions = document.createElement('div');
-  actions.className = 'stock-card-actions';
+  actions.className = 'watchlist-card-actions';
 
-  const buyBtn = document.createElement('button');
-  buyBtn.type = 'button';
-  buyBtn.className = 'btn btn-tinted btn-sm';
-  buyBtn.textContent = '+ 加碼';
-  buyBtn.addEventListener('click', () => openStockTradeModal(ctx, pos.asset, 'buy'));
+  const wire = (btn: HTMLButtonElement, fn: () => void) => {
+    btn.addEventListener('click', (e) => {
+      if (stopProp) e.stopPropagation();
+      fn();
+    });
+  };
 
-  const divBtn = document.createElement('button');
-  divBtn.type = 'button';
-  divBtn.className = 'btn btn-tinted btn-sm';
-  divBtn.textContent = '配息/配股';
-  divBtn.addEventListener('click', () => openStockDividendModal(ctx, pos.asset));
+  const convBtn = document.createElement('button');
+  convBtn.type = 'button';
+  convBtn.className = 'btn btn-tinted btn-sm';
+  convBtn.textContent = '轉為正式持股';
+  wire(convBtn, () => openStockBaselineModal(ctx, asset, { convertFromWatchlist: true }));
 
-  const sellBtn = document.createElement('button');
-  sellBtn.type = 'button';
-  sellBtn.className = 'btn btn-outline btn-sm';
-  sellBtn.textContent = '賣出';
-  sellBtn.addEventListener('click', () => openStockTradeModal(ctx, pos.asset, 'sell'));
+  const editBtn = document.createElement('button');
+  editBtn.type = 'button';
+  editBtn.className = 'btn btn-outline btn-sm';
+  editBtn.textContent = '編輯';
+  wire(editBtn, () => openWatchlistModal(ctx, asset));
 
-  const histBtn = document.createElement('button');
-  histBtn.type = 'button';
-  histBtn.className = 'btn btn-outline btn-sm';
-  histBtn.textContent = pos.transactionCount > 0 ? `明細 (${pos.transactionCount})` : '設成本';
-  histBtn.addEventListener('click', () =>
-    pos.transactionCount > 0
-      ? openStockHistoryModal(ctx, pos.asset)
-      : openStockBaselineModal(ctx, pos.asset)
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'btn btn-outline btn-sm';
+  delBtn.style.color = 'var(--danger)';
+  delBtn.textContent = '移除';
+  wire(delBtn, async () => {
+    if (!confirm(`確定從觀察清單移除「${asset.itemName}」？`)) return;
+    await ctx.engine.deleteAsset(asset.id);
+    showToast(`已移除觀察標的：${asset.itemName}`, 'success');
+    ctx.scheduleSync();
+  });
+
+  actions.appendChild(convBtn);
+  actions.appendChild(editBtn);
+  actions.appendChild(delBtn);
+  return actions;
+}
+
+function renderWatchlistCard(ctx: UiContext, item: WatchlistItemSummary): HTMLElement {
+  const masked = ctx.state.masked;
+  const curr = item.asset.currency || 'TWD';
+  const card = document.createElement('div');
+  card.className = 'card stock-card';
+
+  const head = document.createElement('div');
+  head.className = 'stock-card-head';
+
+  const left = document.createElement('div');
+  left.className = 'item-main';
+  const titleRow = document.createElement('div');
+  titleRow.className = 'stock-title-row';
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'stock-name';
+  nameSpan.textContent = item.asset.itemName;
+  titleRow.appendChild(nameSpan);
+
+  const watchBadge = document.createElement('span');
+  watchBadge.className = 'badge watchlist-tag';
+  watchBadge.style.marginRight = '0';
+  watchBadge.textContent = '觀察中';
+  titleRow.appendChild(watchBadge);
+
+  if (item.asset.ticker) {
+    const tickerBadge = document.createElement('span');
+    tickerBadge.className = 'badge';
+    tickerBadge.style.marginRight = '0';
+    tickerBadge.textContent = item.asset.ticker;
+    titleRow.appendChild(tickerBadge);
+  }
+  const catBtn = document.createElement('button');
+  catBtn.type = 'button';
+  catBtn.className = item.asset.stockCategory ? 'stock-cat-btn set' : 'stock-cat-btn unset';
+  catBtn.textContent = item.asset.stockCategory || '+ 分類';
+  catBtn.addEventListener('click', () => openQuickStockCategoryPicker(ctx, item.asset));
+  titleRow.appendChild(catBtn);
+
+  if (curr === 'USD') {
+    const currBadge = document.createElement('span');
+    currBadge.className = 'badge';
+    currBadge.style.marginRight = '0';
+    currBadge.textContent = 'USD';
+    titleRow.appendChild(currBadge);
+  }
+
+  const subRow = document.createElement('div');
+  subRow.className = 'item-sub tnum';
+  const subParts: string[] = [item.asset.subCategory || '台股'];
+  if (item.previousClose !== null) {
+    subParts.push(`昨收 ${fmtPrice(item.previousClose, masked, curr)}`);
+  }
+  if (item.asset.note) {
+    subParts.push(item.asset.note);
+  }
+  subRow.textContent = subParts.join(' · ');
+
+  left.appendChild(titleRow);
+  left.appendChild(subRow);
+
+  const right = document.createElement('div');
+  right.className = 'stock-head-right tnum';
+  const priceEl = document.createElement('div');
+  priceEl.className = 'stock-head-val';
+  if (item.dailyChange !== null && item.dailyChange !== 0) {
+    priceEl.style.color = item.dailyChange > 0 ? 'var(--stock-pos)' : 'var(--stock-neg)';
+  }
+  priceEl.textContent =
+    item.marketPrice > 0 ? fmtPrice(item.marketPrice, masked, curr) : '待更新';
+  const capEl = document.createElement('div');
+  capEl.className = 'stock-head-cap';
+  capEl.textContent = '目前報價（不計入資產）';
+  right.appendChild(priceEl);
+  right.appendChild(capEl);
+
+  head.appendChild(left);
+  head.appendChild(right);
+  card.appendChild(head);
+
+  const strip = document.createElement('div');
+  strip.className = 'stock-quote-strip tnum';
+  const stripLeft = document.createElement('div');
+  stripLeft.className = 'stock-quote-strip-left';
+  stripLeft.appendChild(createDailyChangeBadge(item.dailyChange, item.dailyChangePct, curr, masked));
+  const stripTime = document.createElement('span');
+  stripTime.className = 'stock-quote-time';
+  stripTime.textContent = item.priceUpdatedAt
+    ? fmtQuoteTimestamp(item.priceUpdatedAt)
+    : '尚未自動更新';
+  strip.appendChild(stripLeft);
+  strip.appendChild(stripTime);
+  card.appendChild(strip);
+
+  card.appendChild(renderWatchlistActions(ctx, item.asset, false));
+  return card;
+}
+
+function renderWatchlistFlipCard(ctx: UiContext, item: WatchlistItemSummary): HTMLElement {
+  const masked = ctx.state.masked;
+  const curr = item.asset.currency || 'TWD';
+  const isFlipped = ctx.state.flippedStockIds.includes(item.asset.id);
+  const accentCls =
+    item.dailyChange !== null && item.dailyChange > 0
+      ? ' accent-pos'
+      : item.dailyChange !== null && item.dailyChange < 0
+        ? ' accent-neg'
+        : '';
+
+  const scene = document.createElement('div');
+  scene.className = 'stock-flip-scene';
+
+  const inner = document.createElement('div');
+  inner.className = 'stock-flip-inner' + (isFlipped ? ' is-flipped' : '');
+
+  // Front
+  const front = document.createElement('div');
+  front.className = 'card stock-card stock-flip-face stock-flip-front' + accentCls;
+
+  const frontTop = document.createElement('div');
+  frontTop.className = 'flip-top-row';
+  const titleRow = document.createElement('div');
+  titleRow.className = 'stock-title-row';
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'stock-name';
+  nameSpan.textContent = item.asset.itemName;
+  titleRow.appendChild(nameSpan);
+  const watchBadge = document.createElement('span');
+  watchBadge.className = 'badge watchlist-tag';
+  watchBadge.style.marginRight = '0';
+  watchBadge.textContent = '觀察中';
+  titleRow.appendChild(watchBadge);
+  if (item.asset.ticker) {
+    const tickerBadge = document.createElement('span');
+    tickerBadge.className = 'badge';
+    tickerBadge.style.marginRight = '0';
+    tickerBadge.textContent = item.asset.ticker;
+    titleRow.appendChild(tickerBadge);
+  }
+  const flipCue = document.createElement('span');
+  flipCue.className = 'flip-cue';
+  flipCue.textContent = '↻ 翻面';
+  frontTop.appendChild(titleRow);
+  frontTop.appendChild(flipCue);
+  front.appendChild(frontTop);
+
+  const hero = document.createElement('div');
+  hero.className = 'flip-price-hero tnum';
+  const priceLeft = document.createElement('div');
+  priceLeft.className = 'flip-price-left';
+  const bigPrice = document.createElement('div');
+  bigPrice.className = 'flip-big-price';
+  if (item.dailyChange !== null && item.dailyChange !== 0) {
+    bigPrice.style.color = item.dailyChange > 0 ? 'var(--stock-pos)' : 'var(--stock-neg)';
+  }
+  bigPrice.textContent =
+    item.marketPrice > 0 ? fmtPrice(item.marketPrice, masked, curr) : '待更新';
+  const changeRow = document.createElement('div');
+  changeRow.className = 'flip-change-row';
+  changeRow.appendChild(createDailyChangeBadge(item.dailyChange, item.dailyChangePct, curr, masked));
+  priceLeft.appendChild(bigPrice);
+  priceLeft.appendChild(changeRow);
+
+  const rightBox = document.createElement('div');
+  rightBox.className = 'flip-value-right';
+  const prevLabel = document.createElement('div');
+  prevLabel.className = 'flip-val-sub';
+  prevLabel.textContent =
+    item.previousClose !== null
+      ? `昨收 ${fmtPrice(item.previousClose, masked, curr)}`
+      : '昨收待更新';
+  const mktLabel = document.createElement('div');
+  mktLabel.className = 'flip-val-sub';
+  mktLabel.textContent = `${item.asset.subCategory || '台股'} · 不計入總資產`;
+  rightBox.appendChild(prevLabel);
+  rightBox.appendChild(mktLabel);
+
+  hero.appendChild(priceLeft);
+  hero.appendChild(rightBox);
+  front.appendChild(hero);
+
+  if (item.asset.note) {
+    const noteBar = document.createElement('div');
+    noteBar.className = 'flip-summary-strip';
+    const noteChip = document.createElement('span');
+    noteChip.className = 'flip-stat-chip neutral';
+    noteChip.textContent = `筆記：${item.asset.note}`;
+    noteBar.appendChild(noteChip);
+    front.appendChild(noteBar);
+  }
+
+  // Back
+  const back = document.createElement('div');
+  back.className = 'card stock-card stock-flip-face stock-flip-back' + accentCls;
+
+  const backTop = document.createElement('div');
+  backTop.className = 'flip-top-row';
+  const bTitle = document.createElement('div');
+  bTitle.className = 'stock-title-row';
+  const bName = document.createElement('span');
+  bName.className = 'stock-name';
+  bName.textContent = item.asset.itemName;
+  bTitle.appendChild(bName);
+  if (item.asset.ticker) {
+    const bTick = document.createElement('span');
+    bTick.className = 'badge';
+    bTick.style.marginRight = '0';
+    bTick.textContent = item.asset.ticker;
+    bTitle.appendChild(bTick);
+  }
+  const backCue = document.createElement('span');
+  backCue.className = 'flip-cue';
+  backCue.textContent = '↺ 翻回行情';
+  backTop.appendChild(bTitle);
+  backTop.appendChild(backCue);
+  back.appendChild(backTop);
+
+  const detailBox = document.createElement('div');
+  detailBox.className = 'stock-metric-box tnum';
+  const l1 = document.createElement('div');
+  l1.className = 'stock-metric-cost';
+  l1.textContent = `昨收：${item.previousClose !== null ? fmtPrice(item.previousClose, masked, curr) : '待更新'} · 更新：${item.priceUpdatedAt ? fmtQuoteTimestamp(item.priceUpdatedAt) : '尚未更新'}`;
+  const l2 = document.createElement('div');
+  l2.className = 'stock-metric-sub';
+  l2.textContent = item.asset.note ? `觀察備註：${item.asset.note}` : '尚未填寫觀察備註（可點編輯記錄目標買入價）';
+  detailBox.appendChild(l1);
+  detailBox.appendChild(l2);
+  back.appendChild(detailBox);
+
+  back.appendChild(renderWatchlistActions(ctx, item.asset, true));
+
+  inner.appendChild(front);
+  inner.appendChild(back);
+  scene.appendChild(inner);
+  scene.addEventListener('click', () => toggleStockFlip(ctx, item.asset.id, inner));
+  return scene;
+}
+
+/* ==================== Modal 0: 新增 / 編輯觀察清單 ==================== */
+
+export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): void {
+  const body = openModal(existing ? `編輯觀察標的 · ${existing.itemName}` : '新增觀察標的');
+  const form = document.createElement('form');
+
+  const hint = document.createElement('div');
+  hint.className = 'stock-live-preview';
+  hint.textContent = '觀察清單僅追蹤最新報價與今日漲跌，不會計入持股市值、資產配置或個人總淨值；隨時可一鍵轉為正式持股。';
+  form.appendChild(hint);
+
+  const r0 = document.createElement('div');
+  r0.className = 'row-2';
+  r0.appendChild(
+    makeInputField('股票名稱', 'wlName', 'text', existing?.itemName || '', '例如：台積電、NVDA、0050', true)
+  );
+  r0.appendChild(
+    makeInputField(
+      '股票代碼（自動抓報價與昨收）',
+      'wlTicker',
+      'text',
+      existing?.ticker || '',
+      '台股如 2330；美股如 NVDA / VOO',
+      true
+    )
+  );
+  form.appendChild(r0);
+
+  const r1 = document.createElement('div');
+  r1.className = 'row-2';
+  r1.appendChild(
+    makeSelectField('市場', 'wlSub', ['台股', '美股/ETF'], existing?.subCategory === '美股/ETF' ? '美股/ETF' : '台股')
+  );
+  r1.appendChild(makeSelectField('幣別', 'wlCurr', ['TWD', 'USD'], existing?.currency || 'TWD'));
+  form.appendChild(r1);
+
+  let selectedStockCategory = normalizeStockCategory(existing?.stockCategory);
+  const catSection = document.createElement('div');
+  catSection.className = 'field';
+  const catLbl = document.createElement('label');
+  catLbl.textContent = '分類標籤（選填）';
+  catSection.appendChild(catLbl);
+  const catChipsWrap = document.createElement('div');
+  catChipsWrap.className = 'quick-row';
+  const renderCatChips = () => {
+    catChipsWrap.innerHTML = '';
+    const opts = [{ label: '未分類', value: '' }, ...getAllStockCategories(ctx).map((c) => ({ label: c, value: c }))];
+    for (const opt of opts) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chip-btn sm' + (selectedStockCategory === opt.value ? ' active' : '');
+      chip.textContent = opt.label;
+      chip.addEventListener('click', () => {
+        selectedStockCategory = opt.value;
+        renderCatChips();
+      });
+      catChipsWrap.appendChild(chip);
+    }
+  };
+  renderCatChips();
+  catSection.appendChild(catChipsWrap);
+  form.appendChild(catSection);
+
+  const r2 = document.createElement('div');
+  r2.className = 'row-2';
+  r2.appendChild(
+    makeInputField(
+      '目前市價（選填，留空則自動更新）',
+      'wlPrice',
+      'number',
+      existing && existing.unitPrice > 0 ? existing.unitPrice : '',
+      '留空或填參考價'
+    )
+  );
+  r2.appendChild(
+    makeInputField(
+      '昨收價（選填，自動更新帶入）',
+      'wlPrevClose',
+      'number',
+      existing && existing.previousClose ? existing.previousClose : '',
+      '自動更新將帶入'
+    )
+  );
+  form.appendChild(r2);
+
+  form.appendChild(
+    makeInputField('觀察備註（選填）', 'wlNote', 'text', existing?.note || '', '例如：目標買進價 950、等季線回測')
   );
 
-  actions.appendChild(buyBtn);
-  actions.appendChild(divBtn);
-  actions.appendChild(sellBtn);
-  actions.appendChild(histBtn);
-  card.appendChild(actions);
+  const subSel = form.querySelector('#wlSub') as unknown as HTMLSelectElement;
+  const currSel = form.querySelector('#wlCurr') as unknown as HTMLSelectElement;
+  const tickerInp = form.querySelector<HTMLInputElement>('#wlTicker')!;
+  subSel.addEventListener('change', () => {
+    if (!existing) {
+      currSel.value = subSel.value === '美股/ETF' ? 'USD' : 'TWD';
+    }
+  });
+  tickerInp.addEventListener('input', () => {
+    if (existing) return;
+    const raw = tickerInp.value.trim().toUpperCase();
+    if (!raw) return;
+    const looksUs =
+      /^(?:US|NASDAQ|NYSE|NYSEARCA|ARCA|AMEX|BATS|CBOE):/.test(raw) ||
+      /\.US$/.test(raw) ||
+      (/^[A-Z]{1,5}(?:[.\-][A-Z]{1,2})?$/.test(raw) && !raw.startsWith('TPE'));
+    const looksTw =
+      /^(?:TPE|TWSE|TPEX|OTC|TWO|TW):/.test(raw) ||
+      /\.(?:TW|TWO)$/.test(raw) ||
+      /^\d{4,6}[A-Z]?$/.test(raw);
+    if (looksUs && subSel.value !== '美股/ETF') {
+      subSel.value = '美股/ETF';
+      currSel.value = 'USD';
+    } else if (looksTw && subSel.value !== '台股') {
+      subSel.value = '台股';
+      currSel.value = 'TWD';
+    }
+  });
 
-  return card;
+  const btns = document.createElement('div');
+  btns.style.cssText = 'display:grid;grid-template-columns:1fr 2fr;gap:8px;margin-top:14px';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'btn btn-outline';
+  cancelBtn.textContent = '取消';
+  cancelBtn.addEventListener('click', closeModal);
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'submit';
+  saveBtn.className = 'btn btn-primary';
+  saveBtn.textContent = existing ? '儲存觀察標的' : '加入觀察清單';
+  btns.appendChild(cancelBtn);
+  btns.appendChild(saveBtn);
+  form.appendChild(btns);
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const ticker = tickerInp.value.trim().toUpperCase();
+      const rawPrice = el<HTMLInputElement>('wlPrice').value.trim();
+      const rawPrev = el<HTMLInputElement>('wlPrevClose').value.trim();
+      await ctx.engine.saveAsset({
+        id: existing?.id,
+        itemName: el<HTMLInputElement>('wlName').value.trim(),
+        majorType: '資產',
+        updateMode: ticker ? '自動更新' : '手動快照',
+        subCategory: subSel.value,
+        liquidity: '高流動',
+        quantityOrAmount: 0,
+        currency: currSel.value,
+        ticker,
+        unitPrice: rawPrice !== '' ? Number(rawPrice) : existing?.unitPrice ?? 0,
+        previousClose: rawPrev !== '' ? Number(rawPrev) : existing?.previousClose ?? null,
+        costBasis: null,
+        stockCategory: selectedStockCategory,
+        isWatchlist: true,
+        note: el<HTMLInputElement>('wlNote').value.trim(),
+      });
+      closeModal();
+      showToast(existing ? '已更新觀察標的' : '已加入觀察清單（點「更新股價匯率」立即抓報價）', 'success');
+      ctx.scheduleSync();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '儲存失敗', 'error');
+    }
+  });
+
+  body.appendChild(form);
 }
 
 /* ==================== Modal 1: 新增持股 / 編輯期初成本 ==================== */
 
-export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | null): void {
+export function openStockBaselineModal(
+  ctx: UiContext,
+  existing: AssetItem | null,
+  opts?: { convertFromWatchlist?: boolean }
+): void {
+  const isConverting = Boolean(opts?.convertFromWatchlist && existing);
   const snap = ctx.engine.getSnapshot();
   const rate = snap.settings.usdTwdRate || 32.5;
   const pos = existing
     ? computeStockPositionSummary(existing, snap.stockTransactions || [], rate)
     : null;
 
-  const body = openModal(existing ? `期初成本與設定 · ${existing.itemName}` : '新增股票持股');
+  const modalTitle = isConverting
+    ? `轉為正式持股 · ${existing?.itemName}`
+    : existing
+      ? `期初成本與設定 · ${existing.itemName}`
+      : '新增股票持股';
+  const body = openModal(modalTitle);
   const form = document.createElement('form');
 
-  if (pos && pos.transactionCount > 0) {
+  if (isConverting) {
+    const info = document.createElement('div');
+    info.className = 'stock-live-preview';
+    info.style.marginBottom = '12px';
+    info.textContent = '填入持有股數與平均成本後，將直接從觀察清單轉為正式持股（保留最新報價與昨收價）。';
+    form.appendChild(info);
+  } else if (pos && pos.transactionCount > 0) {
     const info = document.createElement('div');
     info.className = 'stock-live-preview tnum';
     info.style.marginBottom = '12px';
@@ -713,13 +1646,20 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
       pos && pos.transactionCount > 0 ? '期初基準股數' : '目前持有股數',
       'stShares',
       'number',
-      existing?.quantityOrAmount ?? '',
+      isConverting ? '' : (existing?.quantityOrAmount ?? ''),
       '1000',
       true
     )
   );
   r2.appendChild(
-    makeInputField('目前市價（每股）', 'stPrice', 'number', existing?.unitPrice ?? '', '40', true)
+    makeInputField(
+      '目前市價（每股）',
+      'stPrice',
+      'number',
+      existing && existing.unitPrice > 0 ? existing.unitPrice : '',
+      '40',
+      true
+    )
   );
   form.appendChild(r2);
 
@@ -892,7 +1832,7 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
 
   const btns = document.createElement('div');
   btns.style.cssText = 'display:grid;grid-template-columns:1fr 2fr;gap:8px;margin-top:14px';
-  if (existing) {
+  if (existing && !isConverting) {
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'btn btn-danger';
@@ -917,7 +1857,7 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
   const saveBtn = document.createElement('button');
   saveBtn.type = 'submit';
   saveBtn.className = 'btn btn-primary';
-  saveBtn.textContent = existing ? '儲存持股成本' : '建立持股';
+  saveBtn.textContent = isConverting ? '確認轉為正式持股' : existing ? '儲存持股成本' : '建立持股';
   btns.appendChild(saveBtn);
   form.appendChild(btns);
 
@@ -946,12 +1886,20 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
         currency: currSel.value,
         ticker,
         unitPrice: marketPrice,
+        previousClose: existing?.previousClose ?? null,
         costBasis: hasCost ? totalCost : null,
         stockCategory: selectedStockCategory,
+        isWatchlist: false,
         note: el<HTMLInputElement>('stNote').value.trim(),
       });
+      if (isConverting) {
+        ctx.state.stocksSubtab = 'holdings';
+      }
       closeModal();
-      showToast(existing ? '已更新持股成本設定' : '已建立新持股', 'success');
+      showToast(
+        isConverting ? '已從觀察清單轉為正式持股' : existing ? '已更新持股成本設定' : '已建立新持股',
+        'success'
+      );
       ctx.scheduleSync();
     } catch (err) {
       showToast(err instanceof Error ? err.message : '儲存失敗', 'error');

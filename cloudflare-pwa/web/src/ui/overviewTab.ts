@@ -1,31 +1,57 @@
+import { DEFAULT_LEDGER_ID } from '../../../shared/constants';
 import {
   aggregatePeriodMetrics,
   computeMonthlyTrend,
   computeNetWorthSummary,
   computeOverviewBreakdownGroups,
   computeSinkingMonthlyReserve,
+  filterCashFlowsByLedgerScope,
 } from '../../../shared/calculations';
 import { el, fmtMoney } from './helpers';
+import { getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { getSelectedYearMonth } from './logTab';
 import type { UiContext } from './state';
 
+function resolveOverviewScope(ctx: UiContext): string {
+  const ledgers = getActiveLedgers(ctx);
+  const scope = ctx.state.overviewLedgerScope || 'net_worth';
+  if (scope === 'net_worth' || scope === 'all') return scope;
+  if (ledgers.some((l) => l.id === scope)) return scope;
+  ctx.state.overviewLedgerScope = 'net_worth';
+  return 'net_worth';
+}
+
 export function renderOverviewTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
+  const ledgers = getActiveLedgers(ctx);
+  const scope = resolveOverviewScope(ctx);
   const year = ctx.state.selectedYear;
   const month = ctx.state.selectedMonth;
   const ym = getSelectedYearMonth(year, month);
 
+  renderLedgerSwitcherBar(ctx, el('overviewLedgerBar'), {
+    mode: 'scope',
+    selectedValue: scope,
+    onSelect: (nextScope) => {
+      ctx.state.overviewLedgerScope = nextScope;
+      renderOverviewTab(ctx);
+    },
+  });
+
   el('overviewMonthLabel').textContent = ym;
 
-  const activeLogs = snap.cashflowLogs.filter((l) => !l.deletedAt);
+  const activeLogs = filterCashFlowsByLedgerScope(snap.cashflowLogs, scope, ledgers);
   const monthLogs = activeLogs.filter((l) => l.yearMonth === ym);
   const yearLogs = activeLogs.filter((l) => l.yearMonth.startsWith(`${year}-`));
 
-  const monthlySinking = snap.sinkingItems
-    .filter((s) => !s.deletedAt)
-    .reduce((sum, s) => sum + computeSinkingMonthlyReserve(s), 0);
+  const includeSinking = scope === 'net_worth' || scope === 'all' || scope === DEFAULT_LEDGER_ID;
+  const monthlySinking = includeSinking
+    ? snap.sinkingItems
+        .filter((s) => !s.deletedAt)
+        .reduce((sum, s) => sum + computeSinkingMonthlyReserve(s), 0)
+    : 0;
 
-  const monthly = aggregatePeriodMetrics(monthLogs, monthlySinking, true);
+  const monthly = aggregatePeriodMetrics(monthLogs, monthlySinking, includeSinking);
   const yearly = aggregatePeriodMetrics(yearLogs, monthlySinking * 12, false);
   const nw = computeNetWorthSummary(
     snap.assetItems,
@@ -33,7 +59,10 @@ export function renderOverviewTab(ctx: UiContext): void {
     monthly.totalConsumption,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],
-    snap.stockTransactions || []
+    snap.stockTransactions || [],
+    undefined,
+    ledgers,
+    scope
   );
 
   const m = ctx.state.overviewPeriod === 'monthly' ? monthly : yearly;
@@ -80,7 +109,7 @@ export function renderOverviewTab(ctx: UiContext): void {
   const groups = computeOverviewBreakdownGroups(
     monthLogs,
     yearLogs,
-    snap.sinkingItems,
+    includeSinking ? snap.sinkingItems : [],
     monthly,
     yearly
   );
@@ -174,8 +203,11 @@ export function renderOverviewTab(ctx: UiContext): void {
 
 export function renderTrendChart(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
+  const ledgers = getActiveLedgers(ctx);
+  const scope = resolveOverviewScope(ctx);
   const year = ctx.state.selectedYear;
-  const trend = computeMonthlyTrend(snap.cashflowLogs, year);
+  const scopedLogs = filterCashFlowsByLedgerScope(snap.cashflowLogs, scope, ledgers);
+  const trend = computeMonthlyTrend(scopedLogs, year);
   const metric = ctx.state.chartMetric;
   const values = trend.map((p) => p[metric]);
   const maxAbs = Math.max(1, ...values.map((v) => Math.abs(v)));

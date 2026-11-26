@@ -12,9 +12,11 @@ const ENTITY_LABELS: Record<SyncEntity, string> = {
   settings: '預算參數設定',
   utility_record: '水電分攤紀錄',
   utility_rents: '固定房租設定',
+  ledger: '多帳本設定',
 };
 
 const FIELD_LABELS: Record<string, string> = {
+  name: '名稱',
   itemName: '項目名稱',
   date: '日期',
   type: '類型',
@@ -35,11 +37,16 @@ const FIELD_LABELS: Record<string, string> = {
   updateMode: '更新方式',
   quantityOrAmount: '餘額 / 股數',
   unitPrice: '單價',
+  previousClose: '昨收價',
   costBasis: '原始總成本',
   ticker: '股票代碼',
+  isWatchlist: '觀察清單',
   isLinkedSavings: '活存連動',
   balanceAnchorDate: '基準生效日',
   isDefaultSavings: '預設連動活存',
+  ledgerId: '所屬帳本',
+  includeInNetWorth: '計入個人總資產',
+  excludeFromNetWorth: '單獨不計入總資產',
   isAmortizingLoan: '自動還本推算',
   loanAnnualRate: '年利率 (%)',
   loanMonthlyPayment: '每月月付金',

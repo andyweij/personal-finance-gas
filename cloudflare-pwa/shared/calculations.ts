@@ -1,8 +1,9 @@
-import { CASHFLOW_TYPES, STOCK_TX_TYPES } from './constants';
+import { CASHFLOW_TYPES, DEFAULT_LEDGER_ID, DEFAULT_LEDGER_NAME, STOCK_TX_TYPES } from './constants';
 import type {
   AllSavingsSummary,
   AssetItem,
   CashFlowLog,
+  Ledger,
   LoanAmortizationSummary,
   LoanScheduleEntry,
   MonthlyTrendPoint,
@@ -15,7 +16,83 @@ import type {
   StockPortfolioSummary,
   StockPositionSummary,
   StockTransaction,
+  WatchlistItemSummary,
+  WatchlistSummary,
 } from './types';
+
+export function getEffectiveLedgerId(item?: { ledgerId?: string | null } | null): string {
+  const s = String(item?.ledgerId ?? '').trim();
+  return s || DEFAULT_LEDGER_ID;
+}
+
+export function ensureActiveLedgers(ledgers?: Ledger[] | null): Ledger[] {
+  const active = (ledgers || [])
+    .filter((l) => !l.deletedAt)
+    .slice()
+    .sort(compareBySortOrder);
+  if (active.some((l) => l.id === DEFAULT_LEDGER_ID)) {
+    return active;
+  }
+  const fallbackDefault: Ledger = {
+    id: DEFAULT_LEDGER_ID,
+    name: DEFAULT_LEDGER_NAME,
+    includeInNetWorth: true,
+    monthlyDailyBudget: null,
+    note: '預設個人帳本（納入總資產與淨值統計）',
+    sortOrder: 0,
+    createdAt: '',
+    updatedAt: '',
+    deletedAt: null,
+  };
+  return [fallbackDefault, ...active];
+}
+
+export function isLedgerIncludedInNetWorth(ledgerId: string, ledgers?: Ledger[] | null): boolean {
+  const lid = String(ledgerId || DEFAULT_LEDGER_ID).trim() || DEFAULT_LEDGER_ID;
+  if (!ledgers || ledgers.length === 0) {
+    return lid === DEFAULT_LEDGER_ID;
+  }
+  const found = ledgers.find((l) => !l.deletedAt && l.id === lid);
+  if (!found) {
+    return lid === DEFAULT_LEDGER_ID;
+  }
+  return Boolean(found.includeInNetWorth);
+}
+
+export function isAssetIncludedInNetWorth(asset: AssetItem, ledgers?: Ledger[] | null): boolean {
+  if (asset.deletedAt || asset.isWatchlist || asset.excludeFromNetWorth) {
+    return false;
+  }
+  return isLedgerIncludedInNetWorth(getEffectiveLedgerId(asset), ledgers);
+}
+
+export function filterAssetsByLedgerScope(
+  assets: AssetItem[],
+  scope: 'net_worth' | 'all' | string,
+  ledgers?: Ledger[] | null
+): AssetItem[] {
+  const active = (assets || []).filter((a) => !a.deletedAt && !a.isWatchlist);
+  if (scope === 'all') return active;
+  if (scope === 'net_worth') {
+    return active.filter((a) => isAssetIncludedInNetWorth(a, ledgers));
+  }
+  const target = String(scope || DEFAULT_LEDGER_ID).trim() || DEFAULT_LEDGER_ID;
+  return active.filter((a) => getEffectiveLedgerId(a) === target);
+}
+
+export function filterCashFlowsByLedgerScope(
+  logs: CashFlowLog[],
+  scope: 'net_worth' | 'all' | string,
+  ledgers?: Ledger[] | null
+): CashFlowLog[] {
+  const active = (logs || []).filter((l) => !l.deletedAt);
+  if (scope === 'all') return active;
+  if (scope === 'net_worth') {
+    return active.filter((l) => isLedgerIncludedInNetWorth(getEffectiveLedgerId(l), ledgers));
+  }
+  const target = String(scope || DEFAULT_LEDGER_ID).trim() || DEFAULT_LEDGER_ID;
+  return active.filter((l) => getEffectiveLedgerId(l) === target);
+}
 
 export function compareBySortOrder<T extends { sortOrder?: number; createdAt: string; id: string }>(
   a: T,
@@ -393,10 +470,15 @@ export function computeAllSavingsSummary(
   assets: AssetItem[],
   logs: CashFlowLog[],
   adjustments: SavingsAdjustment[],
-  usdTwdRate: number
+  usdTwdRate: number,
+  ledgerId?: string
 ): AllSavingsSummary {
   const linkedAccounts = assets
-    .filter((a) => !a.deletedAt && a.isLinkedSavings)
+    .filter((a) => {
+      if (a.deletedAt || !a.isLinkedSavings || a.isWatchlist) return false;
+      if (ledgerId) return getEffectiveLedgerId(a) === ledgerId;
+      return true;
+    })
     .slice()
     .sort(compareBySortOrder);
   const accounts = linkedAccounts.map((acc) =>
@@ -413,8 +495,14 @@ export function computeAllSavingsSummary(
   };
 }
 
+export function isWatchlistAsset(item: AssetItem): boolean {
+  return Boolean(!item.deletedAt && item.isWatchlist);
+}
+
 export function isStockAsset(item: AssetItem): boolean {
-  if (item.deletedAt || item.isLinkedSavings || item.majorType !== '資產') return false;
+  if (item.deletedAt || item.isLinkedSavings || item.isWatchlist || item.majorType !== '資產') {
+    return false;
+  }
   return (
     item.subCategory === '台股' ||
     item.subCategory === '美股/ETF' ||
@@ -432,6 +520,22 @@ function round1(n: number): number {
 
 function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
+}
+
+export function computeStockDailyMetrics(
+  marketPrice: number,
+  previousClose?: number | null
+): { previousClose: number | null; dailyChange: number | null; dailyChangePct: number | null } {
+  const prev =
+    previousClose !== undefined && previousClose !== null && Number.isFinite(Number(previousClose))
+      ? Number(previousClose)
+      : null;
+  if (prev === null || prev <= 0 || !Number.isFinite(marketPrice) || marketPrice <= 0) {
+    return { previousClose: prev && prev > 0 ? prev : null, dailyChange: null, dailyChangePct: null };
+  }
+  const dailyChange = round4(marketPrice - prev);
+  const dailyChangePct = round2((dailyChange / prev) * 100);
+  return { previousClose: prev, dailyChange, dailyChangePct };
 }
 
 export function computeStockPositionSummary(
@@ -490,6 +594,12 @@ export function computeStockPositionSummary(
 
   const currentShares = round4(shares);
   const marketPrice = Number(asset.unitPrice || 0);
+  const { previousClose, dailyChange, dailyChangePct } = computeStockDailyMetrics(
+    marketPrice,
+    asset.previousClose
+  );
+  const dailyPnl = dailyChange !== null ? round2(dailyChange * currentShares) : null;
+  const dailyPnlTwd = dailyPnl !== null ? Math.round(dailyPnl * fxRate) : null;
   const marketValue = round2(currentShares * marketPrice);
   const marketValueTwd = Math.round(marketValue * fxRate);
 
@@ -544,6 +654,11 @@ export function computeStockPositionSummary(
     baselineCostBasis,
     currentShares,
     marketPrice,
+    previousClose,
+    dailyChange,
+    dailyChangePct,
+    dailyPnl,
+    dailyPnlTwd,
     marketValue,
     marketValueTwd,
     costBasis: activeCostBasis,
@@ -586,6 +701,10 @@ export function computeStockPortfolioSummary(
   );
 
   let totalMarketValueTwd = 0;
+  let totalDailyPnlSum = 0;
+  let totalPrevMarketValueTwd = 0;
+  let hasAnyDailyChange = false;
+  let latestPriceUpdatedAt: string | null = null;
   let totalCostBasisTwd = 0;
   let totalUnrealizedPnlTwd = 0;
   let totalCashDividendsTwd = 0;
@@ -599,6 +718,14 @@ export function computeStockPortfolioSummary(
   for (const p of positions) {
     totalMarketValueTwd += p.marketValueTwd;
     totalCashDividendsTwd += p.cumulativeCashDividendsTwd;
+    if (p.asset.priceUpdatedAt && (!latestPriceUpdatedAt || p.asset.priceUpdatedAt > latestPriceUpdatedAt)) {
+      latestPriceUpdatedAt = p.asset.priceUpdatedAt;
+    }
+    if (p.dailyPnlTwd !== null && p.previousClose !== null && p.currentShares > 0) {
+      hasAnyDailyChange = true;
+      totalDailyPnlSum += p.dailyPnlTwd;
+      totalPrevMarketValueTwd += Math.round(p.previousClose * p.currentShares * p.fxRate);
+    }
     if (p.hasCostBasis) {
       hasAnyCostBasis = true;
       totalCostBasisTwd += p.costBasisTwd;
@@ -610,6 +737,12 @@ export function computeStockPortfolioSummary(
       totalInvestedAllTimeTwd += Math.round(p.totalInvestedAllTime * p.fxRate);
     }
   }
+
+  const totalDailyPnlTwd = hasAnyDailyChange ? Math.round(totalDailyPnlSum) : null;
+  const totalDailyChangePct =
+    hasAnyDailyChange && totalPrevMarketValueTwd > 0
+      ? round2((totalDailyPnlSum / totalPrevMarketValueTwd) * 100)
+      : null;
 
   const totalUnrealizedRoiPct =
     totalCostBasisTwd > 0 ? round1((totalUnrealizedPnlTwd / totalCostBasisTwd) * 100) : 0;
@@ -625,6 +758,9 @@ export function computeStockPortfolioSummary(
   return {
     positions,
     totalMarketValueTwd: Math.round(totalMarketValueTwd),
+    totalDailyPnlTwd,
+    totalDailyChangePct,
+    latestPriceUpdatedAt,
     totalCostBasisTwd: Math.round(totalCostBasisTwd),
     totalUnrealizedPnlTwd: Math.round(totalUnrealizedPnlTwd),
     totalUnrealizedRoiPct,
@@ -637,6 +773,36 @@ export function computeStockPortfolioSummary(
     totalReturnRoiPct,
     hasAnyCostBasis,
   };
+}
+
+export function computeWatchlistSummary(assets: AssetItem[]): WatchlistSummary {
+  const watchAssets = (assets || [])
+    .filter((a) => isWatchlistAsset(a))
+    .slice()
+    .sort(compareBySortOrder);
+
+  let latestPriceUpdatedAt: string | null = null;
+  const items: WatchlistItemSummary[] = watchAssets.map((asset) => {
+    const marketPrice = Number(asset.unitPrice || 0);
+    const { previousClose, dailyChange, dailyChangePct } = computeStockDailyMetrics(
+      marketPrice,
+      asset.previousClose
+    );
+    const ts = asset.priceUpdatedAt || null;
+    if (ts && (!latestPriceUpdatedAt || ts > latestPriceUpdatedAt)) {
+      latestPriceUpdatedAt = ts;
+    }
+    return {
+      asset,
+      marketPrice,
+      previousClose,
+      dailyChange,
+      dailyChangePct,
+      priceUpdatedAt: ts,
+    };
+  });
+
+  return { items, latestPriceUpdatedAt };
 }
 
 export function computeAssetEffectiveShares(
@@ -966,7 +1132,9 @@ export function computeNetWorthSummary(
   logs: CashFlowLog[] = [],
   adjustments: SavingsAdjustment[] = [],
   stockTransactions: StockTransaction[] = [],
-  asOfDate = getTodayYmdLocal()
+  asOfDate = getTodayYmdLocal(),
+  ledgers?: Ledger[] | null,
+  ledgerScope: 'net_worth' | 'all' | string = 'net_worth'
 ): NetWorthSummary {
   let totalAssets = 0;
   let totalLiabilities = 0;
@@ -976,8 +1144,16 @@ export function computeNetWorthSummary(
   let fundStructuredValue = 0;
   let insuranceValue = 0;
 
-  for (const a of assets) {
-    if (a.deletedAt) continue;
+  const scopedAssets =
+    ledgerScope === 'all'
+      ? (assets || []).filter((a) => !a.deletedAt && !a.isWatchlist)
+      : ledgerScope === 'net_worth'
+        ? (assets || []).filter((a) => isAssetIncludedInNetWorth(a, ledgers))
+        : (assets || []).filter(
+            (a) => !a.deletedAt && !a.isWatchlist && getEffectiveLedgerId(a) === ledgerScope
+          );
+
+  for (const a of scopedAssets) {
     const twdValue = computeAssetEffectiveTwdValue(a, usdTwdRate, logs, adjustments, stockTransactions, asOfDate);
     if (a.majorType === '資產') {
       totalAssets += twdValue;

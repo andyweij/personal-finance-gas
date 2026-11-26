@@ -1,4 +1,5 @@
 import './styles.css';
+import { DEFAULT_LEDGER_ID } from '../../shared/constants';
 import { computeAllSavingsSummary } from '../../shared/calculations';
 import type { PnlColorScheme } from '../../shared/types';
 import { normalizePnlColorScheme } from '../../shared/validation';
@@ -22,7 +23,13 @@ import {
   renderConfigTab,
 } from './ui/configTab';
 import { getAssetSectionIds, openAssetModal, openSavingsAccountModal, renderAssetsTab } from './ui/assetsTab';
-import { getOrderedStockIds, openStockBaselineModal, renderStocksTab } from './ui/stocksTab';
+import {
+  getOrderedStockIds,
+  getOrderedWatchlistIds,
+  openStockBaselineModal,
+  openWatchlistModal,
+  renderStocksTab,
+} from './ui/stocksTab';
 import { bindUtilityTabEvents, renderUtilityTab } from './ui/utilityTab';
 import { cancelReorder, startReorder } from './ui/reorderHelper';
 import {
@@ -38,7 +45,13 @@ import {
 import { initBottomNavScrub } from './ui/tabBarScrub';
 import { openConflictsModal } from './ui/conflictUi';
 import { openHelpGuideModal } from './ui/helpGuideUi';
-import type { AppUiState, StockChartDimension, StockChartType, UiContext } from './ui/state';
+import type {
+  AppUiState,
+  StockCardDisplayMode,
+  StockChartDimension,
+  StockChartType,
+  UiContext,
+} from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
 
@@ -83,6 +96,7 @@ async function bootstrap(): Promise<void> {
   const parsedIdle = storedIdle !== null && !Number.isNaN(Number(storedIdle)) ? Number(storedIdle) : 5;
   const storedAlloc = localStorage.getItem('finance_alloc_mode');
   const storedStockView = localStorage.getItem('finance_stock_view_mode');
+  const storedCardMode = localStorage.getItem('finance_stock_card_mode');
   const storedChartType = localStorage.getItem('finance_stock_chart_type');
   const storedChartDim = localStorage.getItem('finance_stock_chart_dim');
   const storedPnlScheme = normalizePnlColorScheme(localStorage.getItem('finance_pnl_scheme'));
@@ -106,10 +120,15 @@ async function bootstrap(): Promise<void> {
     storedChartDim === 'category' || storedChartDim === 'cost' || storedChartDim === 'market'
       ? storedChartDim
       : 'value';
+  const validCardMode: StockCardDisplayMode = storedCardMode === 'flip' ? 'flip' : 'list';
 
   const state: AppUiState = {
     masked: localStorage.getItem('finance_masked') === '1',
     activeTab: 'log',
+    activeLedgerId: localStorage.getItem('finance_active_ledger_id') || DEFAULT_LEDGER_ID,
+    assetsLedgerScope: 'net_worth',
+    overviewLedgerScope: 'net_worth',
+    recurringLedgerScope: 'all',
     logSubtab: 'entry',
     ledgerMode: 'list',
     ledgerPage: 1,
@@ -122,7 +141,10 @@ async function bootstrap(): Promise<void> {
     recurringFilter: 'all',
     allocMode: storedAlloc === 'pct' || storedAlloc === 'amt' ? storedAlloc : 'both',
     allocHighlight: null,
+    stocksSubtab: 'holdings',
     stockPriceViewMode: storedStockView === 'total' ? 'total' : 'unit',
+    stockCardDisplayMode: validCardMode,
+    flippedStockIds: [],
     stockChartType: validChartType,
     stockChartDimension: validChartDim,
     stockChartHighlight: null,
@@ -240,6 +262,13 @@ async function bootstrap(): Promise<void> {
         state.passkeys = nextMeta.passkeys || [];
         state.passkeyCount = state.passkeys.length;
         state.biometricLockEnabled = Boolean(nextMeta.biometricLockEnabled);
+        state.activeLedgerId = DEFAULT_LEDGER_ID;
+        localStorage.setItem('finance_active_ledger_id', DEFAULT_LEDGER_ID);
+        state.assetsLedgerScope = 'net_worth';
+        state.overviewLedgerScope = 'net_worth';
+        state.recurringLedgerScope = 'all';
+        state.flippedStockIds = [];
+        state.logLinkedAccountTouched = false;
       }
       ctx.applyUtilityTabVisibility();
       ctx.renderAll();
@@ -564,6 +593,7 @@ function bindEvents(ctx: UiContext): void {
         currency: ctx.state.logCurrency,
         note: el<HTMLInputElement>('noteInput').value.trim(),
         linkedAccountId,
+        ledgerId: ctx.state.activeLedgerId,
         makeRecurring,
       });
       el<HTMLInputElement>('amountInput').value = '';
@@ -579,7 +609,8 @@ function bindEvents(ctx: UiContext): void {
           snap.assetItems,
           snap.cashflowLogs,
           snap.savingsAdjustments || [],
-          snap.settings.usdTwdRate
+          snap.settings.usdTwdRate,
+          ctx.state.activeLedgerId
         );
         const acc = sav.accounts.find((a) => a.account.id === linkedAccountId);
         if (acc) {
@@ -771,10 +802,37 @@ function bindEvents(ctx: UiContext): void {
       renderStocksTab(ctx);
     });
   });
-  el('addStockBtn').addEventListener('click', () => openStockBaselineModal(ctx, null));
+  document.querySelectorAll<HTMLButtonElement>('#stocksSubtabBar [data-stocks-sub]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const nextSub = btn.dataset.stocksSub === 'watchlist' ? 'watchlist' : 'holdings';
+      if (ctx.state.reorderSection === 'stocks' || ctx.state.reorderSection === 'watchlist') {
+        cancelReorder(ctx, true);
+      }
+      ctx.state.stocksSubtab = nextSub;
+      renderStocksTab(ctx);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>('#stockCardModeToggle .mini-seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      ctx.state.stockCardDisplayMode = btn.dataset.cardMode === 'flip' ? 'flip' : 'list';
+      localStorage.setItem('finance_stock_card_mode', ctx.state.stockCardDisplayMode);
+      renderStocksTab(ctx);
+    });
+  });
+  el('addStockBtn').addEventListener('click', () => {
+    if (ctx.state.stocksSubtab === 'watchlist') {
+      openWatchlistModal(ctx, null);
+    } else {
+      openStockBaselineModal(ctx, null);
+    }
+  });
   el('stocksRefreshMarketBtn').addEventListener('click', () => void refreshMarketAction());
   el('reorderStocksBtn').addEventListener('click', () => {
-    startReorder(ctx, 'stocks', getOrderedStockIds(ctx));
+    if (ctx.state.stocksSubtab === 'watchlist') {
+      startReorder(ctx, 'watchlist', getOrderedWatchlistIds(ctx));
+    } else {
+      startReorder(ctx, 'stocks', getOrderedStockIds(ctx));
+    }
   });
 
   // Tab 5 Utility subtab events

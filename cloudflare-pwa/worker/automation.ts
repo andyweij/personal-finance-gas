@@ -2,6 +2,9 @@ import { CASHFLOW_TYPES } from '../shared/constants';
 import {
   computeAssetEffectiveTwdValue,
   computeSinkingMonthlyReserve,
+  getEffectiveLedgerId,
+  isAssetIncludedInNetWorth,
+  isLedgerIncludedInNetWorth,
 } from '../shared/calculations';
 import { buildMonthlyDedupKey, shouldPostRecurringItem } from '../shared/recurring';
 import { assertUserId, ensureAppSettings, exportFullSnapshot } from './sync';
@@ -51,16 +54,19 @@ export async function runMonthlyRecurringD1(
 
   const existingRows = await db
     .prepare(
-      `SELECT type, item_name, recurring_dedup_key
+      `SELECT type, item_name, recurring_dedup_key, ledger_id
        FROM cashflow_logs
        WHERE user_id = ? AND year_month = ? AND source = '自動入帳' AND deleted_at IS NULL`
     )
     .bind(uid, yearMonth)
-    .all<{ type: string; item_name: string; recurring_dedup_key: string | null }>();
+    .all<{ type: string; item_name: string; recurring_dedup_key: string | null; ledger_id?: string | null }>();
 
   const existingKeys = new Set<string>();
   for (const r of existingRows.results) {
-    existingKeys.add(r.recurring_dedup_key || buildMonthlyDedupKey(yearMonth, r.type, r.item_name));
+    existingKeys.add(
+      r.recurring_dedup_key ||
+        buildMonthlyDedupKey(yearMonth, r.type, r.item_name, r.ledger_id || 'default')
+    );
   }
 
   const recurringRows = await db
@@ -77,6 +83,7 @@ export async function runMonthlyRecurringD1(
       billing_spec: string;
       note: string;
       linked_account_id: string | null;
+      ledger_id?: string | null;
     }>();
 
   let insertedCount = 0;
@@ -87,7 +94,8 @@ export async function runMonthlyRecurringD1(
     if (!item.item_name || !item.type || item.amount <= 0) continue;
     if (!shouldPostRecurringItem(item.cycle, item.billing_spec, year, month)) continue;
 
-    const dedupKey = buildMonthlyDedupKey(yearMonth, item.type, item.item_name);
+    const ledgerId = String(item.ledger_id || 'default').trim() || 'default';
+    const dedupKey = buildMonthlyDedupKey(yearMonth, item.type, item.item_name, ledgerId);
     if (existingKeys.has(dedupKey)) {
       skippedCount++;
       continue;
@@ -104,8 +112,8 @@ export async function runMonthlyRecurringD1(
     await db
       .prepare(
         `INSERT INTO cashflow_logs
-          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -122,6 +130,7 @@ export async function runMonthlyRecurringD1(
         finalNote,
         dedupKey,
         item.linked_account_id || null,
+        ledgerId,
         nowIso,
         nowIso
       )
@@ -176,6 +185,7 @@ export async function runMonthEndSnapshotD1(
   let insuranceAssets = 0;
 
   for (const item of full.assetItems) {
+    if (!isAssetIncludedInNetWorth(item, full.ledgers)) continue;
     const twdValue = computeAssetEffectiveTwdValue(
       item,
       full.settings.usdTwdRate,
@@ -208,6 +218,7 @@ export async function runMonthEndSnapshotD1(
   let monthlyCoreExpense = 0;
   for (const l of full.cashflowLogs) {
     if (l.yearMonth !== yearMonth) continue;
+    if (!isLedgerIncludedInNetWorth(getEffectiveLedgerId(l), full.ledgers)) continue;
     if (l.type === CASHFLOW_TYPES.FIXED_INCOME || l.type === CASHFLOW_TYPES.OTHER_INCOME) {
       monthlyIncome += l.twdAmount;
     } else if (

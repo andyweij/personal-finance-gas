@@ -86,14 +86,17 @@
   <main class="container">
     <!-- ==================== TAB 1: 記帳 ==================== -->
     <section class="tab-view active" id="tab-log">
-      <div class="card">
+      <div class="ledger-bar" id="logLedgerBar"></div>
+      <div class="ledger-isolated-banner" id="logIsolatedBanner" style="display:none"></div>
+
+      <div class="card" id="logBudgetCard">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <span style="font-size:13px;font-weight:600;color:var(--text-secondary)">當月日常消費預算</span>
+          <span id="logBudgetCardTitle" style="font-size:13px;font-weight:600;color:var(--text-secondary)">當月日常消費預算</span>
           <span class="fx-pill tint" id="logMonthBadge">--</span>
         </div>
         <div class="budget-numbers">
           <div>
-            <div style="font-size:12px;color:var(--text-muted)">剩餘可用</div>
+            <div id="remainingBudgetLabel" style="font-size:12px;color:var(--text-muted)">剩餘可用</div>
             <div class="big-num" id="remainingBudget">NT$ --</div>
           </div>
           <div class="tnum" style="text-align:right;font-size:12px;color:var(--text-secondary);line-height:1.55">
@@ -101,7 +104,7 @@
             <div id="budgetLimitText">上限 NT$ --</div>
           </div>
         </div>
-        <div class="progress-track"><div class="progress-fill" id="budgetProgress"></div></div>
+        <div class="progress-track" id="budgetProgressTrack"><div class="progress-fill" id="budgetProgress"></div></div>
         <div class="hero-footer tnum">
           <span id="usagePctText">使用率：--%</span>
           <span id="quickFreeCashText">自由現金流：--</span>
@@ -256,6 +259,7 @@
 
     <!-- ==================== TAB 2: 總覽 ==================== -->
     <section class="tab-view" id="tab-overview">
+      <div class="ledger-bar" id="overviewLedgerBar"></div>
       <div class="month-nav">
         <button type="button" class="btn btn-outline btn-sm" id="prevMonthBtn">上月</button>
         <span class="month-label" id="overviewMonthLabel">--</span>
@@ -323,9 +327,11 @@
 
     <!-- ==================== TAB 3: 資產負債 ==================== -->
     <section class="tab-view" id="tab-assets">
+      <div class="ledger-bar" id="assetsLedgerBar"></div>
+      <div class="ledger-isolated-banner" id="assetsIsolatedBanner" style="display:none"></div>
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <span style="font-size:13px;font-weight:600;color:var(--text-secondary)">整合淨資產 (TWD)</span>
+          <span id="assetsHeroTitle" style="font-size:13px;font-weight:600;color:var(--text-secondary)">整合淨資產 (TWD)</span>
           <span class="fx-pill" id="debtRatioBadge">負債比 --%</span>
         </div>
         <div class="big-num" style="margin:6px 0 4px" id="netWorthHero">NT$ --</div>
@@ -395,6 +401,14 @@
         <div class="list-group" id="manualAssetsList"></div>
       </div>
 
+      <div id="independentLedgersSection" style="display:none">
+        <div class="section-heading">
+          <span>獨立管理帳本資產（不計入個人總淨值）</span>
+          <span>點擊切換檢視明細</span>
+        </div>
+        <div class="list-group" id="independentLedgersList"></div>
+      </div>
+
       <div>
         <div class="section-heading">
           <span>淨資產歷史快照</span>
@@ -417,7 +431,10 @@
             <button type="button" class="mini-seg-btn" data-stock-view="total">總額 (39,000)</button>
           </div>
         </div>
-        <div class="big-num" style="margin:6px 0 4px" id="stocksMarketValueHero">NT$ --</div>
+        <div class="stocks-hero-row">
+          <div class="big-num" style="margin:6px 0 4px" id="stocksMarketValueHero">NT$ --</div>
+          <span class="daily-change-pill flat tnum" id="stocksHeroDailyBadge" style="display:none">--</span>
+        </div>
 
         <div class="sub-tile-grid">
           <div class="sub-tile">
@@ -439,17 +456,36 @@
           <span id="stocksRecoveryPctText">整體配息回本：0.0%</span>
           <span id="stocksUnrecoveredText">--</span>
         </div>
+        <div class="stocks-updated-bar tnum" id="stocksQuoteUpdatedBar">報價更新：尚未同步</div>
       </div>
 
       <div class="card" id="stocksChartCard" style="display:none"></div>
 
-      <div class="stock-top-actions">
-        <button type="button" class="btn btn-primary btn-sm" id="addStockBtn">+ 新增持股</button>
-        <button type="button" class="btn btn-outline btn-sm" id="stocksRefreshMarketBtn">更新股價匯率</button>
-        <button type="button" class="btn btn-outline btn-sm" id="reorderStocksBtn" style="display:none">⇅ 編輯排序</button>
+      <div class="seg-bar" id="stocksSubtabBar">
+        <button type="button" class="seg-btn active" data-stocks-sub="holdings">
+          <span>我的持股</span>
+          <span class="seg-badge" id="stocksHoldingsSubBadge">0</span>
+        </button>
+        <button type="button" class="seg-btn" data-stocks-sub="watchlist">
+          <span>觀察清單</span>
+          <span class="seg-badge" id="stocksWatchlistSubBadge">0</span>
+        </button>
+      </div>
+
+      <div class="stock-toolbar">
+        <div class="stock-top-actions">
+          <button type="button" class="btn btn-primary btn-sm" id="addStockBtn">+ 新增持股</button>
+          <button type="button" class="btn btn-outline btn-sm" id="stocksRefreshMarketBtn">更新股價匯率</button>
+          <button type="button" class="btn btn-outline btn-sm" id="reorderStocksBtn" style="display:none">⇅ 編輯排序</button>
+        </div>
+        <div class="mini-seg" id="stockCardModeToggle" title="切換清單卡片與 3D 翻牌卡">
+          <button type="button" class="mini-seg-btn active" data-card-mode="list">清單</button>
+          <button type="button" class="mini-seg-btn" data-card-mode="flip">翻牌</button>
+        </div>
       </div>
 
       <div class="stocks-list" id="stocksPortfolioList"></div>
+      <div class="stocks-list" id="stocksWatchlistList" style="display:none"></div>
     </section>
 
     <!-- ==================== TAB 5: 工具（固定收支 / 稅金分攤 / 水電分攤） ==================== -->
@@ -461,6 +497,7 @@
       </div>
 
       <div id="subtab-recurring" style="display:flex;flex-direction:column;gap:12px">
+        <div class="ledger-bar" id="recurringLedgerBar"></div>
         <div class="card compact">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
             <div>

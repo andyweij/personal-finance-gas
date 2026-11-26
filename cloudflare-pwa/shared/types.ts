@@ -11,6 +11,19 @@ export interface AppSettings {
   version?: number;
 }
 
+export interface Ledger {
+  id: string;
+  name: string;
+  includeInNetWorth: boolean;
+  monthlyDailyBudget?: number | null;
+  note: string;
+  sortOrder?: number;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+  version?: number;
+}
+
 export interface CashFlowLog {
   id: string;
   date: string; // YYYY-MM-DD
@@ -26,6 +39,7 @@ export interface CashFlowLog {
   note: string;
   recurringDedupKey?: string | null;
   linkedAccountId?: string | null;
+  ledgerId?: string;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -44,6 +58,7 @@ export interface RecurringItem {
   status: string;
   note: string;
   linkedAccountId?: string | null;
+  ledgerId?: string;
   sortOrder?: number;
   createdAt: string;
   updatedAt: string;
@@ -78,6 +93,7 @@ export interface AssetItem {
   quantityOrAmount: number;
   currency: string;
   unitPrice: number;
+  previousClose?: number | null;
   costBasis?: number | null;
   priceUpdatedAt?: string | null;
   note: string;
@@ -90,6 +106,9 @@ export interface AssetItem {
   loanMonthlyPayment?: number | null;
   loanBillingDay?: number | null;
   stockCategory?: string;
+  isWatchlist?: boolean;
+  ledgerId?: string;
+  excludeFromNetWorth?: boolean;
   sortOrder?: number;
   createdAt: string;
   updatedAt: string;
@@ -123,6 +142,11 @@ export interface StockPositionSummary {
   baselineCostBasis: number;
   currentShares: number;
   marketPrice: number;
+  previousClose: number | null;
+  dailyChange: number | null;
+  dailyChangePct: number | null;
+  dailyPnl: number | null;
+  dailyPnlTwd: number | null;
   marketValue: number; // asset currency
   marketValueTwd: number;
   /** 原始持有總成本（不含息，原幣） */
@@ -165,6 +189,9 @@ export interface StockPositionSummary {
 export interface StockPortfolioSummary {
   positions: StockPositionSummary[];
   totalMarketValueTwd: number;
+  totalDailyPnlTwd: number | null;
+  totalDailyChangePct: number | null;
+  latestPriceUpdatedAt: string | null;
   totalCostBasisTwd: number;
   totalUnrealizedPnlTwd: number;
   totalUnrealizedRoiPct: number;
@@ -176,6 +203,20 @@ export interface StockPortfolioSummary {
   totalReturnPnlTwd: number;
   totalReturnRoiPct: number;
   hasAnyCostBasis: boolean;
+}
+
+export interface WatchlistItemSummary {
+  asset: AssetItem;
+  marketPrice: number;
+  previousClose: number | null;
+  dailyChange: number | null;
+  dailyChangePct: number | null;
+  priceUpdatedAt: string | null;
+}
+
+export interface WatchlistSummary {
+  items: WatchlistItemSummary[];
+  latestPriceUpdatedAt: string | null;
 }
 
 export interface LoanScheduleEntry {
@@ -276,6 +317,7 @@ export interface RentUtilityRents {
 
 export interface FinanceSnapshot {
   settings: AppSettings;
+  ledgers?: Ledger[];
   cashflowLogs: CashFlowLog[];
   recurringItems: RecurringItem[];
   sinkingItems: SinkingFundItem[];
@@ -288,6 +330,7 @@ export interface FinanceSnapshot {
 }
 
 export type SyncEntity =
+  | 'ledger'
   | 'cashflow'
   | 'recurring'
   | 'sinking'
@@ -330,6 +373,7 @@ export interface SyncRequest {
 
 export interface SyncDelta {
   settings: AppSettings | null;
+  ledgers?: Ledger[];
   cashflowLogs: CashFlowLog[];
   recurringItems: RecurringItem[];
   sinkingItems: SinkingFundItem[];
