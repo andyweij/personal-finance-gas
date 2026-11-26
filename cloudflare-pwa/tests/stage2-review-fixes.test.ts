@@ -357,29 +357,33 @@ describe('Phase 2 Review Remediation (P2-C1..C10 & P2-S1..S12)', () => {
       return new Response('not found', { status: 404 });
     };
 
-    // 1st refresh changes price 1000 -> 1050 (v1 -> v2)
+    // 1st refresh changes price 1000 -> 1050: Q7/F7 keeps optimistic-lock version at 1 while advancing change_seq
     await refreshMarketData(db, mockFetch, 'owner');
     const after1 = await db
-      .prepare('SELECT unit_price, previous_close, version FROM asset_items WHERE user_id = ? AND id = ?')
+      .prepare('SELECT unit_price, previous_close, version, change_seq FROM asset_items WHERE user_id = ? AND id = ?')
       .bind('owner', 's-2330')
-      .first<{ unit_price: number; previous_close: number; version: number }>();
-    expect(after1).toEqual({ unit_price: 1050, previous_close: 1020, version: 2 });
+      .first<{ unit_price: number; previous_close: number; version: number; change_seq: number }>();
+    expect(after1?.unit_price).toBe(1050);
+    expect(after1?.previous_close).toBe(1020);
+    expect(after1?.version).toBe(1);
+    expect(after1?.change_seq).toBeGreaterThan(0);
 
-    // 2nd refresh returns IDENTICAL (1050, 1020) and FX (32.5) -> MUST NOT increment versions!
+    // 2nd refresh returns IDENTICAL (1050, 1020) and FX (32.5) -> MUST NOT increment change_seq or versions!
     const settingsBefore2 = await db
       .prepare('SELECT version FROM app_settings WHERE user_id = ?')
       .bind('owner')
       .first<{ version: number }>();
     await refreshMarketData(db, mockFetch, 'owner');
     const after2 = await db
-      .prepare('SELECT unit_price, previous_close, version FROM asset_items WHERE user_id = ? AND id = ?')
+      .prepare('SELECT unit_price, previous_close, version, change_seq FROM asset_items WHERE user_id = ? AND id = ?')
       .bind('owner', 's-2330')
-      .first<{ unit_price: number; previous_close: number; version: number }>();
+      .first<{ unit_price: number; previous_close: number; version: number; change_seq: number }>();
     const settingsAfter2 = await db
       .prepare('SELECT version FROM app_settings WHERE user_id = ?')
       .bind('owner')
       .first<{ version: number }>();
-    expect(after2?.version).toBe(2);
+    expect(after2?.version).toBe(1);
+    expect(after2?.change_seq).toBe(after1?.change_seq);
     expect(settingsAfter2?.version).toBe(settingsBefore2?.version);
 
     // P2-S5 (Option A): disable autoFxEnabled & set manual FX 31.0 -> POST /api/market/refresh MUST keep 31.0!

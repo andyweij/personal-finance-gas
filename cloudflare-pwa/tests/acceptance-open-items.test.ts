@@ -212,7 +212,7 @@ describe('驗收：伺服器端尚未修正項目', () => {
     expect(res.ackedMutationIds).not.toContain('stale');
   });
 
-  it.fails('F7: 報價更新後，離線裝置只改成本（未帶報價欄位）不得產生版本衝突，且不得覆蓋新報價', async () => {
+  it('F7: 報價更新後，離線裝置只改成本（未帶報價欄位）不得產生版本衝突，且不得覆蓋新報價', async () => {
     const db = createTestD1();
     // 1. 建立自動更新的美股持股（version 1）
     const create = await processSyncRequest(db, UID, {
@@ -288,7 +288,7 @@ describe('驗收：伺服器端尚未修正項目', () => {
     expect(Number(final?.cost_basis)).toBe(1400);
   });
 
-  it.fails('F8: 台北 23:00（UTC 15:00）的排程落在美股盤中，不得以盤中價覆寫美股報價（月底淨值快照也在這次執行）', async () => {
+  it('F8: 台北 23:00（UTC 15:00）的排程落在美股盤中，不得以盤中價覆寫美股報價（月底淨值快照也在這次執行）', async () => {
     const db = createTestD1();
     await db
       .prepare(
@@ -545,7 +545,7 @@ describe('驗收：客戶端尚未修正項目', () => {
     localDb.close();
   });
 
-  it.fails('Q8: 清空自動更新持股的代號時，不得把既有價格歸零（只有「換成另一個非空代號」才可清空價格）', async () => {
+  it('Q8: 清空自動更新持股的代號時，不得把既有價格歸零（只有「換成另一個非空代號」才可清空價格）', async () => {
     const db = createTestD1();
     const localDb = new LocalFinanceDB(`q8-${crypto.randomUUID()}`);
     const engine = newEngine(localDb, d1Fetch(db));

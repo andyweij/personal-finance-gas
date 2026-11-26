@@ -558,8 +558,20 @@ export function createApp() {
     const user = c.get('authUser');
     const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
     if (mismatch) return c.json(mismatch, 409);
+    // Q8: optional `{ assetIds: string[] }` body limits the refresh to specific holdings (e.g. right after a
+    // ticker replacement) so the new ticker gets a quote without waiting for the next scheduled run.
+    const body = (await c.req.json().catch(() => null)) as { assetIds?: unknown } | null;
+    const assetIds =
+      body && Array.isArray(body.assetIds)
+        ? body.assetIds.filter((x): x is string => typeof x === 'string' && x.trim() !== '').slice(0, 50)
+        : undefined;
     // Respect user's autoFxEnabled setting instead of forcing FX overwrite
-    const result = await refreshMarketData(c.env.DB, fetch, user.id);
+    const result = await refreshMarketData(
+      c.env.DB,
+      fetch,
+      user.id,
+      assetIds && assetIds.length > 0 ? { assetIds } : undefined
+    );
     return c.json({ ok: true, ...result });
   });
 
@@ -822,8 +834,11 @@ export default {
       return;
     }
 
-    // Daily 23:00 Asia/Taipei (15:00 UTC): refresh TW/US prices & FX for all active users, snapshot on month-end
-    await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'all' });
+    // Daily 23:00 Asia/Taipei (15:00 UTC): refresh TW closing prices & FX for all active users, snapshot on month-end.
+    // Q6 / F8: 23:00 Taipei falls inside US regular trading hours (22:30/21:30 – 05:00/04:00 Taipei), so US quotes
+    // would be intraday prices. US closes are owned exclusively by the 06:00 run; keep them untouched here so the
+    // month-end net-worth snapshot records the last US CLOSE rather than a mid-session price.
+    await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'tw' });
     if (isTaiwanMonthEnd(now)) {
       await runMonthEndSnapshotAllUsersD1(env.DB, now);
     }
