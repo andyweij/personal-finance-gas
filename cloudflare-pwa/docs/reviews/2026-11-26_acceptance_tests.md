@@ -18,16 +18,20 @@
 
 | 測試 | 審查編號 | 目前狀態 | 在 v1.8.6 上的失敗訊息 |
 |---|---|---|---|
-| N2 完整重抓期間的寫入不得遺失 | Q2 / N2 | `it.fails` | `expected false to be true`（snapshot 與下次 delta 都沒有該筆） |
-| N4 舊 epoch mutation 不得寫入還原資料 | Q5 / N4 | `it.fails` | `expected { id: 'cf-stale' } to be null` |
+| N2 完整重抓期間的寫入不得遺失 | Q2 / N2 | ✅ v1.8.7 已改為 `it` | `expected false to be true`（snapshot 與下次 delta 都沒有該筆） |
+| N4 舊 epoch mutation 不得寫入還原資料 | Q5 / N4 | ✅ v1.8.7 已改為 `it` | `expected { id: 'cf-stale' } to be null` |
 | F7 報價更新後離線改成本不得衝突 | Q7 / F7 | `it.fails` | `conflicts` 長度為 1 |
 | F8 23:00 不得以美股盤中價覆寫 | Q6 / F8 | `it.fails` | `expected 133 to be 148` |
-| Q1 伺服器整體故障不得隔離正常資料 | Q1 | `it.fails` | 2 筆正常資料被移進拒絕清單 |
-| N1 重新載入後再編輯不得假衝突 | Q4 / N1 | `it.fails` | `conflicts` 長度為 1 |
-| N3 重新套用不得覆蓋較新編輯 | N3 | `it.fails` | `expected 'offline-old' to be 'newer'` |
+| Q1 伺服器整體故障不得隔離正常資料 | Q1 | ✅ v1.8.7 已改為 `it` | 2 筆正常資料被移進拒絕清單 |
+| N1 重新載入後再編輯不得假衝突 | Q4 / N1 | ✅ v1.8.7 已改為 `it` | `conflicts` 長度為 1 |
+| N3 重新套用不得覆蓋較新編輯 | N3 | ✅ v1.8.7 已改為 `it` | `expected 'offline-old' to be 'newer'` |
 | Q8 清空代號不得把價格歸零 | Q8 / F5 | `it.fails` | `expected +0 to be 148` |
 | R6 被拒值不得寫入伺服器 | Q3 / R6 | 回歸保護（`it`） | 已通過（僅涵蓋欄位驗證型拒絕） |
 | F1 邊界 重新套用時價格不得為 NaN | F1 | 回歸保護（`it`） | 已通過 |
+| V1 只有寫入路徑故障時不得隔離正常資料 | V1（v1.8.7 審查） | `it.fails` | 5 筆正常資料被隔離 |
+| V2 被延後紀錄之後的 mutation 不得插隊 | V2（v1.8.7 審查） | `it.fails` | 刪除帳本被拒（1 筆拒絕） |
+| V3 被略過的凍結項目必須保留 | V3（v1.8.7 審查） | `it.fails` | 找不到被略過的編輯 |
+| V4 舊 epoch mutation 不得依還原資料被拒絕 | V4（v1.8.7 審查） | `it.fails` | 刪除帳本出現在 `rejected` |
 
 ### 未涵蓋（需人工確認）
 
@@ -48,11 +52,11 @@
 請修正 cloudflare-pwa 的未完成審查項目。範圍僅限 cloudflare-pwa/，不要修改根目錄 GAS 版。
 
 先閱讀：
-- cloudflare-pwa/docs/reviews/2026-11-26_v1.8.6_review.md（「需修正」與「尚未完成清單」）
+- 最新一份審查文件（目前為 cloudflare-pwa/docs/reviews/2026-11-26_v1.8.7_review.md）及其引用的前一份審查
 - cloudflare-pwa/docs/reviews/2026-11-26_acceptance_tests.md（本文件）
 - cloudflare-pwa/tests/acceptance-open-items.test.ts
 
-本輪只處理「第一組（必修）」：Q1、N2、N1、N4。
+本輪只處理：（依最新審查文件的「建議下一輪交辦」填入，例如 V1、V2、V4、R-1）。
 
 驗收規則（必須遵守）：
 1. 每修好一項，把 tests/acceptance-open-items.test.ts 中對應的 `it.fails` 改成 `it`，且該測試必須通過。
