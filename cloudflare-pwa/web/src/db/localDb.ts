@@ -291,17 +291,26 @@ export class LocalFinanceDB {
           const prev = byKey.get(key);
           if (prev) {
             outboxStore.delete(prev.mutationId);
-            const prevIsNewUnsynced = prev.op === 'upsert' && (prev.baseVersion === null || prev.baseVersion === 0);
+            const prevIsNewUnsynced =
+              prev.op === 'upsert' &&
+              (prev.isNewRecord !== undefined
+                ? prev.isNewRecord
+                : prev.baseVersion === null || prev.baseVersion === 0);
             if (prevIsNewUnsynced && mut.op === 'delete' && !inFlightKeys.has(key)) {
               // Brand-new offline record deleted before ever being sent -> cancel out completely
               byKey.delete(key);
               continue;
             }
-            // Coalesce while preserving the original server baseVersion
+            // Coalesce while preserving the original server baseVersion and isNewRecord marker
             this.outboxSeq += 1;
             const coalesced: SyncMutation & { _seq: number } = {
               ...mut,
               baseVersion: prev.baseVersion !== undefined ? prev.baseVersion : mut.baseVersion,
+              ...(prev.isNewRecord !== undefined
+                ? { isNewRecord: prev.isNewRecord }
+                : mut.isNewRecord !== undefined
+                  ? { isNewRecord: mut.isNewRecord }
+                  : {}),
               _seq: this.outboxSeq,
             };
             outboxStore.put(coalesced);

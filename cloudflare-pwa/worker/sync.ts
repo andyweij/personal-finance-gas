@@ -409,6 +409,22 @@ class VersionConflictError extends Error {
   }
 }
 
+class RejectError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RejectError';
+  }
+}
+
+function runValidation<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof RejectError) throw err;
+    throw new RejectError(err instanceof Error ? err.message : '資料驗證失敗');
+  }
+}
+
 const NEXT_SEQ_SQL = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1';
 const CURR_SEQ_SQL = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)';
 
@@ -513,7 +529,8 @@ async function commitAtomicMutation(
   primaryWriteStmt: D1PreparedStatement,
   postStatements: D1PreparedStatement[],
   refetchCurrent: () => Promise<{ row: Record<string, unknown> | null; mapped: Record<string, unknown> | null }>,
-  legacyClientTs?: string
+  legacyClientTs?: string,
+  onZeroChanges?: () => Promise<void>
 ): Promise<void> {
   const idempStmt = db
     .prepare(
@@ -544,6 +561,17 @@ async function commitAtomicMutation(
     const results = await db.batch(batchStmts);
     const changed = Number(results[0]?.meta?.changes ?? 0);
     if (changed !== 1) {
+      // S1: Check if an identical concurrent retry already succeeded and recorded idempotency
+      const already = await db
+        .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
+        .bind(uid, mutation.mutationId)
+        .first();
+      if (already) return;
+
+      if (onZeroChanges) {
+        await onZeroChanges();
+      }
+
       const latest = await refetchCurrent();
       const serverVersion = Number(latest.row?.version ?? 1);
       throw new VersionConflictError({
@@ -559,7 +587,7 @@ async function commitAtomicMutation(
       });
     }
   } catch (err) {
-    if (err instanceof VersionConflictError) throw err;
+    if (err instanceof VersionConflictError || err instanceof RejectError) throw err;
     const already = await db
       .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
       .bind(uid, mutation.mutationId)
@@ -588,7 +616,7 @@ async function applySingleMutation(
 
   if (mutation.entity === 'settings') {
     if (mutation.op !== 'upsert') {
-      throw new Error('不支援刪除系統設定。');
+      throw new RejectError('不支援刪除系統設定。');
     }
     const p = mutation.payload || {};
     const existing = await ensureAppSettings(db, uid);
@@ -687,42 +715,82 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (mutation.recordId === DEFAULT_LEDGER_ID) {
-        throw new Error('不可刪除預設個人主帳本。');
+        throw new RejectError('不可刪除預設個人主帳本。');
       }
       if (!existing) {
         await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
         return;
       }
-      const [cfCnt, asCnt, recCnt] = await Promise.all([
-        db
-          .prepare('SELECT COUNT(*) AS cnt FROM cashflow_logs WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
-          .bind(uid, mutation.recordId)
-          .first<{ cnt: number }>(),
-        db
-          .prepare('SELECT COUNT(*) AS cnt FROM asset_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
-          .bind(uid, mutation.recordId)
-          .first<{ cnt: number }>(),
-        db
-          .prepare('SELECT COUNT(*) AS cnt FROM recurring_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
-          .bind(uid, mutation.recordId)
-          .first<{ cnt: number }>(),
-      ]);
-      const remaining = Number(cfCnt?.cnt || 0) + Number(asCnt?.cnt || 0) + Number(recCnt?.cnt || 0);
+      const countLinkedRecords = async () => {
+        const [cfCnt, asCnt, recCnt] = await Promise.all([
+          db
+            .prepare('SELECT COUNT(*) AS cnt FROM cashflow_logs WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
+            .bind(uid, mutation.recordId)
+            .first<{ cnt: number }>(),
+          db
+            .prepare('SELECT COUNT(*) AS cnt FROM asset_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
+            .bind(uid, mutation.recordId)
+            .first<{ cnt: number }>(),
+          db
+            .prepare('SELECT COUNT(*) AS cnt FROM recurring_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
+            .bind(uid, mutation.recordId)
+            .first<{ cnt: number }>(),
+        ]);
+        return Number(cfCnt?.cnt || 0) + Number(asCnt?.cnt || 0) + Number(recCnt?.cnt || 0);
+      };
+      const remaining = await countLinkedRecords();
       if (remaining > 0) {
-        throw new Error(`此帳本仍有 ${remaining} 筆關聯紀錄，請先轉移至其他帳本或刪除紀錄後再移除帳本。`);
+        throw new RejectError(`此帳本仍有 ${remaining} 筆關聯紀錄，請先轉移至其他帳本或刪除紀錄後再移除帳本。`);
       }
       const expectedVersion = Number(existing.version ?? 1);
       const delStmt = db
         .prepare(
-          `UPDATE ledgers SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
+          `UPDATE ledgers
+           SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
+           WHERE user_id = ? AND id = ? AND version = ?
+             AND NOT EXISTS (SELECT 1 FROM cashflow_logs WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL)
+             AND NOT EXISTS (SELECT 1 FROM asset_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL)
+             AND NOT EXISTS (SELECT 1 FROM recurring_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL)`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, expectedVersion);
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchLedger, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          expectedVersion,
+          uid,
+          mutation.recordId,
+          uid,
+          mutation.recordId,
+          uid,
+          mutation.recordId
+        );
+      await commitAtomicMutation(
+        db,
+        uid,
+        mutation,
+        serverTime,
+        delStmt,
+        [],
+        refetchLedger,
+        check.legacyClientTs,
+        async () => {
+          const concurrentRemaining = await countLinkedRecords();
+          if (concurrentRemaining > 0) {
+            throw new RejectError(
+              `此帳本仍有 ${concurrentRemaining} 筆關聯紀錄，請先轉移至其他帳本或刪除紀錄後再移除帳本。`
+            );
+          }
+        }
+      );
       return;
     }
 
     const p = mutation.payload || {};
-    const v = validateLedgerInput({
+    const v = runValidation(() =>
+      validateLedgerInput({
       name: String(p.name || ''),
       includeInNetWorth:
         mutation.recordId === DEFAULT_LEDGER_ID
@@ -745,7 +813,8 @@ async function applySingleMutation(
           : existing?.sort_order !== undefined
             ? Number(existing.sort_order)
             : 0,
-    });
+      })
+    );
 
     const writeStmt = existing
       ? db
@@ -832,24 +901,26 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
-    const v = validateCashFlowInput(
-      {
-        date: String(p.date || ''),
-        type: String(p.type || ''),
-        category: String(p.category || ''),
-        itemName: String(p.itemName || ''),
-        amount: Number(p.amount),
-        currency: String(p.currency || 'TWD'),
-        fxRate: p.fxRate !== undefined ? Number(p.fxRate) : undefined,
-        source: String(p.source || '手機記帳'),
-        note: String(p.note || ''),
-        linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
-        ledgerId:
-          p.ledgerId !== undefined
-            ? normalizeLedgerId(p.ledgerId)
-            : normalizeLedgerId(existing?.ledger_id),
-      },
-      defaultFxRate
+    const v = runValidation(() =>
+      validateCashFlowInput(
+        {
+          date: String(p.date || ''),
+          type: String(p.type || ''),
+          category: String(p.category || ''),
+          itemName: String(p.itemName || ''),
+          amount: Number(p.amount),
+          currency: String(p.currency || 'TWD'),
+          fxRate: p.fxRate !== undefined ? Number(p.fxRate) : undefined,
+          source: String(p.source || '手機記帳'),
+          note: String(p.note || ''),
+          linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
+          ledgerId:
+            p.ledgerId !== undefined
+              ? normalizeLedgerId(p.ledgerId)
+              : normalizeLedgerId(existing?.ledger_id),
+        },
+        defaultFxRate
+      )
     );
 
     const writeStmt = existing
@@ -953,28 +1024,30 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
-    const v = validateRecurringInput({
-      itemName: String(p.itemName || ''),
-      category: String(p.category || ''),
-      type: String(p.type || ''),
-      amount: Number(p.amount),
-      currency: String(p.currency || 'TWD'),
-      cycle: String(p.cycle || '月繳'),
-      billingSpec: String(p.billingSpec || ''),
-      status: String(p.status || '啟用'),
-      note: String(p.note || ''),
-      linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
-      ledgerId:
-        p.ledgerId !== undefined
-          ? normalizeLedgerId(p.ledgerId)
-          : normalizeLedgerId(existing?.ledger_id),
-      sortOrder:
-        p.sortOrder !== undefined
-          ? normalizeSortOrder(p.sortOrder, 0)
-          : existing?.sort_order !== undefined
-            ? Number(existing.sort_order)
-            : 0,
-    });
+    const v = runValidation(() =>
+      validateRecurringInput({
+        itemName: String(p.itemName || ''),
+        category: String(p.category || ''),
+        type: String(p.type || ''),
+        amount: Number(p.amount),
+        currency: String(p.currency || 'TWD'),
+        cycle: String(p.cycle || '月繳'),
+        billingSpec: String(p.billingSpec || ''),
+        status: String(p.status || '啟用'),
+        note: String(p.note || ''),
+        linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
+        ledgerId:
+          p.ledgerId !== undefined
+            ? normalizeLedgerId(p.ledgerId)
+            : normalizeLedgerId(existing?.ledger_id),
+        sortOrder:
+          p.sortOrder !== undefined
+            ? normalizeSortOrder(p.sortOrder, 0)
+            : existing?.sort_order !== undefined
+              ? Number(existing.sort_order)
+              : 0,
+      })
+    );
 
     const writeStmt = existing
       ? db
@@ -1075,21 +1148,23 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
-    const v = validateSinkingInput({
-      itemName: String(p.itemName || ''),
-      category: String(p.category || ''),
-      totalAmount: Number(p.totalAmount),
-      months: Number(p.months),
-      dueNote: String(p.dueNote || ''),
-      status: String(p.status || '啟用'),
-      note: String(p.note || ''),
-      sortOrder:
-        p.sortOrder !== undefined
-          ? normalizeSortOrder(p.sortOrder, 0)
-          : existing?.sort_order !== undefined
-            ? Number(existing.sort_order)
-            : 0,
-    });
+    const v = runValidation(() =>
+      validateSinkingInput({
+        itemName: String(p.itemName || ''),
+        category: String(p.category || ''),
+        totalAmount: Number(p.totalAmount),
+        months: Number(p.months),
+        dueNote: String(p.dueNote || ''),
+        status: String(p.status || '啟用'),
+        note: String(p.note || ''),
+        sortOrder:
+          p.sortOrder !== undefined
+            ? normalizeSortOrder(p.sortOrder, 0)
+            : existing?.sort_order !== undefined
+              ? Number(existing.sort_order)
+              : 0,
+      })
+    );
 
     const writeStmt = existing
       ? db
@@ -1182,72 +1257,74 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
-    const v = validateAssetInput({
-      updateMode: String(p.updateMode || '手動快照'),
-      majorType: String(p.majorType || '資產'),
-      subCategory: String(p.subCategory || '其他資產'),
-      liquidity: String(p.liquidity || '中流動'),
-      itemName: String(p.itemName || ''),
-      ticker: String(p.ticker || ''),
-      quantityOrAmount: Number(p.quantityOrAmount),
-      currency: String(p.currency || 'TWD'),
-      unitPrice:
-        p.unitPrice !== undefined
-          ? Number(p.unitPrice)
-          : existing?.unit_price !== undefined
-            ? Number(existing.unit_price)
-            : 1,
-      previousClose:
-        p.previousClose !== undefined
-          ? (p.previousClose as number | null)
-          : existing?.previous_close !== undefined && existing?.previous_close !== null
-            ? Number(existing.previous_close)
+    const v = runValidation(() =>
+      validateAssetInput({
+        updateMode: String(p.updateMode || '手動快照'),
+        majorType: String(p.majorType || '資產'),
+        subCategory: String(p.subCategory || '其他資產'),
+        liquidity: String(p.liquidity || '中流動'),
+        itemName: String(p.itemName || ''),
+        ticker: String(p.ticker || ''),
+        quantityOrAmount: Number(p.quantityOrAmount),
+        currency: String(p.currency || 'TWD'),
+        unitPrice:
+          p.unitPrice !== undefined
+            ? Number(p.unitPrice)
+            : existing?.unit_price !== undefined
+              ? Number(existing.unit_price)
+              : 1,
+        previousClose:
+          p.previousClose !== undefined
+            ? (p.previousClose as number | null)
+            : existing?.previous_close !== undefined && existing?.previous_close !== null
+              ? Number(existing.previous_close)
+              : null,
+        costBasis:
+          p.costBasis !== undefined
+            ? (p.costBasis as number | null)
+            : existing?.cost_basis !== undefined && existing?.cost_basis !== null
+              ? Number(existing.cost_basis)
+              : null,
+        note: String(p.note || ''),
+        isLinkedSavings: Boolean(p.isLinkedSavings),
+        balanceAnchorDate: p.balanceAnchorDate ? String(p.balanceAnchorDate) : null,
+        balanceAnchorAt: p.balanceAnchorAt ? String(p.balanceAnchorAt) : null,
+        isDefaultSavings: Boolean(p.isDefaultSavings),
+        isAmortizingLoan: Boolean(p.isAmortizingLoan),
+        loanAnnualRate:
+          p.loanAnnualRate !== undefined && p.loanAnnualRate !== null ? Number(p.loanAnnualRate) : null,
+        loanMonthlyPayment:
+          p.loanMonthlyPayment !== undefined && p.loanMonthlyPayment !== null
+            ? Number(p.loanMonthlyPayment)
             : null,
-      costBasis:
-        p.costBasis !== undefined
-          ? (p.costBasis as number | null)
-          : existing?.cost_basis !== undefined && existing?.cost_basis !== null
-            ? Number(existing.cost_basis)
-            : null,
-      note: String(p.note || ''),
-      isLinkedSavings: Boolean(p.isLinkedSavings),
-      balanceAnchorDate: p.balanceAnchorDate ? String(p.balanceAnchorDate) : null,
-      balanceAnchorAt: p.balanceAnchorAt ? String(p.balanceAnchorAt) : null,
-      isDefaultSavings: Boolean(p.isDefaultSavings),
-      isAmortizingLoan: Boolean(p.isAmortizingLoan),
-      loanAnnualRate:
-        p.loanAnnualRate !== undefined && p.loanAnnualRate !== null ? Number(p.loanAnnualRate) : null,
-      loanMonthlyPayment:
-        p.loanMonthlyPayment !== undefined && p.loanMonthlyPayment !== null
-          ? Number(p.loanMonthlyPayment)
-          : null,
-      loanBillingDay:
-        p.loanBillingDay !== undefined && p.loanBillingDay !== null ? Number(p.loanBillingDay) : null,
-      stockCategory:
-        p.stockCategory !== undefined
-          ? normalizeStockCategory(p.stockCategory)
-          : existing?.stock_category !== undefined
-            ? String(existing.stock_category || '')
-            : '',
-      isWatchlist:
-        p.isWatchlist !== undefined
-          ? Boolean(p.isWatchlist)
-          : Number(existing?.is_watchlist || 0) === 1,
-      ledgerId:
-        p.ledgerId !== undefined
-          ? normalizeLedgerId(p.ledgerId)
-          : normalizeLedgerId(existing?.ledger_id),
-      excludeFromNetWorth:
-        p.excludeFromNetWorth !== undefined
-          ? Boolean(p.excludeFromNetWorth)
-          : Number(existing?.exclude_from_net_worth || 0) === 1,
-      sortOrder:
-        p.sortOrder !== undefined
-          ? normalizeSortOrder(p.sortOrder, 0)
-          : existing?.sort_order !== undefined
-            ? Number(existing.sort_order)
-            : 0,
-    });
+        loanBillingDay:
+          p.loanBillingDay !== undefined && p.loanBillingDay !== null ? Number(p.loanBillingDay) : null,
+        stockCategory:
+          p.stockCategory !== undefined
+            ? normalizeStockCategory(p.stockCategory)
+            : existing?.stock_category !== undefined
+              ? String(existing.stock_category || '')
+              : '',
+        isWatchlist:
+          p.isWatchlist !== undefined
+            ? Boolean(p.isWatchlist)
+            : Number(existing?.is_watchlist || 0) === 1,
+        ledgerId:
+          p.ledgerId !== undefined
+            ? normalizeLedgerId(p.ledgerId)
+            : normalizeLedgerId(existing?.ledger_id),
+        excludeFromNetWorth:
+          p.excludeFromNetWorth !== undefined
+            ? Boolean(p.excludeFromNetWorth)
+            : Number(existing?.exclude_from_net_worth || 0) === 1,
+        sortOrder:
+          p.sortOrder !== undefined
+            ? normalizeSortOrder(p.sortOrder, 0)
+            : existing?.sort_order !== undefined
+              ? Number(existing.sort_order)
+              : 0,
+      })
+    );
 
     const postStatements: D1PreparedStatement[] = [];
     if (v.isDefaultSavings) {
@@ -1391,16 +1468,18 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
-    const v = validateSavingsAdjustmentInput(
-      {
-        accountId: String(p.accountId || ''),
-        date: String(p.date || ''),
-        amount: Number(p.amount),
-        currency: p.currency ? String(p.currency) : 'TWD',
-        note: String(p.note || ''),
-        transferGroupId: p.transferGroupId ? String(p.transferGroupId) : null,
-      },
-      defaultFxRate
+    const v = runValidation(() =>
+      validateSavingsAdjustmentInput(
+        {
+          accountId: String(p.accountId || ''),
+          date: String(p.date || ''),
+          amount: Number(p.amount),
+          currency: p.currency ? String(p.currency) : 'TWD',
+          note: String(p.note || ''),
+          transferGroupId: p.transferGroupId ? String(p.transferGroupId) : null,
+        },
+        defaultFxRate
+      )
     );
     const twdAmount = p.twdAmount !== undefined ? Math.round(Number(p.twdAmount)) : v.twdAmount;
 
@@ -1494,16 +1573,18 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
-    const v = validateStockTransactionInput({
-      assetId: String(p.assetId || ''),
-      date: String(p.date || ''),
-      txType: String(p.txType || ''),
-      shares: p.shares !== undefined ? Number(p.shares) : 0,
-      totalAmount: p.totalAmount !== undefined ? Number(p.totalAmount) : 0,
-      fee: p.fee !== undefined ? Number(p.fee) : 0,
-      linkedCashflowId: p.linkedCashflowId ? String(p.linkedCashflowId) : null,
-      note: String(p.note || ''),
-    });
+    const v = runValidation(() =>
+      validateStockTransactionInput({
+        assetId: String(p.assetId || ''),
+        date: String(p.date || ''),
+        txType: String(p.txType || ''),
+        shares: p.shares !== undefined ? Number(p.shares) : 0,
+        totalAmount: p.totalAmount !== undefined ? Number(p.totalAmount) : 0,
+        fee: p.fee !== undefined ? Number(p.fee) : 0,
+        linkedCashflowId: p.linkedCashflowId ? String(p.linkedCashflowId) : null,
+        note: String(p.note || ''),
+      })
+    );
 
     const writeStmt = existing
       ? db
@@ -1558,7 +1639,7 @@ async function applySingleMutation(
 
   if (mutation.entity === 'utility_rents') {
     if (mutation.op !== 'upsert') {
-      throw new Error('不支援刪除固定房租設定。');
+      throw new RejectError('不支援刪除固定房租設定。');
     }
     const existing = await ensureRentUtilitySettings(db, uid);
     const existingRow = await db
@@ -1576,7 +1657,9 @@ async function applySingleMutation(
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
       return;
     }
-    const v = validateUtilityRentsInput((mutation.payload || {}) as Partial<RentUtilityRents>);
+    const v = runValidation(() =>
+      validateUtilityRentsInput((mutation.payload || {}) as Partial<RentUtilityRents>)
+    );
     const expectedVersion = Number(existingRow?.version ?? 1);
     const writeStmt = db
       .prepare(
@@ -1601,6 +1684,14 @@ async function applySingleMutation(
   }
 
   if (mutation.entity === 'utility_record') {
+    if (mutation.op !== 'delete') {
+      const pEarly = mutation.payload || {};
+      const payloadPeriodEarly =
+        pEarly.period !== undefined && pEarly.period !== null ? String(pEarly.period).trim() : '';
+      if (payloadPeriodEarly && payloadPeriodEarly !== mutation.recordId) {
+        throw new RejectError(`水電期別鍵值不一致（${mutation.recordId} vs ${payloadPeriodEarly}）。`);
+      }
+    }
     const existing = await db
       .prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND period = ?')
       .bind(uid, mutation.recordId)
@@ -1630,7 +1721,7 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (existing && Number(existing.is_baseline) === 1) {
-        throw new Error('不可刪除起始表底紀錄。');
+        throw new RejectError('不可刪除起始表底紀錄。');
       }
       if (!existing) {
         await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -1646,19 +1737,21 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
-    const v = validateUtilityRecordInput({
-      period: String(p.period || mutation.recordId),
-      isBaseline: Boolean(p.isBaseline),
-      curTotal: Number(p.curTotal),
-      cur6F: Number(p.cur6F),
-      totalElec: Number(p.totalElec ?? 0),
-      totalWater: Number(p.totalWater ?? 0),
-      f6People: Number(p.f6People ?? 2),
-      f5People: Number(p.f5People ?? 3),
-      curA: Number(p.curA),
-      curB: Number(p.curB),
-      curC: Number(p.curC),
-    });
+    const v = runValidation(() =>
+      validateUtilityRecordInput({
+        period: mutation.recordId,
+        isBaseline: Boolean(p.isBaseline),
+        curTotal: Number(p.curTotal),
+        cur6F: Number(p.cur6F),
+        totalElec: Number(p.totalElec ?? 0),
+        totalWater: Number(p.totalWater ?? 0),
+        f6People: Number(p.f6People ?? 2),
+        f5People: Number(p.f5People ?? 3),
+        curA: Number(p.curA),
+        curB: Number(p.curB),
+        curC: Number(p.curC),
+      })
+    );
 
     const writeStmt = existing
       ? db
@@ -1682,7 +1775,7 @@ async function applySingleMutation(
             check.nextVersion,
             uid,
             uid,
-            v.period,
+            mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
@@ -1694,7 +1787,7 @@ async function applySingleMutation(
           )
           .bind(
             uid,
-            v.period,
+            mutation.recordId,
             v.isBaseline ? 1 : 0,
             v.curTotal,
             v.cur6F,
@@ -1715,7 +1808,7 @@ async function applySingleMutation(
     return;
   }
 
-  throw new Error(`不支援的同步資料類型：${String(mutation.entity)}`);
+  throw new RejectError(`不支援的同步資料類型：${String(mutation.entity)}`);
 }
 
 export async function querySyncDelta(
@@ -1939,11 +2032,15 @@ export async function processSyncRequest(
     } catch (err) {
       if (err instanceof VersionConflictError) {
         conflicts.push(err.conflict);
-      } else {
+      } else if (err instanceof RejectError) {
         rejected.push({
           mutationId: mut.mutationId,
-          reason: err instanceof Error ? err.message : 'Failed to apply mutation',
+          reason: err.message || '資料驗證失敗，伺服器拒絕此筆異動',
         });
+      } else {
+        // S2: Transient / infrastructure error (e.g. D1 overload/timeout) must NOT be treated as permanent rejection
+        console.error('[sync] transient mutation failure:', mut.entity, mut.recordId, err);
+        throw err;
       }
     }
   }
@@ -2173,7 +2270,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO ledgers
             (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM ledgers WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2185,6 +2282,8 @@ export async function importFullSnapshot(
           v.sortOrder,
           createdAt,
           nowIso,
+          uid,
+          lid,
           uid
         )
     );
@@ -2204,7 +2303,7 @@ export async function importFullSnapshot(
       db
         .prepare(
           `UPDATE app_settings
-           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = 1, change_seq = ${CURR_SEQ_SQL}
+           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
            WHERE user_id = ?`
         )
         .bind(
@@ -2227,7 +2326,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO cashflow_logs
             (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM cashflow_logs WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2247,6 +2346,8 @@ export async function importFullSnapshot(
           v.ledgerId,
           createdAt,
           nowIso,
+          uid,
+          id,
           uid
         )
     );
@@ -2258,7 +2359,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO recurring_items
             (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM recurring_items WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2277,6 +2378,8 @@ export async function importFullSnapshot(
           v.sortOrder,
           createdAt,
           nowIso,
+          uid,
+          id,
           uid
         )
     );
@@ -2288,7 +2391,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO sinking_fund_items
             (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM sinking_fund_items WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2303,6 +2406,8 @@ export async function importFullSnapshot(
           v.sortOrder,
           createdAt,
           nowIso,
+          uid,
+          id,
           uid
         )
     );
@@ -2314,7 +2419,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO asset_items
             (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM asset_items WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2347,6 +2452,8 @@ export async function importFullSnapshot(
           v.excludeFromNetWorth ? 1 : 0,
           createdAt,
           nowIso,
+          uid,
+          id,
           uid
         )
     );
@@ -2358,7 +2465,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO savings_adjustments
             (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM savings_adjustments WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2371,6 +2478,8 @@ export async function importFullSnapshot(
           v.transferGroupId,
           createdAt,
           nowIso,
+          uid,
+          id,
           uid
         )
     );
@@ -2382,7 +2491,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO stock_transactions
             (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM stock_transactions WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2397,6 +2506,8 @@ export async function importFullSnapshot(
           v.note,
           createdAt,
           nowIso,
+          uid,
+          id,
           uid
         )
     );
@@ -2435,7 +2546,7 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT version FROM rent_utility_settings WHERE user_id = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2444,6 +2555,7 @@ export async function importFullSnapshot(
           validatedUtilityRents.rentB,
           validatedUtilityRents.rentC,
           nowIso,
+          uid,
           uid
         )
     );
@@ -2455,7 +2567,7 @@ export async function importFullSnapshot(
         .prepare(
           `INSERT OR REPLACE INTO rent_utility_records
             (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM rent_utility_records WHERE user_id = ? AND period = ?), 0) + 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2472,6 +2584,8 @@ export async function importFullSnapshot(
           v.curC,
           createdAt,
           nowIso,
+          uid,
+          v.period,
           uid
         )
     );

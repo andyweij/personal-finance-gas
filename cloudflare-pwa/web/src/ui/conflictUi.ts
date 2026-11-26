@@ -262,7 +262,7 @@ export function openConflictsModal(ctx: UiContext): void {
       'padding:10px 12px;border-radius:11px;background:var(--surface-alt);margin-bottom:12px;font-size:12.5px;line-height:1.55;color:var(--text-secondary)';
     if (conflicts.length > 0) rejIntro.style.marginTop = '14px';
     rejIntro.textContent =
-      '以下本機異動被伺服器拒絕並已移出待同步佇列（未成功建立的項目已自動回滾）。請檢視原因或點擊從雲端重整：';
+      '以下本機異動被伺服器拒絕並已移出待同步佇列：新建紀錄已自動回滾；編輯或刪除遭拒時系統會自動從雲端還原最新狀態。您也可複製原輸入內容或手動重整雲端帳本：';
     body.appendChild(rejIntro);
 
     const rejList = document.createElement('div');
@@ -284,7 +284,7 @@ export function openConflictsModal(ctx: UiContext): void {
       const badge = document.createElement('span');
       badge.className = 'badge red';
       badge.style.marginRight = '0';
-      badge.textContent = '同步遭拒';
+      badge.textContent = r.isNewRecord ? '新建遭拒（已回滾）' : '異動遭拒（已還原）';
       head.appendChild(title);
       head.appendChild(badge);
       card.appendChild(head);
@@ -296,6 +296,22 @@ export function openConflictsModal(ctx: UiContext): void {
 
       const actions = document.createElement('div');
       actions.className = 'conflict-actions';
+
+      if (r.clientPayload) {
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.className = 'btn btn-outline btn-sm';
+        copyBtn.textContent = '複製內容';
+        copyBtn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(JSON.stringify(r.clientPayload, null, 2));
+            showToast('已複製該筆異動內容', 'success');
+          } catch {
+            showToast('瀏覽器不支援剪貼簿複製', 'error');
+          }
+        });
+        actions.appendChild(copyBtn);
+      }
 
       const dismissBtn = document.createElement('button');
       dismissBtn.type = 'button';
@@ -316,8 +332,15 @@ export function openConflictsModal(ctx: UiContext): void {
       resyncBtn.textContent = '從雲端重整並清除';
       resyncBtn.addEventListener('click', async () => {
         resyncBtn.disabled = true;
+        const res = await ctx.engine.syncNow(true);
+        if (!res.ok) {
+          resyncBtn.disabled = false;
+          if (!res.authRequired) {
+            showToast(res.error || '從雲端重整失敗，請確認網路後重試', 'error');
+          }
+          return;
+        }
         await ctx.engine.dismissRejection(r.mutationId);
-        await ctx.engine.syncNow(true);
         showToast('已從雲端重整最新帳本', 'success');
         if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
           openConflictsModal(ctx);
@@ -333,5 +356,29 @@ export function openConflictsModal(ctx: UiContext): void {
     }
 
     body.appendChild(rejList);
+  }
+
+  const pendingCount = ctx.engine.getStatus().pendingCount;
+  if (pendingCount > 0) {
+    const syncPendingBtn = document.createElement('button');
+    syncPendingBtn.type = 'button';
+    syncPendingBtn.className = 'btn btn-outline btn-sm';
+    syncPendingBtn.style.cssText = 'width:100%;margin-top:12px;';
+    syncPendingBtn.textContent = `立即同步其餘 ${pendingCount} 筆待上傳異動`;
+    syncPendingBtn.addEventListener('click', async () => {
+      syncPendingBtn.disabled = true;
+      const res = await ctx.engine.syncNow();
+      if (res.ok) {
+        showToast('待上傳異動已同步完成', 'success');
+      } else if (!res.authRequired) {
+        showToast(res.error || '同步失敗', 'error');
+      }
+      if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+        openConflictsModal(ctx);
+      } else {
+        closeModal();
+      }
+    });
+    body.appendChild(syncPendingBtn);
   }
 }

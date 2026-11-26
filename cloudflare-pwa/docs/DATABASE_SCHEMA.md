@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.0 / D1 Schema `0012`）
+# 資料庫 Schema 設計架構（v1.8.3 / D1 Schema `0013`）
 
-> **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（20 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0012_transfer_group.sql`](../migrations/0012_transfer_group.sql)  
-> **對應版本**：`APP_VERSION = 1.8.0` / `DB_SCHEMA_VERSION = 0012` / `SW_CACHE_VERSION = finance-pwa-v20`
+> **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（21 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
+> **最新 Migration**：[`0013_sync_cursor_epoch_and_auto_fx.sql`](../migrations/0013_sync_cursor_epoch_and_auto_fx.sql)  
+> **對應版本**：`APP_VERSION = 1.8.3` / `DB_SCHEMA_VERSION = 0013` / `SW_CACHE_VERSION = finance-pwa-v23`
 
 ---
 

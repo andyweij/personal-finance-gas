@@ -744,13 +744,17 @@ async function saveChallenge(
   purpose: 'register' | 'authenticate',
   userId: string | null = null
 ) {
-  const expiresAt = new Date(Date.now() + CHALLENGE_TTL_MS).toISOString();
-  await db
-    .prepare(
-      'INSERT OR REPLACE INTO auth_challenges (challenge, purpose, expires_at, user_id) VALUES (?, ?, ?, ?)'
-    )
-    .bind(challenge, purpose, expiresAt, userId)
-    .run();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const expiresAt = new Date(nowMs + CHALLENGE_TTL_MS).toISOString();
+  await db.batch([
+    db.prepare('DELETE FROM auth_challenges WHERE expires_at <= ?').bind(nowIso),
+    db
+      .prepare(
+        'INSERT OR REPLACE INTO auth_challenges (challenge, purpose, expires_at, user_id) VALUES (?, ?, ?, ?)'
+      )
+      .bind(challenge, purpose, expiresAt, userId),
+  ]);
 }
 
 export async function checkAndRecordFixedWindowRateLimit(
@@ -761,36 +765,41 @@ export async function checkAndRecordFixedWindowRateLimit(
 ): Promise<{ blocked: boolean; retryAfterSec?: number }> {
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
+  const windowCutoffIso = new Date(nowMs - windowMs).toISOString();
+  const lockUntilIso = new Date(nowMs + windowMs).toISOString();
+
+  // Atomic fixed-window counter: updated_at stores window_start and only resets once expired!
   const row = await db
-    .prepare('SELECT fail_count, locked_until, updated_at FROM auth_rate_limits WHERE ip_key = ?')
-    .bind(ipKey)
-    .first<{ fail_count: number; locked_until: string | null; updated_at: string }>();
-
-  if (row?.locked_until && Date.parse(row.locked_until) > nowMs) {
-    return {
-      blocked: true,
-      retryAfterSec: Math.max(1, Math.ceil((Date.parse(row.locked_until) - nowMs) / 1000)),
-    };
-  }
-
-  const windowExpired = !row || nowMs - Date.parse(row.updated_at) >= windowMs;
-  const nextCount = windowExpired ? 1 : row.fail_count + 1;
-  const blocked = nextCount > maxRequests;
-  const lockedUntil = blocked ? new Date(nowMs + windowMs).toISOString() : null;
-
-  await db
     .prepare(
       `INSERT INTO auth_rate_limits (ip_key, fail_count, locked_until, updated_at)
-       VALUES (?, ?, ?, ?)
+       VALUES (?, 1, NULL, ?)
        ON CONFLICT(ip_key) DO UPDATE SET
-         fail_count = excluded.fail_count,
-         locked_until = excluded.locked_until,
-         updated_at = excluded.updated_at`
+         fail_count = CASE
+           WHEN auth_rate_limits.updated_at <= ? THEN 1
+           ELSE auth_rate_limits.fail_count + 1
+         END,
+         locked_until = CASE
+           WHEN auth_rate_limits.updated_at <= ? THEN NULL
+           WHEN auth_rate_limits.fail_count + 1 > ? THEN COALESCE(auth_rate_limits.locked_until, ?)
+           ELSE auth_rate_limits.locked_until
+         END,
+         updated_at = CASE
+           WHEN auth_rate_limits.updated_at <= ? THEN excluded.updated_at
+           ELSE auth_rate_limits.updated_at
+         END
+       RETURNING fail_count, locked_until, updated_at`
     )
-    .bind(ipKey, nextCount, lockedUntil, nowIso)
-    .run();
+    .bind(ipKey, nowIso, windowCutoffIso, windowCutoffIso, maxRequests, lockUntilIso, windowCutoffIso)
+    .first<{ fail_count: number; locked_until: string | null; updated_at: string }>();
 
-  return blocked ? { blocked: true, retryAfterSec: Math.ceil(windowMs / 1000) } : { blocked: false };
+  const count = Number(row?.fail_count ?? 1);
+  if (count > maxRequests) {
+    const windowStartMs = row?.updated_at ? Date.parse(row.updated_at) : nowMs;
+    const resetAtMs = windowStartMs + windowMs;
+    const retryAfterSec = Math.max(1, Math.ceil((resetAtMs - nowMs) / 1000));
+    return { blocked: true, retryAfterSec };
+  }
+  return { blocked: false };
 }
 
 function extractChallengeFromClientDataJSON(clientDataJSON: string | undefined): string | null {
@@ -842,24 +851,28 @@ export async function insertPasskeyCredentialOrThrow(
     nowIso: string;
   }
 ): Promise<void> {
-  const res = await db
-    .prepare(
-      `INSERT OR IGNORE INTO auth_passkeys (credential_id, user_id, public_key, counter, transports, device_name, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      params.credentialId,
-      params.userId,
-      params.publicKeyB64,
-      params.counter,
-      params.transports,
-      params.deviceName.slice(0, 60),
-      params.nowIso
-    )
-    .run();
-
-  if ((res.meta?.changes ?? 0) !== 1) {
-    throw new Error('此 Passkey 憑證已被綁定，無法覆蓋既有憑證。');
+  try {
+    await db
+      .prepare(
+        `INSERT INTO auth_passkeys (credential_id, user_id, public_key, counter, transports, device_name, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        params.credentialId,
+        params.userId,
+        params.publicKeyB64,
+        params.counter,
+        params.transports,
+        params.deviceName.slice(0, 60),
+        params.nowIso
+      )
+      .run();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/UNIQUE|PRIMARY KEY/i.test(msg)) {
+      throw new Error('此 Passkey 憑證已被綁定，無法覆蓋既有憑證。');
+    }
+    throw err;
   }
 }
 

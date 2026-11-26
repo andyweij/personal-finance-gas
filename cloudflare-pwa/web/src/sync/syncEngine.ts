@@ -364,6 +364,7 @@ export class SyncEngine {
         recordId: id,
         clientTimestamp: nowIso,
         baseVersion: existing?.version ?? null,
+        isNewRecord: !existing,
         payload: { ...ledger },
       },
     ]);
@@ -508,6 +509,7 @@ export class SyncEngine {
         recordId: id,
         clientTimestamp: nowIso,
         baseVersion: null,
+        isNewRecord: true,
         payload: { ...record },
       },
     ];
@@ -541,6 +543,7 @@ export class SyncEngine {
         recordId: recId,
         clientTimestamp: nowIso,
         baseVersion: null,
+        isNewRecord: true,
         payload: { ...recItem },
       });
     }
@@ -729,6 +732,7 @@ export class SyncEngine {
         recordId: id,
         clientTimestamp: nowIso,
         baseVersion: existing?.version ?? null,
+        isNewRecord: !existing,
         payload: { ...item },
       },
     ]);
@@ -755,6 +759,7 @@ export class SyncEngine {
         recordId: item.id,
         clientTimestamp: nowIso,
         baseVersion: item.version ?? null,
+        isNewRecord: false,
         payload: { ...item },
       }));
     const nextSnapshot: FinanceSnapshot = {
@@ -816,6 +821,7 @@ export class SyncEngine {
         recordId: id,
         clientTimestamp: nowIso,
         baseVersion: existing?.version ?? null,
+        isNewRecord: !existing,
         payload: { ...item },
       },
     ]);
@@ -842,6 +848,7 @@ export class SyncEngine {
         recordId: item.id,
         clientTimestamp: nowIso,
         baseVersion: item.version ?? null,
+        isNewRecord: false,
         payload: { ...item },
       }));
     const nextSnapshot: FinanceSnapshot = {
@@ -957,6 +964,7 @@ export class SyncEngine {
         recordId: id,
         clientTimestamp: nowIso,
         baseVersion: existing?.version ?? null,
+        isNewRecord: !existing,
         payload: { ...item },
       },
     ]);
@@ -988,6 +996,7 @@ export class SyncEngine {
         recordId: assetId,
         clientTimestamp: nowIso,
         baseVersion: existing.version ?? null,
+        isNewRecord: false,
         payload: { ...updated },
       },
     ]);
@@ -1014,6 +1023,7 @@ export class SyncEngine {
         recordId: item.id,
         clientTimestamp: nowIso,
         baseVersion: item.version ?? null,
+        isNewRecord: false,
         payload: { ...item },
       }));
     const nextSnapshot: FinanceSnapshot = {
@@ -1556,6 +1566,7 @@ export class SyncEngine {
         recordId: updatedBaseline.period,
         clientTimestamp: nowIso,
         baseVersion: baseline.version ?? null,
+        isNewRecord: false,
         payload: { ...updatedBaseline },
       });
     }
@@ -1567,6 +1578,7 @@ export class SyncEngine {
       recordId: record.period,
       clientTimestamp: nowIso,
       baseVersion: existing?.version ?? null,
+      isNewRecord: !existing,
       payload: { ...record },
     });
 
@@ -1632,8 +1644,20 @@ export class SyncEngine {
     nextSnapshot: FinanceSnapshot,
     mutations: SyncMutation[]
   ): Promise<void> {
+    const normalizedMutations = mutations.map((m) =>
+      m.isNewRecord !== undefined
+        ? m
+        : {
+            ...m,
+            isNewRecord:
+              m.op === 'upsert' &&
+              m.entity !== 'settings' &&
+              m.entity !== 'utility_rents' &&
+              (m.baseVersion === null || m.baseVersion === 0),
+          }
+    );
     try {
-      await this.db.commitLocalMutation(nextSnapshot, mutations, this.inFlightMutationIds);
+      await this.db.commitLocalMutation(nextSnapshot, normalizedMutations, this.inFlightMutationIds);
     } catch (err) {
       const msg = err instanceof Error ? err.message : '本機儲存失敗，變更未寫入';
       this.opts.onError?.(msg);
@@ -1857,6 +1881,8 @@ export class SyncEngine {
     }, delayMs);
   }
 
+  private syncingIsFullPull = false;
+
   async syncNow(forceFullPull = false): Promise<SyncResult> {
     if (this.accountMismatchHalted) {
       return {
@@ -1865,13 +1891,22 @@ export class SyncEngine {
         error: '目前瀏覽器登入帳號已變更，已停止同步以避免跨帳號寫入。請重新整理或切換帳號。',
       };
     }
-    if (this.syncingPromise) return this.syncingPromise;
+    if (this.syncingPromise) {
+      if (forceFullPull && !this.syncingIsFullPull) {
+        // C2: Wait for in-flight incremental sync, then execute a real full pull
+        await this.syncingPromise.catch(() => {});
+        return this.syncNow(true);
+      }
+      return this.syncingPromise;
+    }
 
     this.clearScheduledRetry();
+    this.syncingIsFullPull = forceFullPull;
     this.syncingPromise = this.requestLockImpl(`personal-finance-sync:${this.db.getDbName()}`, () =>
       this.performSync(forceFullPull)
     ).finally(() => {
       this.syncingPromise = null;
+      this.syncingIsFullPull = false;
     });
     return this.syncingPromise;
   }
@@ -1998,24 +2033,55 @@ export class SyncEngine {
 
         const incomingRejected = Array.isArray(data.rejected) ? data.rejected : [];
         const batchById = new Map(batch.map((m) => [m.mutationId, m]));
+        const outboxIdsToClear = [
+          ...(data.ackedMutationIds || []),
+          ...incomingConflicts.map((c) => c.mutationId),
+          ...incomingRejected.map((r) => r.mutationId),
+        ];
+        const clearedSet = new Set(outboxIdsToClear);
+        const batchIdSet = new Set(batch.map((m) => m.mutationId));
+        const currentOutbox = await this.db.getOutbox();
+        const pendingKeysAfterClear = new Set(
+          currentOutbox
+            .filter((m) => !clearedSet.has(m.mutationId) && !batchIdSet.has(m.mutationId))
+            .map((m) => `${m.entity}:${m.recordId}`)
+        );
+
         const rejectedCreatesToRollback: Array<{ entity: string; recordId: string }> = [];
+        let needsFullResyncAfterRejection = false;
         let nextRejections = this.rejections;
         if (incomingRejected.length > 0) {
           const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
           const rejectedAt = data.serverTime || new Date().toISOString();
           for (const r of incomingRejected) {
             const orig = batchById.get(r.mutationId);
+            // C4: Prefer explicit isNewRecord flag over inferring from baseVersion
+            const isCreate = orig
+              ? orig.isNewRecord !== undefined
+                ? orig.isNewRecord
+                : orig.op === 'upsert' && (orig.baseVersion === null || orig.baseVersion === 0)
+              : false;
             byMutId.set(r.mutationId, {
               mutationId: r.mutationId,
               entity: orig?.entity || 'unknown',
               op: orig?.op || 'upsert',
               recordId: orig?.recordId || r.mutationId,
+              isNewRecord: isCreate,
               reason: r.reason || '伺服器拒絕此筆異動',
               clientPayload: orig?.payload,
               rejectedAt,
             });
-            if (orig && orig.op === 'upsert' && (orig.baseVersion === null || orig.baseVersion === 0)) {
-              rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
+            if (orig) {
+              const key = `${orig.entity}:${orig.recordId}`;
+              // C3: Only roll back a rejected create if there is NO newer pending edit for the same record
+              if (isCreate) {
+                if (!pendingKeysAfterClear.has(key)) {
+                  rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
+                }
+              } else if (!pendingKeysAfterClear.has(key)) {
+                // C1 & C6: Rejected edit or delete (including settings/utility_rents) must full-resync to restore server state
+                needsFullResyncAfterRejection = true;
+              }
             }
           }
           nextRejections = Array.from(byMutId.values());
@@ -2039,17 +2105,8 @@ export class SyncEngine {
           ...(typeof data.dataEpoch === 'number' ? { dataEpoch: data.dataEpoch } : {}),
         };
 
-        const outboxIdsToClear = [
-          ...(data.ackedMutationIds || []),
-          ...incomingConflicts.map((c) => c.mutationId),
-          ...incomingRejected.map((r) => r.mutationId),
-        ];
-        const clearedSet = new Set(outboxIdsToClear);
-        const batchIdSet = new Set(batch.map((m) => m.mutationId));
-
         // Re-apply and rebase ALL pending outbox mutations that were not cleared
         // (especially edits/deletes made while this sync batch was in-flight!)
-        const currentOutbox = await this.db.getOutbox();
         const rebasedMutations: Array<{ oldMutationId: string; replacement: SyncMutation }> = [];
 
         for (const pendingMut of currentOutbox) {
@@ -2116,6 +2173,7 @@ export class SyncEngine {
                   ...pendingMut,
                   mutationId: crypto.randomUUID(),
                   baseVersion: nextVersion,
+                  isNewRecord: false,
                   payload: overlaidPayload,
                 },
               });
@@ -2142,6 +2200,12 @@ export class SyncEngine {
         this.updateStatus(this.computeStatus(remainingOutbox.length));
 
         const madeForwardProgress = outboxIdsToClear.length > 0;
+
+        if (needsFullResyncAfterRejection && !applyAsFull) {
+          // C1: Immediately pull full server state to restore locally diverged edits/deletes
+          fullPullPass = true;
+          continue;
+        }
         fullPullPass = false;
 
         if (hadMoreBatches && remainingOutbox.length > 0 && madeForwardProgress) {

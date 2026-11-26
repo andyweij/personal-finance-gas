@@ -351,6 +351,7 @@ export interface SyncMutation {
   recordId: string;
   clientTimestamp: string;
   baseVersion?: number | null;
+  isNewRecord?: boolean;
   payload?: Record<string, unknown>;
   retryCount?: number;
   lastError?: string;
@@ -373,6 +374,7 @@ export interface SyncRejection {
   entity: SyncEntity | string;
   op: SyncOp | string;
   recordId: string;
+  isNewRecord?: boolean;
   reason: string;
   clientPayload?: Record<string, unknown>;
   rejectedAt: string;
