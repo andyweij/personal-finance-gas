@@ -1,5 +1,5 @@
 import type { StockPortfolioSummary } from '../../../shared/types';
-import { fmtMoney } from './helpers';
+import { fmtMoney, fmtPct } from './helpers';
 import type { StockChartDimension, StockChartType, UiContext } from './state';
 
 export const STOCK_CHART_PALETTE = [
@@ -315,8 +315,7 @@ function svgEl<K extends keyof SVGElementTagNameMap>(
 
 function fmtSignedPct(pct: number, masked: boolean): string {
   if (masked) return '••%';
-  const sign = pct > 0 ? '+' : '';
-  return `${sign}${pct.toFixed(1)}%`;
+  return fmtPct(pct, 1, true); // v1.8.15: never "-0.0%"
 }
 
 export interface StockChartCardOptions {
@@ -530,7 +529,7 @@ export function renderStockChartCard(
           'font-weight': '700',
           'pointer-events': 'none',
         });
-        txt.textContent = `${arc.item.pct.toFixed(1)}%`;
+        txt.textContent = `${fmtPct(arc.item.pct, 1)}`;
         g.appendChild(txt);
       }
 
@@ -552,7 +551,7 @@ export function renderStockChartCard(
         const p = document.createElement('div');
         p.className = 'stock-donut-pct';
         p.style.color = selectedItem.color;
-        p.textContent = `${selectedItem.pct.toFixed(1)}%`;
+        p.textContent = `${fmtPct(selectedItem.pct, 1)}`;
         const v = document.createElement('div');
         v.className = 'stock-donut-sub';
         v.textContent = fmtMoney(selectedItem.value, masked);
@@ -607,7 +606,7 @@ export function renderStockChartCard(
       nameSpan.textContent = `${idx + 1}. ${item.label}`;
       const valSpan = document.createElement('span');
       valSpan.className = 'stock-hbar-val';
-      valSpan.textContent = `${item.pct.toFixed(1)}% · ${fmtMoney(item.value, masked)}`;
+      valSpan.textContent = `${fmtPct(item.pct, 1)} · ${fmtMoney(item.value, masked)}`;
       top.appendChild(nameSpan);
       top.appendChild(valSpan);
 
@@ -689,7 +688,7 @@ export function renderStockChartCard(
             'font-weight': '600',
             'pointer-events': 'none',
           });
-          pctTxt.textContent = `${r.item.pct.toFixed(1)}%`;
+          pctTxt.textContent = `${fmtPct(r.item.pct, 1)}`;
           g.appendChild(pctTxt);
         }
       }
@@ -715,7 +714,7 @@ export function renderStockChartCard(
     dot.className = 'alloc-dot';
     dot.style.background = selectedItem.color;
     const label = document.createElement('strong');
-    label.textContent = `${selectedItem.label} (${selectedItem.pct.toFixed(1)}%)`;
+    label.textContent = `${selectedItem.label} (${fmtPct(selectedItem.pct, 1)})`;
     left.appendChild(dot);
     left.appendChild(label);
 
@@ -777,7 +776,7 @@ export function renderStockChartCard(
 
       const right = document.createElement('span');
       right.className = 'stock-legend-pct tnum';
-      right.textContent = `${item.pct.toFixed(1)}%`;
+      right.textContent = `${fmtPct(item.pct, 1)}`;
 
       tile.appendChild(left);
       tile.appendChild(right);

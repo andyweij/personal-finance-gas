@@ -266,7 +266,7 @@ export function openHelpGuideModal(focusSection?: HelpSectionId): void {
     ['建置編號', BUILD_COMMIT],
     ['建置時間', formatBuildTime(BUILD_TIME)],
     ['資料庫 Schema', `v${DB_SCHEMA_VERSION}`],
-    ['離線快取', SW_CACHE_VERSION],
+    ['離線快取', `${SW_CACHE_VERSION}（每次建置自動更新）`],
   ];
   for (const [k, v] of metaRows) {
     const cell = document.createElement('div');

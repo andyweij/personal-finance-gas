@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.11 / D1 Schema `0015`）
+# 資料庫 Schema 設計架構（v1.8.15 / D1 Schema `0016`）
 
-> **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（21 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0015_security_events.sql`](../migrations/0015_security_events.sql)  
-> **對應版本**：`APP_VERSION = 1.8.11` / `DB_SCHEMA_VERSION = 0015` / `SW_CACHE_VERSION = finance-pwa-v31`
+> **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（24 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
+> **最新 Migration**：[`0016_automation_runs.sql`](../migrations/0016_automation_runs.sql)  
+> **對應版本**：`APP_VERSION = 1.8.15` / `DB_SCHEMA_VERSION = 0016` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
 
 ---
 
@@ -131,7 +131,7 @@ erDiagram
 | `twd_amount` | `INTEGER` | `NOT NULL` | 折合台幣整數金額 |
 | `source` | `TEXT` | `NOT NULL DEFAULT '手機記帳'` | 來源標記（手機記帳／自動入帳） |
 | `note` | `TEXT` | `NOT NULL DEFAULT ''` | 備註 |
-| `recurring_dedup_key` | `TEXT` | `NULL` | 常態自動入帳冪等鍵（非預設帳本含 `${ledgerId}\|\|` 前綴） |
+| `recurring_dedup_key` | `TEXT` | `NULL` | 常態自動入帳冪等鍵。v1.8.12 起為 `rec:<recurring_items.id>:<YYYY-MM>`（每個項目每月一筆，`INSERT … ON CONFLICT DO NOTHING`）；v1.8.11 以前為 `YYYY-MM\|\|類型\|\|名稱`（非預設帳本含 `${ledgerId}\|\|` 前綴），仍視為已入帳 |
 | `linked_account_id` | `TEXT` | `NULL` | 關聯的連動活存 `asset_items.id` |
 | `created_at` / `updated_at` / `deleted_at` / `version` | `TEXT` / `INTEGER` | 標準同步欄位 | 軟刪除與樂觀鎖 |
 
@@ -150,6 +150,7 @@ erDiagram
 | **識別與歸屬** | `user_id`, `id` | `TEXT` | `PK` | 租戶與資產 UUID |
 | | `ledger_id` | `TEXT` | `'default'` | 所屬帳本 ID（`0011`） |
 | | `exclude_from_net_worth` | `INTEGER` | `0` | `1`＝單筆排除不計入個人總資產（`0011`） |
+| | `quote_checked_at` | `TEXT` | `NULL` | 最後一次嘗試抓取報價的時間（不論成功與否；`0016`，v1.8.13）。排程依此排序，最久未嘗試者優先，避免下市或錯誤代號長期占用對外請求額度；僅供伺服器使用，不同步、不遞增 `change_seq` |
 | | `sort_order` | `INTEGER` | `0` | 手動拖曳排序順序（`0008`） |
 | **基本分類與估值** | `update_mode` | `TEXT` | `'手動快照'` | `手動快照` / `自動更新` |
 | | `major_type` | `TEXT` | `'資產'` | `資產` / `負債` |
@@ -230,13 +231,14 @@ erDiagram
 
 ---
 
-### C. 同步輔助與水電分攤工具（3 張表）
+### C. 同步輔助、排程與水電分攤工具（4 張表）
 
 | 資料表 | 主鍵 | 核心欄位與索引 | 用途 |
 | --- | --- | --- | --- |
 | `sync_idempotency` | `(user_id, mutation_id)` | `applied_at` | 記錄已執行的離線 Mutation UUID，防止網路重試重複套用 |
 | `rent_utility_records` | `(user_id, period)` | `is_baseline`, `cur_total`, `cur_6f`, `total_elec`, `total_water`, `f6_people`, `f5_people`, `cur_a`, `cur_b`, `cur_c`, `created_at`, `updated_at`, `deleted_at`, `version`（`idx_rent_utility_user_updated`） | 各期電表／水電費分攤紀錄（`0002`） |
 | `rent_utility_settings` | `user_id` | `rent_6f`, `rent_a`, `rent_b`, `rent_c`, `updated_at`, `version` | 各房固定房租金額設定（`0002`） |
+| `automation_runs` | `(user_id, kind, period)` | `kind`（`recurring` / `snapshot`）、`period`（`YYYY-MM`）、`status`（`done` / `partial` / `failed`）、`detail`、`updated_at` | 排程執行紀錄（`0016`，v1.8.13 H6）：每次排程先補跑沒有 `done` 的本月常態入帳（帳號在當月之前建立）與上月月底快照；migration 以「本月已有自動入帳」「上月已有快照」為證據標記為已完成，部署不會回補過去的期間 |
 
 ---
 
@@ -259,7 +261,7 @@ flowchart LR
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0015`）
+## 5. Migration 演進總覽（`0001` → `0016`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -278,6 +280,7 @@ flowchart LR
 | `0013` | `0013_sync_cursor_epoch_and_auto_fx.sql` | 新增 `user_sync_state`（單調 `change_seq` 與 `data_epoch`）與 `sync_lww_timestamps`；11 張可同步表加入 `change_seq` 與複合索引；`app_settings` 加入 `auto_fx_enabled`（排程自動匯率開關） |
 | `0014` | `0014_auth_challenge_expiry_index.sql` | `auth_challenges(expires_at)` 索引，避免每次 Passkey options 請求清理過期 challenge 時全表掃描 |
 | `0015` | `0015_security_events.sql` | 新增 `auth_security_events` 稽核表（例如以管理員重置碼重設密碼），成員登入時顯示 30 天內的安全通知 |
+| `0016` | `0016_automation_runs.sql` | 新增 `automation_runs` 排程執行紀錄，支援錯過的常態入帳與月底快照自動補跑（v1.8.13） |
 
 ---
 
@@ -292,5 +295,8 @@ flowchart LR
     AND (price_updated_at IS NULL OR price_updated_at < '<部署日期，例如 2026-11-26>');
   ```
 - **沒有 `clientEpoch` 的客戶端（R-2）**：伺服器在發生過 replace 還原（`data_epoch > 1`）之後，若收到不帶 `clientEpoch` 且含 mutation 的請求，一律回傳 `epochMismatch` + 完整資料、不套用任何 mutation。目前的網頁客戶端會帶上本機 `dataEpoch`（新裝置為 `null` 時會先完整拉取並採用伺服器回傳的 epoch），因此只有極舊版本或 meta 遺失的裝置會走到這條路徑；其待送變更會被凍結並由使用者決定捨棄或重新套用。
+- **參照完整性（v1.8.12，M3）**：同步寫入 `cashflow_logs`、`recurring_items`、`asset_items`、`savings_adjustments`、`stock_transactions` 時，本次有變更的 `ledger_id`、`linked_account_id`、`account_id`、`asset_id` 必須指向同一使用者、未刪除的紀錄（寫入語句內 `AND EXISTS (...)`，`default` 帳本永遠有效），否則拒絕；沒有變更的既有參照（舊資料可能已懸空）照常放行。JSON 匯入時帳本參照必須能對應到匯入內容、`default` 或（merge 模式）雲端現有帳本。
+- **原子群組（v1.8.12，M4）**：帶有相同 `atomicGroupId` 的 mutation（帳戶互轉的兩邊與手續費、成對刪除）在同一個 D1 batch 寫入，每筆主寫入後的守衛語句在 0 列變更時讓整個 batch 失敗並回滾；舊版客戶端在同一請求中送出、`transferGroupId` 相同的存轉新增也視為一組。
+- **資源上限（v1.8.13，H5 / H6）**：同步、匯入、手動更新報價與排程都以「每次呼叫 50 次 D1 查詢、50 個對外請求」（Workers 免費方案）為預算；付費方案可在 `[vars]` 設定 `D1_QUERY_BUDGET`（例如 `900`）與 `SUBREQUEST_BUDGET` 提高上限。同步伺服器每次請求最多處理 20 筆異動（與客戶端批次大小一致），預算不足時其餘異動不回應確認、由客戶端下一次請求再送。
 - **`auth_rate_limits.locked_until`**：自 v1.8.3 起限速改以固定時間窗計數，此欄位仍會寫入但已不再被讀取；保留欄位以免破壞既有資料，未來重建該表時可移除。
 

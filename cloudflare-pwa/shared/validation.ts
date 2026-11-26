@@ -1,3 +1,4 @@
+import { LOAN_MAX_ANNUAL_RATE_PERCENT } from './calculations';
 import {
   ALL_CASHFLOW_TYPES,
   ALL_STOCK_TX_TYPES,
@@ -488,7 +489,7 @@ export function validateAssetInput(payload: AssetInputPayload) {
     const rateNum = Number(payload.loanAnnualRate ?? 0);
     const payNum = Number(payload.loanMonthlyPayment);
     const dayNum = Math.round(Number(payload.loanBillingDay ?? 1));
-    if (Number.isNaN(rateNum) || !Number.isFinite(rateNum) || rateNum < 0 || rateNum > 50) {
+    if (Number.isNaN(rateNum) || !Number.isFinite(rateNum) || rateNum < 0 || rateNum > LOAN_MAX_ANNUAL_RATE_PERCENT) {
       throw new Error('貸款年利率需介於 0% ～ 50%。');
     }
     if (Number.isNaN(payNum) || !Number.isFinite(payNum) || payNum <= 0) {
@@ -504,7 +505,7 @@ export function validateAssetInput(payload: AssetInputPayload) {
     // Preserve optional numeric fields if provided on a paused/manual loan for easy re-enabling
     if (payload.loanAnnualRate !== undefined && payload.loanAnnualRate !== null && payload.loanAnnualRate !== '') {
       const r = Number(payload.loanAnnualRate);
-      if (Number.isFinite(r) && r >= 0 && r <= 50) loanAnnualRate = Math.round(r * 1000) / 1000;
+      if (Number.isFinite(r) && r >= 0 && r <= LOAN_MAX_ANNUAL_RATE_PERCENT) loanAnnualRate = Math.round(r * 1000) / 1000;
     }
     if (
       payload.loanMonthlyPayment !== undefined &&

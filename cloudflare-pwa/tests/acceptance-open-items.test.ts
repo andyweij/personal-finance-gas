@@ -68,6 +68,7 @@ function hookDb(
             new Proxy(s, {
               get(t, p) {
                 const orig = t[p as string] as unknown;
+                if (p === '__sql') return sql;
                 if (p === 'bind') {
                   return (...args: unknown[]) =>
                     wrap((orig as (...a: unknown[]) => Record<string, unknown>).apply(t, args));
@@ -85,6 +86,15 @@ function hookDb(
               },
             });
           return wrap(stmt);
+        };
+      }
+      if (prop === 'batch') {
+        // v1.8.13 (H5): reads are now batched — let hooks see each batched statement as method 'batch'
+        return async (stmts: Array<{ __sql?: string }>) => {
+          for (const st of stmts) await hook(String(st.__sql || ''), 'before', 'batch');
+          const r = await target.batch(stmts as unknown as D1PreparedStatement[]);
+          for (const st of stmts) await hook(String(st.__sql || ''), 'after', 'batch');
+          return r;
         };
       }
       const v = (target as unknown as Record<string | symbol, unknown>)[prop];
@@ -138,7 +148,7 @@ describe('驗收：伺服器端尚未修正項目', () => {
       // 在完整 snapshot 讀取途中，另一台裝置寫入一筆資料
       if (
         phase === 'after' &&
-        method === 'all' &&
+        (method === 'all' || method === 'batch') &&
         !fired &&
         /FROM rent_utility_records WHERE user_id = \? AND deleted_at IS NULL/.test(sql)
       ) {
@@ -180,7 +190,7 @@ describe('驗收：伺服器端尚未修正項目', () => {
 
     let fired = false;
     const hooked = hookDb(db, async (sql, phase, method) => {
-      if (phase === 'before' && method === 'first' && !fired && /SELECT mutation_id FROM sync_idempotency/.test(sql)) {
+      if (phase === 'before' && (method === 'first' || method === 'batch') && !fired && /SELECT mutation_id FROM sync_idempotency/.test(sql)) {
         fired = true;
         await importFullSnapshot(db, UID, { cashflowLogs: [] }, 'replace'); // 另一台裝置完成還原
       }
@@ -725,7 +735,7 @@ describe('驗收：v1.8.7 審查新增項目', () => {
 
     let fired = false;
     const hooked = hookDb(db, async (sql, phase, method) => {
-      if (phase === 'before' && method === 'first' && !fired && /SELECT mutation_id FROM sync_idempotency/.test(sql)) {
+      if (phase === 'before' && (method === 'first' || method === 'batch') && !fired && /SELECT mutation_id FROM sync_idempotency/.test(sql)) {
         fired = true;
         // 另一台裝置用備份還原（L2 仍有關聯紀錄）
         await importFullSnapshot(

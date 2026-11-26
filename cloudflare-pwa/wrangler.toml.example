@@ -17,7 +17,7 @@ database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 migrations_dir = "migrations"
 
 # Cloudflare Cron Triggers (UTC 時區)
-# 1. 0 0 1 * *  => 台灣時間每月 1 號 08:00：更新美股／匯率並執行常態收支自動入帳
+# 1. 0 0 1 * *  => 台灣時間每月 1 號 08:00：先執行常態收支自動入帳（與補跑上月快照），再更新美股／匯率
 # 2. 0 15 * * * => 台灣時間每日 23:00：更新匯率與台股／美股報價，並於月底自動建立淨資產快照
 # 3. 0 22 * * * => 台灣時間每日 06:00：美股收盤後僅自動更新美股報價與匯率（避免台股盤前 MIS 換日覆蓋收盤價）
 [triggers]
@@ -25,4 +25,7 @@ crons = ["0 0 1 * *", "0 15 * * *", "0 22 * * *"]
 
 [vars]
 APP_TIMEZONE = "Asia/Taipei"
+# v1.8.13：每次呼叫可用的 D1 查詢數與對外請求數（預設為 Workers 免費方案的 50；付費方案可提高，例如 D1_QUERY_BUDGET = "900"）
+# D1_QUERY_BUDGET = "50"
+# SUBREQUEST_BUDGET = "50"
 # 部署前請使用 `npx wrangler secret put SETUP_SECRET` 設定首次初始化密鑰

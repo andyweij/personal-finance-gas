@@ -1,3 +1,5 @@
+import { todayInTimeZone } from '../../../shared/dates';
+import { roundTo } from '../../../shared/format';
 import { CASHFLOW_TYPES, DEFAULT_STOCK_CATEGORIES, STOCK_TX_TYPES } from '../../../shared/constants';
 import {
   computeAllSavingsSummary,
@@ -21,8 +23,7 @@ import {
   makeSelectField,
   openModal,
   showToast,
-  TRASH_SVG,
-} from './helpers';
+  TRASH_SVG, fmtPct, bindSubmit } from './helpers';
 import { renderReorderList } from './reorderHelper';
 import { renderStockChartCard } from './stockCharts';
 import type { UiContext } from './state';
@@ -94,9 +95,7 @@ export function getOrderedWatchlistIds(ctx: UiContext): string[] {
 }
 
 function todayYmdLocal(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return todayInTimeZone(); // v1.8.15: "today" is the APP_TIMEZONE date, like the server
 }
 
 export function fmtQuoteTimestamp(iso?: string | null): string {
@@ -126,7 +125,8 @@ function fmtPrice(n: number, masked: boolean, currency = 'TWD'): string {
 
 function fmtCurrencyAmount(n: number, currency: string, masked: boolean): string {
   if (masked) return (currency === 'USD' ? 'US$' : 'NT$ ') + '•••••';
-  const num = Number(n || 0);
+  // v1.8.15: sign of the value as displayed (cents for USD, whole dollars for TWD)
+  const num = roundTo(Number(n || 0), currency === 'USD' ? 2 : 0);
   const sign = num < 0 ? '-' : '';
   const abs = Math.abs(num);
   if (currency === 'USD') {
@@ -137,7 +137,7 @@ function fmtCurrencyAmount(n: number, currency: string, masked: boolean): string
 
 function fmtSignedCurrency(n: number, currency: string, masked: boolean): string {
   if (masked) return '•••••';
-  const num = Number(n || 0);
+  const num = roundTo(Number(n || 0), currency === 'USD' ? 2 : 0);
   if (num > 0) return '+' + fmtCurrencyAmount(num, currency, false);
   if (num < 0) return fmtCurrencyAmount(num, currency, false);
   return fmtCurrencyAmount(0, currency, false);
@@ -145,9 +145,7 @@ function fmtSignedCurrency(n: number, currency: string, masked: boolean): string
 
 function fmtSignedPct(pct: number, masked: boolean, decimals = 1): string {
   if (masked) return '••%';
-  const num = Number(pct || 0);
-  const sign = num > 0 ? '+' : '';
-  return `${sign}${num.toFixed(decimals)}%`;
+  return fmtPct(Number(pct || 0), decimals, true); // v1.8.15: never "-0.0%"
 }
 
 function fmtShares(shares: number): string {
@@ -380,7 +378,7 @@ export function renderStocksTab(ctx: UiContext): void {
   recoveryBar.style.width = `${Math.min(100, Math.max(0, portfolio.overallCostRecoveryPct))}%`;
   recoveryBar.style.background =
     portfolio.overallCostRecoveryPct >= 100 ? 'var(--stock-pos-bar)' : 'var(--primary)';
-  recoveryPctText.textContent = `整體配息回本：${portfolio.overallCostRecoveryPct.toFixed(1)}%`;
+  recoveryPctText.textContent = `整體配息回本：${fmtPct(portfolio.overallCostRecoveryPct, 1)}`;
   if (!portfolio.hasAnyCostBasis) {
     unrecoveredText.textContent = '尚未設定成本';
   } else if (portfolio.totalUnrecoveredCostTwd === 0 && portfolio.totalCashDividendsTwd > 0) {
@@ -727,7 +725,7 @@ function renderStockPositionCard(
     const wtBadge = document.createElement('span');
     wtBadge.className = 'badge';
     wtBadge.style.cssText = 'margin-right:0;background:var(--fill);color:var(--text-secondary)';
-    wtBadge.textContent = `佔 ${weightPct.toFixed(1)}%`;
+    wtBadge.textContent = `佔 ${fmtPct(weightPct, 1)}`;
     titleRow.appendChild(wtBadge);
   }
   if (curr === 'USD') {
@@ -850,7 +848,7 @@ function renderStockPositionCard(
       meta.className = 'stock-recovery-meta tnum';
       const parts: string[] = [];
       if (pos.cumulativeCashDividends > 0) {
-        parts.push(`配息回本 ${pos.costRecoveryPct.toFixed(1)}%`);
+        parts.push(`配息回本 ${fmtPct(pos.costRecoveryPct, 1)}`);
       }
       if (pos.cumulativeStockDividendShares > 0) {
         parts.push(`累計配股 +${fmtShares(pos.cumulativeStockDividendShares)} 股`);
@@ -925,7 +923,7 @@ function renderStockFlipCard(
     const wtBadge = document.createElement('span');
     wtBadge.className = 'badge';
     wtBadge.style.cssText = 'margin-right:0;background:var(--fill);color:var(--text-secondary)';
-    wtBadge.textContent = `佔 ${weightPct.toFixed(1)}%`;
+    wtBadge.textContent = `佔 ${fmtPct(weightPct, 1)}`;
     titleRow.appendChild(wtBadge);
   }
   if (pos.isCostRecovered) {
@@ -1014,7 +1012,7 @@ function renderStockFlipCard(
 
     const recChip = document.createElement('span');
     recChip.className = 'flip-stat-chip neutral';
-    recChip.textContent = `回本 ${pos.costRecoveryPct.toFixed(0)}%`;
+    recChip.textContent = `回本 ${fmtPct(pos.costRecoveryPct, 0)}`;
 
     summaryRow.appendChild(pChip);
     summaryRow.appendChild(dChip);
@@ -1539,7 +1537,7 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
   btns.appendChild(saveBtn);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     try {
       const ticker = tickerInp.value.trim().toUpperCase();
@@ -1974,7 +1972,7 @@ export function openStockBaselineModal(
   btns.appendChild(saveBtn);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const { hasCost, totalCost, unitCost, shares, marketPrice } = computeImplied();
     if (hasCost && isUnitPriceSuspicious(unitCost, marketPrice)) {
@@ -2316,7 +2314,7 @@ export function openStockTradeModal(
   btns.appendChild(submit);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const { shares, fee, totalAmount, impliedUnitPrice } = computeTrade();
     if (!isBuy && shares > pos.currentShares) {
@@ -2482,7 +2480,7 @@ export function openStockDividendModal(ctx: UiContext, asset: AssetItem): void {
     if (divKind === 'cash') {
       if (!(netCash > 0)) {
         previewBox.textContent = pos.hasCostBasis
-          ? `目前持有 ${fmtShares(pos.currentShares)} 股 · 未回本成本 ${fmtCurrencyAmount(pos.unrecoveredCost, curr, false)}（已回本 ${pos.costRecoveryPct.toFixed(1)}%）`
+          ? `目前持有 ${fmtShares(pos.currentShares)} 股 · 未回本成本 ${fmtCurrencyAmount(pos.unrecoveredCost, curr, false)}（已回本 ${fmtPct(pos.costRecoveryPct, 1)}）`
           : `目前持有 ${fmtShares(pos.currentShares)} 股 · 累計配息 ${fmtCurrencyAmount(pos.cumulativeCashDividends, curr, false)}`;
         return;
       }
@@ -2499,7 +2497,7 @@ export function openStockDividendModal(ctx: UiContext, asset: AssetItem): void {
         nextUnrecovered === 0
           ? `實領 ${fmtCurrencyAmount(netCash, curr, false)} → 🎉 成本已完全歸零（100%）` +
             (nextExcess > 0 ? ` · 超額回收 +${fmtCurrencyAmount(nextExcess, curr, false)}` : '')
-          : `實領 ${fmtCurrencyAmount(netCash, curr, false)} → 未回本成本 ${fmtCurrencyAmount(pos.unrecoveredCost, curr, false)} → ${fmtCurrencyAmount(nextUnrecovered, curr, false)}（回本 ${nextPct.toFixed(1)}%）`;
+          : `實領 ${fmtCurrencyAmount(netCash, curr, false)} → 未回本成本 ${fmtCurrencyAmount(pos.unrecoveredCost, curr, false)} → ${fmtCurrencyAmount(nextUnrecovered, curr, false)}（回本 ${fmtPct(nextPct, 1)}）`;
     } else {
       if (!(stockShares > 0)) {
         previewBox.textContent = `股票配股會增加持有股數、總投入成本不變，自動稀釋每股平均成本（目前 ${fmtShares(pos.currentShares)} 股）`;
@@ -2581,7 +2579,7 @@ export function openStockDividendModal(ctx: UiContext, asset: AssetItem): void {
   btns.appendChild(submit);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const { netCash, fee, stockShares } = computeDividend();
     try {
@@ -2957,7 +2955,7 @@ export function openStockCategoryManagerModal(ctx: UiContext): void {
     addBtn.textContent = '+ 新增分類';
     addForm.appendChild(addInp);
     addForm.appendChild(addBtn);
-    addForm.addEventListener('submit', async (ev) => {
+    bindSubmit(addForm, async (ev) => {
       ev.preventDefault();
       const cleaned = normalizeStockCategory(addInp.value);
       if (!cleaned) {

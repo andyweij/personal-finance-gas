@@ -1,3 +1,4 @@
+import { todayInTimeZone } from '../../../shared/dates';
 import { DEFAULT_LEDGER_ID, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
 import {
   aggregatePeriodMetrics,
@@ -8,7 +9,7 @@ import {
 } from '../../../shared/calculations';
 import type { CashFlowLog } from '../../../shared/types';
 import { openAccountTransferModal, openSavingsAccountModal } from './assetsTab';
-import { el, fmtMoney, fmtNum, showToast, TRASH_SVG } from './helpers';
+import { el, fmtMoney, fmtNum, showToast, TRASH_SVG, fmtPct } from './helpers';
 import { renderLedgerSwitcherBar, resolveActiveLedger } from './ledgerUi';
 import type { UiContext } from './state';
 
@@ -17,9 +18,7 @@ export function getSelectedYearMonth(year: number, month: number): string {
 }
 
 export function getTodayYmd(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return todayInTimeZone(); // v1.8.15: "today" is the APP_TIMEZONE date, like the server
 }
 
 export function renderLogCategories(ctx: UiContext): void {
@@ -388,7 +387,7 @@ export function renderLogTab(ctx: UiContext): void {
     el('remainingBudget').style.color = remaining < 0 ? 'var(--neg)' : 'var(--text)';
     el('spentText').textContent = '已花費 ' + fmtMoney(monthly.dailyExpense, ctx.state.masked);
     el('budgetLimitText').textContent = '上限 ' + fmtMoney(budget, ctx.state.masked);
-    el('usagePctText').textContent = `使用率：${usagePct.toFixed(1)}%`;
+    el('usagePctText').textContent = `使用率：${fmtPct(usagePct, 1)}`;
     el('quickFreeCashText').textContent = '自由現金流：' + fmtMoney(monthly.freeCashFlow, ctx.state.masked);
 
     progressTrack.style.display = '';

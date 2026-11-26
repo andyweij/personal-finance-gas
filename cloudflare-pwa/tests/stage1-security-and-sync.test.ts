@@ -181,7 +181,24 @@ describe('Stage 1 Security & Sync Hardening (1.1 - 1.6)', () => {
 
     const racingDb = {
       ...db,
-      batch: db.batch.bind(db),
+      // v1.8.13 (H5): the row read is now prefetched inside a batch — hold that batch at the same barrier
+      batch: async (stmts: D1PreparedStatement[]) => {
+        const results = await db.batch(stmts);
+        const readsRow = stmts.some((st) =>
+          String((st as unknown as { query?: string }).query || '').includes(
+            'SELECT * FROM cashflow_logs WHERE user_id = ? AND id = ?'
+          )
+        );
+        if (readsRow) {
+          selectBarrierCount += 1;
+          if (selectBarrierCount === 2) {
+            releaseBarrier();
+          } else {
+            await barrier;
+          }
+        }
+        return results;
+      },
       exec: db.exec.bind(db),
       dump: db.dump.bind(db),
       prepare(query: string) {
@@ -282,7 +299,24 @@ describe('Stage 1 Security & Sync Hardening (1.1 - 1.6)', () => {
     });
     const racingCreateDb = {
       ...db,
-      batch: db.batch.bind(db),
+      // v1.8.13 (H5): the row read is now prefetched inside a batch — hold that batch at the same barrier
+      batch: async (stmts: D1PreparedStatement[]) => {
+        const results = await db.batch(stmts);
+        const readsRow = stmts.some((st) =>
+          String((st as unknown as { query?: string }).query || '').includes(
+            'SELECT * FROM cashflow_logs WHERE user_id = ? AND id = ?'
+          )
+        );
+        if (readsRow) {
+          createBarrierCount += 1;
+          if (createBarrierCount === 2) {
+            releaseCreateBarrier();
+          } else if (createBarrierCount < 2) {
+            await createBarrier;
+          }
+        }
+        return results;
+      },
       exec: db.exec.bind(db),
       dump: db.dump.bind(db),
       prepare(query: string) {

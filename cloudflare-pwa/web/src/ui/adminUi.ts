@@ -1,3 +1,4 @@
+import { ymdInTimeZone } from '../../../shared/dates';
 import {
   adminCreateInvite,
   adminCreateResetCode,
@@ -5,7 +6,7 @@ import {
   adminUpdateMember,
   fetchAdminDashboard, setAuthExpectedUser
 } from '../auth/authClient';
-import { openModal, setLoading, showToast } from './helpers';
+import { openModal, setLoading, showToast, bindSubmit } from './helpers';
 import type { UiContext } from './state';
 
 async function copyToClipboard(text: string, successMsg: string): Promise<void> {
@@ -139,7 +140,7 @@ export async function openFamilyAdminModal(
   invForm.appendChild(noteInput);
   invForm.appendChild(daysSelect);
   invForm.appendChild(genBtn);
-  invForm.addEventListener('submit', async (e) => {
+  bindSubmit(invForm, async (e) => {
     e.preventDefault();
     setLoading(true);
     try {
@@ -149,7 +150,7 @@ export async function openFamilyAdminModal(
         title: `一次性邀請碼已產生${created.note ? `（${created.note}）` : ''}`,
         code: created.inviteCode,
         link,
-        note: `僅顯示這一次，註冊完成即永久失效（有效至 ${created.expiresAt.slice(0, 10)}）。`,
+        note: `僅顯示這一次，註冊完成即永久失效（有效至 ${ymdInTimeZone(created.expiresAt)}）。`,
       });
     } catch (err) {
       showToast(err instanceof Error ? err.message : '產生邀請碼失敗', 'error');
@@ -185,7 +186,7 @@ export async function openFamilyAdminModal(
     const metaLine = document.createElement('div');
     metaLine.className = 'muted tnum';
     metaLine.style.fontSize = '11px';
-    metaLine.textContent = `建立：${u.createdAt.slice(0, 10)} · 最近登入：${u.lastLoginAt ? u.lastLoginAt.slice(0, 10) : '尚未'}`;
+    metaLine.textContent = `建立：${ymdInTimeZone(u.createdAt)} · 最近登入：${u.lastLoginAt ? ymdInTimeZone(u.lastLoginAt) : '尚未'}`;
     left.appendChild(nameLine);
     left.appendChild(metaLine);
 
@@ -321,7 +322,7 @@ export async function openFamilyAdminModal(
       const sub = document.createElement('div');
       sub.className = 'muted tnum';
       sub.style.fontSize = '11px';
-      sub.textContent = `建立 ${inv.createdAt.slice(0, 10)} · 到期 ${inv.expiresAt.slice(0, 10)}`;
+      sub.textContent = `建立 ${ymdInTimeZone(inv.createdAt)} · 到期 ${ymdInTimeZone(inv.expiresAt)}`;
       info.appendChild(label);
       info.appendChild(sub);
       r.appendChild(info);
