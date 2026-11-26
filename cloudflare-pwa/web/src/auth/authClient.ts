@@ -1,3 +1,4 @@
+import { createCrossTabChannel } from '../sync/crossTab';
 import {
   startAuthentication,
   startRegistration,
@@ -18,6 +19,21 @@ export interface RememberedAccount {
   username: string;
   displayName: string;
   showUtilityTab?: boolean;
+}
+
+/**
+ * P2-S11: The account THIS tab believes it is signed in as (per tab, unlike localStorage which every tab
+ * shares). Sent as X-Expected-User on authenticated writes so the server refuses (409) a write made after
+ * another tab switched the shared session cookie to a different account.
+ */
+let tabExpectedUserId: string | null = null;
+
+export function setAuthExpectedUser(userId: string | null | undefined): void {
+  tabExpectedUserId = userId || null;
+}
+
+function authedHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return tabExpectedUserId ? { ...extra, 'x-expected-user': tabExpectedUserId } : extra;
 }
 
 export function getRememberedAccount(): RememberedAccount | null {
@@ -189,7 +205,7 @@ export async function updateMyProfile(patch: {
   const res = await fetch('/api/auth/profile', {
     method: 'PATCH',
     credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
+    headers: authedHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify(patch),
   });
   const body = (await res.json().catch(() => ({}))) as { error?: string; user?: AuthUser };
@@ -205,7 +221,7 @@ export async function changeMyPassword(
   const res = await fetch('/api/auth/change-password', {
     method: 'POST',
     credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
+    headers: authedHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({ currentPassword, newPassword }),
   });
   const body = (await res.json().catch(() => ({}))) as { error?: string };
@@ -213,17 +229,19 @@ export async function changeMyPassword(
 }
 
 export async function logoutSession(allDevices = false): Promise<void> {
-  await fetch(`/api/auth/logout${allDevices ? '?all=1' : ''}`, {
-    method: 'POST',
-    credentials: 'same-origin',
-  });
-  if (typeof BroadcastChannel !== 'undefined') {
+  try {
+    await fetch(`/api/auth/logout${allDevices ? '?all=1' : ''}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+    });
+  } finally {
+    // P2-C10: tell other tabs even if the request failed (e.g. offline) — this tab is logging out either way
     try {
-      const ch = new BroadcastChannel('personal-finance-account-sync');
-      ch.postMessage({ type: 'logout' });
-      ch.close();
+      const ch = createCrossTabChannel('personal-finance-account-sync');
+      ch?.postMessage({ type: 'logout' });
+      ch?.close();
     } catch {
-      // Ignore BroadcastChannel errors
+      // Ignore cross-tab messaging errors
     }
   }
 }
@@ -232,6 +250,7 @@ export async function registerPasskey(deviceName = '我的裝置'): Promise<void
   const optRes = await fetch('/api/auth/passkey/register/options', {
     method: 'POST',
     credentials: 'same-origin',
+    headers: authedHeaders(),
   });
   if (!optRes.ok) throw new Error('無法啟動 Passkey 註冊');
   const optionsJSON = (await optRes.json()) as PublicKeyCredentialCreationOptionsJSON;
@@ -240,7 +259,7 @@ export async function registerPasskey(deviceName = '我的裝置'): Promise<void
   const verRes = await fetch('/api/auth/passkey/register/verify', {
     method: 'POST',
     credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
+    headers: authedHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({ response: attResp, deviceName }),
   });
   const verBody = (await verRes.json().catch(() => ({}))) as { error?: string };
@@ -278,7 +297,7 @@ export async function savePinConfig(payload: {
   const res = await fetch('/api/auth/pin', {
     method: 'POST',
     credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
+    headers: authedHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify(payload),
   });
   const body = (await res.json().catch(() => ({}))) as {
@@ -320,7 +339,7 @@ export async function adminCreateInvite(note: string, expiresInDays = 7): Promis
   const res = await fetch('/api/admin/invites', {
     method: 'POST',
     credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
+    headers: authedHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({ note, expiresInDays }),
   });
   const body = (await res.json().catch(() => ({}))) as {
@@ -343,6 +362,7 @@ export async function adminRevokeInvite(inviteId: string): Promise<void> {
   const res = await fetch(`/api/admin/invites/${encodeURIComponent(inviteId)}`, {
     method: 'DELETE',
     credentials: 'same-origin',
+    headers: authedHeaders(),
   });
   const body = (await res.json().catch(() => ({}))) as { error?: string };
   if (!res.ok) throw new Error(body.error || '作廢邀請碼失敗');
@@ -355,7 +375,7 @@ export async function adminCreateResetCode(
   const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/reset-code`, {
     method: 'POST',
     credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
+    headers: authedHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({ expiresInMinutes }),
   });
   const body = (await res.json().catch(() => ({}))) as {
@@ -379,7 +399,7 @@ export async function adminUpdateMember(
   const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}`, {
     method: 'PATCH',
     credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
+    headers: authedHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify(patch),
   });
   const body = (await res.json().catch(() => ({}))) as { error?: string; user?: AdminUserSummary };

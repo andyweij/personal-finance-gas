@@ -58,7 +58,14 @@ import {
   type SinkingInputPayload,
   type StockTransactionInputPayload,
 } from '../../../shared/validation';
-import { createDefaultLedger, createEmptySnapshot, type LocalFinanceDB, type LocalMeta } from '../db/localDb';
+import {
+  createDefaultLedger,
+  createEmptySnapshot,
+  StaleSnapshotError,
+  type LocalFinanceDB,
+  type LocalMeta,
+} from '../db/localDb';
+import { createCrossTabChannel, type CrossTabChannel } from './crossTab';
 
 export type SyncStateKind = 'synced' | 'syncing' | 'pending' | 'offline' | 'auth_required' | 'conflict';
 
@@ -100,6 +107,14 @@ export interface SyncEngineOptions {
  * Fallback cross-tab mutex using localStorage TTL lease when Web Locks API
  * (navigator.locks) is unavailable (e.g., older iOS Safari < 15.4).
  */
+/** P2-C7: another tab holds the sync lease; this sync is skipped and retried later. */
+class SyncLockBusyError extends Error {
+  constructor() {
+    super('另一個分頁正在同步，稍後將自動重試');
+    this.name = 'SyncLockBusyError';
+  }
+}
+
 async function withLocalStorageLease<T>(lockName: string, fn: () => Promise<T>): Promise<T> {
   if (typeof localStorage === 'undefined') {
     return fn();
@@ -108,28 +123,39 @@ async function withLocalStorageLease<T>(lockName: string, fn: () => Promise<T>):
   const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const ttlMs = 30_000;
   const maxWaitMs = 15_000;
+  const settleMs = 60;
   const deadline = Date.now() + maxWaitMs;
 
-  const tryAcquire = (): boolean => {
+  const readLease = (): { token?: string; expiresAt?: number } | null => {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as { token?: string; expiresAt?: number }) : null;
+  };
+
+  // P2-C7: localStorage has no compare-and-set. Write our token, wait a moment so a competing tab's write
+  // (which overwrites ours) becomes visible, then confirm the lease is still ours.
+  const tryAcquire = async (): Promise<boolean> => {
     try {
-      const now = Date.now();
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        const parsed = JSON.parse(raw) as { token?: string; expiresAt?: number };
-        if (parsed && typeof parsed.expiresAt === 'number' && parsed.expiresAt > now && parsed.token !== token) {
-          return false;
-        }
+      const current = readLease();
+      if (current && typeof current.expiresAt === 'number' && current.expiresAt > Date.now() && current.token !== token) {
+        return false;
       }
-      localStorage.setItem(key, JSON.stringify({ token, expiresAt: now + ttlMs }));
-      const verify = JSON.parse(localStorage.getItem(key) || '{}') as { token?: string };
-      return verify.token === token;
+      localStorage.setItem(key, JSON.stringify({ token, expiresAt: Date.now() + ttlMs }));
+      await new Promise((r) => setTimeout(r, settleMs));
+      return readLease()?.token === token;
     } catch {
+      // Storage unavailable (e.g. private mode quota): no cross-tab coordination is possible
       return true;
     }
   };
 
-  while (!tryAcquire() && Date.now() < deadline) {
+  let acquired = await tryAcquire();
+  while (!acquired && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 80 + Math.floor(Math.random() * 60)));
+    acquired = await tryAcquire();
+  }
+  if (!acquired) {
+    // Never run without the lease: two tabs sending the same outbox concurrently causes self-conflicts
+    throw new SyncLockBusyError();
   }
 
   const renewTimer = setInterval(() => {
@@ -247,7 +273,9 @@ export class SyncEngine {
   private singleItemSuccessStreak = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly instanceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  private dbChannel: BroadcastChannel | null = null;
+  private dbChannel: CrossTabChannel | null = null;
+  /** P2-C10: request of the sync pass in flight, aborted by destroy() */
+  private activeSyncController: AbortController | null = null;
   private destroyed = false;
 
   private readonly fetchImpl: typeof fetch;
@@ -286,19 +314,17 @@ export class SyncEngine {
         return withLocalStorageLease(name, fn);
       });
 
-    if (typeof BroadcastChannel !== 'undefined') {
-      try {
-        this.dbChannel = new BroadcastChannel(`personal-finance-db:${this.db.getDbName()}`);
-        this.dbChannel.onmessage = (evt: MessageEvent) => {
-          const msg = evt.data as { type?: string; senderId?: string } | null;
-          if (!msg || msg.senderId === this.instanceId || this.destroyed) return;
-          if (msg.type === 'snapshot_changed') {
-            void this.reloadFromIndexedDb();
-          }
-        };
-      } catch {
-        this.dbChannel = null;
-      }
+    // BroadcastChannel, or localStorage storage events on browsers without it (Safari < 15.4)
+    this.dbChannel = createCrossTabChannel(`personal-finance-db:${this.db.getDbName()}`);
+    if (this.dbChannel) {
+      this.dbChannel.onmessage = (data: unknown) => {
+        const msg = data as { type?: string; senderId?: string } | null;
+        if (!msg || msg.senderId === this.instanceId || this.destroyed) return;
+        if (msg.type === 'snapshot_changed') {
+          // Reload may race with init/destroy; errors here must not become unhandled rejections
+          void this.reloadFromIndexedDb().catch(() => undefined);
+        }
+      };
     }
 
     // P2-C3: Serialize all local CRUD & meta mutators through the shared Promise-chain mutex
@@ -339,7 +365,20 @@ export class SyncEngine {
     const self = this as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
     for (const methodName of serializedMethods) {
       const orig = self[methodName].bind(this);
-      self[methodName] = (...args: unknown[]) => this.runSerialized(() => orig(...args));
+      self[methodName] = (...args: unknown[]) =>
+        this.runSerialized(async () => {
+          try {
+            return await orig(...args);
+          } catch (err) {
+            // P2-C6: another tab wrote the snapshot after this tab last read it. Reload and recompute the edit
+            // on top of the latest data instead of overwriting it (nothing was written: the commit aborted).
+            if (err instanceof StaleSnapshotError) {
+              await this.reloadStateUnlocked();
+              return orig(...args);
+            }
+            throw err;
+          }
+        });
     }
   }
 
@@ -370,17 +409,20 @@ export class SyncEngine {
 
   async reloadFromIndexedDb(): Promise<void> {
     if (this.destroyed) return;
-    await this.runSerialized(async () => {
-      if (this.destroyed) return;
-      this.snapshot = await this.db.getSnapshot();
-      this.meta = await this.db.getMeta();
-      this.conflicts = await this.db.getConflicts();
-      this.rejections = await this.db.getRejections();
-      this.frozenOutbox = await this.db.getFrozenOutbox();
-      const outbox = await this.db.getOutbox();
-      this.emitSnapshot();
-      this.updateStatus(this.computeStatus(outbox.length));
-    });
+    await this.runSerialized(() => this.reloadStateUnlocked());
+  }
+
+  /** Reloads in-memory state from IndexedDB. Caller must already hold the runSerialized lock. */
+  private async reloadStateUnlocked(): Promise<void> {
+    if (this.destroyed) return;
+    this.snapshot = await this.db.getSnapshot();
+    this.meta = await this.db.getMeta();
+    this.conflicts = await this.db.getConflicts();
+    this.rejections = await this.db.getRejections();
+    this.frozenOutbox = await this.db.getFrozenOutbox();
+    const outbox = await this.db.getOutbox();
+    this.emitSnapshot();
+    this.updateStatus(this.computeStatus(outbox.length));
   }
 
   setExpectedUserId(userId?: string): void {
@@ -395,6 +437,13 @@ export class SyncEngine {
 
   destroy(): void {
     this.destroyed = true;
+    // P2-C10: stop an in-flight sync so it does not keep working against a database that is being closed
+    try {
+      this.activeSyncController?.abort();
+    } catch {
+      // ignore
+    }
+    this.activeSyncController = null;
     if (this.retryTimer !== null) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
@@ -679,22 +728,31 @@ export class SyncEngine {
   }
 
   async updateLocalPinCache(pinEnabled: boolean, pinSalt: string | null, pinHash: string | null): Promise<void> {
-    const nextMeta: LocalMeta = { ...this.meta, pinEnabled, pinSalt, pinHash };
-    await this.db.saveMeta(nextMeta);
-    this.meta = nextMeta;
+    await this.applyAuthMetaPatch({ pinEnabled, pinSalt, pinHash });
+  }
+
+  /** P2-C6: patch only the lock-screen fields in the stored meta and tell other tabs to reload. */
+  private async applyAuthMetaPatch(patch: Partial<LocalMeta>): Promise<void> {
+    const merged = await this.db.patchAuthMeta(patch);
+    if (merged) {
+      this.meta = { ...this.meta, ...patch };
+    } else {
+      // No stored meta yet (first run): write the full meta once
+      const nextMeta: LocalMeta = { ...this.meta, ...patch };
+      await this.db.saveMeta(nextMeta);
+      this.meta = nextMeta;
+    }
+    this.broadcastDbChanged();
   }
 
   async updateLocalBiometricCache(
     biometricLockEnabled: boolean,
     passkeys?: LocalMeta['passkeys']
   ): Promise<void> {
-    const nextMeta: LocalMeta = {
-      ...this.meta,
+    await this.applyAuthMetaPatch({
       biometricLockEnabled,
       ...(passkeys !== undefined ? { passkeys } : {}),
-    };
-    await this.db.saveMeta(nextMeta);
-    this.meta = nextMeta;
+    });
   }
 
   private updateStatus(next: SyncStatus): void {
@@ -2103,6 +2161,7 @@ export class SyncEngine {
     try {
       await this.db.commitLocalMutation(nextSnapshot, normalizedMutations, this.inFlightMutationIds);
     } catch (err) {
+      if (err instanceof StaleSnapshotError) throw err; // handled by the serialized wrapper (reload + retry)
       const msg = err instanceof Error ? err.message : '本機儲存失敗，變更未寫入';
       this.opts.onError?.(msg);
       throw err;
@@ -2399,10 +2458,18 @@ export class SyncEngine {
     this.syncingIsFullPull = forceFullPull;
     this.syncingPromise = this.requestLockImpl(`personal-finance-sync:${this.db.getDbName()}`, () =>
       this.performSync(forceFullPull)
-    ).finally(() => {
-      this.syncingPromise = null;
-      this.syncingIsFullPull = false;
-    });
+    )
+      .catch((err: unknown): SyncResult => {
+        if (err instanceof SyncLockBusyError) {
+          this.scheduleRetry(5_000);
+          return { ok: false, error: err.message };
+        }
+        throw err;
+      })
+      .finally(() => {
+        this.syncingPromise = null;
+        this.syncingIsFullPull = false;
+      });
     return this.syncingPromise;
   }
 
@@ -2599,6 +2666,7 @@ export class SyncEngine {
     let quarantinedInThisSync = false;
 
     for (let pass = 0; pass < maxPasses; pass++) {
+      if (this.destroyed) return { ok: false, error: '同步已停止（帳號已切換或頁面已關閉）' };
       let outbox: SyncMutation[] = [];
       let batch: SyncMutation[] = [];
       let hadMoreBatches = false;
@@ -2641,6 +2709,7 @@ export class SyncEngine {
       });
 
       const controller = new AbortController();
+      this.activeSyncController = controller;
       const timeoutId = setTimeout(() => controller.abort(), this.requestTimeoutMs);
 
       try {
@@ -2885,6 +2954,35 @@ export class SyncEngine {
                 if (!applyAsFull) {
                   needsFullResyncAfterRejection = true;
                 }
+                // R6: queued later edits of the same record were built on top of the rejected local value, so
+                // sending them could write the rejected value to the server. Hold them for review instead.
+                if (orig) {
+                  const key = `${orig.entity}:${orig.recordId}`;
+                  if (!ackedKeys.has(key)) {
+                    const followUps = currentOutbox.filter(
+                      (m) =>
+                        !clearedSet.has(m.mutationId) &&
+                        !batchIdSet.has(m.mutationId) &&
+                        `${m.entity}:${m.recordId}` === key
+                    );
+                    for (const dep of followUps) {
+                      outboxIdsToClear.push(dep.mutationId);
+                      clearedSet.add(dep.mutationId);
+                      byMutId.set(dep.mutationId, {
+                        mutationId: dep.mutationId,
+                        entity: dep.entity,
+                        op: dep.op,
+                        recordId: dep.recordId,
+                        isNewRecord: false,
+                        resolutionStatus: 'held_after_reject',
+                        reason: '前一筆編輯遭伺服器拒絕，這筆後續編輯包含遭拒的內容，已暫停送出並還原雲端資料；如仍需要請參考內容重新輸入',
+                        ...(dep.payload ? { clientPayload: dep.payload } : {}),
+                        rejectedAt,
+                      });
+                    }
+                    if (followUps.length > 0) needsFullResyncAfterRejection = true;
+                  }
+                }
                 byMutId.set(r.mutationId, {
                   mutationId: r.mutationId,
                   entity: orig?.entity || 'unknown',
@@ -3083,6 +3181,10 @@ export class SyncEngine {
         }
         return { ok: true };
       } catch (err) {
+        if (this.destroyed) {
+          // P2-C10: aborted by destroy(); the database may already be closed — do nothing further
+          return { ok: false, error: '同步已停止（帳號已切換或頁面已關閉）' };
+        }
         const isAbort = err instanceof DOMException && err.name === 'AbortError';
         const httpStatus = (err as { httpStatus?: number })?.httpStatus;
         const msg = isAbort

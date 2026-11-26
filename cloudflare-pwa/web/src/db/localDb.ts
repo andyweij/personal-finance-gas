@@ -71,6 +71,33 @@ export interface LocalMeta {
   passkeys?: CachedPasskeyDto[];
 }
 
+/**
+ * P2-C6: Lock-screen fields owned by updateLocalPinCache / updateLocalBiometricCache. Every other meta write
+ * keeps the stored values of these fields, so a tab holding a stale in-memory meta (e.g. while syncing)
+ * can never revert a PIN or biometric change made in another tab.
+ */
+const AUTH_META_FIELDS = ['pinEnabled', 'pinSalt', 'pinHash', 'biometricLockEnabled', 'passkeys'] as const;
+type AuthMetaPatch = Partial<Pick<LocalMeta, (typeof AUTH_META_FIELDS)[number]>>;
+
+function pickAuthMeta(meta: Partial<LocalMeta>): AuthMetaPatch {
+  const out: Record<string, unknown> = {};
+  for (const k of AUTH_META_FIELDS) {
+    if (k in meta) out[k] = (meta as Record<string, unknown>)[k];
+  }
+  return out as AuthMetaPatch;
+}
+
+/**
+ * P2-C6: Thrown by commitLocalMutation when another tab wrote the snapshot after this tab last read it.
+ * The engine reloads from IndexedDB and recomputes the edit instead of overwriting the other tab's data.
+ */
+export class StaleSnapshotError extends Error {
+  constructor() {
+    super('Local snapshot changed in another tab');
+    this.name = 'StaleSnapshotError';
+  }
+}
+
 export class LocalFinanceDB {
   private db: IDBDatabase | null = null;
 
@@ -123,6 +150,11 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readonly');
+      // P2-C6: read the revision first so it is known before the snapshot request resolves
+      const revReq = tx.objectStore(STORE_KV).get('snapshot_rev');
+      revReq.onsuccess = () => {
+        this.lastSnapshotRev = Number(revReq.result) || 0;
+      };
       const req = tx.objectStore(STORE_KV).get('snapshot');
       req.onsuccess = () => {
         const raw = req.result as Partial<FinanceSnapshot> | undefined;
@@ -164,7 +196,11 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readwrite');
-      tx.objectStore(STORE_KV).put(snapshot, 'snapshot');
+      {
+        const kvSnap = tx.objectStore(STORE_KV);
+        kvSnap.put(snapshot, 'snapshot');
+        this.bumpSnapshotRev(kvSnap);
+      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
@@ -193,7 +229,7 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readwrite');
-      tx.objectStore(STORE_KV).put(meta, 'meta');
+      this.putMetaKeepingAuth(tx.objectStore(STORE_KV), meta);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
@@ -243,6 +279,46 @@ export class LocalFinanceDB {
   }
 
   private outboxSeq = 0;
+  /** P2-C6: snapshot revision this instance last read or wrote (stored under KV key 'snapshot_rev'). */
+  private lastSnapshotRev = 0;
+
+  /** P2-C6: write meta but keep the stored lock-screen fields (see AUTH_META_FIELDS). */
+  private putMetaKeepingAuth(kv: IDBObjectStore, meta: LocalMeta): void {
+    const req = kv.get('meta');
+    req.onsuccess = () => {
+      const stored = req.result as LocalMeta | undefined;
+      kv.put(stored ? { ...meta, ...pickAuthMeta(stored) } : meta, 'meta');
+    };
+  }
+
+  /** P2-C6: update only the lock-screen fields, merged into the stored meta (cursor etc. untouched). */
+  async patchAuthMeta(patch: AuthMetaPatch): Promise<LocalMeta | null> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      const kv = tx.objectStore(STORE_KV);
+      let merged: LocalMeta | null = null;
+      const req = kv.get('meta');
+      req.onsuccess = () => {
+        const stored = req.result as LocalMeta | undefined;
+        if (!stored) return;
+        merged = { ...stored, ...patch };
+        kv.put(merged, 'meta');
+      };
+      tx.oncomplete = () => resolve(merged);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+    });
+  }
+
+  private bumpSnapshotRev(kv: IDBObjectStore): void {
+    const req = kv.get('snapshot_rev');
+    req.onsuccess = () => {
+      const next = (Number(req.result) || 0) + 1;
+      kv.put(next, 'snapshot_rev');
+      this.lastSnapshotRev = next;
+    };
+  }
 
   async getOutbox(): Promise<SyncMutation[]> {
     const db = this.getDb();
@@ -356,7 +432,8 @@ export class LocalFinanceDB {
       }
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
-      kv.put(meta, 'meta');
+      this.bumpSnapshotRev(kv);
+      this.putMetaKeepingAuth(kv, meta);
       kv.put(rejections, 'rejections');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -453,18 +530,40 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
-      tx.objectStore(STORE_KV).put(snapshot, 'snapshot');
+      const kv = tx.objectStore(STORE_KV);
       const outboxStore = tx.objectStore(STORE_OUTBOX);
-      const getAllReq = outboxStore.getAll();
-
-      getAllReq.onsuccess = () => {
-        const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
-        this.applyMutationsToOutboxStore(outboxStore, existingList, mutations, inFlightIds);
+      let stale = false;
+      let newRev = this.lastSnapshotRev;
+      // P2-C6: only write if no other tab changed the snapshot since this tab last read/wrote it
+      const revReq = kv.get('snapshot_rev');
+      revReq.onsuccess = () => {
+        const cur = Number(revReq.result) || 0;
+        if (cur !== this.lastSnapshotRev) {
+          stale = true;
+          try {
+            tx.abort();
+          } catch {
+            /* already aborted */
+          }
+          return;
+        }
+        newRev = cur + 1;
+        kv.put(snapshot, 'snapshot');
+        kv.put(newRev, 'snapshot_rev');
+        const getAllReq = outboxStore.getAll();
+        getAllReq.onsuccess = () => {
+          const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
+          this.applyMutationsToOutboxStore(outboxStore, existingList, mutations, inFlightIds);
+        };
       };
 
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+      tx.oncomplete = () => {
+        this.lastSnapshotRev = newRev;
+        resolve();
+      };
+      tx.onerror = () => reject(stale ? new StaleSnapshotError() : tx.error);
+      tx.onabort = () =>
+        reject(stale ? new StaleSnapshotError() : tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -477,6 +576,7 @@ export class LocalFinanceDB {
       const tx = db.transaction(STORE_KV, 'readwrite');
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
+      this.bumpSnapshotRev(kv);
       kv.put(conflicts, 'conflicts');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -495,6 +595,7 @@ export class LocalFinanceDB {
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
+      this.bumpSnapshotRev(kv);
       kv.put(conflicts, 'conflicts');
       const outboxStore = tx.objectStore(STORE_OUTBOX);
       const getAllReq = outboxStore.getAll();
@@ -549,7 +650,8 @@ export class LocalFinanceDB {
         outboxStore.clear();
         kv.put(mergedFrozen, 'frozen_outbox');
         kv.put(snapshot, 'snapshot');
-        kv.put(meta, 'meta');
+        this.bumpSnapshotRev(kv);
+        this.putMetaKeepingAuth(kv, meta);
         if (conflicts !== undefined) kv.put(conflicts, 'conflicts');
         if (rejections !== undefined) kv.put(rejections, 'rejections');
       };
@@ -665,6 +767,7 @@ export class LocalFinanceDB {
         skippedCount = transformed.skippedCount;
 
         kv.put(transformed.nextSnapshot, 'snapshot');
+        this.bumpSnapshotRev(kv);
         kv.put([], 'frozen_outbox');
         if (transformed.skippedRejections && transformed.skippedRejections.length > 0) {
           const byId = new Map(existingRejections.map((r) => [r.mutationId, r]));
@@ -756,7 +859,8 @@ export class LocalFinanceDB {
       }
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
-      kv.put(meta, 'meta');
+      this.bumpSnapshotRev(kv);
+      this.putMetaKeepingAuth(kv, meta);
       if (conflicts !== undefined) {
         kv.put(conflicts, 'conflicts');
       }

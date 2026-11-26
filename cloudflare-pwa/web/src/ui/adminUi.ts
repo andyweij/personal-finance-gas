@@ -3,7 +3,7 @@ import {
   adminCreateResetCode,
   adminRevokeInvite,
   adminUpdateMember,
-  fetchAdminDashboard,
+  fetchAdminDashboard, setAuthExpectedUser
 } from '../auth/authClient';
 import { openModal, setLoading, showToast } from './helpers';
 import type { UiContext } from './state';
@@ -250,6 +250,7 @@ export async function openFamilyAdminModal(
         const updated = await adminUpdateMember(u.id, { showUtilityTab: !u.showUtilityTab });
         if (isSelf && ctx.state.currentUser) {
           ctx.state.currentUser = { ...ctx.state.currentUser, showUtilityTab: updated.showUtilityTab };
+          setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
           ctx.applyUtilityTabVisibility();
         }
         showToast(`${u.displayName} 水電分頁已設為${updated.showUtilityTab ? '顯示' : '隱藏'}`, 'success');

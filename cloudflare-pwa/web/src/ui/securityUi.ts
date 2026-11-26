@@ -13,7 +13,7 @@ import {
   savePinConfig,
   setupMasterPassword,
   updateMyProfile,
-  verifyOfflinePin,
+  verifyOfflinePin, setAuthExpectedUser
 } from '../auth/authClient';
 import { triggerOfflineFaceIdUnlock } from '../auth/offlineWebAuthn';
 import { openFamilyAdminModal } from './adminUi';
@@ -137,6 +137,7 @@ export function openAuthScreen(
           await ctx.switchAccountDb(status.user);
         }
         ctx.state.currentUser = status.user;
+        setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
         ctx.state.pinEnabled = Boolean(status.pinEnabled);
         ctx.state.pinSalt = status.pinSalt || null;
         ctx.state.pinHash = status.pinHash || null;
@@ -563,6 +564,7 @@ function openProfileEditModal(ctx: UiContext): void {
         displayName: el<HTMLInputElement>('profDisplay').value.trim(),
       });
       ctx.state.currentUser = updated;
+      setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
       showToast('個人資料已更新', 'success');
       openSecurityModal(ctx);
     } catch (err) {
@@ -698,6 +700,7 @@ export function openSecurityModal(ctx: UiContext): void {
       try {
         const updated = await updateMyProfile({ showUtilityTab: cb.checked });
         ctx.state.currentUser = updated;
+        setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
         ctx.applyUtilityTabVisibility();
         showToast(updated.showUtilityTab ? '已顯示水電分攤分頁' : '已隱藏水電分攤分頁', 'success');
       } catch (err) {
@@ -1114,6 +1117,7 @@ export function openSecurityModal(ctx: UiContext): void {
     await logoutSession(false);
     ctx.state.authenticated = false;
     ctx.state.currentUser = null;
+    setAuthExpectedUser(null);
     closeModal();
     openAuthScreen(ctx, 'login', '已登出，請重新登入以同步雲端資料', () => {
       void ctx.engine.syncNow(true);

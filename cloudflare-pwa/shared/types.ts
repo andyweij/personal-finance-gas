@@ -380,7 +380,7 @@ export interface SyncRejection {
   op: SyncOp | string;
   recordId: string;
   isNewRecord?: boolean;
-  resolutionStatus?: 'rolled_back' | 'restored' | 'pending_resync' | 'quarantined' | 'skipped_newer';
+  resolutionStatus?: 'rolled_back' | 'restored' | 'pending_resync' | 'quarantined' | 'skipped_newer' | 'held_after_reject';
   reason: string;
   clientPayload?: Record<string, unknown>;
   rejectedAt: string;

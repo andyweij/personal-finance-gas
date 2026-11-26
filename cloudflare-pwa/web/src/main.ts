@@ -5,7 +5,8 @@ import type { PnlColorScheme } from '../../shared/types';
 import { normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
-import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount } from './auth/authClient';
+import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount, setAuthExpectedUser } from './auth/authClient';
+import { createCrossTabChannel } from './sync/crossTab';
 import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast } from './ui/helpers';
 import {
   getTodayYmd,
@@ -204,10 +205,7 @@ async function bootstrap(): Promise<void> {
 
   let syncDebounce: number | undefined;
   let activeDb = new LocalFinanceDB(LocalFinanceDB.dbNameForUser(remembered?.id));
-  const accountChannel =
-    typeof BroadcastChannel !== 'undefined'
-      ? new BroadcastChannel('personal-finance-account-sync')
-      : null;
+  const accountChannel = createCrossTabChannel('personal-finance-account-sync');
 
   const createSyncEngineForDb = (db: LocalFinanceDB, expectedUserId?: string): SyncEngine =>
     new SyncEngine(db, {
@@ -298,6 +296,7 @@ async function bootstrap(): Promise<void> {
     switchAccountDb: async (user) => {
       const prevUserId = ctx.state.currentUser?.id || remembered?.id || null;
       ctx.state.currentUser = user;
+      setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
       cancelReorder(ctx, true);
       saveRememberedAccount(user);
       const nextDbName = LocalFinanceDB.dbNameForUser(user.id);
@@ -336,8 +335,8 @@ async function bootstrap(): Promise<void> {
   ctx.engine = createSyncEngineForDb(activeDb, remembered?.id);
 
   if (accountChannel) {
-    accountChannel.onmessage = (evt: MessageEvent) => {
-      const msg = evt.data as { type?: string; userId?: string } | null;
+    accountChannel.onmessage = (data: unknown) => {
+      const msg = data as { type?: string; userId?: string } | null;
       if (!msg) return;
       if (msg.type === 'logout') {
         ctx.engine.haltForAccountMismatch();

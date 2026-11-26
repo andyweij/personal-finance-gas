@@ -370,7 +370,8 @@ export function openConflictsModal(ctx: UiContext): void {
       badge.className =
         r.resolutionStatus === 'pending_resync' ||
         r.resolutionStatus === 'quarantined' ||
-        r.resolutionStatus === 'skipped_newer'
+        r.resolutionStatus === 'skipped_newer' ||
+        r.resolutionStatus === 'held_after_reject'
           ? 'badge warn'
           : 'badge red';
       badge.style.marginRight = '0';
@@ -385,7 +386,9 @@ export function openConflictsModal(ctx: UiContext): void {
                 ? '反覆失敗（已移出佇列）'
                 : r.resolutionStatus === 'skipped_newer'
                   ? '還原前的編輯（已有較新版本，未套用）'
-                  : r.isNewRecord
+                  : r.resolutionStatus === 'held_after_reject'
+                    ? '後續編輯（因前一筆遭拒已暫停）'
+                    : r.isNewRecord
                   ? '新建遭拒（已回滾）'
                   : '異動遭拒（待重整雲端）';
       badge.textContent = statusLabel;

@@ -86,6 +86,31 @@ function getOriginAndRpId(c: AppContext): { origin: string; rpID: string; isHttp
   };
 }
 
+/** Reads a request body as UTF-8 text, or returns null as soon as it exceeds maxBytes. */
+async function readBodyWithLimit(req: Request, maxBytes: number): Promise<string | null> {
+  if (!req.body) return '';
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const ch of chunks) {
+    buf.set(ch, offset);
+    offset += ch.byteLength;
+  }
+  return new TextDecoder().decode(buf);
+}
+
 /**
  * R5: Route-level error response. Validation / business errors (plain messages written for users) are returned
  * as 400. Database, driver and programming errors must never leak SQL or internal text and must not look
@@ -356,6 +381,23 @@ export function createApp() {
     }
     c.set('authUser', session.user);
     c.set('tokenHash', session.tokenHash || '');
+    // P2-S11: every authenticated write refuses a request made by a tab that believes it is another account
+    // (the session cookie is shared by all tabs, so another tab may have switched accounts).
+    const method = c.req.method.toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      const expected = (c.req.header('x-expected-user') || '').trim();
+      if (expected && expected !== session.user.id) {
+        return c.json(
+          {
+            error: '目前瀏覽器登入帳號已變更，已停止寫入以避免跨帳號污染。請重新整理或切換帳號。',
+            code: 'ACCOUNT_MISMATCH',
+            expectedUserId: expected,
+            actualUserId: session.user.id,
+          },
+          409
+        );
+      }
+    }
     await next();
   };
 
@@ -518,7 +560,6 @@ export function createApp() {
   // Core Offline-First Bidirectional Sync Endpoint (strictly scoped to authUser.id)
   const MAX_SYNC_BODY_BYTES = 2 * 1024 * 1024; // 2 MB UTF-8 bytes
   const MAX_SYNC_MUTATIONS = 200;
-  const textEncoder = new TextEncoder();
 
   const checkExpectedUserMismatch = (
     expectedHeader: string | undefined,
@@ -548,8 +589,10 @@ export function createApp() {
       return c.json({ error: '單次同步請求體積過大，請分批同步。' }, 413);
     }
 
-    const rawText = await c.req.text();
-    if (textEncoder.encode(rawText).byteLength > MAX_SYNC_BODY_BYTES) {
+    // P2-S11: read the body as a stream with a byte cap, so a chunked request without Content-Length
+    // is never buffered beyond the limit.
+    const rawText = await readBodyWithLimit(c.req.raw, MAX_SYNC_BODY_BYTES);
+    if (rawText === null) {
       return c.json({ error: '單次同步請求體積過大，請分批同步。' }, 413);
     }
     let body: SyncRequest = { mutations: [] };

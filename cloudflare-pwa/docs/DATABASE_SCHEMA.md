@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.9 / D1 Schema `0014`）
+# 資料庫 Schema 設計架構（v1.8.10 / D1 Schema `0014`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（21 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
 > **最新 Migration**：[`0014_auth_challenge_expiry_index.sql`](../migrations/0014_auth_challenge_expiry_index.sql)  
-> **對應版本**：`APP_VERSION = 1.8.9` / `DB_SCHEMA_VERSION = 0014` / `SW_CACHE_VERSION = finance-pwa-v29`
+> **對應版本**：`APP_VERSION = 1.8.10` / `DB_SCHEMA_VERSION = 0014` / `SW_CACHE_VERSION = finance-pwa-v30`
 
 ---
 

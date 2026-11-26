@@ -383,13 +383,22 @@ export async function ensureRentUtilitySettings(
   }
 
   const nowIso = new Date().toISOString();
-  await db
-    .prepare(
-      `INSERT OR IGNORE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
-       VALUES (?, 0, 0, 0, 0, ?, 1)`
-    )
-    .bind(uid, nowIso)
-    .run();
+  // P2-S12: allocate a change_seq like every other synced row, so a lazily created row is never invisible
+  // to a device that already holds a cursor.
+  await db.batch([
+    db
+      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+      .bind(uid, nowIso),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version, change_seq)
+         VALUES (?, 0, 0, 0, 0, ?, 1, ${NEXT_SEQ_SQL})`
+      )
+      .bind(uid, nowIso, uid),
+    db
+      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+      .bind(nowIso, uid),
+  ]);
 
   return { ...DEFAULT_UTILITY_RENTS, updatedAt: nowIso, version: 1 };
 }
@@ -2715,6 +2724,7 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_logs_start = stmts.length;
   for (const { id, v, createdAt } of validatedLogs) {
     stmts.push(
       db
@@ -2764,6 +2774,8 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_logs_end = stmts.length;
+  const range_recurring_start = stmts.length;
   for (const { id, v, createdAt } of validatedRecurring) {
     stmts.push(
       db
@@ -2811,6 +2823,8 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_recurring_end = stmts.length;
+  const range_sinking_start = stmts.length;
   for (const { id, v, createdAt } of validatedSinking) {
     stmts.push(
       db
@@ -2850,6 +2864,8 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_sinking_end = stmts.length;
+  const range_assets_start = stmts.length;
   for (const { id, v, priceUpdatedAt, createdAt } of validatedAssets) {
     stmts.push(
       db
@@ -2924,6 +2940,7 @@ export async function importFullSnapshot(
         )
     );
   }
+  const range_assets_end = stmts.length;
 
   for (const { id, v, twdAmount, createdAt } of validatedAdjs) {
     stmts.push(
@@ -3097,14 +3114,19 @@ export async function importFullSnapshot(
     );
   }
 
-  if (stmts.length > 0) {
-    await db.batch(stmts);
-  }
+  const results = stmts.length > 0 ? await db.batch(stmts) : [];
+  // Count rows actually written: merge mode skips rows that are soft-deleted on the server
+  // (ON CONFLICT ... WHERE deleted_at IS NULL), and those must not be reported as imported.
+  const countChanged = (start: number, end: number) => {
+    let n = 0;
+    for (let i = start; i < end; i++) n += Number(results[i]?.meta?.changes ?? 0) > 0 ? 1 : 0;
+    return n;
+  };
 
   return {
-    importedLogs: validatedLogs.length,
-    importedRecurring: validatedRecurring.length,
-    importedSinking: validatedSinking.length,
-    importedAssets: validatedAssets.length,
+    importedLogs: countChanged(range_logs_start, range_logs_end),
+    importedRecurring: countChanged(range_recurring_start, range_recurring_end),
+    importedSinking: countChanged(range_sinking_start, range_sinking_end),
+    importedAssets: countChanged(range_assets_start, range_assets_end),
   };
 }
