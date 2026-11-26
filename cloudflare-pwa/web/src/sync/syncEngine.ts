@@ -912,12 +912,22 @@ export class SyncEngine {
           ? existing.sortOrder ?? 0
           : this.nextSortOrderFor(this.snapshot.assetItems);
 
+    const resolvedUnitPrice =
+      payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? (v.isWatchlist ? 0 : 1);
+    const priceChangedLocally =
+      Boolean(existing) && payload.unitPrice !== undefined && resolvedUnitPrice !== existing!.unitPrice;
+    const resolvedPreviousClose =
+      payload.previousClose !== undefined
+        ? v.previousClose
+        : priceChangedLocally
+          ? null
+          : existing?.previousClose ?? null;
+
     const item: AssetItem = {
       id,
       ...v,
-      unitPrice: payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? (v.isWatchlist ? 0 : 1),
-      previousClose:
-        payload.previousClose !== undefined ? v.previousClose : existing?.previousClose ?? null,
+      unitPrice: resolvedUnitPrice,
+      previousClose: resolvedPreviousClose,
       costBasis:
         v.isWatchlist
           ? null
@@ -956,6 +966,19 @@ export class SyncEngine {
       assetItems: mergeById(updatedAssets, [item]).sort(compareBySortOrder),
     };
 
+    const mutationPayload: Record<string, unknown> = { ...item };
+    if (existing && v.updateMode === '自動更新' && !payload.manualPriceOverride) {
+      if (payload.unitPrice === undefined) {
+        delete mutationPayload.unitPrice;
+      }
+      if (payload.previousClose === undefined) {
+        delete mutationPayload.previousClose;
+      }
+    }
+    if (payload.manualPriceOverride) {
+      mutationPayload.manualPriceOverride = true;
+    }
+
     await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
@@ -965,7 +988,7 @@ export class SyncEngine {
         clientTimestamp: nowIso,
         baseVersion: existing?.version ?? null,
         isNewRecord: !existing,
-        payload: { ...item },
+        payload: mutationPayload,
       },
     ]);
     return item;

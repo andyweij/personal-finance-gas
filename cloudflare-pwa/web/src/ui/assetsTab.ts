@@ -15,6 +15,7 @@ import {
   solveImpliedLoanAnnualRate,
 } from '../../../shared/calculations';
 import type { AssetItem } from '../../../shared/types';
+import { resolveStockModalPriceFields } from '../../../shared/validation';
 import {
   closeModal,
   el,
@@ -1870,17 +1871,29 @@ export function openAssetModal(
       const payVal = el<HTMLInputElement>('asLoanPay').value.trim();
       const dayVal = el<HTMLInputElement>('asLoanDay').value.trim();
 
+      const updateMode = el<HTMLSelectElement>('asMode').value;
+      const rawPrice = el<HTMLInputElement>('asPrice').value.trim();
+      const priceFields =
+        existing && updateMode === '自動更新'
+          ? resolveStockModalPriceFields({
+              existing,
+              rawPrice,
+              hasPrevCloseInput: false,
+              defaultNewPrice: 1,
+            })
+          : { unitPrice: parseFloat(rawPrice) || 1 };
+
       await ctx.engine.saveAsset({
         id: existing?.id,
         itemName: el<HTMLInputElement>('asName').value.trim(),
         majorType,
-        updateMode: el<HTMLSelectElement>('asMode').value,
+        updateMode,
         subCategory: el<HTMLSelectElement>('asSub').value,
         liquidity: el<HTMLSelectElement>('asLiq').value,
         quantityOrAmount: parseFloat(el<HTMLInputElement>('asQty').value),
         currency: el<HTMLSelectElement>('asCurr').value,
         ticker: el<HTMLInputElement>('asTicker').value.trim(),
-        unitPrice: parseFloat(el<HTMLInputElement>('asPrice').value) || 1,
+        ...priceFields,
         ledgerId: el<HTMLSelectElement>('asLedger').value || DEFAULT_LEDGER_ID,
         excludeFromNetWorth: el<HTMLInputElement>('asExcludeNw').checked,
         note: el<HTMLInputElement>('asNote').value.trim(),

@@ -312,6 +312,66 @@ export interface AssetInputPayload {
   ledgerId?: string;
   excludeFromNetWorth?: boolean;
   sortOrder?: number;
+  /** True only when user explicitly modified unitPrice or previousClose in UI; allows overriding server-owned auto-updated quotes. */
+  manualPriceOverride?: boolean;
+}
+
+/**
+ * Resolves price/previousClose fields for stock/watchlist edit forms:
+ * - Unchanged price & prevClose on an existing record -> omits both so server-owned auto quotes are preserved.
+ * - Manually changed unitPrice without editing previousClose -> clears previousClose to null & marks manualPriceOverride: true.
+ * - Explicitly edited previousClose (or new record) -> passes provided values and marks manualPriceOverride: true on existing records.
+ */
+export function resolveStockModalPriceFields(params: {
+  existing: { unitPrice: number; previousClose?: number | null } | null | undefined;
+  rawPrice: string;
+  rawPrevClose?: string;
+  hasPrevCloseInput: boolean;
+  defaultNewPrice?: number;
+}): {
+  unitPrice?: number;
+  previousClose?: number | null;
+  manualPriceOverride?: boolean;
+} {
+  const { existing, rawPrice, rawPrevClose = '', hasPrevCloseInput, defaultNewPrice = 0 } = params;
+  const trimmedPrice = rawPrice.trim();
+  const trimmedPrev = rawPrevClose.trim();
+  const parsedPrice = trimmedPrice !== '' ? Number(trimmedPrice) : null;
+  const parsedPrev = trimmedPrev !== '' ? Number(trimmedPrev) : null;
+
+  if (!existing) {
+    return {
+      unitPrice: parsedPrice !== null && Number.isFinite(parsedPrice) ? parsedPrice : defaultNewPrice,
+      previousClose: hasPrevCloseInput && parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null,
+    };
+  }
+
+  const existingPrev = existing.previousClose ?? null;
+  const priceChanged =
+    parsedPrice !== null && Number.isFinite(parsedPrice) && parsedPrice !== existing.unitPrice;
+  const prevChanged = hasPrevCloseInput
+    ? (parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null) !== existingPrev
+    : false;
+
+  if (!priceChanged && !prevChanged) {
+    // Neither price nor previousClose was edited: omit both so server-owned live quotes are untouched
+    return {};
+  }
+
+  if (priceChanged && !prevChanged) {
+    // User manually changed market price without updating previousClose -> clear stale previousClose
+    return {
+      unitPrice: parsedPrice!,
+      previousClose: null,
+      manualPriceOverride: true,
+    };
+  }
+
+  return {
+    unitPrice: parsedPrice !== null && Number.isFinite(parsedPrice) ? parsedPrice : existing.unitPrice,
+    previousClose: parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null,
+    manualPriceOverride: true,
+  };
 }
 
 export function validateAssetInput(payload: AssetInputPayload) {

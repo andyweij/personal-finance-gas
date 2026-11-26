@@ -201,6 +201,39 @@ function formatUtcOffsetDateKey(epochSec: number, gmtOffsetSec: number): string 
   return `${y}-${m}-${d}`;
 }
 
+async function fetchYahoo1dPreviousClose(
+  host: string,
+  symbol: string,
+  fetchImpl: FetchLike
+): Promise<number | null> {
+  try {
+    const url = `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
+    const res = await fetchImpl(url, {
+      headers: { Accept: 'application/json', 'User-Agent': MARKET_USER_AGENT },
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      chart?: {
+        result?: Array<{
+          meta?: {
+            previousClose?: number;
+            chartPreviousClose?: number;
+          };
+        }>;
+      };
+    };
+    const meta = json?.chart?.result?.[0]?.meta;
+    // On range=1d, both meta.previousClose and meta.chartPreviousClose represent the previous trading day's close
+    const candidate = Number(meta?.previousClose ?? meta?.chartPreviousClose);
+    if (Number.isFinite(candidate) && candidate > 0) {
+      return roundStockPrice(candidate);
+    }
+  } catch {
+    // Ignore 1d fallback failure
+  }
+  return null;
+}
+
 async function fetchYahooChartQuote(
   symbol: string,
   fetchImpl: FetchLike
@@ -249,7 +282,8 @@ async function fetchYahooChartQuote(
         }
       }
       if (!Number.isFinite(candidate) || candidate <= 0) {
-        candidate = Number(meta?.previousClose ?? meta?.chartPreviousClose);
+        // Never use range=5d chartPreviousClose (~1 week ago) as current price
+        candidate = Number(meta?.previousClose);
       }
 
       if (Number.isFinite(candidate) && candidate > 0) {
@@ -285,11 +319,10 @@ async function fetchYahooChartQuote(
           const metaPrev = Number(meta?.previousClose);
           if (Number.isFinite(metaPrev) && metaPrev > 0) {
             prevClose = metaPrev;
-          } else if (validPairs.length <= 1) {
-            const chartPrev = Number(meta?.chartPreviousClose);
-            if (Number.isFinite(chartPrev) && chartPrev > 0) {
-              prevClose = chartPrev;
-            }
+          } else {
+            // Do NOT use range=5d meta.chartPreviousClose (that is ~1 week prior to the chart window).
+            // Query range=1d where meta.previousClose / chartPreviousClose is the true previous trading day's close.
+            prevClose = await fetchYahoo1dPreviousClose(host, symbol, fetchImpl);
           }
         }
 
@@ -378,6 +411,19 @@ async function fetchStooqUsQuote(
   return null;
 }
 
+function parseFirstMisBookPrice(raw?: string): number | null {
+  if (!raw || raw === '-') return null;
+  for (const part of String(raw).split('_')) {
+    const trimmed = part.trim();
+    if (!trimmed || trimmed === '-') continue;
+    const n = Number(trimmed);
+    if (Number.isFinite(n) && n > 0) {
+      return roundStockPrice(n);
+    }
+  }
+  return null;
+}
+
 async function fetchTwseMisQuote(
   code: string,
   preferredExchange: 'tse' | 'otc' | undefined,
@@ -395,14 +441,38 @@ async function fetchTwseMisQuote(
       headers: { Accept: 'application/json', 'User-Agent': MARKET_USER_AGENT },
     });
     if (!res.ok) return null;
-    const json = (await res.json()) as { msgArray?: Array<{ z?: string; y?: string }> };
+    const json = (await res.json()) as {
+      msgArray?: Array<{ z?: string; y?: string; b?: string; a?: string; o?: string }>;
+    };
     const entries = json?.msgArray || [];
     for (const entry of entries) {
       const yNum = Number(entry?.y);
       const validY = Number.isFinite(yNum) && yNum > 0 ? roundStockPrice(yNum) : null;
+
+      // 1. Latest trade price z
       const zNum = entry?.z && entry.z !== '-' ? Number(entry.z) : NaN;
-      const validZ = Number.isFinite(zNum) && zNum > 0 ? roundStockPrice(zNum) : null;
-      const price = validZ ?? validY;
+      let price: number | null = Number.isFinite(zNum) && zNum > 0 ? roundStockPrice(zNum) : null;
+
+      // 2. When z === '-' (e.g., 5s snapshot without trade or closing call auction), try best bid/ask (b / a)
+      if (price === null) {
+        const bestBid = parseFirstMisBookPrice(entry?.b);
+        const bestAsk = parseFirstMisBookPrice(entry?.a);
+        if (bestBid !== null && bestAsk !== null) {
+          price = roundStockPrice((bestBid + bestAsk) / 2);
+        } else {
+          price = bestBid ?? bestAsk;
+        }
+      }
+
+      // 3. Fallback to opening price o
+      if (price === null) {
+        const oNum = entry?.o && entry.o !== '-' ? Number(entry.o) : NaN;
+        if (Number.isFinite(oNum) && oNum > 0) {
+          price = roundStockPrice(oNum);
+        }
+      }
+
+      // 4. Never fall back to previousClose y as live price — return null so Yahoo Finance takes over
       if (price !== null && price > 0) {
         return {
           price,
@@ -484,7 +554,7 @@ export async function refreshMarketData(
   db: D1Database,
   fetchImpl: FetchLike = fetch,
   targetUserId?: string,
-  opts?: { forceFx?: boolean }
+  opts?: { forceFx?: boolean; marketScope?: 'all' | 'tw' | 'us' }
 ): Promise<{
   usdTwdRate: number;
   fxUpdated: boolean;
@@ -493,6 +563,7 @@ export async function refreshMarketData(
   failedTickers: string[];
 }> {
   const nowIso = new Date().toISOString();
+  const marketScope = opts?.marketScope ?? 'all';
   let usdTwdRate = 32.5;
   let targetAutoFx = true;
 
@@ -571,6 +642,12 @@ export async function refreshMarketData(
       currency: item.currency,
     };
     const norm = normalizeMarketTicker(item.ticker, hint);
+    if (marketScope === 'us' && norm?.market !== 'US') {
+      continue;
+    }
+    if (marketScope === 'tw' && norm?.market !== 'TW') {
+      continue;
+    }
     const cacheKey = norm ? `${norm.market}:${norm.yahooSymbol}` : item.ticker.trim().toUpperCase();
 
     let quote: StockQuoteResult | null;
@@ -589,7 +666,7 @@ export async function refreshMarketData(
         db
           .prepare(
             `UPDATE asset_items
-             SET unit_price = ?, previous_close = COALESCE(?, previous_close), price_updated_at = ?, updated_at = ?,
+             SET unit_price = ?, previous_close = ?, price_updated_at = ?, updated_at = ?,
                  version = version + 1,
                  change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
              WHERE user_id = ? AND id = ?`

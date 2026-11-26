@@ -1257,6 +1257,11 @@ async function applySingleMutation(
     }
 
     const p = mutation.payload || {};
+    const isManualPriceOverride = Boolean(p.manualPriceOverride);
+    const existingTicker = existing ? String(existing.ticker || '').trim().toUpperCase() : '';
+    const incomingTicker = String(p.ticker || '').trim().toUpperCase();
+    const tickerChanged = Boolean(existing && existingTicker !== incomingTicker);
+
     const v = runValidation(() =>
       validateAssetInput({
         updateMode: String(p.updateMode || '手動快照'),
@@ -1326,6 +1331,23 @@ async function applySingleMutation(
       })
     );
 
+    // Server-owned live quotes: for existing auto-updated assets on the same ticker, preserve server's
+    // unit_price & previous_close unless the client explicitly marks manualPriceOverride: true.
+    let finalUnitPrice = v.unitPrice;
+    let finalPreviousClose = v.previousClose;
+    if (existing && v.updateMode === '自動更新' && !isManualPriceOverride) {
+      if (!tickerChanged) {
+        finalUnitPrice = existing.unit_price !== undefined ? Number(existing.unit_price) : v.unitPrice;
+        finalPreviousClose =
+          existing.previous_close !== undefined && existing.previous_close !== null
+            ? Number(existing.previous_close)
+            : null;
+      } else if (p.previousClose === undefined) {
+        // Ticker changed: do not pair old ticker's previous_close with new ticker
+        finalPreviousClose = null;
+      }
+    }
+
     const postStatements: D1PreparedStatement[] = [];
     if (v.isDefaultSavings) {
       postStatements.push(
@@ -1356,8 +1378,8 @@ async function applySingleMutation(
             v.ticker,
             v.quantityOrAmount,
             v.currency,
-            v.unitPrice,
-            v.previousClose,
+            finalUnitPrice,
+            finalPreviousClose,
             v.costBasis,
             v.note,
             v.isLinkedSavings ? 1 : 0,

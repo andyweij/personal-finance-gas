@@ -494,9 +494,11 @@ describe('Cloudflare Worker API + D1 Integration', () => {
       if (url.includes('open.er-api.com')) {
         return new Response(JSON.stringify({ rates: { TWD: 32.8 } }), { status: 200 });
       }
-      // VOO via Yahoo query1
+      // VOO via Yahoo query1 (count primary range=5d lookups to verify VOO & NYSEARCA:VOO dedup)
       if (url.includes('query1.finance.yahoo.com') && url.includes('/chart/VOO?')) {
-        vooLookups += 1;
+        if (url.includes('range=5d')) {
+          vooLookups += 1;
+        }
         return new Response(
           JSON.stringify({ chart: { result: [{ meta: { regularMarketPrice: 545.25 } }] } }),
           { status: 200 }

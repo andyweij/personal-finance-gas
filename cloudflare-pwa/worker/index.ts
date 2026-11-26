@@ -772,19 +772,21 @@ export default {
     const tw = getTaiwanDateParts(now);
 
     if (controller.cron === '0 0 1 * *') {
-      await refreshMarketData(env.DB);
+      // Monthly 1st 08:00 Asia/Taipei (before TW open): refresh US & FX only, then post monthly recurring
+      await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'us' });
       await runMonthlyRecurringAllUsersD1(env.DB, tw.year, tw.month);
       return;
     }
 
     if (controller.cron === '0 22 * * *') {
-      // Daily 06:00 Asia/Taipei (22:00 UTC): refresh US & TW closing prices and FX after US market close
-      await refreshMarketData(env.DB);
+      // Daily 06:00 Asia/Taipei (22:00 UTC): refresh ONLY US closing prices & FX after US market close
+      // (avoid touching TW stocks while TWSE MIS may have rolled over pre-market)
+      await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'us' });
       return;
     }
 
     // Daily 23:00 Asia/Taipei (15:00 UTC): refresh TW/US prices & FX for all active users, snapshot on month-end
-    await refreshMarketData(env.DB);
+    await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'all' });
     if (isTaiwanMonthEnd(now)) {
       await runMonthEndSnapshotAllUsersD1(env.DB, now);
     }

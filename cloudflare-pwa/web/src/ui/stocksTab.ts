@@ -11,7 +11,7 @@ import type {
   StockTransaction,
   WatchlistItemSummary,
 } from '../../../shared/types';
-import { normalizeStockCategory } from '../../../shared/validation';
+import { normalizeStockCategory, resolveStockModalPriceFields } from '../../../shared/validation';
 import {
   closeModal,
   el,
@@ -1487,6 +1487,13 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
       const ticker = tickerInp.value.trim().toUpperCase();
       const rawPrice = el<HTMLInputElement>('wlPrice').value.trim();
       const rawPrev = el<HTMLInputElement>('wlPrevClose').value.trim();
+      const priceFields = resolveStockModalPriceFields({
+        existing,
+        rawPrice,
+        rawPrevClose: rawPrev,
+        hasPrevCloseInput: true,
+        defaultNewPrice: 0,
+      });
       await ctx.engine.saveAsset({
         id: existing?.id,
         itemName: el<HTMLInputElement>('wlName').value.trim(),
@@ -1497,8 +1504,7 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
         quantityOrAmount: 0,
         currency: currSel.value,
         ticker,
-        unitPrice: rawPrice !== '' ? Number(rawPrice) : existing?.unitPrice ?? 0,
-        previousClose: rawPrev !== '' ? Number(rawPrev) : existing?.previousClose ?? null,
+        ...priceFields,
         costBasis: null,
         stockCategory: selectedStockCategory,
         isWatchlist: true,
@@ -1662,6 +1668,19 @@ export function openStockBaselineModal(
     )
   );
   form.appendChild(r2);
+
+  form.appendChild(
+    makeInputField(
+      '昨收價（選填，修改市價未填將自動清空待更新）',
+      'stPrevClose',
+      'number',
+      existing && existing.previousClose != null && existing.previousClose > 0
+        ? existing.previousClose
+        : '',
+      '留空待自動更新',
+      false
+    )
+  );
 
   // Cost input mode selector (每股平均成本 vs 期初總成本)
   let costMode: 'unit' | 'total' = ctx.state.stockPriceViewMode;
@@ -1875,6 +1894,15 @@ export function openStockBaselineModal(
     }
     try {
       const ticker = el<HTMLInputElement>('stTicker').value.trim().toUpperCase();
+      const rawPrice = priceInp.value.trim();
+      const rawPrev = el<HTMLInputElement>('stPrevClose').value.trim();
+      const priceFields = resolveStockModalPriceFields({
+        existing,
+        rawPrice,
+        rawPrevClose: rawPrev,
+        hasPrevCloseInput: true,
+        defaultNewPrice: marketPrice,
+      });
       await ctx.engine.saveAsset({
         id: existing?.id,
         itemName: el<HTMLInputElement>('stName').value.trim(),
@@ -1885,8 +1913,7 @@ export function openStockBaselineModal(
         quantityOrAmount: shares,
         currency: currSel.value,
         ticker,
-        unitPrice: marketPrice,
-        previousClose: existing?.previousClose ?? null,
+        ...priceFields,
         costBasis: hasCost ? totalCost : null,
         stockCategory: selectedStockCategory,
         isWatchlist: false,
