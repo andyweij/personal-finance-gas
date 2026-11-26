@@ -563,10 +563,10 @@ body {
 .auth-screen.open, .lock-screen.open { display: flex; }
 /* H3 / M11: the overlay is only a blur — hide everything behind it so amounts cannot be read through it;
    app-backgrounded hides the app while it is in the background (OS app-switcher snapshot) */
-body.app-concealed > :not(#authScreen):not(#lockScreen):not(#toast):not(#loadingBar),
+body.app-concealed > :not(#authScreen):not(#lockScreen):not(#toast):not(#loadingBar):not(#swUpdateBanner),
 body.app-backgrounded > :not(#authScreen):not(#lockScreen):not(#loadingBar) { visibility: hidden; }
 /* Toasts stay visible above the sign-in screen, but never above the lock screen */
-body.lock-open > #toast { visibility: hidden; }
+body.lock-open > #toast, body.lock-open > #swUpdateBanner { visibility: hidden; }
 .auth-card { width: 100%; max-width: 400px; background: var(--surface); border: 0.5px solid var(--border); border-radius: 22px; padding: 24px 20px; box-shadow: var(--card-shadow); }
 .auth-title { font-size: 20px; font-weight: 700; text-align: center; }
 .auth-sub { font-size: 13px; color: var(--text-secondary); text-align: center; margin: 4px 0 16px; }
@@ -2354,3 +2354,22 @@ body.is-reordering-drag {
   margin-top: 2px;
 }
 
+
+/* M12 (v1.8.14): "new version available" prompt */
+.update-banner {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 84px);
+  transform: translateX(-50%);
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 24px);
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--surface, #fff);
+  color: var(--text, #111);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  font-size: 13.5px;
+}

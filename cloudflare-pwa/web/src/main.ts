@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import './styles.css';
 import { DEFAULT_LEDGER_ID } from '../../shared/constants';
 import { computeAllSavingsSummary } from '../../shared/calculations';
@@ -72,14 +73,93 @@ import { applyAuthMetaToState } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
 
+/**
+ * M12 (v1.8.14): register the Service Worker and offer updates. A new version installs in the background and
+ * waits; the user is asked ("有新版本") and only on confirmation does the page send SKIP_WAITING, after which the
+ * page reloads once when the new worker takes control. Unsynced data is safe: it lives in IndexedDB.
+ */
+function showUpdateBanner(worker: ServiceWorker, activatedElsewhere = false): void {
+  const existing = document.getElementById('swUpdateBanner');
+  if (existing && !activatedElsewhere) return;
+  existing?.remove();
+  const bar = document.createElement('div');
+  bar.id = 'swUpdateBanner';
+  bar.className = 'update-banner';
+  bar.setAttribute('role', 'status');
+  bar.setAttribute('aria-live', 'polite');
+  const text = document.createElement('span');
+  text.textContent = activatedElsewhere ? '新版本已在其他分頁啟用，請重新整理' : '有新版本可以使用';
+  const later = document.createElement('button');
+  later.type = 'button';
+  later.className = 'btn btn-sm';
+  later.textContent = '稍後';
+  later.addEventListener('click', () => bar.remove());
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.className = 'btn btn-tinted btn-sm';
+  apply.textContent = activatedElsewhere ? '重新整理' : '立即更新';
+  apply.addEventListener('click', () => {
+    apply.disabled = true;
+    // Review (M12): another tab may already have activated this worker — then only a reload is needed
+    if (activatedElsewhere || worker.state === 'activated' || worker.state === 'redundant') {
+      window.location.reload();
+      return;
+    }
+    updateRequested = true;
+    worker.postMessage({ type: 'SKIP_WAITING' });
+  });
+  bar.appendChild(text);
+  bar.appendChild(later);
+  bar.appendChild(apply);
+  document.body.appendChild(bar);
+}
+
+let updateRequested = false;
+
 function registerServiceWorker(): void {
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js').catch(() => {
+  // Review (M12): the dev server serves untransformed sources; never let a Service Worker cache them
+  if (!import.meta.env.PROD) return;
+  if (!('serviceWorker' in navigator)) return;
+  const hadControllerAtLoad = Boolean(navigator.serviceWorker.controller);
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (updateRequested) {
+      updateRequested = false;
+      window.location.reload();
+      return;
+    }
+    // First install (clients.claim) — nothing to do. Otherwise another tab activated a new version while this
+    // tab still runs the old bundle: ask for a reload instead of silently continuing with old code.
+    if (hadControllerAtLoad && navigator.serviceWorker.controller) {
+      showUpdateBanner(navigator.serviceWorker.controller, true);
+    }
+  });
+  window.addEventListener('load', () => {
+    navigator.serviceWorker
+      .register('/sw.js')
+      .then((reg) => {
+        const offer = (worker: ServiceWorker | null) => {
+          if (worker && navigator.serviceWorker.controller) showUpdateBanner(worker);
+        };
+        const track = (incoming: ServiceWorker) => {
+          if (incoming.state === 'installed') offer(incoming);
+          incoming.addEventListener('statechange', () => {
+            if (incoming.state === 'installed') offer(incoming);
+          });
+        };
+        if (reg.waiting) offer(reg.waiting);
+        if (reg.installing) track(reg.installing); // an update that started before `load`
+        reg.addEventListener('updatefound', () => {
+          if (reg.installing) track(reg.installing);
+        });
+        // Check for a new version when the app comes back to the foreground
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible') void reg.update().catch(() => undefined);
+        });
+      })
+      .catch(() => {
         // Ignore registration errors in unsupported dev contexts
       });
-    });
-  }
+  });
 }
 
 function renderSyncPill(status: SyncStatus): void {
@@ -135,7 +215,8 @@ function renderSyncPill(status: SyncStatus): void {
  */
 function concealAppWhileOverlayOpen(): void {
   const overlayIds = ['authScreen', 'lockScreen'];
-  const keepVisible = new Set([...overlayIds, 'toast', 'loadingBar']);
+  // M12: the update prompt stays usable on the sign-in screen (it is hidden while the lock screen is open)
+  const keepVisible = new Set([...overlayIds, 'toast', 'loadingBar', 'swUpdateBanner']);
   const overlays = overlayIds
     .map((id) => document.getElementById(id))
     .filter((n): n is HTMLElement => Boolean(n));
