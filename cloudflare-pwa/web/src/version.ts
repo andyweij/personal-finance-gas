@@ -2,13 +2,14 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.12';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.13';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
-export const DB_SCHEMA_VERSION = '0015';
-export const SW_CACHE_VERSION = 'finance-pwa-v32';
+export const DB_SCHEMA_VERSION = '0016';
+export const SW_CACHE_VERSION = 'finance-pwa-v33';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.8.13：資源上限與排程（同步每次請求的資料庫查詢由 20 多次降到 4 次起跳，並依免費方案每次 50 次的上限自動分批；排程改為先入帳再更新報價，每一步驟獨立處理錯誤，錯過的常態入帳與月底快照會在下一次排程自動補跑；報價更新依剩餘的對外請求額度分批、優先更新最久未更新的標的，所有對外請求都有逾時；匯入限制 2 MB、欄位型別錯誤回 400、大型匯入一次完整寫入不會留下半套資料，CSV 重複匯入不會產生重複資料並寫入帳本；月底快照不計入快照日之後的紀錄，日期依 APP_TIMEZONE 計算）',
   'v1.8.12：資料正確性修正（同步隔離一筆編輯時，同一筆的後續編輯一併暫停送出並還原雲端資料；整個請求層級的 400／413 不再誤隔離正常資料；寫入時檢查帳本、連動活存、帳戶與持股是否存在，並保留既有資料的舊參照；帳戶互轉的兩邊與手續費改為同時成立或同時失敗；常態收支以項目為單位入帳，同名項目都會入帳且並行執行不重複；美元活存以原幣加總後一次換算；手動入帳驗證年月；其他分頁變更 PIN／Face ID 後本分頁同步更新）',
   'v1.8.11：安全性強化（修正帳戶互轉預覽的 XSS；加入 CSP 等安全標頭與跨站請求檢查；登出時刪除本機帳本資料，伺服器回報未登入時必須重新登入才能檢視；登入、初始化、變更密碼與 PIN 改為原子限速並依 IPv6 /64 計算；離線 Face ID 驗證改為驗不過就拒絕；切到背景自動上鎖、PIN 錯誤次數限制、鎖定時隱藏背後內容；管理員重置碼重設密碼會留下稽核紀錄、通知成員並清除 Passkey 與 PIN；Session 自登入起 90 天強制過期並每日清理過期資料）',
   'v1.8.10：完成剩餘低優先審查項目（R6 編輯遭拒時同一筆的後續編輯暫停送出並列入清單，避免把遭拒內容寫上雲端；多分頁以快照版本號偵測其他分頁的寫入並自動重載重算，不再互相覆蓋；PIN 與生物辨識設定改為獨立欄位更新，同步不會還原其他分頁的變更；無 Web Locks 時的同步鎖改為寫入後確認，拿不到鎖就稍後重試；不支援 BroadcastChannel 的瀏覽器改用 storage 事件跨分頁通知；切換帳號時中止進行中的同步；所有需登入的寫入端點檢查 X-Expected-User；同步請求以串流方式限制大小；Yahoo 昨收補查需與現價同一交易日；水電租金設定配置同步序號；合併匯入只計入實際寫入的筆數）',

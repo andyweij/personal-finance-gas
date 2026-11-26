@@ -613,17 +613,59 @@ export async function fetchTaiwanStockPrice(
   return fetchStockPrice(rawTicker, fetchImpl);
 }
 
+/**
+ * H6 (v1.8.13): outbound requests of one Worker invocation are capped (Workers Free: 50 external subrequests).
+ * The returned fetch counts requests, adds an AbortSignal timeout to every request, and refuses (throws) once the
+ * budget is used up; callers already treat a failed request as "no quote".
+ */
+export const MARKET_FETCH_TIMEOUT_MS = 8000;
+/** Most requests one quote lookup can make (TW: MIS + Yahoo hosts + 1d previous-close + .TWO fallback). */
+export const MAX_FETCHES_PER_QUOTE = 8;
+/** Most requests the FX lookup can make (open.er-api + two Yahoo hosts). */
+export const MAX_FETCHES_FOR_FX = 3;
+
+export interface FetchBudget {
+  fetch: FetchLike;
+  used(): number;
+  remaining(): number;
+}
+
+export function createBudgetedFetch(
+  fetchImpl: FetchLike | typeof fetch,
+  limit: number,
+  timeoutMs = MARKET_FETCH_TIMEOUT_MS
+): FetchBudget {
+  let used = 0;
+  const budgeted: FetchLike = async (input, init) => {
+    if (used >= limit) throw new Error('subrequest budget exhausted for this invocation');
+    used += 1;
+    const signal = init?.signal ?? AbortSignal.timeout(timeoutMs);
+    return (fetchImpl as FetchLike)(input, { ...(init || {}), signal });
+  };
+  return { fetch: budgeted, used: () => used, remaining: () => Math.max(0, limit - used) };
+}
+
 export async function refreshMarketData(
   db: D1Database,
   fetchImpl: FetchLike = fetch,
   targetUserId?: string,
-  opts?: { forceFx?: boolean; marketScope?: 'all' | 'tw' | 'us'; assetIds?: string[] }
+  opts?: {
+    forceFx?: boolean;
+    marketScope?: 'all' | 'tw' | 'us';
+    assetIds?: string[];
+    /** H6: stop before a quote lookup that might not fit the remaining subrequests */
+    fetchBudget?: { remaining(): number };
+    /** H6: stop before the next D1 write when the per-invocation D1 query budget is nearly used */
+    shouldStop?: () => boolean;
+  }
 ): Promise<{
   usdTwdRate: number;
   fxUpdated: boolean;
   updatedAt: string;
   updatedTickers: Array<{ id: string; ticker: string; price: number; previousClose?: number }>;
   failedTickers: string[];
+  /** H6: auto-updated assets left for the next run because the budget ran out */
+  deferredCount?: number;
 }> {
   const nowIso = new Date().toISOString();
   const marketScope = opts?.marketScope ?? 'all';
@@ -645,7 +687,8 @@ export async function refreshMarketData(
     : targetUserId
       ? targetAutoFx || Boolean(opts?.forceFx)
       : true;
-  const liveFx = shouldFetchFx ? await fetchUsdTwdRate(fetchImpl) : null;
+  const fxFits = !opts?.fetchBudget || opts.fetchBudget.remaining() >= MAX_FETCHES_FOR_FX;
+  const liveFx = shouldFetchFx && fxFits ? await fetchUsdTwdRate(fetchImpl) : null;
   if (liveFx !== null) {
     usdTwdRate = liveFx;
     fxUpdated = true;
@@ -666,6 +709,7 @@ export async function refreshMarketData(
     }
 
     for (const uid of fxUserIds) {
+      if (opts?.shouldStop?.()) break;
       await db.batch([
         db
           .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
@@ -689,7 +733,8 @@ export async function refreshMarketData(
     ? await db
         .prepare(
           `SELECT user_id, id, ticker, sub_category, currency FROM asset_items
-           WHERE user_id = ? AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL`
+           WHERE user_id = ? AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL
+           ORDER BY price_updated_at IS NOT NULL, price_updated_at ASC, rowid ASC`
         )
         .bind(targetUserId)
         .all<{ user_id: string; id: string; ticker: string; sub_category?: string; currency?: string }>()
@@ -697,7 +742,8 @@ export async function refreshMarketData(
         .prepare(
           `SELECT user_id, id, ticker, sub_category, currency FROM asset_items
            WHERE user_id IN (SELECT id FROM users WHERE is_active = 1)
-             AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL`
+             AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL
+           ORDER BY price_updated_at IS NOT NULL, price_updated_at ASC, rowid ASC`
         )
         .all<{ user_id: string; id: string; ticker: string; sub_category?: string; currency?: string }>();
 
@@ -705,8 +751,14 @@ export async function refreshMarketData(
   const quoteCache = new Map<string, StockQuoteResult | null>();
   const updatedTickers: Array<{ id: string; ticker: string; price: number; previousClose?: number }> = [];
   const failedTickers: string[] = [];
+  let deferredCount = 0;
+  let stopped = false;
 
   for (const item of autoAssets.results) {
+    if (stopped) {
+      deferredCount += 1;
+      continue;
+    }
     if (assetIdFilter && !assetIdFilter.has(item.id)) {
       continue;
     }
@@ -727,11 +779,22 @@ export async function refreshMarketData(
     if (quoteCache.has(cacheKey)) {
       quote = quoteCache.get(cacheKey) ?? null;
     } else {
+      if (opts?.fetchBudget && opts.fetchBudget.remaining() < MAX_FETCHES_PER_QUOTE) {
+        // H6: not enough subrequests left for a full lookup — leave this (and the rest) for the next run
+        stopped = true;
+        deferredCount += 1;
+        continue;
+      }
       quote = await fetchStockQuote(item.ticker, fetchImpl, hint);
       quoteCache.set(cacheKey, quote);
     }
 
     if (quote !== null) {
+      if (opts?.shouldStop?.()) {
+        stopped = true;
+        deferredCount += 1;
+        continue;
+      }
       await db.batch([
         db
           .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
@@ -775,5 +838,5 @@ export async function refreshMarketData(
     }
   }
 
-  return { usdTwdRate, fxUpdated, updatedAt: nowIso, updatedTickers, failedTickers };
+  return { usdTwdRate, fxUpdated, updatedAt: nowIso, updatedTickers, failedTickers, deferredCount };
 }

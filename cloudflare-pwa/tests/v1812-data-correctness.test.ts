@@ -384,8 +384,11 @@ describe('v1.8.12 server transfer atomicity (M4)', () => {
     );
     // Another device creates a row with the second leg's id right before the group commits
     const realBatch = db.batch.bind(db);
+    let batchCalls = 0;
     (db as unknown as { batch: typeof db.batch }).batch = (async (stmts: D1PreparedStatement[]) => {
-      if (stmts.length > 6) {
+      batchCalls += 1;
+      // batch #1 is the per-request baseline, #2 the prefetch, #3 the group commit (v1.8.13 H5)
+      if (batchCalls === 3) {
         await db
           .prepare(
             "INSERT INTO savings_adjustments (user_id, id, account_id, date, amount, twd_amount, note, created_at, updated_at, version, change_seq) VALUES ('owner', 'adj-in', 'acc-b', '2026-11-26', 5, 5, 'other', 'x', 'x', 1, 99)"

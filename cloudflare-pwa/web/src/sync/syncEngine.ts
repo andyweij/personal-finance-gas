@@ -11,6 +11,7 @@ import {
   DEFAULT_LEDGER_ID,
   RECURRING_CASHFLOW_TYPES,
   STOCK_TX_TYPES,
+  SYNC_MAX_MUTATIONS_PER_REQUEST,
 } from '../../../shared/constants';
 import {
   sortUtilityRecords,
@@ -298,7 +299,8 @@ export class SyncEngine {
     this.expectedUserId = opts.expectedUserId;
     this.requestTimeoutMs = Math.max(20, opts.requestTimeoutMs ?? 20_000);
     this.retryBaseDelayMs = Math.max(50, opts.retryBaseDelayMs ?? 2_000);
-    this.maxBatchSize = Math.max(1, Math.min(200, opts.maxBatchSize ?? 50));
+    // H5: never more than the server processes per request (D1 query budget)
+    this.maxBatchSize = Math.max(1, Math.min(SYNC_MAX_MUTATIONS_PER_REQUEST, opts.maxBatchSize ?? SYNC_MAX_MUTATIONS_PER_REQUEST));
     this.maxPoisonRetries = Math.max(2, Math.min(20, opts.maxPoisonRetries ?? 5));
     this.requestLockImpl =
       opts.requestLock ||
