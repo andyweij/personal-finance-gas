@@ -10,13 +10,9 @@ import {
 
 export type GoogleSheetCsvKind = 'cashflow' | 'recurring' | 'sinking' | 'asset' | 'networth';
 
-function escapeCsvCell(val: unknown): string {
-  const str = val === null || val === undefined ? '' : String(val);
-  if (/[",\r\n]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
+// v1.8.15: shared escaping with CSV formula-injection protection (= + - @ prefixed with ')
+import { escapeCsvCell } from './format';
+export { escapeCsvCell };
 
 function cleanNumber(raw: unknown, fallback = 0): number {
   const s = String(raw ?? '')

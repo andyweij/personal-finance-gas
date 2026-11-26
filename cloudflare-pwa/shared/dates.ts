@@ -49,3 +49,10 @@ export function previousYearMonth(yearMonth: string): string {
   const pm = m === 1 ? 12 : m - 1;
   return `${py}-${String(pm).padStart(2, '0')}`;
 }
+
+/** v1.8.15: YYYY-MM-DD of a stored ISO timestamp in the app time zone (admin screens, file names) */
+export function ymdInTimeZone(iso: string, timeZone: string = APP_TIMEZONE): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso || '').slice(0, 10);
+  return getDatePartsInTimeZone(d, timeZone).ymd;
+}

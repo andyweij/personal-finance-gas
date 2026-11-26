@@ -1,7 +1,9 @@
+import { todayInTimeZone } from '../../../shared/dates';
 import { mutationReferenceKeys, orderMutationsByDependencies } from '../../../shared/syncOrder';
 import {
   applySubsetReorder,
   compareBySortOrder,
+  computeStockPositionSummary,
   ensureActiveLedgers,
   getEffectiveLedgerId,
   isTransferableAccount,
@@ -243,6 +245,9 @@ function mergeUtilityRecords(
   return sortUtilityRecords(Array.from(map.values()));
 }
 
+/** v1.8.15: cross-tab reload debounce */
+const CROSS_TAB_RELOAD_DEBOUNCE_MS = 150;
+
 export class SyncEngine {
   private snapshot: FinanceSnapshot = createEmptySnapshot();
   private meta: LocalMeta = {
@@ -285,6 +290,7 @@ export class SyncEngine {
   private readonly requestTimeoutMs: number;
   private readonly retryBaseDelayMs: number;
   private readonly maxBatchSize: number;
+  private crossTabReloadTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly maxPoisonRetries: number;
   private readonly requestLockImpl: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
 
@@ -324,8 +330,13 @@ export class SyncEngine {
         const msg = data as { type?: string; senderId?: string } | null;
         if (!msg || msg.senderId === this.instanceId || this.destroyed) return;
         if (msg.type === 'snapshot_changed') {
-          // Reload may race with init/destroy; errors here must not become unhandled rejections
-          void this.reloadFromIndexedDb().catch(() => undefined);
+          // v1.8.15: a burst of writes in another tab (e.g. a sync applying many batches) reloads once
+          if (this.crossTabReloadTimer !== null) clearTimeout(this.crossTabReloadTimer);
+          this.crossTabReloadTimer = setTimeout(() => {
+            this.crossTabReloadTimer = null;
+            // Reload may race with init/destroy; errors here must not become unhandled rejections
+            void this.reloadFromIndexedDb().catch(() => undefined);
+          }, CROSS_TAB_RELOAD_DEBOUNCE_MS);
         }
       };
     }
@@ -371,16 +382,19 @@ export class SyncEngine {
       const orig = self[methodName].bind(this);
       self[methodName] = (...args: unknown[]) =>
         this.runSerialized(async () => {
-          try {
-            return await orig(...args);
-          } catch (err) {
-            // P2-C6: another tab wrote the snapshot after this tab last read it. Reload and recompute the edit
-            // on top of the latest data instead of overwriting it (nothing was written: the commit aborted).
-            if (err instanceof StaleSnapshotError) {
+          // P2-C6: another tab wrote the snapshot after this tab last read it. Reload and recompute the edit
+          // on top of the latest data instead of overwriting it (nothing was written: the commit aborted).
+          // v1.8.15: retry a few times (busy tabs), then fail with a message the user can act on.
+          for (let attempt = 0; ; attempt++) {
+            try {
+              return await orig(...args);
+            } catch (err) {
+              if (!(err instanceof StaleSnapshotError)) throw err;
+              if (attempt >= 2) {
+                throw new Error('其他分頁正在同時修改資料，這次變更尚未儲存，請再試一次。');
+              }
               await this.reloadStateUnlocked();
-              return orig(...args);
             }
-            throw err;
           }
         });
     }
@@ -439,8 +453,17 @@ export class SyncEngine {
     this.clearScheduledRetry();
   }
 
-  destroy(): void {
+  /**
+   * Stops the engine. v1.8.15: returns a promise that settles once already-queued local operations have finished,
+   * so a caller that closes the database afterwards (account switch) never makes them fail with
+   * "LocalFinanceDB is not open".
+   */
+  destroy(): Promise<void> {
     this.destroyed = true;
+    if (this.crossTabReloadTimer !== null) {
+      clearTimeout(this.crossTabReloadTimer);
+      this.crossTabReloadTimer = null;
+    }
     // P2-C10: stop an in-flight sync so it does not keep working against a database that is being closed
     try {
       this.activeSyncController?.abort();
@@ -460,6 +483,7 @@ export class SyncEngine {
       }
       this.dbChannel = null;
     }
+    return this.stateChain.catch(() => undefined);
   }
 
   /**
@@ -467,8 +491,7 @@ export class SyncEngine {
    * Waits for queued local operations first so nothing writes to the database while it is being deleted.
    */
   async wipeLocalData(): Promise<'deleted' | 'blocked'> {
-    this.destroy();
-    await this.stateChain.catch(() => undefined);
+    await this.destroy();
     return this.db.deleteDatabase();
   }
 
@@ -732,12 +755,20 @@ export class SyncEngine {
     });
   }
 
+  /** v1.8.15: the single-item success streak always restarts when isolation mode is entered or left */
+  private setPoisonSearch(active: boolean): void {
+    if (this.poisonSearchActive !== active) this.singleItemSuccessStreak = 0;
+    this.poisonSearchActive = active;
+  }
+
   private computeStatus(pendingCount: number, lastError?: string): SyncStatus {
     const conflictCount = this.conflicts.length;
     const rejectedCount = this.rejections.length;
     const frozenOutboxCount = this.frozenOutbox.length;
+    // v1.8.15: only items that need a decision (conflicts, frozen edits) take over the state; rejections are
+    // reported through rejectedCount and no longer hide "offline" / "pending"
     const state: SyncStateKind =
-      conflictCount > 0 || rejectedCount > 0 || frozenOutboxCount > 0
+      conflictCount > 0 || frozenOutboxCount > 0
         ? 'conflict'
         : !this.isOnline()
           ? 'offline'
@@ -761,7 +792,8 @@ export class SyncEngine {
 
   /** P2-C6: patch only the lock-screen fields in the stored meta and tell other tabs to reload. */
   private async applyAuthMetaPatch(patch: Partial<LocalMeta>): Promise<void> {
-    const merged = await this.db.patchAuthMeta(patch);
+    // v1.8.15: when no meta is stored yet, patchAuthMeta creates it (from this.meta) in the same transaction
+    const merged = await this.db.patchAuthMeta(patch, this.meta);
     if (merged) {
       // M9: take every lock-screen field from the stored meta (another tab may have changed the ones not patched)
       this.meta = {
@@ -1587,7 +1619,7 @@ export class SyncEngine {
     if (!existing) throw new Error('找不到指定的負債項目。');
     const ymd =
       anchorDate ||
-      `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+      todayInTimeZone();
     const keepAuto = opts?.disableAutoAmortize ? false : Boolean(existing.isAmortizingLoan);
     return this.saveAssetInner({
       ...existing,
@@ -1606,7 +1638,7 @@ export class SyncEngine {
     const existing = this.snapshot.assetItems.find((a) => a.id === accountId && !a.deletedAt);
     if (!existing) throw new Error('找不到指定的活存帳戶。');
     const nowIso = new Date().toISOString();
-    const ymd = anchorDate || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+    const ymd = anchorDate || todayInTimeZone();
     return this.saveAssetInner({
       ...existing,
       id: existing.id,
@@ -1922,6 +1954,13 @@ export class SyncEngine {
     const asset = this.snapshot.assetItems.find((a) => a.id === payload.assetId && !a.deletedAt);
     if (!asset) throw new Error('找不到對應的持股項目。');
     const v = validateStockTransactionInput(payload);
+    if (v.txType === STOCK_TX_TYPES.SELL) {
+      // v1.8.15: refuse to sell more shares than currently held
+      const held = computeStockPositionSummary(asset, this.snapshot.stockTransactions || [], 1).currentShares;
+      if (v.shares > held + 1e-9) {
+        throw new Error(`賣出股數 (${v.shares}) 超過目前持有股數 (${held})。`);
+      }
+    }
     const nowIso = new Date().toISOString();
     const txId = crypto.randomUUID();
     const mutations: SyncMutation[] = [];
@@ -2213,6 +2252,8 @@ export class SyncEngine {
     } catch (err) {
       if (err instanceof StaleSnapshotError) throw err; // handled by the serialized wrapper (reload + retry)
       const msg = err instanceof Error ? err.message : '本機儲存失敗，變更未寫入';
+      // v1.8.15: the caller usually shows the same error again — showToast drops a toast whose text is already
+      // part of the visible one, so the user sees it once
       this.opts.onError?.(msg);
       throw err;
     }
@@ -2784,22 +2825,23 @@ export class SyncEngine {
       let reqClientEpoch: number | null = null;
 
       await this.runSerialized(async () => {
-        outbox = await this.db.getOutbox();
         // R2 & Q1: Shrink batch size to 1 after a failure or while isolating a poison-pill mutation
         const effectiveBatchSize =
           this.consecutiveFailures >= 1 || this.poisonSearchActive ? 1 : this.maxBatchSize;
         // Q4 / N1 & V2: strict queue prefix, at most one mutation per entity:recordId per HTTP batch
-        const selection = this.selectSyncUnits(outbox, effectiveBatchSize);
-        batch = selection.batch;
-        batchUnitCount = selection.unitCount;
+        // v1.8.15: select the batch and mark it sent in ONE IndexedDB transaction, so another tab cannot
+        // coalesce / cancel a selected mutation in between
+        const sentAtIso = new Date().toISOString();
+        const taken = await this.db.takeOutboxBatch((list) => {
+          const selection = this.selectSyncUnits(list, effectiveBatchSize);
+          batchUnitCount = selection.unitCount;
+          return selection.batch.map((m) => m.mutationId);
+        }, sentAtIso);
+        outbox = taken.outbox;
+        batch = taken.batch;
         hadMoreBatches = outbox.length > batch.length;
         // P2-C2: Persist sentAt & attempts to IndexedDB BEFORE sending HTTP request so timeout/reload never coalesces sent mutations
         if (batch.length > 0) {
-          const sentAtIso = new Date().toISOString();
-          await this.db.markOutboxBatchSent(
-            batch.map((m) => m.mutationId),
-            sentAtIso
-          );
           for (const m of batch) {
             this.inFlightMutationIds.add(m.mutationId);
           }
@@ -2984,7 +3026,7 @@ export class SyncEngine {
             this.meta = nextMeta;
             this.conflicts = nextConflicts;
             this.frozenOutbox = mergedFrozen;
-            this.poisonSearchActive = false;
+            this.setPoisonSearch(false);
             this.emitSnapshot();
             this.broadcastDbChanged();
             this.updateStatus(this.computeStatus(0));
@@ -3255,7 +3297,7 @@ export class SyncEngine {
 
           const remainingOutbox = await this.db.getOutbox();
           if (remainingOutbox.length === 0) {
-            this.poisonSearchActive = false;
+            this.setPoisonSearch(false);
           }
           this.emitSnapshot();
           this.broadcastDbChanged();
@@ -3278,7 +3320,7 @@ export class SyncEngine {
         if (batchUnitCount === 1 && this.poisonSearchActive && passOutcome.madeForwardProgress) {
           this.singleItemSuccessStreak += 1;
           if (this.singleItemSuccessStreak >= 5) {
-            this.poisonSearchActive = false;
+            this.setPoisonSearch(false);
             this.singleItemSuccessStreak = 0;
           }
         }
@@ -3352,7 +3394,7 @@ export class SyncEngine {
             if (batchUnitCount > 1) {
               // Server is healthy (or rejected payload size/format), so a specific mutation in this batch is poison.
               // Switch to single-item isolation mode without penalizing innocent items in the batch.
-              this.poisonSearchActive = true;
+              this.setPoisonSearch(true);
             } else {
               // M4: a single unit may be an atomic group (e.g. both legs of a transfer) — it is isolated as a whole
               const updatedBatch = await this.db.incrementOutboxRetryCounts(
@@ -3375,7 +3417,7 @@ export class SyncEngine {
                 // Q1: Do NOT reset consecutiveFailures to 0 on quarantine (keep backoff & single-item
                 // batching until a subsequent mutation actually succeeds), and cap at 1 quarantine per sync.
                 quarantinedInThisSync = true;
-                this.poisonSearchActive = false;
+                this.setPoisonSearch(false);
                 if (remainingAfterQuarantine > 0) {
                   fullPullPass = false;
                   continue;

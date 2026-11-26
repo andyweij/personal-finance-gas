@@ -1,3 +1,5 @@
+import { todayInTimeZone } from './dates';
+import { roundTo } from './format';
 import { CASHFLOW_TYPES, DEFAULT_LEDGER_ID, DEFAULT_LEDGER_NAME, STOCK_TX_TYPES } from './constants';
 import type {
   AllSavingsSummary,
@@ -163,9 +165,7 @@ export function applySubsetReorder<T extends { id: string; sortOrder?: number; c
 }
 
 function getTodayYmdLocal(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return todayInTimeZone(); // v1.8.15: "today" is the APP_TIMEZONE date, like the server
 }
 
 function makeClampedYmd(year: number, month: number, day: number): string {
@@ -196,7 +196,10 @@ export function computeLoanAmortizationSummary(
   usdTwdRate: number,
   asOfDate = getTodayYmdLocal()
 ): LoanAmortizationSummary {
-  const baseBalance = Math.max(0, Math.round(item.quantityOrAmount * (item.unitPrice || 1)));
+  // v1.8.15: amounts are kept in the loan's currency precision (USD cents, TWD whole dollars)
+  const dp = loanCurrencyDecimals(item.currency);
+  const money = (n: number) => roundTo(n, dp);
+  const baseBalance = Math.max(0, money(item.quantityOrAmount * (item.unitPrice || 1)));
   const fxRate = item.currency === 'USD' ? usdTwdRate : 1;
 
   if (
@@ -234,10 +237,10 @@ export function computeLoanAmortizationSummary(
   let curDate = nextBillingDateAfter(item.balanceAnchorDate, billingDay);
 
   while (curDate <= asOfDate && bal > 0 && elapsedPeriods < 1200) {
-    const interest = Math.round(bal * monthlyRate);
+    const interest = money(bal * monthlyRate);
     const principal =
-      monthlyPayment <= interest ? 0 : Math.min(bal, Math.round(monthlyPayment - interest));
-    bal = Math.max(0, bal - principal);
+      monthlyPayment <= interest ? 0 : Math.min(bal, money(monthlyPayment - interest));
+    bal = Math.max(0, money(bal - principal));
     totalPaidInterest += interest;
     totalPaidPrincipal += principal;
     elapsedPeriods++;
@@ -245,10 +248,10 @@ export function computeLoanAmortizationSummary(
   }
 
   const nextPaymentDate = bal > 0 ? curDate : null;
-  const nextInterest = bal > 0 ? Math.round(bal * monthlyRate) : 0;
+  const nextInterest = bal > 0 ? money(bal * monthlyRate) : 0;
   const isInterestOnly = bal > 0 && monthlyPayment <= nextInterest;
   const nextPrincipal =
-    bal > 0 ? (isInterestOnly ? 0 : Math.min(bal, Math.round(monthlyPayment - nextInterest))) : 0;
+    bal > 0 ? (isInterestOnly ? 0 : Math.min(bal, money(monthlyPayment - nextInterest))) : 0;
 
   let remainingPeriods: number | null = 0;
   let estimatedPayoffYm: string | null = null;
@@ -263,14 +266,14 @@ export function computeLoanAmortizationSummary(
       let count = 0;
       let lastDate = curDate;
       while (simBal > 0 && count < 1200) {
-        const interest = Math.round(simBal * monthlyRate);
+        const interest = money(simBal * monthlyRate);
         if (monthlyPayment <= interest) {
           remainingPeriods = null;
           estimatedPayoffYm = null;
           break;
         }
-        const principal = Math.min(simBal, Math.round(monthlyPayment - interest));
-        simBal = Math.max(0, simBal - principal);
+        const principal = Math.min(simBal, money(monthlyPayment - interest));
+        simBal = Math.max(0, money(simBal - principal));
         lastDate = simDate;
         count++;
         simDate = nextBillingDateAfter(simDate, billingDay);
@@ -284,11 +287,11 @@ export function computeLoanAmortizationSummary(
 
   return {
     baseBalance,
-    currentBalance: Math.round(bal),
+    currentBalance: money(bal),
     currentBalanceTwd: Math.round(bal * fxRate),
     elapsedPeriods,
-    totalPaidInterest: Math.round(totalPaidInterest),
-    totalPaidPrincipal: Math.round(totalPaidPrincipal),
+    totalPaidInterest: money(totalPaidInterest),
+    totalPaidPrincipal: money(totalPaidPrincipal),
     nextPaymentDate,
     nextInterest,
     nextPrincipal,
@@ -318,17 +321,18 @@ export function computeLoanAmortizationSchedule(
   const monthlyRate = Math.max(0, Number(item.loanAnnualRate ?? 0)) / 100 / 12;
   const monthlyPayment = Number(item.loanMonthlyPayment);
   const limit = Math.min(600, Math.max(1, Math.round(maxPeriods)));
+  const money = (n: number) => roundTo(n, loanCurrencyDecimals(item.currency));
 
   const entries: LoanScheduleEntry[] = [];
   let bal = summary.currentBalance;
   let payDate = summary.nextPaymentDate;
 
   for (let i = 1; i <= limit && bal > 0; i++) {
-    const interest = Math.round(bal * monthlyRate);
+    const interest = money(bal * monthlyRate);
     if (monthlyPayment <= interest) break;
-    const principal = Math.min(bal, Math.round(monthlyPayment - interest));
-    const payment = principal + interest;
-    bal = Math.max(0, bal - principal);
+    const principal = Math.min(bal, money(monthlyPayment - interest));
+    const payment = money(principal + interest);
+    bal = Math.max(0, money(bal - principal));
     entries.push({
       periodIndex: i,
       paymentDate: payDate,
@@ -390,8 +394,12 @@ export function solveImpliedLoanAnnualRate(params: {
     return (baseBalance * (r * factor)) / (factor - 1);
   };
 
+  // v1.8.15: search the same 0–50% range that loan validation accepts
   let lo = 0;
-  let hi = 0.3;
+  let hi = LOAN_MAX_ANNUAL_RATE_PERCENT / 100;
+  if (calcPayment(hi) < monthlyPayment) {
+    throw new Error(`依月付金推算的年利率超過 ${LOAN_MAX_ANNUAL_RATE_PERCENT}%，請確認月付金、申貸日與年限。`);
+  }
   for (let i = 0; i < 80; i++) {
     const mid = (lo + hi) / 2;
     if (calcPayment(mid) < monthlyPayment) {
@@ -554,8 +562,16 @@ export function isStockAsset(item: AssetItem): boolean {
 }
 
 function round2(n: number): number {
-  return Math.round(n * 100) / 100;
+  return roundTo(n, 2); // v1.8.15: decimal rounding (1.005 → 1.01)
 }
+
+/** v1.8.15: decimals a loan is tracked in (USD cents, TWD whole dollars) */
+function loanCurrencyDecimals(currency: string): number {
+  return currency === 'USD' ? 2 : 0;
+}
+
+/** v1.8.15: upper bound of a loan's annual rate (validation and the implied-rate solver use the same value) */
+export const LOAN_MAX_ANNUAL_RATE_PERCENT = 50;
 
 function round1(n: number): number {
   return Math.round(n * 10) / 10;
@@ -625,10 +641,13 @@ export function computeStockPositionSummary(
       const sold = Math.min(tx.shares, shares);
       const avgBefore = shares > 0 ? costBasis / shares : 0;
       const removedCost = hasCostBasis ? avgBefore * sold : 0;
+      // v1.8.15: a sell of more shares than held (e.g. after editing an earlier buy) only realizes the proceeds
+      // of the shares that actually existed, so realized P&L and cost stay consistent
+      const proceeds = tx.shares > 0 && sold < tx.shares ? (tx.totalAmount * sold) / tx.shares : tx.totalAmount;
       shares = Math.max(0, shares - sold);
       if (hasCostBasis) {
         costBasis = shares > 0 ? Math.max(0, costBasis - removedCost) : 0;
-        realizedPnl += tx.totalAmount - removedCost;
+        realizedPnl += proceeds - removedCost;
       }
     } else if (tx.txType === STOCK_TX_TYPES.CASH_DIVIDEND) {
       cumulativeCashDividends += tx.totalAmount;

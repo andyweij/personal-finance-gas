@@ -1,3 +1,4 @@
+import { todayInTimeZone } from '../../../shared/dates';
 import { exportCashFlowCsv } from '../../../shared/csv';
 import {
   changeMyPassword,
@@ -27,8 +28,7 @@ import {
   makeInputField,
   openModal,
   setLoading,
-  showToast,
-} from './helpers';
+  showToast, bindSubmit } from './helpers';
 import { APP_VERSION, BUILD_COMMIT, DB_SCHEMA_VERSION } from '../version';
 import type { UiContext } from './state';
 import { applyAuthMetaToState } from './state';
@@ -295,7 +295,7 @@ export function openAuthScreen(
       form.appendChild(offlineBtn);
     }
 
-    form.addEventListener('submit', async (e) => {
+    bindSubmit(form, async (e) => {
       e.preventDefault();
       el('authError').textContent = '';
       setLoading(true);
@@ -331,7 +331,7 @@ export function openAuthScreen(
     submit.textContent = '完成初始化並進入系統';
     form.appendChild(submit);
 
-    form.addEventListener('submit', async (e) => {
+    bindSubmit(form, async (e) => {
       e.preventDefault();
       el('authError').textContent = '';
       setLoading(true);
@@ -371,7 +371,7 @@ export function openAuthScreen(
     submit.textContent = '完成註冊並建立專屬帳本';
     form.appendChild(submit);
 
-    form.addEventListener('submit', async (e) => {
+    bindSubmit(form, async (e) => {
       e.preventDefault();
       el('authError').textContent = '';
       const pwd = el<HTMLInputElement>('regPwd').value;
@@ -416,7 +416,7 @@ export function openAuthScreen(
   submit.textContent = '重設密碼';
   form.appendChild(submit);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     el('authError').textContent = '';
     const pwd = el<HTMLInputElement>('rstPwd').value;
@@ -657,7 +657,7 @@ function openProfileEditModal(ctx: UiContext): void {
   submit.textContent = '儲存個人資料';
   form.appendChild(submit);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     setLoading(true);
     try {
@@ -691,7 +691,7 @@ function openChangePasswordModal(ctx: UiContext): void {
   submit.textContent = '更新主密碼';
   form.appendChild(submit);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const cur = el<HTMLInputElement>('chgCurPwd').value;
     const next = el<HTMLInputElement>('chgNewPwd').value;
@@ -1052,7 +1052,7 @@ export function openSecurityModal(ctx: UiContext): void {
     pinBtns.appendChild(offBtn);
   }
   pinForm.appendChild(pinBtns);
-  pinForm.addEventListener('submit', async (e) => {
+  bindSubmit(pinForm, async (e) => {
     e.preventDefault();
     const cur = ctx.state.pinEnabled ? el<HTMLInputElement>('secCurPin').value.trim() : '';
     const nextPin = el<HTMLInputElement>('secNewPin').value.trim();
@@ -1091,7 +1091,7 @@ export function openSecurityModal(ctx: UiContext): void {
   expJsonBtn.textContent = '匯出完整 JSON';
   expJsonBtn.addEventListener('click', () => {
     const data = ctx.engine.getSnapshot();
-    const ymd = new Date().toISOString().slice(0, 10);
+    const ymd = todayInTimeZone(); // v1.8.15: file name uses the APP_TIMEZONE date (not UTC)
     const suffix = user ? `-${user.username}` : '';
     downloadTextFile(
       `personal-finance-backup${suffix}-${ymd}.json`,
@@ -1107,7 +1107,7 @@ export function openSecurityModal(ctx: UiContext): void {
   expCsvBtn.textContent = '匯出流水帳 CSV';
   expCsvBtn.addEventListener('click', () => {
     const csv = exportCashFlowCsv(ctx.engine.getSnapshot().cashflowLogs);
-    const ymd = new Date().toISOString().slice(0, 10);
+    const ymd = todayInTimeZone();
     downloadTextFile(`CashFlow_Log-${ymd}.csv`, csv, 'text/csv;charset=utf-8');
     showToast('已匯出 UTF-8 BOM CSV', 'success');
   });

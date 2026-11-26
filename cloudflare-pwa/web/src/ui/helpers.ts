@@ -1,3 +1,4 @@
+import { formatPercent, roundTo } from '../../../shared/format';
 export const EYE_OPEN_SVG =
   '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>';
 export const EYE_OFF_SVG =
@@ -29,8 +30,16 @@ export function isDesktopDevice(): boolean {
 }
 
 let toastTimer: number | undefined;
+let lastToast: { text: string; at: number } | null = null;
+
 export function showToast(msg: string, variant?: 'success' | 'error'): void {
   const node = el('toast');
+  // v1.8.15: the same error reported twice (engine onError + the caller's catch) is shown once
+  const now = Date.now();
+  if (lastToast && now - lastToast.at < 1500 && msg && lastToast.text.includes(msg)) return;
+  lastToast = { text: msg, at: now };
+  node.setAttribute('role', 'status');
+  node.setAttribute('aria-live', 'polite');
   node.textContent = msg;
   node.className = 'toast show' + (variant ? ' ' + variant : '');
   window.clearTimeout(toastTimer);
@@ -47,8 +56,14 @@ export function fmtNum(n: number): string {
 
 export function fmtMoney(n: number, masked: boolean, prefix = 'NT$ '): string {
   if (masked) return prefix + '•••••';
-  const num = Number(n || 0);
+  // v1.8.15: the sign follows the value as displayed (whole dollars) — never "-NT$ 0"
+  const num = roundTo(Number(n || 0), 0);
   return (num < 0 ? '-' : '') + prefix + fmtNum(Math.abs(num));
+}
+
+/** v1.8.15: percentage for display — never "-0.0%" */
+export function fmtPct(n: number, decimals = 1, signed = false): string {
+  return formatPercent(n, decimals, signed);
 }
 
 export function fmtRaw(n: number, curr: string, masked: boolean): string {
@@ -56,16 +71,73 @@ export function fmtRaw(n: number, curr: string, masked: boolean): string {
   return (curr === 'USD' ? 'US$' : 'NT$ ') + Number(n || 0).toLocaleString('zh-TW', { maximumFractionDigits: 2 });
 }
 
+/* v1.8.15 accessibility: Esc closes the modal, focus moves into it (and stays inside on Tab) and returns to
+   where it was when the modal closes. */
+let modalReturnFocus: HTMLElement | null = null;
+let modalKeysBound = false;
+
+const FOCUSABLE =
+  'button:not([disabled]), [href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function bindModalKeys(): void {
+  if (modalKeysBound) return;
+  modalKeysBound = true;
+  document.addEventListener('keydown', (e) => {
+    const backdrop = document.getElementById('modalBackdrop');
+    if (!backdrop?.classList.contains('open')) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeModal();
+      return;
+    }
+    if (e.key === 'Tab') {
+      const sheet = document.getElementById('modalSheet') || backdrop;
+      const items = Array.from(sheet.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((n) => n.offsetParent !== null || n === document.activeElement);
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (!sheet.contains(document.activeElement)) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  });
+}
+
 export function openModal(title: string): HTMLElement {
+  bindModalKeys();
+  const backdrop = el('modalBackdrop');
+  if (!backdrop.classList.contains('open')) {
+    modalReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  }
   el('modalTitle').textContent = title;
+  el('modalSheet').setAttribute('aria-labelledby', 'modalTitle');
   const body = el('modalBody');
   body.innerHTML = '';
-  el('modalBackdrop').classList.add('open');
+  backdrop.classList.add('open');
+  // the caller fills the body synchronously; focus its first control afterwards
+  window.setTimeout(() => {
+    if (!backdrop.classList.contains('open')) return;
+    const target =
+      body.querySelector<HTMLElement>('input:not([type="hidden"]):not([disabled]), select, textarea') ||
+      body.querySelector<HTMLElement>(FOCUSABLE) ||
+      document.getElementById('closeModalBtn');
+    target?.focus();
+  }, 0);
   return body;
 }
 
 export function closeModal(): void {
   el('modalBackdrop').classList.remove('open');
+  const back = modalReturnFocus;
+  modalReturnFocus = null;
+  if (back && document.contains(back)) back.focus();
 }
 
 export function makeInputField(
@@ -133,5 +205,30 @@ export function downloadTextFile(filename: string, content: string, mimeType: st
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  // v1.8.15: iOS Safari reads the blob after click() returns — revoking immediately can produce an empty file
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/**
+ * v1.8.15: submit handler that cannot run twice at once — a double tap (iOS) or a second Enter while the first
+ * save is still running is ignored, and the form's submit buttons are disabled until the handler settles.
+ */
+export function bindSubmit(form: HTMLElement, handler: (e: SubmitEvent) => unknown): void {
+  form.addEventListener('submit', async (e) => {
+    if (form.dataset.submitting === '1') {
+      e.preventDefault();
+      return;
+    }
+    form.dataset.submitting = '1';
+    const buttons = Array.from(
+      form.querySelectorAll<HTMLButtonElement>('button[type="submit"], button:not([type])')
+    ).filter((b) => !b.disabled);
+    for (const b of buttons) b.disabled = true;
+    try {
+      await handler(e as SubmitEvent);
+    } finally {
+      delete form.dataset.submitting;
+      for (const b of buttons) b.disabled = false;
+    }
+  });
 }

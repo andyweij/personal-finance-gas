@@ -2,7 +2,7 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.14';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.15';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0016';
@@ -10,6 +10,7 @@ export const DB_SCHEMA_VERSION = '0016';
 export const SW_CACHE_VERSION = 'finance-pwa';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.8.15：細節修正（儲存時防止連點重複建立；CSV 匯出防公式注入、水電 CSV 正確跳脫；「今天」、匯出檔名與管理畫面日期一律依台北時間；不再顯示 -NT$ 0、-0.0%；iOS 下載不再拿到空檔案；視窗支援 Esc 關閉與鍵盤焦點、提示訊息可被讀屏器播報、可雙指縮放；金額改用十進位捨入，美元貸款保留小數、隱含利率可推算到 50%、賣出超過持股時拒絕並正確計算；同步遇到多分頁同時寫入會重試、批次選取與標記在同一交易、切換帳號等待進行中的操作；只重繪目前分頁、跨分頁重新載入合併處理）',
   'v1.8.14：離線快取改版（建置時自動產生完整的預快取清單與版本雜湊，安裝後第一次離線開啟也能正常顯示；只有開啟頁面時才會改用離線畫面，程式檔載入失敗不會再拿到網頁內容；含邀請碼或重設碼的網址不會被快取；有新版本時顯示「有新版本」提示，確認後才更新並重新載入）',
   'v1.8.13：資源上限與排程（同步每次請求的資料庫查詢由 20 多次降到 4 次起跳，並依免費方案每次 50 次的上限自動分批；排程改為先入帳再更新報價，每一步驟獨立處理錯誤，錯過的常態入帳與月底快照會在下一次排程自動補跑；報價更新依剩餘的對外請求額度分批、優先更新最久未更新的標的，所有對外請求都有逾時；匯入限制 2 MB、欄位型別錯誤回 400、大型匯入一次完整寫入不會留下半套資料，CSV 重複匯入不會產生重複資料並寫入帳本；月底快照不計入快照日之後的紀錄，日期依 APP_TIMEZONE 計算）',
   'v1.8.12：資料正確性修正（同步隔離一筆編輯時，同一筆的後續編輯一併暫停送出並還原雲端資料；整個請求層級的 400／413 不再誤隔離正常資料；寫入時檢查帳本、連動活存、帳戶與持股是否存在，並保留既有資料的舊參照；帳戶互轉的兩邊與手續費改為同時成立或同時失敗；常態收支以項目為單位入帳，同名項目都會入帳且並行執行不重複；美元活存以原幣加總後一次換算；手動入帳驗證年月；其他分頁變更 PIN／Face ID 後本分頁同步更新）',

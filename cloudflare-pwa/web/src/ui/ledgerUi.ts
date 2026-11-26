@@ -1,7 +1,7 @@
 import { DEFAULT_LEDGER_ID } from '../../../shared/constants';
 import { ensureActiveLedgers, getEffectiveLedgerId } from '../../../shared/calculations';
 import type { Ledger } from '../../../shared/types';
-import { closeModal, el, makeInputField, openModal, showToast } from './helpers';
+import { closeModal, el, makeInputField, openModal, showToast, bindSubmit } from './helpers';
 import type { UiContext } from './state';
 
 export function getActiveLedgers(ctx: UiContext): Ledger[] {
@@ -305,7 +305,7 @@ export function openLedgerEditModal(ctx: UiContext, existing: Ledger | null): vo
   btns.appendChild(saveBtn);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     try {
       const budgetEl = document.getElementById('lgBudget') as HTMLInputElement | null;

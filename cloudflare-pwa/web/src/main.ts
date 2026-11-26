@@ -15,7 +15,7 @@ import {
   setAuthExpectedUser,
 } from './auth/authClient';
 import { createCrossTabChannel } from './sync/crossTab';
-import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast } from './ui/helpers';
+import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast, bindSubmit } from './ui/helpers';
 import {
   getTodayYmd,
   renderLogCategories,
@@ -162,10 +162,27 @@ function registerServiceWorker(): void {
   });
 }
 
+type AppTab = AppUiState['activeTab'];
+const ALL_TABS: AppTab[] = ['log', 'overview', 'assets', 'stocks', 'tools'];
+const dirtyTabs = new Set<AppTab>(ALL_TABS);
+let renderTabImpl: ((tab: AppTab) => void) | null = null;
+
+function renderTabIfDirty(tab: AppTab): void {
+  if (!dirtyTabs.has(tab) || !renderTabImpl) return;
+  dirtyTabs.delete(tab);
+  renderTabImpl(tab);
+}
+
 function renderSyncPill(status: SyncStatus): void {
   const pill = el('syncStatusPill');
   pill.className = `sync-pill ${status.state}`;
-  if (status.state === 'conflict') {
+  // v1.8.15: rejections no longer turn the engine state into 'conflict' (so offline / pending stay visible);
+  // the pill still shows them as a warning together with that state
+  const rejectionOnly =
+    (status.rejectedCount || 0) > 0 &&
+    (status.state === 'synced' || status.state === 'pending' || status.state === 'offline');
+  if (rejectionOnly) pill.className = 'sync-pill conflict';
+  if (status.state === 'conflict' || rejectionOnly) {
     const cCount = status.conflictCount || 0;
     const rCount = status.rejectedCount || 0;
     const fCount = status.frozenOutboxCount || 0;
@@ -387,12 +404,10 @@ async function bootstrap(): Promise<void> {
       const fxEl = el('fxTopPill');
       fxEl.textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}${autoFx ? '' : ' · 手動'}`;
       fxEl.title = autoFx ? '自動更新美元匯率（點擊調整）' : '手動固定美元匯率（點擊調整）';
-      renderLogTab(ctx);
-      renderOverviewTab(ctx);
-      renderAssetsTab(ctx);
-      renderStocksTab(ctx);
-      renderConfigTab(ctx);
-      renderUtilityTab(ctx);
+      // v1.8.15 performance: only the visible tab is rendered now; the others are marked dirty and rendered
+      // when they are opened (each tab reads the engine snapshot, not another tab's DOM)
+      for (const tab of ALL_TABS) dirtyTabs.add(tab);
+      renderTabIfDirty(ctx.state.activeTab);
     },
     scheduleSync: () => {
       window.clearTimeout(syncDebounce);
@@ -431,7 +446,8 @@ async function bootstrap(): Promise<void> {
       saveRememberedAccount(user);
       const nextDbName = LocalFinanceDB.dbNameForUser(user.id);
       if (activeDb.getDbName() !== nextDbName) {
-        ctx.engine?.destroy();
+        // v1.8.15: let queued local operations finish before the database is closed
+        await ctx.engine?.destroy();
         activeDb.close();
         activeDb = new LocalFinanceDB(nextDbName);
         const nextEngine = createSyncEngineForDb(activeDb, user.id);
@@ -456,6 +472,16 @@ async function bootstrap(): Promise<void> {
     },
   };
 
+  renderTabImpl = (tab) => {
+    if (tab === 'log') renderLogTab(ctx);
+    else if (tab === 'overview') renderOverviewTab(ctx);
+    else if (tab === 'assets') renderAssetsTab(ctx);
+    else if (tab === 'stocks') renderStocksTab(ctx);
+    else {
+      renderConfigTab(ctx);
+      renderUtilityTab(ctx);
+    }
+  };
   ctx.engine = createSyncEngineForDb(activeDb, remembered?.id);
 
   if (accountChannel) {
@@ -602,6 +628,7 @@ function bindEvents(ctx: UiContext): void {
       cancelReorder(ctx);
     }
     ctx.state.activeTab = tab;
+    renderTabIfDirty(tab); // v1.8.15: tabs are rendered lazily
     navButtons.forEach((b, i) => b.classList.toggle('active', i === safeIdx));
     document.querySelectorAll('.tab-view').forEach((v) => v.classList.toggle('active', v.id === 'tab-' + tab));
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -847,7 +874,7 @@ function bindEvents(ctx: UiContext): void {
   el('amountInput').addEventListener('input', () => updateFxPreview(ctx));
   el('dateInput').addEventListener('change', () => updateSavingsPreview(ctx));
 
-  el('expenseForm').addEventListener('submit', async (e) => {
+  bindSubmit(el('expenseForm'), async (e) => {
     e.preventDefault();
     const amount = parseFloat(el<HTMLInputElement>('amountInput').value);
     const date = el<HTMLInputElement>('dateInput').value;
@@ -923,7 +950,7 @@ function bindEvents(ctx: UiContext): void {
     });
   });
 
-  el('budgetForm').addEventListener('submit', async (e) => {
+  bindSubmit(el('budgetForm'), async (e) => {
     e.preventDefault();
     try {
       await ctx.engine.saveBudgetSettings(

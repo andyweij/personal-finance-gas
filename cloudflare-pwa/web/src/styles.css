@@ -2373,3 +2373,9 @@ body.is-reordering-drag {
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
   font-size: 13.5px;
 }
+
+/* v1.8.15: pinch-zoom is allowed again (no maximum-scale); 16px text in inputs on touch devices stops iOS from
+   zooming the page when a field gets focus */
+@media (pointer: coarse) {
+  input, select, textarea, .field input, .field select { font-size: 16px; }
+}
