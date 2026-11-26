@@ -228,22 +228,42 @@ export async function changeMyPassword(
   if (!res.ok) throw new Error(body.error || '變更密碼失敗');
 }
 
-export async function logoutSession(allDevices = false): Promise<void> {
+/**
+ * H3: set when logout could not reach the server (offline / 5xx). The HttpOnly session cookie cannot be cleared
+ * from script, so the server logout is retried at the next start before anything is shown.
+ */
+export const PENDING_SERVER_LOGOUT_KEY = 'pf_pending_server_logout';
+
+/** Returns true only when the server confirmed the session was revoked. */
+export async function logoutSession(allDevices = false, broadcast = true): Promise<boolean> {
+  let ok = false;
   try {
-    await fetch(`/api/auth/logout${allDevices ? '?all=1' : ''}`, {
+    const res = await fetch(`/api/auth/logout${allDevices ? '?all=1' : ''}`, {
       method: 'POST',
       credentials: 'same-origin',
     });
+    ok = res.ok;
+  } catch {
+    ok = false;
   } finally {
     // P2-C10: tell other tabs even if the request failed (e.g. offline) — this tab is logging out either way
-    try {
-      const ch = createCrossTabChannel('personal-finance-account-sync');
-      ch?.postMessage({ type: 'logout' });
-      ch?.close();
-    } catch {
-      // Ignore cross-tab messaging errors
+    if (broadcast) {
+      try {
+        const ch = createCrossTabChannel('personal-finance-account-sync');
+        ch?.postMessage({ type: 'logout' });
+        ch?.close();
+      } catch {
+        // Ignore cross-tab messaging errors
+      }
     }
   }
+  try {
+    if (ok) localStorage.removeItem(PENDING_SERVER_LOGOUT_KEY);
+    else localStorage.setItem(PENDING_SERVER_LOGOUT_KEY, '1');
+  } catch {
+    // storage unavailable
+  }
+  return ok;
 }
 
 export async function registerPasskey(deviceName = '我的裝置'): Promise<void> {

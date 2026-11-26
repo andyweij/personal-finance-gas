@@ -956,7 +956,7 @@ export function openSecurityModal(ctx: UiContext): void {
     const bioRow = document.createElement('div');
     bioRow.style.cssText =
       'display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px;padding-top:10px;border-top:0.5px solid var(--sep)';
-    bioRow.innerHTML = `<div><div style="font-size:13px;font-weight:600">啟動與閒置時用 Face ID 解鎖</div><div class="muted" style="font-size:11px">支援飛航模式離線刷臉解鎖</div></div>`;
+    bioRow.innerHTML = `<div><div style="font-size:13px;font-weight:600">啟動與閒置時用 Face ID 解鎖</div><div class="muted" style="font-size:11px">支援飛航模式離線刷臉解鎖；部分裝置的 Passkey（例如某些 Windows Hello）無法離線驗證，建議同時設定 PIN 作為備援</div></div>`;
     const sw = document.createElement('label');
     sw.className = 'switch';
     const cb = document.createElement('input');
@@ -1231,15 +1231,21 @@ export function openSecurityModal(ctx: UiContext): void {
       return;
     }
     setLoading(true);
+    let wipe: 'deleted' | 'blocked' = 'deleted';
     try {
-      await logoutSession(false).catch(() => undefined);
+      // If the server cannot be reached, logoutSession records a pending server logout that the next start
+      // completes before showing anything (the HttpOnly cookie cannot be cleared from script)
+      await logoutSession(false);
       ctx.state.authenticated = false;
       ctx.state.currentUser = null;
       setAuthExpectedUser(null);
       clearRememberedAccount();
-      await ctx.engine.wipeLocalData();
+      wipe = await ctx.engine.wipeLocalData();
     } finally {
       setLoading(false);
+    }
+    if (wipe === 'blocked') {
+      alert('此網站還有其他分頁開著，請關閉其他分頁，才能完成刪除這台裝置上的資料。');
     }
     // Reload into a clean state: no remembered account and no local ledger left on this device
     window.location.reload();

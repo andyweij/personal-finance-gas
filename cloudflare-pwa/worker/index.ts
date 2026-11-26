@@ -10,6 +10,7 @@ import {
   changeUserPassword,
   checkAndRecordFixedWindowRateLimit,
   checkRateLimit,
+  peekRateLimit,
   cleanupExpiredAuthData,
   listRecentSecurityEvents,
   clearRateLimit,
@@ -191,9 +192,9 @@ export function createApp() {
         return c.json({ error: '拒絕跨站請求。' }, 403);
       }
     }
+    // Decide from headers only: in workerd a bodyless POST (Content-Length: 0) still has a non-null req.body
     const contentLength = Number(c.req.header('content-length') || '0');
-    // A body may arrive chunked without Content-Length, so also look at the request stream itself
-    const hasBody = contentLength > 0 || Boolean(c.req.header('transfer-encoding')) || c.req.raw.body !== null;
+    const hasBody = contentLength > 0 || Boolean(c.req.header('transfer-encoding'));
     const contentType = (c.req.header('content-type') || '').toLowerCase();
     if (hasBody && !contentType.startsWith('application/json')) {
       return c.json({ error: '請求內容必須為 JSON。' }, 415);
@@ -214,6 +215,10 @@ export function createApp() {
     }
 
     const user = session.user;
+    if (session.refreshedCookie) {
+      const { isHttps } = getOriginAndRpId(c);
+      c.header('Set-Cookie', buildSessionCookie(session.refreshedCookie.token, isHttps, false, session.refreshedCookie.maxAgeSec));
+    }
     const passkeyRows = await c.env.DB.prepare(
       'SELECT credential_id, public_key, transports FROM auth_passkeys WHERE user_id = ?'
     )
@@ -355,8 +360,10 @@ export function createApp() {
     const uname = String(body.username || '').trim().toLowerCase();
     const rateKey = uname ? `${ip}:${uname}` : ip;
     // H2: per IP+account, plus a per-account budget across all IPs (bounds distributed guessing)
+    // The per-account budget only counts VERIFIED failures (peek first, count after a wrong password), so a
+    // single blocked IP cannot keep spending it to lock the real user out.
     const limit = await checkRateLimit(c.env.DB, rateKey);
-    const userLimit = uname ? await checkRateLimit(c.env.DB, `user:${uname}`, 20) : { blocked: false };
+    const userLimit = uname && !limit.blocked ? await peekRateLimit(c.env.DB, `user:${uname}`, 20) : { blocked: false };
     if (limit.blocked || userLimit.blocked) {
       const retry = Math.max(limit.retryAfterSec || 0, userLimit.retryAfterSec || 0) || 900;
       return c.json({ error: `登入嘗試次數過多，請於 ${Math.ceil(retry / 60)} 分鐘後再試。` }, 429);
@@ -364,6 +371,7 @@ export function createApp() {
 
     const user = await verifyUserPassword(c.env.DB, body.username, String(body.password || ''));
     if (!user) {
+      if (uname) await checkRateLimit(c.env.DB, `user:${uname}`, 20);
       return c.json({ error: '帳號或主密碼不正確。' }, 401);
     }
 
@@ -432,6 +440,10 @@ export function createApp() {
     }
     c.set('authUser', session.user);
     c.set('tokenHash', session.tokenHash || '');
+    if (session.refreshedCookie) {
+      const { isHttps } = getOriginAndRpId(c);
+      c.header('Set-Cookie', buildSessionCookie(session.refreshedCookie.token, isHttps, false, session.refreshedCookie.maxAgeSec));
+    }
     // P2-S11: every authenticated write refuses a request made by a tab that believes it is another account
     // (the session cookie is shared by all tabs, so another tab may have switched accounts).
     const method = c.req.method.toUpperCase();

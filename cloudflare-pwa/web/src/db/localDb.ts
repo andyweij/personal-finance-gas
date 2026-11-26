@@ -143,14 +143,31 @@ export class LocalFinanceDB {
   }
 
   /** H3: close and permanently delete this account's local database (used on logout). */
-  async deleteDatabase(): Promise<void> {
+  /**
+   * Returns 'blocked' when another tab (e.g. one still running an older version) keeps the database open for
+   * more than 3 s; the delete stays queued and completes once that tab closes.
+   */
+  async deleteDatabase(): Promise<'deleted' | 'blocked'> {
     this.close();
-    await new Promise<void>((resolve, reject) => {
+    return new Promise<'deleted' | 'blocked'>((resolve, reject) => {
+      let settled = false;
       const req = indexedDB.deleteDatabase(this.dbName);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-      // Blocked means another tab still holds it open; it will close on versionchange and the delete proceeds
-      req.onblocked = () => undefined;
+      req.onsuccess = () => {
+        settled = true;
+        resolve('deleted');
+      };
+      req.onerror = () => {
+        settled = true;
+        reject(req.error);
+      };
+      req.onblocked = () => {
+        setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            resolve('blocked');
+          }
+        }, 3000);
+      };
     });
   }
 

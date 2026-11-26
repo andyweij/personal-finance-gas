@@ -5,7 +5,14 @@ import type { PnlColorScheme } from '../../shared/types';
 import { normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
-import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount, setAuthExpectedUser } from './auth/authClient';
+import {
+  fetchAuthStatus,
+  getRememberedAccount,
+  logoutSession,
+  PENDING_SERVER_LOGOUT_KEY,
+  saveRememberedAccount,
+  setAuthExpectedUser,
+} from './auth/authClient';
 import { createCrossTabChannel } from './sync/crossTab';
 import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast } from './ui/helpers';
 import {
@@ -126,16 +133,18 @@ function renderSyncPill(status: SyncStatus): void {
  * is only a blur) nor reachable by keyboard / screen readers. Watches both overlays' `open` class.
  */
 function concealAppWhileOverlayOpen(): void {
-  const overlays = ['authScreen', 'lockScreen']
+  const overlayIds = ['authScreen', 'lockScreen'];
+  const keepVisible = new Set([...overlayIds, 'toast', 'loadingBar']);
+  const overlays = overlayIds
     .map((id) => document.getElementById(id))
     .filter((n): n is HTMLElement => Boolean(n));
-  const appParts = Array.from(
-    document.querySelectorAll<HTMLElement>('body > header.topbar, body > main.container, body > nav.bottom-nav')
-  );
   const apply = () => {
     const covered = overlays.some((o) => o.classList.contains('open'));
     document.body.classList.toggle('app-concealed', covered);
-    for (const part of appParts) {
+    document.body.classList.toggle('lock-open', Boolean(document.getElementById('lockScreen')?.classList.contains('open')));
+    // Every other top-level element (topbar, content, nav, modal sheet, calculator…) is hidden and inert
+    for (const part of Array.from(document.body.children) as HTMLElement[]) {
+      if (keepVisible.has(part.id) || part.tagName === 'SCRIPT') continue;
       if (covered) {
         part.setAttribute('inert', '');
         part.setAttribute('aria-hidden', 'true');
@@ -440,6 +449,22 @@ async function bootstrap(): Promise<void> {
       username: userParam,
     });
     return;
+  }
+
+  // H3: a logout that could not reach the server must be completed before the session cookie is trusted again
+  let pendingServerLogout = false;
+  try {
+    pendingServerLogout = localStorage.getItem(PENDING_SERVER_LOGOUT_KEY) === '1';
+  } catch {
+    pendingServerLogout = false;
+  }
+  if (pendingServerLogout) {
+    const done = navigator.onLine ? await logoutSession(false, false) : false;
+    if (!done) {
+      closeLockScreen(ctx);
+      openAuthScreen(ctx, 'login', '已登出，請重新登入', () => void ctx.engine.syncNow(true));
+      return;
+    }
   }
 
   // 2. 背景檢查雲端登入狀態並自動同步
@@ -1059,21 +1084,31 @@ function bindEvents(ctx: UiContext): void {
       state: 'offline',
     });
   });
+  const BACKGROUND_LOCK_GRACE_MS = 30_000;
+  let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
-    // M11: lock as soon as the app goes to the background, so the OS app-switcher snapshot shows the lock
-    // screen instead of balances (only when a PIN / Face ID lock is enabled)
+    // M11: when the app goes to the background, conceal it at once (the OS app-switcher snapshot must not show
+    // balances) but only lock if it stays away for a while — a quick switch to copy an OTP or a file picker
+    // must not discard the open form or force an unlock.
     if (document.visibilityState === 'hidden') {
-      if (
-        isAnyLockEnabled(ctx) &&
-        !el('lockScreen').classList.contains('open') &&
-        !el('authScreen').classList.contains('open')
-      ) {
-        closeModal();
-        openLockScreen(ctx, '已自動鎖定');
+      if (isAnyLockEnabled(ctx)) {
+        hiddenAt = Date.now();
+        document.body.classList.add('app-backgrounded');
       }
       return;
     }
     if (document.visibilityState === 'visible') {
+      const awayMs = hiddenAt ? Date.now() - hiddenAt : 0;
+      hiddenAt = 0;
+      document.body.classList.remove('app-backgrounded');
+      if (
+        awayMs > BACKGROUND_LOCK_GRACE_MS &&
+        isAnyLockEnabled(ctx) &&
+        !el('lockScreen').classList.contains('open') &&
+        !el('authScreen').classList.contains('open')
+      ) {
+        openLockScreen(ctx, '已自動鎖定');
+      }
       checkIdle();
       if (navigator.onLine) {
         void ctx.engine.syncNow();

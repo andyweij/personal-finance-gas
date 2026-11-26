@@ -561,10 +561,12 @@ body {
   color: var(--text); display: none; flex-direction: column; align-items: center; justify-content: center; padding: 24px;
 }
 .auth-screen.open, .lock-screen.open { display: flex; }
-/* H3 / M11: the overlay is only a blur — hide the app behind it so amounts cannot be read through it */
-body.app-concealed > header.topbar,
-body.app-concealed > main.container,
-body.app-concealed > nav.bottom-nav { visibility: hidden; }
+/* H3 / M11: the overlay is only a blur — hide everything behind it so amounts cannot be read through it;
+   app-backgrounded hides the app while it is in the background (OS app-switcher snapshot) */
+body.app-concealed > :not(#authScreen):not(#lockScreen):not(#toast):not(#loadingBar),
+body.app-backgrounded > :not(#authScreen):not(#lockScreen):not(#loadingBar) { visibility: hidden; }
+/* Toasts stay visible above the sign-in screen, but never above the lock screen */
+body.lock-open > #toast { visibility: hidden; }
 .auth-card { width: 100%; max-width: 400px; background: var(--surface); border: 0.5px solid var(--border); border-radius: 22px; padding: 24px 20px; box-shadow: var(--card-shadow); }
 .auth-title { font-size: 20px; font-weight: 700; text-align: center; }
 .auth-sub { font-size: 13px; color: var(--text-secondary); text-align: center; margin: 4px 0 16px; }
@@ -586,7 +588,7 @@ body.app-concealed > nav.bottom-nav { visibility: hidden; }
   background: rgba(29, 29, 31, 0.92); color: #FFFFFF; padding: 10px 18px;
   border-radius: 999px; font-size: 13px; font-weight: 500;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24); transition: opacity 0.2s ease, transform 0.2s ease;
-  opacity: 0; pointer-events: none; z-index: 110; /* M11: below the lock / sign-in screens (120) */ max-width: 92vw; text-align: center;
+  opacity: 0; pointer-events: none; z-index: 150; max-width: 92vw; text-align: center;
 }
 .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
 .toast.success { background: var(--success); }

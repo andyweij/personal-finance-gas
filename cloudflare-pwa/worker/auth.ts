@@ -128,13 +128,14 @@ export function parseSessionTokenFromCookie(cookieHeader: string | null | undefi
   return null;
 }
 
-export function buildSessionCookie(token: string, isHttps: boolean, clear = false): string {
+export function buildSessionCookie(token: string, isHttps: boolean, clear = false, maxAgeSec?: number): string {
+  const age = Math.max(0, Math.floor(maxAgeSec ?? SESSION_TTL_SECONDS));
   const attrs = [
     `${SESSION_COOKIE_NAME}=${clear ? '' : encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
     'SameSite=Strict',
-    clear ? 'Max-Age=0' : `Max-Age=${SESSION_TTL_SECONDS}`,
+    clear ? 'Max-Age=0' : `Max-Age=${age}`,
   ];
   if (isHttps) {
     attrs.push('Secure');
@@ -183,7 +184,7 @@ export async function createSession(
 export async function verifySessionCookie(
   db: D1Database,
   cookieHeader: string | null | undefined
-): Promise<{ valid: boolean; tokenHash?: string; user?: UserRow }> {
+): Promise<{ valid: boolean; tokenHash?: string; user?: UserRow; refreshedCookie?: { token: string; maxAgeSec: number } }> {
   const token = parseSessionTokenFromCookie(cookieHeader);
   if (!token) return { valid: false };
 
@@ -214,11 +215,18 @@ export async function verifySessionCookie(
   if (!Number.isFinite(lastSeenMs) || Date.now() - lastSeenMs >= SESSION_REFRESH_INTERVAL_MS) {
     const createdMs = Date.parse(row.created_at);
     const cap = Number.isFinite(createdMs) ? createdMs + SESSION_MAX_AGE_MS : Infinity;
-    const nextExpires = new Date(Math.min(Date.now() + SESSION_TTL_SECONDS * 1000, cap)).toISOString();
+    const nextExpiresMs = Math.min(Date.now() + SESSION_TTL_SECONDS * 1000, cap);
     await db
       .prepare('UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?')
-      .bind(nowIso, nextExpires, tokenHash)
+      .bind(nowIso, new Date(nextExpiresMs).toISOString(), tokenHash)
       .run();
+    // The browser cookie must follow the server expiry, otherwise it silently expires 30 days after sign-in
+    return {
+      valid: true,
+      tokenHash,
+      user,
+      refreshedCookie: { token, maxAgeSec: Math.floor((nextExpiresMs - Date.now()) / 1000) },
+    };
   }
 
   return { valid: true, tokenHash, user };
@@ -240,8 +248,8 @@ export async function cleanupExpiredAuthData(db: D1Database): Promise<void> {
     db.prepare('DELETE FROM auth_rate_limits WHERE updated_at <= ?').bind(iso(now - day)),
     db.prepare('DELETE FROM auth_invites WHERE (used_at IS NOT NULL OR expires_at <= ?) AND created_at <= ?').bind(nowIso, iso(now - 30 * day)),
     db.prepare('DELETE FROM auth_password_resets WHERE (used_at IS NOT NULL OR expires_at <= ?) AND created_at <= ?').bind(nowIso, iso(now - 30 * day)),
-    // Client retries of a mutation happen within minutes/hours; 30 days of idempotency history is ample
-    db.prepare('DELETE FROM sync_idempotency WHERE applied_at <= ?').bind(iso(now - 30 * day)),
+    // Client retries happen within minutes; 90 days also covers a device that stayed offline for a long time
+    db.prepare('DELETE FROM sync_idempotency WHERE applied_at <= ?').bind(iso(now - 90 * day)),
     db.prepare('DELETE FROM auth_security_events WHERE created_at <= ?').bind(iso(now - 365 * day)),
   ]);
 }
@@ -298,6 +306,23 @@ export async function checkRateLimit(
     return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((windowEnd - nowMs) / 1000)) };
   }
   return { blocked: false };
+}
+
+/** Read-only check of a counter (does not count an attempt). Used for budgets that only count failures. */
+export async function peekRateLimit(
+  db: D1Database,
+  key: string,
+  maxAttempts = MAX_LOGIN_FAILS,
+  windowMs = LOCKOUT_MS
+): Promise<{ blocked: boolean; retryAfterSec?: number }> {
+  const row = await db
+    .prepare('SELECT fail_count, updated_at FROM auth_rate_limits WHERE ip_key = ?')
+    .bind(key)
+    .first<{ fail_count: number; updated_at: string }>();
+  if (!row) return { blocked: false };
+  const windowEnd = Date.parse(row.updated_at) + windowMs;
+  if (windowEnd <= Date.now() || Number(row.fail_count) < maxAttempts) return { blocked: false };
+  return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((windowEnd - Date.now()) / 1000)) };
 }
 
 /** @deprecated attempts are now counted atomically by checkRateLimit(); kept as a no-op for callers. */

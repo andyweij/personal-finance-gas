@@ -96,7 +96,13 @@ describe('v1.8.11 security', () => {
     expect((await req(app, env, '/api/auth/login', { method: 'POST', body, headers: { origin: 'https://evil.example' } })).status).toBe(403);
     expect((await req(app, env, '/api/auth/login', { method: 'POST', body, headers: { 'sec-fetch-site': 'cross-site' } })).status).toBe(403);
     expect(
-      (await req(app, env, '/api/auth/login', { method: 'POST', body: 'username=admin', headers: { 'content-type': 'text/plain' } })).status
+      (
+        await req(app, env, '/api/auth/login', {
+          method: 'POST',
+          body: 'username=admin',
+          headers: { 'content-type': 'text/plain', 'content-length': '14' },
+        })
+      ).status
     ).toBe(415);
     expect((await req(app, env, '/api/auth/login', { method: 'POST', body, headers: { origin: 'http://localhost' } })).status).toBe(200);
   });
@@ -240,5 +246,49 @@ describe('v1.8.11 security', () => {
     expect((await reopened.getSnapshot()).cashflowLogs).toHaveLength(0);
     expect(await reopened.getOutbox()).toHaveLength(0);
     reopened.close();
+  });
+
+  it('M10 (blocker regression): a bodyless POST — as workerd delivers it, with Content-Length: 0 — is not refused', async () => {
+    const { app, env, momCookie } = await setup();
+    const logout = await app.request(
+      '/api/auth/logout',
+      {
+        method: 'POST',
+        headers: { cookie: momCookie, 'content-length': '0' },
+        body: new ReadableStream({ start: (c) => c.close() }),
+        duplex: 'half',
+      } as RequestInit,
+      env
+    );
+    expect(logout.status).toBe(200);
+    const after = (await (await req(app, env, '/api/auth/status', { cookie: momCookie })).json()) as { authenticated: boolean };
+    expect(after.authenticated).toBe(false);
+  });
+
+  it('H2: a blocked attacker IP cannot spend the per-account budget and lock the real user out', async () => {
+    const { app, env } = await setup();
+    for (let i = 0; i < 40; i++) {
+      await req(app, env, '/api/auth/login', { method: 'POST', ip: '10.66.66.66', body: { username: 'mom', password: 'wrong' } });
+    }
+    const real = await req(app, env, '/api/auth/login', {
+      method: 'POST',
+      ip: '10.0.0.2',
+      body: { username: 'mom', password: 'MomPassword123!' },
+    });
+    expect(real.status).toBe(200);
+  });
+
+  it('M1: when the server extends a session it also re-issues the cookie with the remaining lifetime', async () => {
+    const { app, env, momCookie } = await setup();
+    await env.DB.prepare('UPDATE auth_sessions SET last_seen_at = ?, created_at = ?').bind(
+      new Date(Date.now() - 2 * 86_400_000).toISOString(),
+      new Date(Date.now() - 80 * 86_400_000).toISOString()
+    ).run();
+    const res = await req(app, env, '/api/auth/status', { cookie: momCookie });
+    const setCookie = res.headers.get('set-cookie') || '';
+    const maxAge = Number(/Max-Age=(\d+)/.exec(setCookie)?.[1]);
+    // 10 days left before the 90-day cap
+    expect(maxAge).toBeGreaterThan(9 * 86_400);
+    expect(maxAge).toBeLessThanOrEqual(10 * 86_400);
   });
 });
