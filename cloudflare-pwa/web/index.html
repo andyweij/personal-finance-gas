@@ -750,6 +750,86 @@
     </div>
   </div>
 
+  <!-- 懸浮隨手計算機按鈕（可拖曳定位，高於一般彈窗、低於鎖定畫面） -->
+  <button
+    type="button"
+    class="calc-fab"
+    id="calcFabBtn"
+    aria-label="開啟隨手計算機"
+    aria-expanded="false"
+    title="隨手計算機（可拖曳移動位置）"
+  >
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="4" y="2" width="16" height="20" rx="2.5"></rect>
+      <line x1="8" y1="6.5" x2="16" y2="6.5"></line>
+      <circle cx="8.5" cy="11.5" r="0.8" fill="currentColor"></circle>
+      <circle cx="12" cy="11.5" r="0.8" fill="currentColor"></circle>
+      <circle cx="15.5" cy="11.5" r="0.8" fill="currentColor"></circle>
+      <circle cx="8.5" cy="15" r="0.8" fill="currentColor"></circle>
+      <circle cx="12" cy="15" r="0.8" fill="currentColor"></circle>
+      <circle cx="15.5" cy="15" r="0.8" fill="currentColor"></circle>
+      <circle cx="8.5" cy="18.5" r="0.8" fill="currentColor"></circle>
+      <line x1="12" y1="18.5" x2="16" y2="18.5"></line>
+    </svg>
+  </button>
+
+  <!-- 獨立浮層隨手計算機（不關閉既有頁面或編輯彈窗） -->
+  <div class="calc-backdrop" id="calcBackdrop" role="dialog" aria-modal="true" aria-label="隨手計算機">
+    <div class="calc-sheet" id="calcSheet">
+      <div class="calc-head">
+        <div class="calc-head-left">
+          <span class="calc-title">隨手計算機</span>
+          <span class="calc-target-badge" id="calcTargetBadge">獨立試算模式</span>
+        </div>
+        <button type="button" class="icon-btn sm" id="calcCloseBtn" aria-label="關閉計算機">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <div class="calc-display">
+        <div class="calc-display-top">
+          <button type="button" class="calc-load-btn" id="calcLoadCurrentBtn" style="display:none"></button>
+        </div>
+        <div class="calc-expr tnum" id="calcExprDisplay">0</div>
+        <div class="calc-result tnum" id="calcResultDisplay"></div>
+      </div>
+
+      <div class="calc-history-row" id="calcHistoryRow" style="display:none"></div>
+
+      <div class="calc-keypad" id="calcKeypad">
+        <button type="button" class="calc-key fn" data-calc-key="clear">AC</button>
+        <button type="button" class="calc-key fn" data-calc-key="back" aria-label="倒退">⌫</button>
+        <button type="button" class="calc-key fn" data-calc-key="paren">( )</button>
+        <button type="button" class="calc-key op" data-calc-key="/">÷</button>
+
+        <button type="button" class="calc-key" data-calc-key="7">7</button>
+        <button type="button" class="calc-key" data-calc-key="8">8</button>
+        <button type="button" class="calc-key" data-calc-key="9">9</button>
+        <button type="button" class="calc-key op" data-calc-key="*">×</button>
+
+        <button type="button" class="calc-key" data-calc-key="4">4</button>
+        <button type="button" class="calc-key" data-calc-key="5">5</button>
+        <button type="button" class="calc-key" data-calc-key="6">6</button>
+        <button type="button" class="calc-key op" data-calc-key="-">−</button>
+
+        <button type="button" class="calc-key" data-calc-key="1">1</button>
+        <button type="button" class="calc-key" data-calc-key="2">2</button>
+        <button type="button" class="calc-key" data-calc-key="3">3</button>
+        <button type="button" class="calc-key op" data-calc-key="+">+</button>
+
+        <button type="button" class="calc-key fn" data-calc-key="%">%</button>
+        <button type="button" class="calc-key" data-calc-key="0">0</button>
+        <button type="button" class="calc-key" data-calc-key=".">.</button>
+        <button type="button" class="calc-key eq" data-calc-key="eval">=</button>
+      </div>
+
+      <div class="calc-footer">
+        <button type="button" class="btn btn-outline" id="calcCopyBtn">複製結果</button>
+        <button type="button" class="btn btn-primary" id="calcApplyBtn">完成關閉</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
   <script type="module" src="/src/main.ts"></script>
 </body>

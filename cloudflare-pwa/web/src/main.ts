@@ -45,6 +45,7 @@ import {
 import { initBottomNavScrub } from './ui/tabBarScrub';
 import { openConflictsModal } from './ui/conflictUi';
 import { openHelpGuideModal } from './ui/helpGuideUi';
+import { initFloatingCalculator } from './ui/calculatorUi';
 import type {
   AppUiState,
   StockCardDisplayMode,
@@ -838,12 +839,17 @@ function bindEvents(ctx: UiContext): void {
   // Tab 5 Utility subtab events
   bindUtilityTabEvents(ctx);
 
+  // Global non-disruptive floating mini calculator
+  initFloatingCalculator();
+
   // iOS PWA Auto-Sync on reconnect / return to foreground + Idle Auto-Lock
   const checkIdle = () => {
     if (ctx.state.idleMinutes <= 0) return;
     if (el('lockScreen').classList.contains('open')) return;
     if (Date.now() - ctx.state.lastActivityAt < ctx.state.idleMinutes * 60 * 1000) return;
 
+    el('calcBackdrop').classList.remove('open');
+    el('calcFabBtn').classList.remove('is-open');
     closeModal();
     if (isAnyLockEnabled(ctx)) {
       openLockScreen(ctx, `閒置超過 ${ctx.state.idleMinutes} 分鐘，已自動鎖定`);

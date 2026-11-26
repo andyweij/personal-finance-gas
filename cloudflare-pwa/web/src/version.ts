@@ -2,13 +2,14 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.7.0';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.7.1';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0011';
-export const SW_CACHE_VERSION = 'finance-pwa-v18';
+export const SW_CACHE_VERSION = 'finance-pwa-v19';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.7.1：新增全域可拖曳「懸浮隨手計算機」（不中斷既有表單與編輯彈窗，支援四則運算／括號／百分比、近期計算紀錄，以及一鍵帶入剛剛輸入的金額或股數欄位並自動重算）',
   'v1.7.0：新增多帳本隔離管理（可建立獨立帳本隔離流水帳、多項活存與資產，並自由設定是否計入個人總資產／淨值與月底快照；支援單筆資產排除、各帳本獨立預設連動活存與常態收支跨帳本自動入帳）',
   'v1.6.0：持股頁新增「觀察清單」（自動更新報價但不計入總資產與投資組合，支援一鍵轉為持股）、昨收價與今日漲跌／日損益自動配色、股價最後更新時間顯示，以及單欄大張 3D 翻牌卡檢視模式',
   'v1.5.0：新增美股／ETF 自動行情同步（支援 VOO、NVDA、AAPL、BRK.B、NASDAQ:TSLA 等格式，Yahoo Finance ＋ Stooq 免費雙備援，並強化台股上櫃／債券 ETF 自動報價與美股收盤後排程）',
