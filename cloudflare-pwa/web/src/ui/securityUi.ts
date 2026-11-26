@@ -1023,10 +1023,12 @@ export function openSecurityModal(ctx: UiContext): void {
       const summaries: string[] = [];
       for (const file of files) {
         const csvText = await file.text();
+        const headers: Record<string, string> = { 'content-type': 'application/json' };
+        if (ctx.state.currentUser?.id) headers['x-expected-user'] = ctx.state.currentUser.id;
         const res = await fetch('/api/import/csv', {
           method: 'POST',
           credentials: 'same-origin',
-          headers: { 'content-type': 'application/json' },
+          headers,
           body: JSON.stringify({ csvText }),
         });
         const json = (await res.json()) as {
@@ -1070,10 +1072,12 @@ export function openSecurityModal(ctx: UiContext): void {
     setLoading(true);
     try {
       const parsed = JSON.parse(await file.text());
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (ctx.state.currentUser?.id) headers['x-expected-user'] = ctx.state.currentUser.id;
       const res = await fetch('/api/import/json', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
+        headers,
         body: JSON.stringify({ mode: 'merge', data: parsed.data || parsed }),
       });
       const json = (await res.json()) as { ok?: boolean; error?: string };

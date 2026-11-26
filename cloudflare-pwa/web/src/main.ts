@@ -78,7 +78,11 @@ function renderSyncPill(status: SyncStatus): void {
   if (status.state === 'conflict') {
     const cCount = status.conflictCount || 0;
     const rCount = status.rejectedCount || 0;
-    if (cCount > 0 && rCount > 0) {
+    const fCount = status.frozenOutboxCount || 0;
+    if (fCount > 0) {
+      pill.textContent = `⚠ 待確認 (${fCount + cCount + rCount})`;
+      pill.title = `雲端已從備份還原，有 ${fCount} 筆還原前離線異動待確認，點擊處理`;
+    } else if (cCount > 0 && rCount > 0) {
       pill.textContent = `⚠ 異常 (${cCount + rCount})`;
       pill.title = `有 ${cCount} 筆版本衝突與 ${rCount} 筆同步失敗，點擊處理`;
     } else if (rCount > 0) {
@@ -325,10 +329,25 @@ async function bootstrap(): Promise<void> {
   if (accountChannel) {
     accountChannel.onmessage = (evt: MessageEvent) => {
       const msg = evt.data as { type?: string; userId?: string } | null;
-      if (!msg || msg.type !== 'account_changed') return;
+      if (!msg) return;
+      if (msg.type === 'logout') {
+        ctx.engine.haltForAccountMismatch();
+        ctx.state.authenticated = false;
+        showToast('其他分頁已登出帳號，已停止同步', 'error');
+        openAuthScreen(ctx, 'login', '其他分頁已登出帳號，請重新登入', () => {
+          void fetchAuthStatus().then(async (auth) => {
+            if (auth.authenticated && auth.user) {
+              await ctx.switchAccountDb(auth.user);
+              void ctx.engine.syncNow(true);
+            }
+          });
+        });
+        return;
+      }
+      if (msg.type !== 'account_changed') return;
       const currentId = ctx.state.currentUser?.id || remembered?.id;
       if (msg.userId && msg.userId !== currentId) {
-        ctx.engine.destroy();
+        ctx.engine.haltForAccountMismatch();
         showToast('其他分頁已切換登入帳號，正在同步切換對應帳本…');
         void fetchAuthStatus()
           .then(async (auth) => {
@@ -843,7 +862,13 @@ function bindEvents(ctx: UiContext): void {
   const refreshMarketAction = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/market/refresh', { method: 'POST', credentials: 'same-origin' });
+      const headers: Record<string, string> = {};
+      if (ctx.state.currentUser?.id) headers['x-expected-user'] = ctx.state.currentUser.id;
+      const res = await fetch('/api/market/refresh', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
+      });
       const json = (await res.json()) as {
         usdTwdRate?: number;
         updatedTickers?: unknown[];

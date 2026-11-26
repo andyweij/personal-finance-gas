@@ -256,9 +256,112 @@ export class LocalFinanceDB {
     });
   }
 
+  async getFrozenOutbox(): Promise<SyncMutation[]> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readonly');
+      const req = tx.objectStore(STORE_KV).get('frozen_outbox');
+      req.onsuccess = () => resolve(Array.isArray(req.result) ? (req.result as SyncMutation[]) : []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async saveFrozenOutbox(items: SyncMutation[]): Promise<void> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      tx.objectStore(STORE_KV).put(items, 'frozen_outbox');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async markOutboxBatchSent(mutationIds: string[], sentAtIso: string): Promise<void> {
+    if (mutationIds.length === 0) return;
+    const idSet = new Set(mutationIds);
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_OUTBOX, 'readwrite');
+      const store = tx.objectStore(STORE_OUTBOX);
+      const req = store.getAll();
+      req.onsuccess = () => {
+        const list = (req.result as Array<SyncMutation & { _seq?: number }>) || [];
+        for (const item of list) {
+          if (idSet.has(item.mutationId)) {
+            store.put({
+              ...item,
+              sentAt: item.sentAt || sentAtIso,
+              attempts: (item.attempts ?? 0) + 1,
+            });
+          }
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  private applyMutationsToOutboxStore(
+    outboxStore: IDBObjectStore,
+    existingList: Array<SyncMutation & { _seq?: number }>,
+    mutations: SyncMutation[],
+    inFlightIds?: ReadonlySet<string>
+  ): void {
+    const byKey = new Map<string, SyncMutation & { _seq?: number }>();
+    const lockedKeys = new Set<string>();
+    for (const item of existingList) {
+      const k = `${item.entity}:${item.recordId}`;
+      // P2-C2: Once a mutation has ever been sent (persisted sentAt) or is in-flight,
+      // it MUST NOT be coalesced or cancelled by later edits/deletes.
+      const isImmutable = Boolean(item.sentAt) || Boolean(inFlightIds && inFlightIds.has(item.mutationId));
+      if (isImmutable) {
+        lockedKeys.add(k);
+      } else {
+        byKey.set(k, item);
+      }
+    }
+
+    for (const mut of mutations) {
+      const key = `${mut.entity}:${mut.recordId}`;
+      const prev = byKey.get(key);
+      if (prev) {
+        outboxStore.delete(prev.mutationId);
+        const prevIsNewUnsynced =
+          prev.op === 'upsert' &&
+          (prev.isNewRecord !== undefined
+            ? prev.isNewRecord
+            : prev.baseVersion === null || prev.baseVersion === 0);
+        if (prevIsNewUnsynced && mut.op === 'delete' && !lockedKeys.has(key)) {
+          // Brand-new offline record deleted before ever being sent -> cancel out completely
+          byKey.delete(key);
+          continue;
+        }
+        // Coalesce while preserving the original server baseVersion and isNewRecord marker
+        this.outboxSeq += 1;
+        const coalesced: SyncMutation & { _seq: number } = {
+          ...mut,
+          baseVersion: prev.baseVersion !== undefined ? prev.baseVersion : mut.baseVersion,
+          ...(prev.isNewRecord !== undefined
+            ? { isNewRecord: prev.isNewRecord }
+            : mut.isNewRecord !== undefined
+              ? { isNewRecord: mut.isNewRecord }
+              : {}),
+          _seq: this.outboxSeq,
+        };
+        outboxStore.put(coalesced);
+        byKey.set(key, coalesced);
+      } else {
+        this.outboxSeq += 1;
+        const record = { ...mut, _seq: this.outboxSeq };
+        outboxStore.put(record);
+        byKey.set(key, record);
+      }
+    }
+  }
+
   /**
    * 單一 IndexedDB 交易同時更新本機 Snapshot 並加入 Outbox，並自動整併同一筆紀錄的離線多次修改
-   * （保留最初的伺服器 baseVersion；已送出等待回應的 in-flight mutation 不會被合併或抵銷；
+   * （保留最初的伺服器 baseVersion；曾送出過的 sentAt / in-flight mutation 絕不合併或抵銷；
    * 僅在新建尚未送出時，新建後立即刪除才會互相抵銷）
    */
   async commitLocalMutation(
@@ -275,55 +378,121 @@ export class LocalFinanceDB {
 
       getAllReq.onsuccess = () => {
         const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
-        const byKey = new Map<string, SyncMutation & { _seq?: number }>();
-        const inFlightKeys = new Set<string>();
-        for (const item of existingList) {
-          const k = `${item.entity}:${item.recordId}`;
-          if (inFlightIds && inFlightIds.has(item.mutationId)) {
-            inFlightKeys.add(k);
-          } else {
-            byKey.set(k, item);
-          }
-        }
-
-        for (const mut of mutations) {
-          const key = `${mut.entity}:${mut.recordId}`;
-          const prev = byKey.get(key);
-          if (prev) {
-            outboxStore.delete(prev.mutationId);
-            const prevIsNewUnsynced =
-              prev.op === 'upsert' &&
-              (prev.isNewRecord !== undefined
-                ? prev.isNewRecord
-                : prev.baseVersion === null || prev.baseVersion === 0);
-            if (prevIsNewUnsynced && mut.op === 'delete' && !inFlightKeys.has(key)) {
-              // Brand-new offline record deleted before ever being sent -> cancel out completely
-              byKey.delete(key);
-              continue;
-            }
-            // Coalesce while preserving the original server baseVersion and isNewRecord marker
-            this.outboxSeq += 1;
-            const coalesced: SyncMutation & { _seq: number } = {
-              ...mut,
-              baseVersion: prev.baseVersion !== undefined ? prev.baseVersion : mut.baseVersion,
-              ...(prev.isNewRecord !== undefined
-                ? { isNewRecord: prev.isNewRecord }
-                : mut.isNewRecord !== undefined
-                  ? { isNewRecord: mut.isNewRecord }
-                  : {}),
-              _seq: this.outboxSeq,
-            };
-            outboxStore.put(coalesced);
-            byKey.set(key, coalesced);
-          } else {
-            this.outboxSeq += 1;
-            const record = { ...mut, _seq: this.outboxSeq };
-            outboxStore.put(record);
-            byKey.set(key, record);
-          }
-        }
+        this.applyMutationsToOutboxStore(outboxStore, existingList, mutations, inFlightIds);
       };
 
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async resolveConflictKeepServerTx(
+    snapshot: FinanceSnapshot,
+    conflicts: SyncConflict[]
+  ): Promise<void> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      const kv = tx.objectStore(STORE_KV);
+      kv.put(snapshot, 'snapshot');
+      kv.put(conflicts, 'conflicts');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async resolveConflictKeepLocalTx(
+    snapshot: FinanceSnapshot,
+    conflicts: SyncConflict[],
+    retryMutation: SyncMutation,
+    inFlightIds?: ReadonlySet<string>
+  ): Promise<void> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
+      const kv = tx.objectStore(STORE_KV);
+      kv.put(snapshot, 'snapshot');
+      kv.put(conflicts, 'conflicts');
+      const outboxStore = tx.objectStore(STORE_OUTBOX);
+      const getAllReq = outboxStore.getAll();
+      getAllReq.onsuccess = () => {
+        const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
+        this.applyMutationsToOutboxStore(outboxStore, existingList, [retryMutation], inFlightIds);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async freezeOutboxAndApplySnapshot(
+    snapshot: FinanceSnapshot,
+    meta: LocalMeta,
+    conflicts?: SyncConflict[],
+    rejections?: SyncRejection[]
+  ): Promise<SyncMutation[]> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      let mergedFrozen: SyncMutation[] = [];
+      const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
+      const kv = tx.objectStore(STORE_KV);
+      const outboxStore = tx.objectStore(STORE_OUTBOX);
+      const frozenReq = kv.get('frozen_outbox');
+      const outboxReq = outboxStore.getAll();
+
+      let existingFrozen: SyncMutation[] | null = null;
+      let existingOutbox: Array<SyncMutation & { _seq?: number }> | null = null;
+
+      const tryFinalize = () => {
+        if (existingFrozen === null || existingOutbox === null) return;
+        existingOutbox.sort(
+          (a, b) =>
+            a.clientTimestamp.localeCompare(b.clientTimestamp) || (a._seq ?? 0) - (b._seq ?? 0)
+        );
+        const byId = new Map<string, SyncMutation>();
+        for (const f of existingFrozen) byId.set(f.mutationId, f);
+        for (const item of existingOutbox) {
+          const { _seq: _ignored, ...rest } = item;
+          byId.set(rest.mutationId, rest);
+        }
+        mergedFrozen = Array.from(byId.values());
+        outboxStore.clear();
+        kv.put(mergedFrozen, 'frozen_outbox');
+        kv.put(snapshot, 'snapshot');
+        kv.put(meta, 'meta');
+        if (conflicts !== undefined) kv.put(conflicts, 'conflicts');
+        if (rejections !== undefined) kv.put(rejections, 'rejections');
+      };
+
+      frozenReq.onsuccess = () => {
+        existingFrozen = Array.isArray(frozenReq.result) ? (frozenReq.result as SyncMutation[]) : [];
+        tryFinalize();
+      };
+      outboxReq.onsuccess = () => {
+        existingOutbox = (outboxReq.result as Array<SyncMutation & { _seq?: number }>) || [];
+        tryFinalize();
+      };
+
+      tx.oncomplete = () => resolve(mergedFrozen);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async reapplyFrozenOutboxTx(
+    snapshot: FinanceSnapshot,
+    mutations: SyncMutation[]
+  ): Promise<void> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
+      const kv = tx.objectStore(STORE_KV);
+      kv.put(snapshot, 'snapshot');
+      kv.put([], 'frozen_outbox');
+      const outboxStore = tx.objectStore(STORE_OUTBOX);
+      const getAllReq = outboxStore.getAll();
+      getAllReq.onsuccess = () => {
+        const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
+        this.applyMutationsToOutboxStore(outboxStore, existingList, mutations);
+      };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });

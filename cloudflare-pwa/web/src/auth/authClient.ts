@@ -217,6 +217,15 @@ export async function logoutSession(allDevices = false): Promise<void> {
     method: 'POST',
     credentials: 'same-origin',
   });
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      const ch = new BroadcastChannel('personal-finance-account-sync');
+      ch.postMessage({ type: 'logout' });
+      ch.close();
+    } catch {
+      // Ignore BroadcastChannel errors
+    }
+  }
 }
 
 export async function registerPasskey(deviceName = '我的裝置'): Promise<void> {

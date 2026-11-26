@@ -124,20 +124,95 @@ function computeChangedFields(conflict: SyncConflict): Array<{ label: string; lo
 export function openConflictsModal(ctx: UiContext): void {
   const conflicts = ctx.engine.getConflicts();
   const rejections = ctx.engine.getRejections();
+  const frozenOutbox = ctx.engine.getFrozenOutbox();
+  const totalIssues = conflicts.length + rejections.length + frozenOutbox.length;
   const body = openModal(
-    conflicts.length > 0 && rejections.length > 0
-      ? `同步異常處理（衝突 ${conflicts.length} · 失敗 ${rejections.length}）`
-      : rejections.length > 0
-        ? `同步失敗紀錄 (${rejections.length})`
-        : `同步衝突處理 (${conflicts.length})`
+    frozenOutbox.length > 0
+      ? `帳本已從備份還原（待處理變更 ${frozenOutbox.length}）`
+      : conflicts.length > 0 && rejections.length > 0
+        ? `同步異常處理（衝突 ${conflicts.length} · 失敗 ${rejections.length}）`
+        : rejections.length > 0
+          ? `同步失敗紀錄 (${rejections.length})`
+          : `同步衝突處理 (${conflicts.length})`
   );
 
-  if (!conflicts.length && !rejections.length) {
+  if (totalIssues === 0) {
     const empty = document.createElement('div');
     empty.className = 'list-empty';
     empty.textContent = '目前沒有任何同步衝突或失敗紀錄，所有裝置資料一致。';
     body.appendChild(empty);
     return;
+  }
+
+  if (frozenOutbox.length > 0) {
+    const frozenCard = document.createElement('div');
+    frozenCard.className = 'conflict-card';
+    frozenCard.style.marginBottom = '14px';
+
+    const head = document.createElement('div');
+    head.className = 'conflict-head';
+    const title = document.createElement('div');
+    title.className = 'conflict-title';
+    title.textContent = `雲端已透過「覆蓋還原」重設帳本，已暫停上傳本機 ${frozenOutbox.length} 筆離線異動`;
+    const badge = document.createElement('span');
+    badge.className = 'badge warn';
+    badge.style.marginRight = '0';
+    badge.textContent = `已凍結 ${frozenOutbox.length} 筆`;
+    head.appendChild(title);
+    head.appendChild(badge);
+    frozenCard.appendChild(head);
+
+    const desc = document.createElement('div');
+    desc.className = 'conflict-del-note';
+    desc.textContent =
+      '目前畫面已載入雲端最新還原的帳本。請決定要捨棄這批還原前的本機待送變更，或將它們重新套用至目前還原後的帳本：';
+    frozenCard.appendChild(desc);
+
+    const actions = document.createElement('div');
+    actions.className = 'conflict-actions';
+
+    const discardBtn = document.createElement('button');
+    discardBtn.type = 'button';
+    discardBtn.className = 'btn btn-outline btn-sm';
+    discardBtn.textContent = '全部捨棄（保留還原資料）';
+    discardBtn.addEventListener('click', async () => {
+      discardBtn.disabled = true;
+      await ctx.engine.discardFrozenOutbox();
+      showToast('已捨棄還原前的待送變更，保留雲端還原資料', 'success');
+      if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+        openConflictsModal(ctx);
+      } else {
+        closeModal();
+      }
+    });
+
+    const reapplyBtn = document.createElement('button');
+    reapplyBtn.type = 'button';
+    reapplyBtn.className = 'btn btn-primary btn-sm';
+    reapplyBtn.textContent = `重新套用這 ${frozenOutbox.length} 筆變更`;
+    reapplyBtn.addEventListener('click', async () => {
+      reapplyBtn.disabled = true;
+      const res = await ctx.engine.reapplyFrozenOutbox();
+      if (res.ok) {
+        showToast('已將待送變更重新套用至目前帳本', 'success');
+      } else if (!res.authRequired) {
+        showToast(res.error || '重新套用同步未完全完成，稍後將自動重試', 'error');
+      }
+      if (
+        ctx.engine.getConflicts().length > 0 ||
+        ctx.engine.getRejections().length > 0 ||
+        ctx.engine.getFrozenOutbox().length > 0
+      ) {
+        openConflictsModal(ctx);
+      } else {
+        closeModal();
+      }
+    });
+
+    actions.appendChild(discardBtn);
+    actions.appendChild(reapplyBtn);
+    frozenCard.appendChild(actions);
+    body.appendChild(frozenCard);
   }
 
   if (conflicts.length > 0) {

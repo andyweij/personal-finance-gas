@@ -353,6 +353,8 @@ export interface SyncMutation {
   baseVersion?: number | null;
   isNewRecord?: boolean;
   payload?: Record<string, unknown>;
+  sentAt?: string;
+  attempts?: number;
   retryCount?: number;
   lastError?: string;
 }
@@ -407,6 +409,7 @@ export interface SyncResponse {
   syncCursor?: number;
   dataEpoch?: number;
   fullResyncRequired?: boolean;
+  epochMismatch?: boolean;
   ackedMutationIds: string[];
   rejected: Array<{ mutationId: string; reason: string }>;
   conflicts?: SyncConflict[];

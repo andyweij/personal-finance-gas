@@ -109,20 +109,28 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
   }
 
   const nowIso = new Date().toISOString();
-  await db
-    .prepare(
-      `INSERT OR IGNORE INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, auto_fx_enabled, pnl_color_scheme, custom_stock_categories, updated_at, version)
-       VALUES (?, ?, ?, ?, 1, ?, '[]', ?, 1)`
-    )
-    .bind(
-      uid,
-      DEFAULT_MONTHLY_DAILY_BUDGET,
-      DEFAULT_EMERGENCY_MONTHS,
-      DEFAULT_USD_TWD_RATE,
-      DEFAULT_PNL_COLOR_SCHEME,
-      nowIso
-    )
-    .run();
+  await db.batch([
+    db
+      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+      .bind(uid, nowIso),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, auto_fx_enabled, pnl_color_scheme, custom_stock_categories, updated_at, version, change_seq)
+         VALUES (?, ?, ?, ?, 1, ?, '[]', ?, 1, ${NEXT_SEQ_SQL})`
+      )
+      .bind(
+        uid,
+        DEFAULT_MONTHLY_DAILY_BUDGET,
+        DEFAULT_EMERGENCY_MONTHS,
+        DEFAULT_USD_TWD_RATE,
+        DEFAULT_PNL_COLOR_SCHEME,
+        nowIso,
+        uid
+      ),
+    db
+      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+      .bind(nowIso, uid),
+  ]);
 
   return {
     monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
@@ -145,21 +153,29 @@ export async function ensureDefaultLedger(db: D1Database, userId: string): Promi
     .first();
   if (existing) return;
   const nowIso = new Date().toISOString();
-  await db
-    .prepare(
-      `INSERT OR IGNORE INTO ledgers
-        (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
-       VALUES (?, ?, ?, 1, NULL, ?, 1, ?, ?, NULL, 1)`
-    )
-    .bind(
-      uid,
-      DEFAULT_LEDGER_ID,
-      DEFAULT_LEDGER_NAME,
-      '預設個人帳本（納入總資產與淨值統計）',
-      nowIso,
-      nowIso
-    )
-    .run();
+  await db.batch([
+    db
+      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+      .bind(uid, nowIso),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO ledgers
+          (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+         VALUES (?, ?, ?, 1, NULL, ?, 1, ?, ?, NULL, 1, ${NEXT_SEQ_SQL})`
+      )
+      .bind(
+        uid,
+        DEFAULT_LEDGER_ID,
+        DEFAULT_LEDGER_NAME,
+        '預設個人帳本（納入總資產與淨值統計）',
+        nowIso,
+        nowIso,
+        uid
+      ),
+    db
+      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+      .bind(nowIso, uid),
+  ]);
 }
 
 function mapLedgerRow(r: Record<string, unknown>): Ledger {
@@ -2003,21 +2019,17 @@ export async function processSyncRequest(
     req.clientEpoch !== syncStateBefore.dataEpoch;
 
   if (epochMismatch) {
-    for (const mut of mutations) {
-      if (mut?.mutationId) {
-        rejected.push({
-          mutationId: mut.mutationId,
-          reason: '伺服器資料已透過備份還原重設，請於完整重載後確認是否重新套用',
-        });
-      }
-    }
+    // P2-C4: Do NOT dump mutations into rejected[] (which only saw up to 50 items and discarded them).
+    // Return epochMismatch: true + full snapshot so the client freezes ALL pending outbox items and prompts the user.
     const fullDelta = await querySyncDelta(db, uid, null);
+    const syncStateNow = await ensureUserSyncState(db, uid);
     return {
       ok: true,
       serverTime,
-      syncCursor: syncStateBefore.changeSeq,
-      dataEpoch: syncStateBefore.dataEpoch,
+      syncCursor: syncStateNow.changeSeq,
+      dataEpoch: syncStateNow.dataEpoch,
       fullResyncRequired: true,
+      epochMismatch: true,
       ackedMutationIds,
       rejected,
       conflicts,
@@ -2069,9 +2081,52 @@ export async function processSyncRequest(
 
   const syncStateAfter = await ensureUserSyncState(db, uid);
   const useSeqCursor = typeof req.sinceSeq === 'number' && Number.isFinite(req.sinceSeq);
+  const legacySinceAfterReplace =
+    !useSeqCursor &&
+    Boolean(req.since) &&
+    (req.clientEpoch === undefined || req.clientEpoch === null) &&
+    syncStateAfter.dataEpoch > 1;
+  const epochChangedMidRequest = syncStateAfter.dataEpoch !== syncStateBefore.dataEpoch;
+
+  if (epochChangedMidRequest || legacySinceAfterReplace) {
+    // P2-S2 & P2-S9: Never return a partial delta with a bumped epoch or for a legacy `since` client after replace import
+    const fullDelta = await querySyncDelta(db, uid, null);
+    const syncStateFinal = await ensureUserSyncState(db, uid);
+    return {
+      ok: true,
+      serverTime,
+      syncCursor: syncStateFinal.changeSeq,
+      dataEpoch: syncStateFinal.dataEpoch,
+      fullResyncRequired: true,
+      ...(epochChangedMidRequest ? { epochMismatch: true } : {}),
+      ackedMutationIds,
+      rejected,
+      conflicts,
+      delta: fullDelta,
+    };
+  }
+
   const delta = useSeqCursor
     ? await querySyncDelta(db, uid, null, req.sinceSeq, syncStateAfter.changeSeq)
     : await querySyncDelta(db, uid, req.since);
+
+  // P2-S2: Final epoch verification after delta query in case a replace import committed concurrently
+  const syncStateFinal = await ensureUserSyncState(db, uid);
+  if (syncStateFinal.dataEpoch !== syncStateAfter.dataEpoch) {
+    const fullDelta = await querySyncDelta(db, uid, null);
+    return {
+      ok: true,
+      serverTime,
+      syncCursor: syncStateFinal.changeSeq,
+      dataEpoch: syncStateFinal.dataEpoch,
+      fullResyncRequired: true,
+      epochMismatch: true,
+      ackedMutationIds,
+      rejected,
+      conflicts,
+      delta: fullDelta,
+    };
+  }
 
   return {
     ok: true,
@@ -2290,9 +2345,19 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO ledgers
+          `INSERT INTO ledgers
             (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM ledgers WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, id) DO UPDATE SET
+             name = excluded.name,
+             include_in_net_worth = excluded.include_in_net_worth,
+             monthly_daily_budget = excluded.monthly_daily_budget,
+             note = excluded.note,
+             sort_order = excluded.sort_order,
+             updated_at = excluded.updated_at,
+             version = ledgers.version + 1,
+             change_seq = excluded.change_seq
+           WHERE ledgers.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2304,8 +2369,6 @@ export async function importFullSnapshot(
           v.sortOrder,
           createdAt,
           nowIso,
-          uid,
-          lid,
           uid
         )
     );
@@ -2346,9 +2409,27 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO cashflow_logs
+          `INSERT INTO cashflow_logs
             (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM cashflow_logs WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, id) DO UPDATE SET
+             date = excluded.date,
+             year_month = excluded.year_month,
+             type = excluded.type,
+             category = excluded.category,
+             item_name = excluded.item_name,
+             amount = excluded.amount,
+             currency = excluded.currency,
+             fx_rate = excluded.fx_rate,
+             twd_amount = excluded.twd_amount,
+             source = excluded.source,
+             note = excluded.note,
+             linked_account_id = excluded.linked_account_id,
+             ledger_id = excluded.ledger_id,
+             updated_at = excluded.updated_at,
+             version = cashflow_logs.version + 1,
+             change_seq = excluded.change_seq
+           WHERE cashflow_logs.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2368,8 +2449,6 @@ export async function importFullSnapshot(
           v.ledgerId,
           createdAt,
           nowIso,
-          uid,
-          id,
           uid
         )
     );
@@ -2379,9 +2458,26 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO recurring_items
+          `INSERT INTO recurring_items
             (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM recurring_items WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, id) DO UPDATE SET
+             item_name = excluded.item_name,
+             category = excluded.category,
+             type = excluded.type,
+             amount = excluded.amount,
+             currency = excluded.currency,
+             cycle = excluded.cycle,
+             billing_spec = excluded.billing_spec,
+             status = excluded.status,
+             note = excluded.note,
+             linked_account_id = excluded.linked_account_id,
+             ledger_id = excluded.ledger_id,
+             sort_order = excluded.sort_order,
+             updated_at = excluded.updated_at,
+             version = recurring_items.version + 1,
+             change_seq = excluded.change_seq
+           WHERE recurring_items.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2400,8 +2496,6 @@ export async function importFullSnapshot(
           v.sortOrder,
           createdAt,
           nowIso,
-          uid,
-          id,
           uid
         )
     );
@@ -2411,9 +2505,22 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO sinking_fund_items
+          `INSERT INTO sinking_fund_items
             (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM sinking_fund_items WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, id) DO UPDATE SET
+             item_name = excluded.item_name,
+             category = excluded.category,
+             total_amount = excluded.total_amount,
+             months = excluded.months,
+             due_note = excluded.due_note,
+             status = excluded.status,
+             note = excluded.note,
+             sort_order = excluded.sort_order,
+             updated_at = excluded.updated_at,
+             version = sinking_fund_items.version + 1,
+             change_seq = excluded.change_seq
+           WHERE sinking_fund_items.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2428,8 +2535,6 @@ export async function importFullSnapshot(
           v.sortOrder,
           createdAt,
           nowIso,
-          uid,
-          id,
           uid
         )
     );
@@ -2439,9 +2544,40 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO asset_items
+          `INSERT INTO asset_items
             (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM asset_items WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, id) DO UPDATE SET
+             update_mode = excluded.update_mode,
+             major_type = excluded.major_type,
+             sub_category = excluded.sub_category,
+             liquidity = excluded.liquidity,
+             item_name = excluded.item_name,
+             ticker = excluded.ticker,
+             quantity_or_amount = excluded.quantity_or_amount,
+             currency = excluded.currency,
+             unit_price = excluded.unit_price,
+             previous_close = excluded.previous_close,
+             cost_basis = excluded.cost_basis,
+             price_updated_at = excluded.price_updated_at,
+             note = excluded.note,
+             is_linked_savings = excluded.is_linked_savings,
+             balance_anchor_date = excluded.balance_anchor_date,
+             balance_anchor_at = excluded.balance_anchor_at,
+             is_default_savings = excluded.is_default_savings,
+             is_amortizing_loan = excluded.is_amortizing_loan,
+             loan_annual_rate = excluded.loan_annual_rate,
+             loan_monthly_payment = excluded.loan_monthly_payment,
+             loan_billing_day = excluded.loan_billing_day,
+             sort_order = excluded.sort_order,
+             stock_category = excluded.stock_category,
+             is_watchlist = excluded.is_watchlist,
+             ledger_id = excluded.ledger_id,
+             exclude_from_net_worth = excluded.exclude_from_net_worth,
+             updated_at = excluded.updated_at,
+             version = asset_items.version + 1,
+             change_seq = excluded.change_seq
+           WHERE asset_items.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2474,8 +2610,6 @@ export async function importFullSnapshot(
           v.excludeFromNetWorth ? 1 : 0,
           createdAt,
           nowIso,
-          uid,
-          id,
           uid
         )
     );
@@ -2485,9 +2619,20 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO savings_adjustments
+          `INSERT INTO savings_adjustments
             (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM savings_adjustments WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, id) DO UPDATE SET
+             account_id = excluded.account_id,
+             date = excluded.date,
+             amount = excluded.amount,
+             twd_amount = excluded.twd_amount,
+             note = excluded.note,
+             transfer_group_id = excluded.transfer_group_id,
+             updated_at = excluded.updated_at,
+             version = savings_adjustments.version + 1,
+             change_seq = excluded.change_seq
+           WHERE savings_adjustments.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2500,8 +2645,6 @@ export async function importFullSnapshot(
           v.transferGroupId,
           createdAt,
           nowIso,
-          uid,
-          id,
           uid
         )
     );
@@ -2511,9 +2654,22 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO stock_transactions
+          `INSERT INTO stock_transactions
             (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM stock_transactions WHERE user_id = ? AND id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, id) DO UPDATE SET
+             asset_id = excluded.asset_id,
+             date = excluded.date,
+             tx_type = excluded.tx_type,
+             shares = excluded.shares,
+             total_amount = excluded.total_amount,
+             fee = excluded.fee,
+             linked_cashflow_id = excluded.linked_cashflow_id,
+             note = excluded.note,
+             updated_at = excluded.updated_at,
+             version = stock_transactions.version + 1,
+             change_seq = excluded.change_seq
+           WHERE stock_transactions.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2528,8 +2684,6 @@ export async function importFullSnapshot(
           v.note,
           createdAt,
           nowIso,
-          uid,
-          id,
           uid
         )
     );
@@ -2567,8 +2721,16 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT version FROM rent_utility_settings WHERE user_id = ?), 0) + 1, ${CURR_SEQ_SQL})`
+          `INSERT INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id) DO UPDATE SET
+             rent_6f = excluded.rent_6f,
+             rent_a = excluded.rent_a,
+             rent_b = excluded.rent_b,
+             rent_c = excluded.rent_c,
+             updated_at = excluded.updated_at,
+             version = rent_utility_settings.version + 1,
+             change_seq = excluded.change_seq`
         )
         .bind(
           uid,
@@ -2577,7 +2739,6 @@ export async function importFullSnapshot(
           validatedUtilityRents.rentB,
           validatedUtilityRents.rentC,
           nowIso,
-          uid,
           uid
         )
     );
@@ -2587,9 +2748,24 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO rent_utility_records
+          `INSERT INTO rent_utility_records
             (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version, change_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, COALESCE((SELECT version FROM rent_utility_records WHERE user_id = ? AND period = ?), 0) + 1, ${CURR_SEQ_SQL})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})
+           ON CONFLICT(user_id, period) DO UPDATE SET
+             is_baseline = excluded.is_baseline,
+             cur_total = excluded.cur_total,
+             cur_6f = excluded.cur_6f,
+             total_elec = excluded.total_elec,
+             total_water = excluded.total_water,
+             f6_people = excluded.f6_people,
+             f5_people = excluded.f5_people,
+             cur_a = excluded.cur_a,
+             cur_b = excluded.cur_b,
+             cur_c = excluded.cur_c,
+             updated_at = excluded.updated_at,
+             version = rent_utility_records.version + 1,
+             change_seq = excluded.change_seq
+           WHERE rent_utility_records.deleted_at IS NULL`
         )
         .bind(
           uid,
@@ -2606,8 +2782,6 @@ export async function importFullSnapshot(
           v.curC,
           createdAt,
           nowIso,
-          uid,
-          v.period,
           uid
         )
     );

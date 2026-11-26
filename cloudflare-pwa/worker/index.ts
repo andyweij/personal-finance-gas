@@ -471,26 +471,40 @@ export function createApp() {
   });
 
   // Core Offline-First Bidirectional Sync Endpoint (strictly scoped to authUser.id)
-  const MAX_SYNC_BODY_BYTES = 2 * 1024 * 1024; // 2 MB
+  const MAX_SYNC_BODY_BYTES = 2 * 1024 * 1024; // 2 MB UTF-8 bytes
   const MAX_SYNC_MUTATIONS = 200;
+  const textEncoder = new TextEncoder();
+
+  const checkExpectedUserMismatch = (
+    expectedHeader: string | undefined,
+    actualUserId: string
+  ): { error: string; code: string; expectedUserId: string; actualUserId: string } | null => {
+    const expectedUser = (expectedHeader || '').trim();
+    if (expectedUser && expectedUser !== actualUserId) {
+      return {
+        error: '目前瀏覽器登入帳號已變更，已停止寫入以避免跨帳號污染。請重新整理或切換帳號。',
+        code: 'ACCOUNT_MISMATCH',
+        expectedUserId: expectedUser,
+        actualUserId,
+      };
+    }
+    return null;
+  };
 
   app.post('/api/sync', requireAuth, async (c) => {
     const user = c.get('authUser');
-    const expectedUser = (c.req.header('x-expected-user') || '').trim();
-    if (expectedUser && expectedUser !== user.id) {
-      return c.json(
-        {
-          error: '目前瀏覽器登入帳號已變更，已停止同步以避免跨帳號寫入。請重新整理或切換帳號。',
-          code: 'ACCOUNT_MISMATCH',
-          expectedUserId: expectedUser,
-          actualUserId: user.id,
-        },
-        409
-      );
+    const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
+    if (mismatch) {
+      return c.json(mismatch, 409);
+    }
+
+    const contentLength = Number(c.req.header('content-length') || '');
+    if (Number.isFinite(contentLength) && contentLength > MAX_SYNC_BODY_BYTES) {
+      return c.json({ error: '單次同步請求體積過大，請分批同步。' }, 413);
     }
 
     const rawText = await c.req.text();
-    if (rawText.length > MAX_SYNC_BODY_BYTES) {
+    if (textEncoder.encode(rawText).byteLength > MAX_SYNC_BODY_BYTES) {
       return c.json({ error: '單次同步請求體積過大，請分批同步。' }, 413);
     }
     let body: SyncRequest = { mutations: [] };
@@ -511,6 +525,8 @@ export function createApp() {
   // Manual Automation Triggers (strictly scoped to authUser.id)
   app.post('/api/automation/recurring', requireAuth, async (c) => {
     const user = c.get('authUser');
+    const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
+    if (mismatch) return c.json(mismatch, 409);
     const body = (await c.req.json().catch(() => ({}))) as { year?: number; month?: number };
     const result = await runMonthlyRecurringD1(c.env.DB, user.id, body.year, body.month);
     return c.json({ ok: true, ...result });
@@ -518,13 +534,18 @@ export function createApp() {
 
   app.post('/api/automation/snapshot', requireAuth, async (c) => {
     const user = c.get('authUser');
+    const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
+    if (mismatch) return c.json(mismatch, 409);
     const result = await runMonthEndSnapshotD1(c.env.DB, user.id);
     return c.json({ ok: true, ...result });
   });
 
   app.post('/api/market/refresh', requireAuth, async (c) => {
     const user = c.get('authUser');
-    const result = await refreshMarketData(c.env.DB, fetch, user.id, { forceFx: true });
+    const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
+    if (mismatch) return c.json(mismatch, 409);
+    // Respect user's autoFxEnabled setting instead of forcing FX overwrite
+    const result = await refreshMarketData(c.env.DB, fetch, user.id);
     return c.json({ ok: true, ...result });
   });
 
@@ -542,6 +563,8 @@ export function createApp() {
   app.post('/api/import/json', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
+      const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
+      if (mismatch) return c.json(mismatch, 409);
       const body = (await c.req.json()) as { mode?: 'merge' | 'replace'; data?: Record<string, unknown> };
       const summary = await importFullSnapshot(
         c.env.DB,
@@ -558,6 +581,8 @@ export function createApp() {
   app.post('/api/import/csv', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
+      const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
+      if (mismatch) return c.json(mismatch, 409);
       const body = (await c.req.json()) as { csvText?: string; kind?: GoogleSheetCsvKind };
       const csvText = String(body.csvText || '');
       const kind = body.kind || detectGoogleSheetCsvKind(csvText);
@@ -580,8 +605,10 @@ export function createApp() {
         networth: '淨資產歷史快照 (NetWorth_History)',
       };
 
+      // P2-S1: Bump change_seq and insert all CSV rows atomically inside a single D1 batch
       const currSeqExpr = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)';
-      const bumpSeqForCsv = async () => {
+      const commitCsvBatch = async (rowStmts: D1PreparedStatement[]) => {
+        if (rowStmts.length === 0) return;
         await c.env.DB.batch([
           c.env.DB
             .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
@@ -589,15 +616,15 @@ export function createApp() {
           c.env.DB
             .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
             .bind(nowIso, user.id),
+          ...rowStmts,
         ]);
       };
 
       if (kind === 'cashflow') {
         const settings = await ensureAppSettings(c.env.DB, user.id);
         const rows = parseCashFlowCsv(csvText, settings.usdTwdRate);
-        if (rows.length > 0) await bumpSeqForCsv();
-        for (const v of rows) {
-          await c.env.DB
+        const stmts = rows.map((v) =>
+          c.env.DB
             .prepare(
               `INSERT INTO cashflow_logs
                 (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at, version, change_seq)
@@ -621,16 +648,15 @@ export function createApp() {
               nowIso,
               user.id
             )
-            .run();
-        }
+        );
+        await commitCsvBatch(stmts);
         return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
       }
 
       if (kind === 'recurring') {
         const rows = parseRecurringCsv(csvText);
-        if (rows.length > 0) await bumpSeqForCsv();
-        for (const v of rows) {
-          await c.env.DB
+        const stmts = rows.map((v) =>
+          c.env.DB
             .prepare(
               `INSERT INTO recurring_items
                 (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at, version, change_seq)
@@ -652,16 +678,15 @@ export function createApp() {
               nowIso,
               user.id
             )
-            .run();
-        }
+        );
+        await commitCsvBatch(stmts);
         return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
       }
 
       if (kind === 'sinking') {
         const rows = parseSinkingFundCsv(csvText);
-        if (rows.length > 0) await bumpSeqForCsv();
-        for (const v of rows) {
-          await c.env.DB
+        const stmts = rows.map((v) =>
+          c.env.DB
             .prepare(
               `INSERT INTO sinking_fund_items
                 (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version, change_seq)
@@ -681,16 +706,15 @@ export function createApp() {
               nowIso,
               user.id
             )
-            .run();
-        }
+        );
+        await commitCsvBatch(stmts);
         return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
       }
 
       if (kind === 'asset') {
         const rows = parseAssetsCsv(csvText);
-        if (rows.length > 0) await bumpSeqForCsv();
-        for (const v of rows) {
-          await c.env.DB
+        const stmts = rows.map((v) =>
+          c.env.DB
             .prepare(
               `INSERT INTO asset_items
                 (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at, version, change_seq)
@@ -713,15 +737,14 @@ export function createApp() {
               nowIso,
               user.id
             )
-            .run();
-        }
+        );
+        await commitCsvBatch(stmts);
         return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
       }
 
       const rows = parseNetWorthHistoryCsv(csvText);
-      if (rows.length > 0) await bumpSeqForCsv();
-      for (const h of rows) {
-        await c.env.DB
+      const stmts = rows.map((h) =>
+        c.env.DB
           .prepare(
             `INSERT OR REPLACE INTO networth_history
               (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at, change_seq)
@@ -744,8 +767,8 @@ export function createApp() {
             nowIso,
             user.id
           )
-          .run();
-      }
+      );
+      await commitCsvBatch(stmts);
       return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : 'CSV 解析或匯入失敗' }, 400);

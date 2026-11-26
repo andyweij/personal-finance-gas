@@ -605,9 +605,9 @@ export async function refreshMarketData(
             `UPDATE app_settings
              SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ?, version = version + 1,
                  change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
-             WHERE user_id = ?`
+             WHERE user_id = ? AND (usd_twd_rate IS NOT ? OR fx_updated_at IS NULL)`
           )
-          .bind(usdTwdRate, nowIso, nowIso, uid, uid),
+          .bind(usdTwdRate, nowIso, nowIso, uid, uid, usdTwdRate),
         db
           .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
           .bind(nowIso, uid),
@@ -669,9 +669,20 @@ export async function refreshMarketData(
              SET unit_price = ?, previous_close = ?, price_updated_at = ?, updated_at = ?,
                  version = version + 1,
                  change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
-             WHERE user_id = ? AND id = ?`
+             WHERE user_id = ? AND id = ?
+               AND (unit_price IS NOT ? OR previous_close IS NOT ? OR price_updated_at IS NULL)`
           )
-          .bind(quote.price, quote.previousClose, nowIso, nowIso, item.user_id, item.user_id, item.id),
+          .bind(
+            quote.price,
+            quote.previousClose,
+            nowIso,
+            nowIso,
+            item.user_id,
+            item.user_id,
+            item.id,
+            quote.price,
+            quote.previousClose
+          ),
         db
           .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
           .bind(nowIso, item.user_id),
