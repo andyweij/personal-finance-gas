@@ -243,12 +243,6 @@ export class SyncEngine {
   private accountMismatchHalted = false;
   private consecutiveFailures = 0;
   private poisonSearchActive = false;
-  /**
-   * V1: A single mutation that just failed with 5xx while a read-only pull succeeded. It is only counted
-   * toward quarantine after a *different* mutation (the probe) is written successfully right after it —
-   * a successful read alone does not prove the write path is healthy (e.g. D1 write outage / quota).
-   */
-  private poisonSuspect: { mutationId: string; key: string; lastError: string } | null = null;
   /** R-3: consecutive single-item successes while in poison-search mode; resets batching after a streak. */
   private singleItemSuccessStreak = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -541,7 +535,12 @@ export class SyncEngine {
             m.clientTimestamp &&
             currentInFresh.updatedAt > m.clientTimestamp
           ) {
-            keepSkipped(m, '此紀錄在雲端還原後已有較新的版本，未套用還原前的這筆編輯');
+            // Restored rows get a fresh updated_at, so this conservatively skips most legacy items; the edit is
+            // kept in the list (with its payload) for the user to review and re-enter if still wanted.
+            keepSkipped(
+              m,
+              '此筆為舊版本凍結的編輯，無法判斷雲端還原後是否已有較新版本，為避免覆蓋已暫不套用；如仍需要請參考內容手動重新輸入'
+            );
             continue;
           }
 
@@ -2498,9 +2497,10 @@ export class SyncEngine {
     reqSince: string | null,
     reqSinceSeq: number | null,
     reqClientEpoch: number | null,
-    forceFullPull = false
-  ): Promise<{ ok: boolean; epochFrozen: boolean }> {
-    if (!this.isOnline()) return { ok: false, epochFrozen: false };
+    forceFullPull = false,
+    writeProbe = false
+  ): Promise<{ ok: boolean; epochFrozen: boolean; writeProbeOk: boolean }> {
+    if (!this.isOnline()) return { ok: false, epochFrozen: false, writeProbeOk: false };
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), Math.min(this.requestTimeoutMs, 15_000));
     try {
@@ -2518,9 +2518,10 @@ export class SyncEngine {
           sinceSeq: reqSinceSeq,
           clientEpoch: reqClientEpoch,
           mutations: [],
+          ...(writeProbe ? { writeProbe: true } : {}),
         }),
       });
-      if (!res.ok) return { ok: false, epochFrozen: false };
+      if (!res.ok) return { ok: false, epochFrozen: false, writeProbeOk: false };
       const data = (await res.json()) as SyncResponse;
       let epochFrozen = false;
       await this.runSerialized(async () => {
@@ -2566,10 +2567,10 @@ export class SyncEngine {
         this.emitSnapshot();
         this.broadcastDbChanged();
       });
-      return { ok: true, epochFrozen };
+      return { ok: true, epochFrozen, writeProbeOk: data.writeProbeOk === true };
     } catch {
       // Best-effort read-only pull; ignore secondary errors
-      return { ok: false, epochFrozen: false };
+      return { ok: false, epochFrozen: false, writeProbeOk: false };
     } finally {
       clearTimeout(timeoutId);
     }
@@ -2605,29 +2606,13 @@ export class SyncEngine {
       let reqSinceSeq: number | null = null;
       let reqClientEpoch: number | null = null;
 
-      let probeMutationId: string | null = null;
-
       await this.runSerialized(async () => {
         outbox = await this.db.getOutbox();
         // R2 & Q1: Shrink batch size to 1 after a failure or while isolating a poison-pill mutation
         const effectiveBatchSize =
           this.consecutiveFailures >= 1 || this.poisonSearchActive ? 1 : this.maxBatchSize;
-        // V1: While a poison suspect is pending, send ONE mutation of a different record as a write-path probe
-        if (this.poisonSuspect && !outbox.some((m) => m.mutationId === this.poisonSuspect!.mutationId)) {
-          this.poisonSuspect = null;
-        }
-        const suspectKey = this.poisonSuspect?.key;
-        const probe = suspectKey
-          ? outbox.find((m) => `${m.entity}:${m.recordId}` !== suspectKey)
-          : undefined;
-        if (probe) {
-          batch = [probe];
-          probeMutationId = probe.mutationId;
-        } else {
-          this.poisonSuspect = null;
-          // Q4 / N1: At most one mutation per entity:recordId per HTTP batch
-          batch = this.selectSyncBatch(outbox, effectiveBatchSize);
-        }
+        // Q4 / N1 & V2: strict queue prefix, at most one mutation per entity:recordId per HTTP batch
+        batch = this.selectSyncBatch(outbox, effectiveBatchSize);
         hadMoreBatches = outbox.length > batch.length;
         // P2-C2: Persist sentAt & attempts to IndexedDB BEFORE sending HTTP request so timeout/reload never coalesces sent mutations
         if (batch.length > 0) {
@@ -2744,16 +2729,6 @@ export class SyncEngine {
 
         const data = (await res.json()) as SyncResponse;
         this.consecutiveFailures = 0;
-
-        // V1: A probe is sent out of queue order. If the server rejects it, the rejection may only reflect
-        // that ordering (e.g. it depends on the suspect), so keep it queued instead of dropping it.
-        let probeAcked = false;
-        if (probeMutationId) {
-          if (Array.isArray(data.rejected)) {
-            data.rejected = data.rejected.filter((r) => r.mutationId !== probeMutationId);
-          }
-          probeAcked = (data.ackedMutationIds || []).includes(probeMutationId);
-        }
 
         let passOutcome: {
           epochFrozen: boolean;
@@ -3067,29 +3042,8 @@ export class SyncEngine {
           return { ok: true, epochMismatch: true };
         }
 
-        // V1: Probe result. A successful probe write right after the suspect failed proves the write path is
-        // healthy, so the suspect's failure is item-specific and counts toward quarantine.
-        if (probeMutationId && this.poisonSuspect) {
-          const suspect = this.poisonSuspect;
-          this.poisonSuspect = null;
-          if (probeAcked) {
-            const updated = await this.db.incrementOutboxRetryCounts([suspect.mutationId], suspect.lastError);
-            const suspectMut = updated[0];
-            if (
-              suspectMut &&
-              (suspectMut.retryCount ?? 0) >= this.maxPoisonRetries &&
-              !quarantinedInThisSync
-            ) {
-              quarantinedInThisSync = true;
-              await this.quarantinePoisonMutation(suspectMut, suspect.lastError);
-            }
-            fullPullPass = false;
-            continue;
-          }
-        }
-
         // R-3: Leave single-item isolation mode after a streak of healthy single-item writes
-        if (batch.length === 1 && this.poisonSearchActive && !probeMutationId && passOutcome.madeForwardProgress) {
+        if (batch.length === 1 && this.poisonSearchActive && passOutcome.madeForwardProgress) {
           this.singleItemSuccessStreak += 1;
           if (this.singleItemSuccessStreak >= 5) {
             this.poisonSearchActive = false;
@@ -3145,36 +3099,18 @@ export class SyncEngine {
           // 1) Downloads server changes so outbox failures never block pulls.
           // 2) Probes server health: if `mutations: []` ALSO fails (global server outage),
           //    we MUST NOT increment poison retryCount or quarantine healthy mutations!
-          const pullRes = await this.tryReadOnlyPull(reqSince, reqSinceSeq, reqClientEpoch, fullPullPass);
+          // V1: The pull also asks the server for a harmless write (writeProbe). Only a successful write proves
+          // the write path is healthy; a successful read alone does not (e.g. D1 write outage / quota).
+          const pullRes = await this.tryReadOnlyPull(reqSince, reqSinceSeq, reqClientEpoch, fullPullPass, true);
           if (pullRes.epochFrozen) {
             return { ok: true, epochMismatch: true };
           }
 
           const isDeterministicPayloadError = httpStatus === 400 || httpStatus === 413;
+          const isItemSpecificFailure =
+            isDeterministicPayloadError || (pullRes.ok && pullRes.writeProbeOk);
 
-          if (!isDeterministicPayloadError && pullRes.ok) {
-            // V1: 5xx while reads work. This alone does NOT prove the mutation is poison (the write path may be down).
-            this.singleItemSuccessStreak = 0;
-            if (probeMutationId) {
-              // The probe failed too → server-wide write failure. Count nothing; back off below.
-              this.poisonSuspect = null;
-            } else if (batch.length > 1) {
-              this.poisonSearchActive = true;
-            } else {
-              const failed = batch[0];
-              const key = `${failed.entity}:${failed.recordId}`;
-              const currentOutbox = await this.db.getOutbox();
-              if (currentOutbox.some((m) => `${m.entity}:${m.recordId}` !== key)) {
-                // Probe with another record right away; the suspect is only counted if that write succeeds.
-                this.poisonSuspect = { mutationId: failed.mutationId, key, lastError: msg };
-                this.poisonSearchActive = true;
-                continue;
-              }
-              // Nothing else to probe with: keep it queued (it blocks no one) and back off.
-            }
-          }
-
-          if (isDeterministicPayloadError) {
+          if (isItemSpecificFailure) {
             this.singleItemSuccessStreak = 0;
             if (batch.length > 1) {
               // Server is healthy (or rejected payload size/format), so a specific mutation in this batch is poison.

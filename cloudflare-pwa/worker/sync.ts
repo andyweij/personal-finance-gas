@@ -2246,11 +2246,22 @@ export async function processSyncRequest(
     // response never mixes rows from two epochs.
     let stateBeforeQuery = await ensureUserSyncState(db, uid);
     let fullDelta = await querySyncDelta(db, uid, null);
-    for (let attempt = 0; attempt < 3; attempt++) {
+    let stable = false;
+    for (let attempt = 0; attempt < 3 && !stable; attempt++) {
       const stateAfterQuery = await ensureUserSyncState(db, uid);
-      if (stateAfterQuery.dataEpoch === stateBeforeQuery.dataEpoch) break;
+      if (stateAfterQuery.dataEpoch === stateBeforeQuery.dataEpoch) {
+        stable = true;
+        break;
+      }
       stateBeforeQuery = stateAfterQuery;
       fullDelta = await querySyncDelta(db, uid, null);
+    }
+    if (!stable) {
+      const finalState = await ensureUserSyncState(db, uid);
+      if (finalState.dataEpoch !== stateBeforeQuery.dataEpoch) {
+        // Back-to-back restores: fail the request (5xx → client retries) rather than return a mixed snapshot
+        throw new Error('data epoch kept changing while building the full snapshot');
+      }
     }
     return {
       ok: true,
@@ -2276,6 +2287,17 @@ export async function processSyncRequest(
     // P2-C4 & Q2/N2: Do NOT dump mutations into rejected[]; return epochMismatch: true + full snapshot
     // with pre-query changeSeq cursor so the client freezes ALL pending outbox items and misses 0 writes.
     return buildFullResyncResponse(true);
+  }
+
+  // V1: Harmless write used by clients as evidence that the D1 write path is healthy. If this write fails the
+  // whole request fails (5xx), so a client never mistakes a write outage for a broken mutation.
+  let writeProbeOk = false;
+  if (req.writeProbe === true && mutations.length === 0) {
+    await db
+      .prepare('UPDATE user_sync_state SET updated_at = ? WHERE user_id = ?')
+      .bind(serverTime, uid)
+      .run();
+    writeProbeOk = true;
   }
 
   let epochChangedDuringMutations = false;
@@ -2425,6 +2447,7 @@ export async function processSyncRequest(
     rejected,
     conflicts,
     delta,
+    ...(writeProbeOk ? { writeProbeOk: true } : {}),
   };
 }
 

@@ -94,6 +94,15 @@ function getOriginAndRpId(c: AppContext): { origin: string; rpID: string; isHttp
 const INTERNAL_ERROR_RE = /D1_|SQLITE|SQL\b|no such (table|column)|constraint failed|database|network connection|internal error|is not a function|Cannot read prop|undefined|null is not/i;
 
 function routeErrorResponse(c: AppContext, err: unknown, fallback: string) {
+  // Malformed request body (c.req.json() on invalid JSON) is the client's fault → 400
+  if (err instanceof SyntaxError) {
+    return c.json({ error: `${fallback}（請求內容格式錯誤）` }, 400);
+  }
+  // Bad data that trips a DB constraint (e.g. an imported value) is permanent → sanitized 400, never raw SQL
+  if (err instanceof Error && /constraint failed|SQLITE_CONSTRAINT|D1_TYPE_ERROR/i.test(err.message)) {
+    console.warn('[api] constraint error:', c.req.path, err.message);
+    return c.json({ error: `${fallback}（資料格式或欄位約束不符合規範）` }, 400);
+  }
   const isInternal =
     !(err instanceof Error) ||
     err instanceof TypeError ||

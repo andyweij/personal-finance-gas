@@ -25,8 +25,8 @@ function d1Fetch(db: D1Database): typeof fetch {
   }) as typeof fetch;
 }
 
-describe('v1.8.9 fixes (V1 probe evidence, R-1 transaction abort)', () => {
-  it('V1: a real poison pill is still quarantined once enough probe writes of other records succeed after it', async () => {
+describe('v1.8.9 fixes (V1 write-health evidence, R-1 transaction abort)', () => {
+  it('V1: a real poison pill is still quarantined when the server confirms its write path is healthy', async () => {
     const db = createTestD1();
     const localDb = new LocalFinanceDB(`v189-poison-${crypto.randomUUID()}`);
     const realFetch = d1Fetch(db);
@@ -55,7 +55,7 @@ describe('v1.8.9 fixes (V1 probe evidence, R-1 transaction abort)', () => {
       await engine.syncNow();
     }
 
-    // Two probe writes succeeded right after the poison failed → retryCount 2 → quarantined (payload kept)
+    // Each 5xx of the poison is followed by a successful write-health probe → counted → quarantined (payload kept)
     expect(engine.getRejections().map((r) => [r.clientPayload?.itemName, r.resolutionStatus])).toEqual([
       ['毒丸', 'quarantined'],
     ]);
@@ -70,27 +70,16 @@ describe('v1.8.9 fixes (V1 probe evidence, R-1 transaction abort)', () => {
     localDb.close();
   });
 
-  it('V1: a probe rejected by the server (possibly only because of ordering) stays queued instead of being dropped', async () => {
+  it('V1: two poison pills at the head of the queue are both quarantined and the healthy items behind them drain', async () => {
     const db = createTestD1();
-    const localDb = new LocalFinanceDB(`v189-probe-reject-${crypto.randomUUID()}`);
+    const localDb = new LocalFinanceDB(`v189-two-poison-${crypto.randomUUID()}`);
     const realFetch = d1Fetch(db);
     const fetchImpl: typeof fetch = async (input, init) => {
       const body = JSON.parse(String(init?.body || '{}')) as SyncRequest;
-      if (body.mutations.some((m) => m.payload?.itemName === '毒丸')) {
+      if (body.mutations.some((m) => String(m.payload?.itemName || '').startsWith('毒'))) {
         return new Response(JSON.stringify({ error: 'poison crash' }), { status: 500 });
       }
-      const res = await realFetch(input, init);
-      const json = (await res.json()) as Record<string, unknown> & {
-        ackedMutationIds: string[];
-        rejected: Array<{ mutationId: string; reason: string }>;
-      };
-      // Pretend the server rejects the probe (e.g. it depended on the poison)
-      const probe = body.mutations.find((m) => m.payload?.itemName === '依賴毒丸');
-      if (probe) {
-        json.ackedMutationIds = json.ackedMutationIds.filter((id) => id !== probe.mutationId);
-        json.rejected = [...json.rejected, { mutationId: probe.mutationId, reason: 'depends on poison' }];
-      }
-      return new Response(JSON.stringify(json), { status: 200 });
+      return realFetch(input, init);
     };
     const engine = new SyncEngine(localDb, {
       fetchImpl,
@@ -101,17 +90,33 @@ describe('v1.8.9 fixes (V1 probe evidence, R-1 transaction abort)', () => {
     });
     await engine.init();
 
-    await engine.addCashFlow(cfPayload('毒丸'));
-    await engine.addCashFlow(cfPayload('依賴毒丸'));
-    for (let i = 0; i < 3; i++) {
+    await engine.addCashFlow(cfPayload('毒一'));
+    await engine.addCashFlow(cfPayload('毒二'));
+    await engine.addCashFlow(cfPayload('正常一'));
+    await engine.addCashFlow(cfPayload('正常二'));
+
+    for (let i = 0; i < 10; i++) {
       await engine.syncNow();
     }
 
-    expect(engine.getRejections()).toHaveLength(0);
-    expect((await localDb.getOutbox()).map((m) => m.payload?.itemName).sort()).toEqual(['依賴毒丸', '毒丸']);
+    expect(engine.getRejections().map((r) => r.clientPayload?.itemName).sort()).toEqual(['毒一', '毒二']);
+    expect(await localDb.getOutbox()).toHaveLength(0);
+    const rows = await db
+      .prepare('SELECT item_name FROM cashflow_logs WHERE user_id = ? AND deleted_at IS NULL')
+      .bind(UID)
+      .all<{ item_name: string }>();
+    expect((rows.results || []).map((r) => r.item_name).sort()).toEqual(['正常一', '正常二']);
 
     engine.destroy();
     localDb.close();
+  });
+
+  it('V1: the server performs the write-health probe only when asked and reports writeProbeOk', async () => {
+    const db = createTestD1();
+    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: [], writeProbe: true });
+    expect(res.writeProbeOk).toBe(true);
+    const res2 = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: [] });
+    expect(res2.writeProbeOk).toBeUndefined();
   });
 
   it('R-1: an exception inside the re-apply transaction rejects instead of hanging the engine lock', async () => {

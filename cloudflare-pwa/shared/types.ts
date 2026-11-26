@@ -391,6 +391,12 @@ export interface SyncRequest {
   sinceSeq?: number | null;
   clientEpoch?: number | null;
   mutations: SyncMutation[];
+  /**
+   * V1: Ask the server to perform a harmless D1 write (touch user_sync_state.updated_at). Sent with an empty
+   * mutation list after a mutation failed with 5xx, to tell "this mutation is broken" apart from
+   * "the write path is down". The response then carries writeProbeOk: true.
+   */
+  writeProbe?: boolean;
 }
 
 export interface SyncDelta {
@@ -418,6 +424,8 @@ export interface SyncResponse {
   rejected: Array<{ mutationId: string; reason: string }>;
   conflicts?: SyncConflict[];
   delta: SyncDelta;
+  /** V1: true when the requested writeProbe D1 write succeeded. */
+  writeProbeOk?: boolean;
 }
 
 export interface PeriodMetrics {

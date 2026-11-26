@@ -578,7 +578,8 @@ describe('驗收：v1.8.7 審查新增項目', () => {
     const realFetch = d1Fetch(db);
     const fetchImpl: typeof fetch = async (input, init) => {
       const body = JSON.parse(String(init?.body || '{}')) as SyncRequest;
-      if (writesDown && body.mutations.length > 0) {
+      // 寫入路徑故障：任何寫入請求（帶 mutation，或 v1.8.9 起的 writeProbe 寫入健康檢查）都回 503，純讀取正常
+      if (writesDown && (body.mutations.length > 0 || (body as SyncRequest & { writeProbe?: boolean }).writeProbe)) {
         return new Response(JSON.stringify({ error: 'D1 write unavailable' }), { status: 503 });
       }
       return realFetch(input, init);
