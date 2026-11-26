@@ -440,13 +440,14 @@ describe('Stage 2 Sync Correctness (2.1 - 2.7)', () => {
     // Run global cron market refresh (no targetUserId)
     await refreshMarketData(db, mockFetch);
 
-    // 1. Stock unitPrice & version incremented!
+    // 1. Stock unitPrice & change_seq updated; Q7/F7 keeps optimistic-lock version at 1 so offline user edits do not conflict
     const stockRow = await db
-      .prepare('SELECT unit_price, version FROM asset_items WHERE user_id = ? AND id = ?')
+      .prepare('SELECT unit_price, version, change_seq FROM asset_items WHERE user_id = ? AND id = ?')
       .bind('owner', 'asset-2330')
-      .first<{ unit_price: number; version: number }>();
+      .first<{ unit_price: number; version: number; change_seq: number }>();
     expect(stockRow?.unit_price).toBe(1050);
-    expect(stockRow?.version).toBe(2);
+    expect(stockRow?.version).toBe(1);
+    expect(stockRow?.change_seq).toBeGreaterThan(beforeCursor);
 
     // 2. Owner's FX updated AND app_settings.version incremented!
     const ownerSettings = await db

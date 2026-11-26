@@ -329,6 +329,8 @@ export function resolveStockModalPriceFields(params: {
   hasPrevCloseInput: boolean;
   defaultNewPrice?: number;
   tickerChanged?: boolean;
+  /** Q8: new ticker value; clearing the ticker (empty) never zeroes the existing price. */
+  newTicker?: string;
 }): {
   unitPrice?: number;
   previousClose?: number | null;
@@ -341,6 +343,7 @@ export function resolveStockModalPriceFields(params: {
     hasPrevCloseInput,
     defaultNewPrice = 0,
     tickerChanged = false,
+    newTicker,
   } = params;
   const trimmedPrice = rawPrice.trim();
   const trimmedPrev = rawPrevClose.trim();
@@ -361,8 +364,10 @@ export function resolveStockModalPriceFields(params: {
     ? (parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null) !== existingPrev
     : false;
 
-  // F5: Ticker changed without explicit new price -> clear old ticker's price & previousClose
-  if (tickerChanged && !priceChanged) {
+  // F5 / Q8: Ticker REPLACED by another non-empty ticker without explicit new price -> clear old ticker's price & previousClose.
+  // Clearing the ticker keeps the existing quote (falls through to the normal "unchanged" handling below).
+  const tickerReplaced = tickerChanged && (newTicker === undefined || newTicker.trim() !== '');
+  if (tickerReplaced && !priceChanged) {
     return {
       unitPrice: 0,
       previousClose: prevChanged && parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null,

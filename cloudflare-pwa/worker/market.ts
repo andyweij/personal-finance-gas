@@ -597,7 +597,7 @@ export async function refreshMarketData(
   db: D1Database,
   fetchImpl: FetchLike = fetch,
   targetUserId?: string,
-  opts?: { forceFx?: boolean; marketScope?: 'all' | 'tw' | 'us' }
+  opts?: { forceFx?: boolean; marketScope?: 'all' | 'tw' | 'us'; assetIds?: string[] }
 ): Promise<{
   usdTwdRate: number;
   fxUpdated: boolean;
@@ -617,7 +617,14 @@ export async function refreshMarketData(
   }
 
   let fxUpdated = false;
-  const shouldFetchFx = targetUserId ? targetAutoFx || Boolean(opts?.forceFx) : true;
+  // Q8: a targeted refresh (specific asset ids, e.g. right after a ticker replacement) only needs the quotes.
+  const assetIdFilter =
+    targetUserId && Array.isArray(opts?.assetIds) && opts!.assetIds.length > 0 ? new Set(opts!.assetIds) : null;
+  const shouldFetchFx = assetIdFilter
+    ? Boolean(opts?.forceFx)
+    : targetUserId
+      ? targetAutoFx || Boolean(opts?.forceFx)
+      : true;
   const liveFx = shouldFetchFx ? await fetchUsdTwdRate(fetchImpl) : null;
   if (liveFx !== null) {
     usdTwdRate = liveFx;
@@ -680,6 +687,9 @@ export async function refreshMarketData(
   const failedTickers: string[] = [];
 
   for (const item of autoAssets.results) {
+    if (assetIdFilter && !assetIdFilter.has(item.id)) {
+      continue;
+    }
     const hint: TickerHint = {
       subCategory: item.sub_category,
       currency: item.currency,
@@ -708,9 +718,13 @@ export async function refreshMarketData(
           .bind(item.user_id, nowIso),
         db
           .prepare(
+            // Q7 / F7: unit_price / previous_close / price_updated_at are server-owned quote fields.
+            // Do NOT bump `version` here: version is the optimistic lock for USER edits, and bumping it on every
+            // scheduled quote refresh made any offline edit (cost basis, note…) of an auto-updated holding conflict.
+            // Pulls are driven by change_seq, so clients still receive the new quote. User edits that omit the
+            // quote fields (F4) never overwrite them on the server.
             `UPDATE asset_items
              SET unit_price = ?, previous_close = ?, price_updated_at = ?, updated_at = ?,
-                 version = version + 1,
                  change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
              WHERE user_id = ? AND id = ?
                AND (unit_price IS NOT ? OR previous_close IS NOT ? OR price_updated_at IS NULL)`

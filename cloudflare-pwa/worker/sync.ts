@@ -1384,6 +1384,10 @@ async function applySingleMutation(
     const existingTicker = isActiveExisting ? String(existing?.ticker || '').trim().toUpperCase() : '';
     const incomingTicker = String(p.ticker || '').trim().toUpperCase();
     const tickerChanged = Boolean(isActiveExisting && existingTicker !== incomingTicker);
+    // Q8 / F5: Only a replacement with ANOTHER NON-EMPTY ticker invalidates the old quote; clearing the ticker
+    // keeps the last known price (the holding simply stops auto-updating).
+    const tickerReplaced = tickerChanged && incomingTicker !== '';
+    const incomingIsAutoWithTicker = String(p.updateMode || '') === '自動更新' && incomingTicker !== '';
 
     const v = runValidation(() =>
       validateAssetInput({
@@ -1400,7 +1404,10 @@ async function applySingleMutation(
             ? Number(p.unitPrice)
             : isActiveExisting && existing?.unit_price !== undefined
               ? Number(existing.unit_price)
-              : 1,
+              : // Q8: new / resurrected auto-updated asset without a price → 0 ("待更新"), consistent with ticker replacement
+                incomingIsAutoWithTicker
+                ? 0
+                : 1,
         previousClose:
           p.previousClose !== undefined
             ? (p.previousClose as number | null)
@@ -1463,7 +1470,7 @@ async function applySingleMutation(
     let finalPreviousClose = v.previousClose;
     let clearPriceUpdatedAt = false;
     if (isActiveExisting && v.updateMode === '自動更新') {
-      if (!tickerChanged) {
+      if (!tickerReplaced) {
         if (!isManualPriceOverride) {
           finalUnitPrice = existing!.unit_price !== undefined ? Number(existing!.unit_price) : v.unitPrice;
           finalPreviousClose =

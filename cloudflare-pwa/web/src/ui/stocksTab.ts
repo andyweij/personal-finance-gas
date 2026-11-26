@@ -27,6 +27,39 @@ import { renderReorderList } from './reorderHelper';
 import { renderStockChartCard } from './stockCharts';
 import type { UiContext } from './state';
 
+/**
+ * Q8 / F5: Right after a ticker replacement (or creating an auto-updated holding / watchlist item without a price),
+ * push the edit to the server and fetch a quote for THAT asset only, so the holding never sits at price 0 until the
+ * next scheduled run (or gets recorded as 0 by a month-end snapshot). Best-effort: offline / failures simply leave
+ * the "報價待更新" state for the next scheduled or manual refresh.
+ */
+async function refreshQuoteForAsset(ctx: UiContext, assetId: string): Promise<void> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  try {
+    await ctx.engine.syncNow();
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (ctx.state.currentUser?.id) headers['x-expected-user'] = ctx.state.currentUser.id;
+    const res = await fetch('/api/market/refresh', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers,
+      body: JSON.stringify({ assetIds: [assetId] }),
+    });
+    if (!res.ok) return;
+    const json = (await res.json().catch(() => ({}))) as { updatedTickers?: unknown[] };
+    await ctx.engine.syncNow();
+    if ((json.updatedTickers?.length || 0) > 0) {
+      showToast('已取得最新報價', 'success');
+    }
+  } catch {
+    // Leave "報價待更新" for the next scheduled / manual refresh
+  }
+}
+
+function needsImmediateQuote(asset: AssetItem): boolean {
+  return asset.updateMode === '自動更新' && Boolean((asset.ticker || '').trim()) && !asset.priceUpdatedAt;
+}
+
 export function getAllStockCategories(ctx: UiContext): string[] {
   const snap = ctx.engine.getSnapshot();
   const seen = new Set<string>();
@@ -772,7 +805,9 @@ function renderStockPositionCard(
   stripTime.className = 'stock-quote-time';
   stripTime.textContent = pos.asset.priceUpdatedAt
     ? fmtQuoteTimestamp(pos.asset.priceUpdatedAt)
-    : pos.asset.updateMode;
+    : needsImmediateQuote(pos.asset)
+      ? '報價待更新'
+      : pos.asset.updateMode;
   quoteStrip.appendChild(stripLeft);
   quoteStrip.appendChild(stripTime);
   card.appendChild(quoteStrip);
@@ -1027,7 +1062,9 @@ function renderStockFlipCard(
   metaBits.push(
     pos.asset.priceUpdatedAt
       ? `更新 ${fmtQuoteTimestamp(pos.asset.priceUpdatedAt)}`
-      : pos.asset.updateMode
+      : needsImmediateQuote(pos.asset)
+        ? '報價待更新'
+        : pos.asset.updateMode
   );
   if (curr === 'USD') {
     metaBits.push(`市值約 ${fmtMoney(pos.marketValueTwd, masked)}`);
@@ -1512,9 +1549,10 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
         rawPrevClose: rawPrev,
         hasPrevCloseInput: true,
         tickerChanged,
+        newTicker: ticker,
         defaultNewPrice: 0,
       });
-      await ctx.engine.saveAsset({
+      const savedWatch = await ctx.engine.saveAsset({
         id: existing?.id,
         itemName: el<HTMLInputElement>('wlName').value.trim(),
         majorType: '資產',
@@ -1531,8 +1569,22 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
         note: el<HTMLInputElement>('wlNote').value.trim(),
       });
       closeModal();
-      showToast(existing ? '已更新觀察標的' : '已加入觀察清單（點「更新股價匯率」立即抓報價）', 'success');
-      ctx.scheduleSync();
+      const fetchWatchQuote = needsImmediateQuote(savedWatch);
+      showToast(
+        existing
+          ? fetchWatchQuote
+            ? '已更新觀察標的（正在取得新代號報價）'
+            : '已更新觀察標的'
+          : fetchWatchQuote
+            ? '已加入觀察清單（正在取得報價）'
+            : '已加入觀察清單',
+        'success'
+      );
+      if (fetchWatchQuote) {
+        void refreshQuoteForAsset(ctx, savedWatch.id);
+      } else {
+        ctx.scheduleSync();
+      }
     } catch (err) {
       showToast(err instanceof Error ? err.message : '儲存失敗', 'error');
     }
@@ -1937,9 +1989,10 @@ export function openStockBaselineModal(
         rawPrevClose: rawPrev,
         hasPrevCloseInput: true,
         tickerChanged,
+        newTicker: ticker,
         defaultNewPrice: marketPrice,
       });
-      await ctx.engine.saveAsset({
+      const savedHolding = await ctx.engine.saveAsset({
         id: existing?.id,
         itemName: el<HTMLInputElement>('stName').value.trim(),
         majorType: '資產',
@@ -1963,7 +2016,11 @@ export function openStockBaselineModal(
         isConverting ? '已從觀察清單轉為正式持股' : existing ? '已更新持股成本設定' : '已建立新持股',
         'success'
       );
-      ctx.scheduleSync();
+      if (needsImmediateQuote(savedHolding)) {
+        void refreshQuoteForAsset(ctx, savedHolding.id);
+      } else {
+        ctx.scheduleSync();
+      }
     } catch (err) {
       showToast(err instanceof Error ? err.message : '儲存失敗', 'error');
     }

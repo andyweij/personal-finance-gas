@@ -1270,24 +1270,27 @@ export class SyncEngine {
     const tickerChanged = Boolean(
       existing && (existing.ticker || '').trim().toUpperCase() !== v.ticker.trim().toUpperCase()
     );
+    // Q8 / F5: Only replacing the ticker with ANOTHER NON-EMPTY ticker on an auto-updated asset invalidates the old
+    // quote. Clearing the ticker (the holding simply stops auto-updating) must keep the existing price.
+    const tickerReplaced = tickerChanged && v.updateMode === '自動更新' && v.ticker.trim() !== '';
+    const isPendingQuoteAsset = v.updateMode === '自動更新' && v.ticker.trim() !== '';
     const resolvedUnitPrice =
       payload.unitPrice !== undefined
         ? v.unitPrice
-        : tickerChanged && v.updateMode === '自動更新'
+        : tickerReplaced
           ? 0
-          : existing?.unitPrice ?? (v.isWatchlist ? 0 : 1);
+          : existing?.unitPrice ?? (v.isWatchlist || isPendingQuoteAsset ? 0 : 1);
     const priceChangedLocally =
       Boolean(existing) && payload.unitPrice !== undefined && resolvedUnitPrice !== existing!.unitPrice;
     const resolvedPreviousClose =
       payload.previousClose !== undefined
         ? v.previousClose
-        : tickerChanged && v.updateMode === '自動更新'
+        : tickerReplaced
           ? null
           : priceChangedLocally
             ? null
             : existing?.previousClose ?? null;
-    const resolvedPriceUpdatedAt =
-      tickerChanged && v.updateMode === '自動更新' ? null : (existing?.priceUpdatedAt ?? null);
+    const resolvedPriceUpdatedAt = tickerReplaced ? null : (existing?.priceUpdatedAt ?? null);
 
     const item: AssetItem = {
       id,
@@ -1333,7 +1336,7 @@ export class SyncEngine {
     };
 
     const mutationPayload: Record<string, unknown> = { ...item };
-    if (existing && v.updateMode === '自動更新' && !tickerChanged) {
+    if (existing && v.updateMode === '自動更新' && !tickerReplaced) {
       // F4: Even when manualPriceOverride is true (e.g. editing ONLY previousClose),
       // omit unitPrice when caller did not explicitly provide it so server live quote is never clobbered.
       if (payload.unitPrice === undefined) {
