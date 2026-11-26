@@ -357,6 +357,9 @@ export interface SyncMutation {
   attempts?: number;
   retryCount?: number;
   lastError?: string;
+  frozenBaselineExisted?: boolean;
+  frozenBaselineVersion?: number | null;
+  frozenBaselineUpdatedAt?: string | null;
 }
 
 export interface SyncConflict {

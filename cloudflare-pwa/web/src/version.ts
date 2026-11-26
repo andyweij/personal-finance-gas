@@ -2,13 +2,14 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.6';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.7';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0013';
-export const SW_CACHE_VERSION = 'finance-pwa-v26';
+export const SW_CACHE_VERSION = 'finance-pwa-v27';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.8.7：修復 v1.8.6 審查第一組必修同步正確性項目（Q1 伺服器整體 5xx 故障先以唯讀拉取探測健康度，絕不誤隔離正常待上傳異動，且隔離單筆毒丸時維持單筆佇列搜尋不反覆回退大批次；Q2/N2 完整重抓改於查詢前讀取 change_seq 游標消除期間寫入遺失；Q4/N1 同批每筆紀錄最多送出一個異動消除重載後自衝突，並防範 R7 同批已確認紀錄遭誤刪；Q5/N4 所有實體主寫入與冪等語句加上 data_epoch 條件並阻擋請求途中還原競態與舊版無 epoch 寫入；N3 重新套用凍結變更於單一 IndexedDB 交易內比對凍結基準與待送佇列，絕不覆蓋凍結後較新的編輯或刪除）',
   'v1.8.6：第一階段複查（R1–R7）與昨收報價審查（F1–F10）全面修復（補齊 VersionConflictError 並發重複 mutationId 冪等再查消除殘留誤報衝突、強化伺服器異動封包型別與 SQLite 約束拒絕、客戶端毒丸異動單筆隔離與自動移出佇列並於失敗時仍執行唯讀拉取不阻塞雲端下載、持久化 pendingFullResync 跨重載自動還原遭拒異動與精準狀態標示、遭拒新建連帶清除後續相依編輯不復活、Passkey 驗證意外系統錯誤改回脫敏 500；以及持股省略報價欄位合併防離線 NaN、TWSE MIS 跳過開盤前試撮與暫緩撮合並正確處理收盤零成交平盤、只改昨收不覆蓋雲端現價、變更股票代碼自動重置舊價與更新時間、輸入市價即時清空舊昨收，以及部署後自動更新行情指引）',
   'v1.8.5：第二階段審查全面修復（嚴格僅對本次 ack 紀錄執行 rebase 不再繞過他機衝突、Promise-chain 互斥鎖序列化所有本機編輯與同步套用消除並行覆蓋、outbox 持久化 sentAt/attempts 防逾時或重載後誤合併、data_epoch 變動時凍結全部待送異動由使用者決定捨棄或重新套用並偵測請求中還原競態、CSV 匯入原子遞增 change_seq、報價／匯率未變不遞增 version 且 /api/market/refresh 尊重手動匯率設定、merge 匯入不復活軟刪除紀錄、UTF-8 位元組上限與全寫入端點 X-Expected-User 檢查、429 Retry-After 與無進展自動重試、localStorage 備援鎖與多分頁 snapshot_changed/logout 廣播）',
   'v1.8.4：修正持股「昨收」與現價不一致導致漲跌判定異常（TWSE MIS 盤中無成交 z="-" 改依序取委買賣價／開盤價／Yahoo 備援，絕不以昨收冒充現價；06:00 與每月 1 號 08:00 盤前排程僅更新美股與匯率；報價缺昨收時清空為 NULL 不沿用舊值；移除 Yahoo range=5d 的 chartPreviousClose 誤用並改補打 range=1d；持股編輯彈窗新增選填昨收欄位，手動改價未改昨收自動清空；自動更新持股的報價視為伺服器擁有，改成本／股數不覆蓋最新報價）',

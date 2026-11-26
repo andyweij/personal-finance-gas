@@ -128,7 +128,7 @@ const autoUsStock = (extra: Record<string, unknown> = {}) => ({
 /* ============================== 伺服器端 ============================== */
 
 describe('驗收：伺服器端尚未修正項目', () => {
-  it.fails('N2: 完整重抓（epoch 不符）期間其他裝置的寫入，不得同時從 snapshot 與下一次增量中消失', async () => {
+  it('N2: 完整重抓（epoch 不符）期間其他裝置的寫入，不得同時從 snapshot 與下一次增量中消失', async () => {
     const db = createTestD1();
     await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: [] });
     await importFullSnapshot(db, UID, { cashflowLogs: [] }, 'replace'); // epoch -> 2
@@ -174,7 +174,7 @@ describe('驗收：伺服器端尚未修正項目', () => {
     expect(inSnapshot || inNextDelta).toBe(true);
   });
 
-  it.fails('N4: 請求途中發生 replace 匯入時，舊 epoch 的 mutation 不得寫入還原後的資料，也不得被 ack', async () => {
+  it('N4: 請求途中發生 replace 匯入時，舊 epoch 的 mutation 不得寫入還原後的資料，也不得被 ack', async () => {
     const db = createTestD1();
     await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: [] });
 
@@ -355,7 +355,7 @@ describe('驗收：伺服器端尚未修正項目', () => {
 /* ============================== 客戶端 ============================== */
 
 describe('驗收：客戶端尚未修正項目', () => {
-  it.fails('Q1: 伺服器整體故障（與內容無關的持續 500）不得把正常 mutation 隔離出 outbox', async () => {
+  it('Q1: 伺服器整體故障（與內容無關的持續 500）不得把正常 mutation 隔離出 outbox', async () => {
     const db = createTestD1();
     const localDb = new LocalFinanceDB(`q1-${crypto.randomUUID()}`);
     let serverDown = true;
@@ -395,7 +395,7 @@ describe('驗收：客戶端尚未修正項目', () => {
     localDb.close();
   });
 
-  it.fails('N1: 送出失敗（已標記 sentAt）後重新載入，再編輯同一筆，不得產生與自己的假衝突', async () => {
+  it('N1: 送出失敗（已標記 sentAt）後重新載入，再編輯同一筆，不得產生與自己的假衝突', async () => {
     const db = createTestD1();
     const dbName = `n1-${crypto.randomUUID()}`;
 
@@ -483,7 +483,7 @@ describe('驗收：客戶端尚未修正項目', () => {
     localDb.close();
   });
 
-  it.fails('N3: 「重新套用」凍結的舊編輯，不得覆蓋凍結之後才做、且已同步的較新編輯', async () => {
+  it('N3: 「重新套用」凍結的舊編輯，不得覆蓋凍結之後才做、且已同步的較新編輯', async () => {
     const db = createTestD1();
     const localDb = new LocalFinanceDB(`n3-${crypto.randomUUID()}`);
     const engine = newEngine(localDb, d1Fetch(db));

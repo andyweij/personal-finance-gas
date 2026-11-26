@@ -501,9 +501,15 @@ export class LocalFinanceDB {
     snapshot: FinanceSnapshot,
     meta: LocalMeta,
     conflicts?: SyncConflict[],
-    rejections?: SyncRejection[]
+    rejections?: SyncRejection[],
+    options?: {
+      excludeMutationIds?: Iterable<string>;
+      annotateItem?: (item: SyncMutation) => SyncMutation;
+    }
   ): Promise<SyncMutation[]> {
     const db = this.getDb();
+    const excludeSet = options?.excludeMutationIds ? new Set(options.excludeMutationIds) : null;
+    const annotateItem = options?.annotateItem;
     return new Promise((resolve, reject) => {
       let mergedFrozen: SyncMutation[] = [];
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
@@ -524,8 +530,9 @@ export class LocalFinanceDB {
         const byId = new Map<string, SyncMutation>();
         for (const f of existingFrozen) byId.set(f.mutationId, f);
         for (const item of existingOutbox) {
+          if (excludeSet && excludeSet.has(item.mutationId)) continue;
           const { _seq: _ignored, ...rest } = item;
-          byId.set(rest.mutationId, rest);
+          byId.set(rest.mutationId, annotateItem ? annotateItem(rest) : rest);
         }
         mergedFrozen = Array.from(byId.values());
         outboxStore.clear();
@@ -551,22 +558,118 @@ export class LocalFinanceDB {
   }
 
   async reapplyFrozenOutboxTx(
-    snapshot: FinanceSnapshot,
-    mutations: SyncMutation[]
-  ): Promise<void> {
+    transform: (
+      freshSnapshot: FinanceSnapshot,
+      freshFrozen: SyncMutation[],
+      freshOutbox: SyncMutation[]
+    ) => {
+      nextSnapshot: FinanceSnapshot;
+      mutationsToEnqueue: SyncMutation[];
+      appliedCount: number;
+      skippedCount: number;
+    },
+    inFlightIds?: ReadonlySet<string>
+  ): Promise<{
+    snapshot: FinanceSnapshot;
+    appliedCount: number;
+    skippedCount: number;
+    remainingOutboxCount: number;
+  }> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
       const kv = tx.objectStore(STORE_KV);
-      kv.put(snapshot, 'snapshot');
-      kv.put([], 'frozen_outbox');
       const outboxStore = tx.objectStore(STORE_OUTBOX);
-      const getAllReq = outboxStore.getAll();
-      getAllReq.onsuccess = () => {
-        const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
-        this.applyMutationsToOutboxStore(outboxStore, existingList, mutations);
+
+      const snapReq = kv.get('snapshot');
+      const frozenReq = kv.get('frozen_outbox');
+      const outboxReq = outboxStore.getAll();
+
+      let snapLoaded = false;
+      let frozenLoaded = false;
+      let outboxLoaded = false;
+      let rawSnap: FinanceSnapshot | undefined;
+      let freshFrozen: SyncMutation[] = [];
+      let existingList: Array<SyncMutation & { _seq?: number }> = [];
+
+      let resultSnapshot: FinanceSnapshot = createEmptySnapshot();
+      let appliedCount = 0;
+      let skippedCount = 0;
+      let remainingOutboxCount = 0;
+
+      const tryFinalize = () => {
+        if (!snapLoaded || !frozenLoaded || !outboxLoaded) return;
+        const freshSnapshot = rawSnap
+          ? {
+              ...createEmptySnapshot(),
+              ...rawSnap,
+              settings: { ...createEmptySnapshot().settings, ...(rawSnap.settings || {}) },
+              rentUtilityRents: {
+                ...createEmptySnapshot().rentUtilityRents,
+                ...(rawSnap.rentUtilityRents || {}),
+              },
+            }
+          : createEmptySnapshot();
+
+        existingList.sort(
+          (a, b) =>
+            a.clientTimestamp.localeCompare(b.clientTimestamp) || (a._seq ?? 0) - (b._seq ?? 0)
+        );
+        const cleanOutbox: SyncMutation[] = existingList.map((item) => {
+          const { _seq: _ignored, ...rest } = item;
+          return rest;
+        });
+
+        if (freshFrozen.length === 0) {
+          resultSnapshot = freshSnapshot;
+          remainingOutboxCount = cleanOutbox.length;
+          return;
+        }
+
+        const transformed = transform(freshSnapshot, freshFrozen, cleanOutbox);
+        resultSnapshot = transformed.nextSnapshot;
+        appliedCount = transformed.appliedCount;
+        skippedCount = transformed.skippedCount;
+
+        kv.put(transformed.nextSnapshot, 'snapshot');
+        kv.put([], 'frozen_outbox');
+        if (transformed.mutationsToEnqueue.length > 0) {
+          this.applyMutationsToOutboxStore(
+            outboxStore,
+            existingList,
+            transformed.mutationsToEnqueue,
+            inFlightIds
+          );
+        }
+        const countReq = outboxStore.count();
+        countReq.onsuccess = () => {
+          remainingOutboxCount = Number(countReq.result || 0);
+        };
       };
-      tx.oncomplete = () => resolve();
+
+      snapReq.onsuccess = () => {
+        rawSnap = snapReq.result as FinanceSnapshot | undefined;
+        snapLoaded = true;
+        tryFinalize();
+      };
+      frozenReq.onsuccess = () => {
+        freshFrozen = Array.isArray(frozenReq.result) ? (frozenReq.result as SyncMutation[]) : [];
+        frozenLoaded = true;
+        tryFinalize();
+      };
+      outboxReq.onsuccess = () => {
+        existingList = (outboxReq.result as Array<SyncMutation & { _seq?: number }>) || [];
+        outboxLoaded = true;
+        tryFinalize();
+      };
+
+      tx.oncomplete = () =>
+        resolve({
+          snapshot: resultSnapshot,
+          appliedCount,
+          skippedCount,
+          remainingOutboxCount,
+        });
       tx.onerror = () => reject(tx.error);
     });
   }

@@ -432,6 +432,13 @@ class RejectError extends Error {
   }
 }
 
+class EpochMismatchError extends Error {
+  constructor() {
+    super('Data epoch changed concurrently');
+    this.name = 'EpochMismatchError';
+  }
+}
+
 function runValidation<T>(fn: () => T): T {
   try {
     return fn();
@@ -443,6 +450,15 @@ function runValidation<T>(fn: () => T): T {
 
 const NEXT_SEQ_SQL = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1';
 const CURR_SEQ_SQL = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)';
+const EPOCH_GUARD_SQL = 'COALESCE((SELECT data_epoch FROM user_sync_state WHERE user_id = ?), 1) = ?';
+
+async function getCurrentDataEpoch(db: D1Database, uid: string): Promise<number> {
+  const row = await db
+    .prepare('SELECT data_epoch FROM user_sync_state WHERE user_id = ?')
+    .bind(uid)
+    .first<{ data_epoch?: number }>();
+  return Number(row?.data_epoch ?? 1);
+}
 
 function checkVersionOrThrow(
   mutation: SyncMutation,
@@ -529,12 +545,27 @@ async function recordIdempotencyOnly(
   db: D1Database,
   uid: string,
   mutationId: string,
-  serverTime: string
+  serverTime: string,
+  expectedEpoch: number
 ): Promise<void> {
-  await db
-    .prepare('INSERT OR IGNORE INTO sync_idempotency (user_id, mutation_id, applied_at) VALUES (?, ?, ?)')
-    .bind(uid, mutationId, serverTime)
+  const res = await db
+    .prepare(
+      `INSERT OR IGNORE INTO sync_idempotency (user_id, mutation_id, applied_at)
+       SELECT ?, ?, ? WHERE ${EPOCH_GUARD_SQL}`
+    )
+    .bind(uid, mutationId, serverTime, uid, expectedEpoch)
     .run();
+  if (Number(res?.meta?.changes ?? 0) === 0) {
+    const already = await db
+      .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
+      .bind(uid, mutationId)
+      .first();
+    if (already) return;
+    const currEpoch = await getCurrentDataEpoch(db, uid);
+    if (currEpoch !== expectedEpoch) {
+      throw new EpochMismatchError();
+    }
+  }
 }
 
 async function commitAtomicMutation(
@@ -542,6 +573,7 @@ async function commitAtomicMutation(
   uid: string,
   mutation: SyncMutation,
   serverTime: string,
+  expectedEpoch: number,
   primaryWriteStmt: D1PreparedStatement,
   postStatements: D1PreparedStatement[],
   refetchCurrent: () => Promise<{ row: Record<string, unknown> | null; mapped: Record<string, unknown> | null }>,
@@ -584,6 +616,12 @@ async function commitAtomicMutation(
         .first();
       if (already) return;
 
+      // Q5 / N4: Check if a concurrent replace import bumped data_epoch BEFORE reporting conflict/rejection
+      const currEpoch = await getCurrentDataEpoch(db, uid);
+      if (currEpoch !== expectedEpoch) {
+        throw new EpochMismatchError();
+      }
+
       if (onZeroChanges) {
         await onZeroChanges();
       }
@@ -603,7 +641,9 @@ async function commitAtomicMutation(
       });
     }
   } catch (err) {
-    if (err instanceof VersionConflictError || err instanceof RejectError) throw err;
+    if (err instanceof VersionConflictError || err instanceof RejectError || err instanceof EpochMismatchError) {
+      throw err;
+    }
     const already = await db
       .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
       .bind(uid, mutation.mutationId)
@@ -618,7 +658,8 @@ async function applySingleMutation(
   userId: string,
   mutation: SyncMutation,
   defaultFxRate: number,
-  serverTime: string
+  serverTime: string,
+  expectedEpoch: number
 ): Promise<void> {
   const uid = assertUserId(userId);
   let legacyCompareTs: string | null = null;
@@ -648,7 +689,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
     const expectedVersion = Number(existingRow?.version ?? 1);
@@ -674,7 +715,7 @@ async function applySingleMutation(
       .prepare(
         `UPDATE app_settings
          SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
-         WHERE user_id = ? AND version = ?`
+         WHERE user_id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
       )
       .bind(
         budget,
@@ -687,9 +728,11 @@ async function applySingleMutation(
         check.nextVersion,
         uid,
         uid,
-        expectedVersion
+        expectedVersion,
+        uid,
+        expectedEpoch
       );
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], async () => {
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], async () => {
       const row = await db
         .prepare('SELECT * FROM app_settings WHERE user_id = ?')
         .bind(uid)
@@ -717,7 +760,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -734,7 +777,7 @@ async function applySingleMutation(
         throw new RejectError('不可刪除預設個人主帳本。');
       }
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const countLinkedRecords = async () => {
@@ -763,7 +806,7 @@ async function applySingleMutation(
         .prepare(
           `UPDATE ledgers
            SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
-           WHERE user_id = ? AND id = ? AND version = ?
+           WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}
              AND NOT EXISTS (SELECT 1 FROM cashflow_logs WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL)
              AND NOT EXISTS (SELECT 1 FROM asset_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL)
              AND NOT EXISTS (SELECT 1 FROM recurring_items WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL)`
@@ -777,6 +820,8 @@ async function applySingleMutation(
           mutation.recordId,
           expectedVersion,
           uid,
+          expectedEpoch,
+          uid,
           mutation.recordId,
           uid,
           mutation.recordId,
@@ -788,6 +833,7 @@ async function applySingleMutation(
         uid,
         mutation,
         serverTime,
+        expectedEpoch,
         delStmt,
         [],
         refetchLedger,
@@ -837,7 +883,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE ledgers
              SET name = ?, include_in_net_worth = ?, monthly_daily_budget = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ?`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.name,
@@ -850,13 +896,16 @@ async function applySingleMutation(
             uid,
             uid,
             mutation.recordId,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO ledgers
               (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -870,10 +919,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchLedger, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchLedger, check.legacyClientTs);
     return;
   }
 
@@ -890,7 +941,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -904,15 +955,25 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const delStmt = db
         .prepare(
-          `UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
+          `UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchCashflow, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, delStmt, [], refetchCashflow, check.legacyClientTs);
       return;
     }
 
@@ -944,7 +1005,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE cashflow_logs
              SET date = ?, year_month = ?, type = ?, category = ?, item_name = ?, amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, source = ?, note = ?, linked_account_id = ?, ledger_id = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ?`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.date,
@@ -965,13 +1026,16 @@ async function applySingleMutation(
             uid,
             uid,
             mutation.recordId,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO cashflow_logs
               (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -993,10 +1057,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchCashflow, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchCashflow, check.legacyClientTs);
     return;
   }
 
@@ -1013,7 +1079,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -1027,15 +1093,25 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const delStmt = db
         .prepare(
-          `UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
+          `UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchRecurring, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, delStmt, [], refetchRecurring, check.legacyClientTs);
       return;
     }
 
@@ -1070,7 +1146,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE recurring_items
              SET item_name = ?, category = ?, type = ?, amount = ?, currency = ?, cycle = ?, billing_spec = ?, status = ?, note = ?, linked_account_id = ?, ledger_id = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ?`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.itemName,
@@ -1090,13 +1166,16 @@ async function applySingleMutation(
             uid,
             uid,
             mutation.recordId,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO recurring_items
               (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1117,10 +1196,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchRecurring, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchRecurring, check.legacyClientTs);
     return;
   }
 
@@ -1137,7 +1218,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -1151,15 +1232,25 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const delStmt = db
         .prepare(
-          `UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
+          `UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchSinking, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, delStmt, [], refetchSinking, check.legacyClientTs);
       return;
     }
 
@@ -1187,7 +1278,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE sinking_fund_items
              SET item_name = ?, category = ?, total_amount = ?, months = ?, due_note = ?, status = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ?`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.itemName,
@@ -1203,13 +1294,16 @@ async function applySingleMutation(
             uid,
             uid,
             mutation.recordId,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO sinking_fund_items
               (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1226,10 +1320,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchSinking, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchSinking, check.legacyClientTs);
     return;
   }
 
@@ -1246,7 +1342,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -1260,15 +1356,25 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const delStmt = db
         .prepare(
-          `UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
+          `UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAsset, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, delStmt, [], refetchAsset, check.legacyClientTs);
       return;
     }
 
@@ -1416,7 +1522,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE asset_items
              SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, price_updated_at = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ?`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.updateMode,
@@ -1450,13 +1556,16 @@ async function applySingleMutation(
             uid,
             uid,
             mutation.recordId,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO asset_items
               (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1490,10 +1599,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, postStatements, refetchAsset, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, postStatements, refetchAsset, check.legacyClientTs);
     return;
   }
 
@@ -1510,7 +1621,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -1527,15 +1638,25 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const delStmt = db
         .prepare(
-          `UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
+          `UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAdj, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, delStmt, [], refetchAdj, check.legacyClientTs);
       return;
     }
 
@@ -1567,7 +1688,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE savings_adjustments
              SET account_id = ?, date = ?, amount = ?, twd_amount = ?, note = ?, transfer_group_id = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ?`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.accountId,
@@ -1581,13 +1702,16 @@ async function applySingleMutation(
             uid,
             uid,
             mutation.recordId,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO savings_adjustments
               (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1602,10 +1726,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchAdj, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchAdj, check.legacyClientTs);
     return;
   }
 
@@ -1622,7 +1748,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -1639,15 +1765,25 @@ async function applySingleMutation(
 
     if (mutation.op === 'delete') {
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const delStmt = db
         .prepare(
-          `UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
+          `UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchStockTx, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, delStmt, [], refetchStockTx, check.legacyClientTs);
       return;
     }
 
@@ -1670,7 +1806,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE stock_transactions
              SET asset_id = ?, date = ?, tx_type = ?, shares = ?, total_amount = ?, fee = ?, linked_cashflow_id = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND id = ? AND version = ?`
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.assetId,
@@ -1686,13 +1822,16 @@ async function applySingleMutation(
             uid,
             uid,
             mutation.recordId,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO stock_transactions
               (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1709,10 +1848,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchStockTx, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchStockTx, check.legacyClientTs);
     return;
   }
 
@@ -1733,7 +1874,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
     const v = runValidation(() =>
@@ -1744,11 +1885,23 @@ async function applySingleMutation(
       .prepare(
         `UPDATE rent_utility_settings
          SET rent_6f = ?, rent_a = ?, rent_b = ?, rent_c = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
-         WHERE user_id = ? AND version = ?`
+         WHERE user_id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
       )
-      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, check.writeTs, check.nextVersion, uid, uid, expectedVersion);
+      .bind(
+        v.rent6F,
+        v.rentA,
+        v.rentB,
+        v.rentC,
+        check.writeTs,
+        check.nextVersion,
+        uid,
+        uid,
+        expectedVersion,
+        uid,
+        expectedEpoch
+      );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], async () => {
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], async () => {
       const row = await db
         .prepare('SELECT * FROM rent_utility_settings WHERE user_id = ?')
         .bind(uid)
@@ -1784,7 +1937,7 @@ async function applySingleMutation(
       legacyCompareTs
     );
     if (!check.shouldApply) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
       return;
     }
 
@@ -1804,15 +1957,25 @@ async function applySingleMutation(
         throw new RejectError('不可刪除起始表底紀錄。');
       }
       if (!existing) {
-        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
         return;
       }
       const delStmt = db
         .prepare(
-          `UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND period = ? AND version = ?`
+          `UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND period = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, normalizedPeriod, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchUtil, check.legacyClientTs);
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          normalizedPeriod,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, delStmt, [], refetchUtil, check.legacyClientTs);
       return;
     }
 
@@ -1838,7 +2001,7 @@ async function applySingleMutation(
           .prepare(
             `UPDATE rent_utility_records
              SET is_baseline = ?, cur_total = ?, cur_6f = ?, total_elec = ?, total_water = ?, f6_people = ?, f5_people = ?, cur_a = ?, cur_b = ?, cur_c = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND period = ? AND version = ?`
+             WHERE user_id = ? AND period = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
           )
           .bind(
             v.isBaseline ? 1 : 0,
@@ -1856,13 +2019,16 @@ async function applySingleMutation(
             uid,
             uid,
             v.period,
-            Number(existing.version ?? 1)
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch
           )
       : db
           .prepare(
             `INSERT INTO rent_utility_records
               (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}
              ON CONFLICT(user_id, period) DO NOTHING`
           )
           .bind(
@@ -1881,10 +2047,12 @@ async function applySingleMutation(
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
-            uid
+            uid,
+            uid,
+            expectedEpoch
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchUtil, check.legacyClientTs);
+    await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], refetchUtil, check.legacyClientTs);
     return;
   }
 
@@ -2045,39 +2213,56 @@ export async function processSyncRequest(
 ): Promise<SyncResponse> {
   const uid = assertUserId(userId);
   const serverTime = new Date().toISOString();
-  const [settings, syncStateBefore] = await Promise.all([
+  const [settings] = await Promise.all([
     ensureAppSettings(db, uid),
-    ensureUserSyncState(db, uid),
+    ensureRentUtilitySettings(db, uid),
     ensureDefaultLedger(db, uid),
   ]);
+  const syncStateBefore = await ensureUserSyncState(db, uid);
   const mutations = Array.isArray(req.mutations) ? req.mutations : [];
   const ackedMutationIds: string[] = [];
   const rejected: Array<{ mutationId: string; reason: string }> = [];
   const conflicts: SyncConflict[] = [];
 
-  const epochMismatch =
-    typeof req.clientEpoch === 'number' &&
-    Number.isFinite(req.clientEpoch) &&
-    req.clientEpoch !== syncStateBefore.dataEpoch;
-
-  if (epochMismatch) {
-    // P2-C4: Do NOT dump mutations into rejected[] (which only saw up to 50 items and discarded them).
-    // Return epochMismatch: true + full snapshot so the client freezes ALL pending outbox items and prompts the user.
-    const fullDelta = await querySyncDelta(db, uid, null);
-    const syncStateNow = await ensureUserSyncState(db, uid);
+  const buildFullResyncResponse = async (markEpochMismatch: boolean): Promise<SyncResponse> => {
+    // Q2 / N2: Read change_seq & data_epoch BEFORE querying full snapshot so any concurrent write
+    // committed during querySyncDelta(null) has change_seq > stateBeforeQuery.changeSeq and is
+    // guaranteed to be returned either in this snapshot or in the next incremental sync.
+    let stateBeforeQuery = await ensureUserSyncState(db, uid);
+    let fullDelta = await querySyncDelta(db, uid, null);
+    const stateAfterQuery = await ensureUserSyncState(db, uid);
+    if (stateAfterQuery.dataEpoch !== stateBeforeQuery.dataEpoch) {
+      // Another replace import committed mid-snapshot: retry once reading state before query
+      stateBeforeQuery = stateAfterQuery;
+      fullDelta = await querySyncDelta(db, uid, null);
+    }
     return {
       ok: true,
       serverTime,
-      syncCursor: syncStateNow.changeSeq,
-      dataEpoch: syncStateNow.dataEpoch,
+      syncCursor: stateBeforeQuery.changeSeq,
+      dataEpoch: stateBeforeQuery.dataEpoch,
       fullResyncRequired: true,
-      epochMismatch: true,
+      ...(markEpochMismatch ? { epochMismatch: true } : {}),
       ackedMutationIds,
       rejected,
       conflicts,
       delta: fullDelta,
     };
+  };
+
+  const hasClientEpoch = typeof req.clientEpoch === 'number' && Number.isFinite(req.clientEpoch);
+  const expectedEpoch = hasClientEpoch ? Number(req.clientEpoch) : syncStateBefore.dataEpoch;
+  const epochMismatch =
+    (hasClientEpoch && req.clientEpoch !== syncStateBefore.dataEpoch) ||
+    (!hasClientEpoch && mutations.length > 0 && syncStateBefore.dataEpoch > 1);
+
+  if (epochMismatch) {
+    // P2-C4 & Q2/N2: Do NOT dump mutations into rejected[]; return epochMismatch: true + full snapshot
+    // with pre-query changeSeq cursor so the client freezes ALL pending outbox items and misses 0 writes.
+    return buildFullResyncResponse(true);
   }
+
+  let epochChangedDuringMutations = false;
 
   for (const mut of mutations) {
     const rawId =
@@ -2122,9 +2307,15 @@ export async function processSyncRequest(
     }
 
     try {
-      await applySingleMutation(db, uid, mut, settings.usdTwdRate, serverTime);
+      await applySingleMutation(db, uid, mut, settings.usdTwdRate, serverTime, expectedEpoch);
       ackedMutationIds.push(mut.mutationId);
     } catch (err) {
+      if (err instanceof EpochMismatchError) {
+        // Q5 / N4: Concurrent replace import bumped data_epoch mid-request.
+        // Stop immediately so neither this nor any remaining stale-epoch mutation is applied or acked.
+        epochChangedDuringMutations = true;
+        break;
+      }
       if (err instanceof VersionConflictError) {
         // R1: Concurrent duplicate mutationId race — Request A may have committed between our initial
         // sync_idempotency check and our table SELECT, causing checkVersionOrThrow to throw before
@@ -2136,6 +2327,12 @@ export async function processSyncRequest(
         if (appliedByRace) {
           ackedMutationIds.push(mut.mutationId);
         } else {
+          // Q5 / N4: Also check if epoch changed (e.g. replace import reset row version before checkVersionOrThrow)
+          const currEpoch = await getCurrentDataEpoch(db, uid);
+          if (currEpoch !== expectedEpoch) {
+            epochChangedDuringMutations = true;
+            break;
+          }
           conflicts.push(err.conflict);
         }
       } else if (err instanceof RejectError) {
@@ -2173,46 +2370,22 @@ export async function processSyncRequest(
     Boolean(req.since) &&
     (req.clientEpoch === undefined || req.clientEpoch === null) &&
     syncStateAfter.dataEpoch > 1;
-  const epochChangedMidRequest = syncStateAfter.dataEpoch !== syncStateBefore.dataEpoch;
+  const epochChangedMidRequest =
+    epochChangedDuringMutations || syncStateAfter.dataEpoch !== syncStateBefore.dataEpoch;
 
   if (epochChangedMidRequest || legacySinceAfterReplace) {
-    // P2-S2 & P2-S9: Never return a partial delta with a bumped epoch or for a legacy `since` client after replace import
-    const fullDelta = await querySyncDelta(db, uid, null);
-    const syncStateFinal = await ensureUserSyncState(db, uid);
-    return {
-      ok: true,
-      serverTime,
-      syncCursor: syncStateFinal.changeSeq,
-      dataEpoch: syncStateFinal.dataEpoch,
-      fullResyncRequired: true,
-      ...(epochChangedMidRequest ? { epochMismatch: true } : {}),
-      ackedMutationIds,
-      rejected,
-      conflicts,
-      delta: fullDelta,
-    };
+    // P2-S2, P2-S9, Q2/N2 & Q5/N4: Never return a partial delta with a bumped epoch or for a legacy `since` client after replace import
+    return buildFullResyncResponse(epochChangedMidRequest);
   }
 
   const delta = useSeqCursor
     ? await querySyncDelta(db, uid, null, req.sinceSeq, syncStateAfter.changeSeq)
     : await querySyncDelta(db, uid, req.since);
 
-  // P2-S2: Final epoch verification after delta query in case a replace import committed concurrently
+  // P2-S2 & Q2/N2: Final epoch verification after delta query in case a replace import committed concurrently
   const syncStateFinal = await ensureUserSyncState(db, uid);
   if (syncStateFinal.dataEpoch !== syncStateAfter.dataEpoch) {
-    const fullDelta = await querySyncDelta(db, uid, null);
-    return {
-      ok: true,
-      serverTime,
-      syncCursor: syncStateFinal.changeSeq,
-      dataEpoch: syncStateFinal.dataEpoch,
-      fullResyncRequired: true,
-      epochMismatch: true,
-      ackedMutationIds,
-      rejected,
-      conflicts,
-      delta: fullDelta,
-    };
+    return buildFullResyncResponse(true);
   }
 
   return {

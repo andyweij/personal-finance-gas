@@ -194,7 +194,14 @@ export function openConflictsModal(ctx: UiContext): void {
       reapplyBtn.disabled = true;
       const res = await ctx.engine.reapplyFrozenOutbox();
       if (res.ok) {
-        showToast('已將待送變更重新套用至目前帳本', 'success');
+        if (res.skippedCount && res.skippedCount > 0) {
+          showToast(
+            `已重新套用 ${res.appliedCount ?? 0} 筆變更，並保留 ${res.skippedCount} 筆凍結後較新的紀錄`,
+            'success'
+          );
+        } else {
+          showToast('已將待送變更重新套用至目前帳本', 'success');
+        }
       } else if (!res.authRequired) {
         showToast(res.error || '重新套用同步未完全完成，稍後將自動重試', 'error');
       }
