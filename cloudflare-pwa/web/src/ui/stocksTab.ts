@@ -1489,6 +1489,11 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
       if (!prevAutoCleared && wlPriceInp.value.trim() !== initialPriceStr && wlPrevInp.value.trim() === initialPrevStr) {
         wlPrevInp.value = '';
         prevAutoCleared = true;
+      } else if (prevAutoCleared && wlPriceInp.value.trim() === initialPriceStr && wlPrevInp.value.trim() === '') {
+        // F6 edge: price typed back to its original value → restore the auto-cleared previous close,
+        // otherwise submit would send previousClose: null and wipe the server value.
+        wlPrevInp.value = initialPrevStr;
+        prevAutoCleared = false;
       }
     });
   }
@@ -1925,6 +1930,11 @@ export function openStockBaselineModal(
       if (!prevAutoCleared && priceInp.value.trim() !== initialPriceStr && stPrevInp.value.trim() === initialPrevStr) {
         stPrevInp.value = '';
         prevAutoCleared = true;
+      } else if (prevAutoCleared && priceInp.value.trim() === initialPriceStr && stPrevInp.value.trim() === '') {
+        // F6 edge: price typed back to its original value → restore the auto-cleared previous close,
+        // otherwise submit would send previousClose: null and wipe the server value.
+        stPrevInp.value = initialPrevStr;
+        prevAutoCleared = false;
       }
     });
   }

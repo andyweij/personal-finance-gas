@@ -5,7 +5,8 @@ import type { PnlColorScheme } from '../../shared/types';
 import { normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
-import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount } from './auth/authClient';
+import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount, setAuthExpectedUser } from './auth/authClient';
+import { createCrossTabChannel } from './sync/crossTab';
 import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast } from './ui/helpers';
 import {
   getTodayYmd,
@@ -86,8 +87,17 @@ function renderSyncPill(status: SyncStatus): void {
       pill.textContent = `⚠ 異常 (${cCount + rCount})`;
       pill.title = `有 ${cCount} 筆版本衝突與 ${rCount} 筆同步失敗，點擊處理`;
     } else if (rCount > 0) {
-      pill.textContent = `⚠ 同步失敗 (${rCount})`;
-      pill.title = `有 ${rCount} 筆異動被伺服器拒絕，點擊檢視原因`;
+      // Status pill: rejections must not hide offline / pending state
+      const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      const extra = offline
+        ? ' · 離線'
+        : status.pendingCount > 0
+          ? ` · 待同步 ${status.pendingCount}`
+          : '';
+      pill.textContent = `⚠ 同步失敗 (${rCount})${extra}`;
+      pill.title = `有 ${rCount} 筆異動被伺服器拒絕${
+        status.pendingCount > 0 ? `，另有 ${status.pendingCount} 筆待同步` : ''
+      }，點擊同步並檢視原因`;
     } else {
       pill.textContent = `⚠ 衝突 (${cCount || 1})`;
       pill.title = '偵測到離線與雲端版本衝突，點擊選擇保留版本';
@@ -195,10 +205,7 @@ async function bootstrap(): Promise<void> {
 
   let syncDebounce: number | undefined;
   let activeDb = new LocalFinanceDB(LocalFinanceDB.dbNameForUser(remembered?.id));
-  const accountChannel =
-    typeof BroadcastChannel !== 'undefined'
-      ? new BroadcastChannel('personal-finance-account-sync')
-      : null;
+  const accountChannel = createCrossTabChannel('personal-finance-account-sync');
 
   const createSyncEngineForDb = (db: LocalFinanceDB, expectedUserId?: string): SyncEngine =>
     new SyncEngine(db, {
@@ -289,6 +296,7 @@ async function bootstrap(): Promise<void> {
     switchAccountDb: async (user) => {
       const prevUserId = ctx.state.currentUser?.id || remembered?.id || null;
       ctx.state.currentUser = user;
+      setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
       cancelReorder(ctx, true);
       saveRememberedAccount(user);
       const nextDbName = LocalFinanceDB.dbNameForUser(user.id);
@@ -327,8 +335,8 @@ async function bootstrap(): Promise<void> {
   ctx.engine = createSyncEngineForDb(activeDb, remembered?.id);
 
   if (accountChannel) {
-    accountChannel.onmessage = (evt: MessageEvent) => {
-      const msg = evt.data as { type?: string; userId?: string } | null;
+    accountChannel.onmessage = (data: unknown) => {
+      const msg = data as { type?: string; userId?: string } | null;
       if (!msg) return;
       if (msg.type === 'logout') {
         ctx.engine.haltForAccountMismatch();
@@ -491,7 +499,9 @@ function bindEvents(ctx: UiContext): void {
 
   // Topbar actions
   el('syncStatusPill').addEventListener('click', async () => {
-    if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+    // Conflicts and frozen (post-restore) changes need a decision first. Rejections alone do not block a
+    // manual sync: sync first, then the modal below lists the rejections.
+    if (ctx.engine.getConflicts().length > 0 || ctx.engine.getFrozenOutbox().length > 0) {
       openConflictsModal(ctx);
       return;
     }

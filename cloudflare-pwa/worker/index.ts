@@ -86,6 +86,62 @@ function getOriginAndRpId(c: AppContext): { origin: string; rpID: string; isHttp
   };
 }
 
+/** Reads a request body as UTF-8 text, or returns null as soon as it exceeds maxBytes. */
+async function readBodyWithLimit(req: Request, maxBytes: number): Promise<string | null> {
+  if (!req.body) return '';
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const ch of chunks) {
+    buf.set(ch, offset);
+    offset += ch.byteLength;
+  }
+  return new TextDecoder().decode(buf);
+}
+
+/**
+ * R5: Route-level error response. Validation / business errors (plain messages written for users) are returned
+ * as 400. Database, driver and programming errors must never leak SQL or internal text and must not look
+ * permanent to the client, so they become a generic 500.
+ */
+const INTERNAL_ERROR_RE = /D1_|SQLITE|SQL\b|no such (table|column)|constraint failed|database|network connection|internal error|is not a function|Cannot read prop|undefined|null is not/i;
+
+function routeErrorResponse(c: AppContext, err: unknown, fallback: string) {
+  // Malformed request body (c.req.json() on invalid JSON) is the client's fault → 400
+  if (err instanceof SyntaxError) {
+    return c.json({ error: `${fallback}（請求內容格式錯誤）` }, 400);
+  }
+  // Bad data that trips a DB constraint (e.g. an imported value) is permanent → sanitized 400, never raw SQL
+  if (err instanceof Error && /constraint failed|SQLITE_CONSTRAINT|D1_TYPE_ERROR/i.test(err.message)) {
+    console.warn('[api] constraint error:', c.req.path, err.message);
+    return c.json({ error: `${fallback}（資料格式或欄位約束不符合規範）` }, 400);
+  }
+  const isInternal =
+    !(err instanceof Error) ||
+    err instanceof TypeError ||
+    err instanceof RangeError ||
+    err instanceof SyntaxError ||
+    err instanceof ReferenceError ||
+    INTERNAL_ERROR_RE.test(err.message);
+  if (isInternal) {
+    console.error('[api] internal error:', c.req.path, err);
+    return c.json({ error: `${fallback}（伺服器暫時無法處理，請稍後再試）` }, 500);
+  }
+  return c.json({ error: err.message || fallback }, 400);
+}
+
 export function createApp() {
   const app = new Hono<{ Bindings: WorkerEnv; Variables: AppVariables }>();
 
@@ -170,7 +226,7 @@ export function createApp() {
       c.header('Set-Cookie', buildSessionCookie(token, isHttps));
       return c.json({ ok: true, user: toAuthUser(admin), message: '初始化完成並已登入。' });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '初始化失敗' }, 400);
+      return routeErrorResponse(c, err, '初始化失敗');
     }
   });
 
@@ -208,7 +264,7 @@ export function createApp() {
       return c.json({ ok: true, user: toAuthUser(created) });
     } catch (err) {
       await recordLoginFailure(c.env.DB, rateKey);
-      return c.json({ error: err instanceof Error ? err.message : '註冊失敗' }, 400);
+      return routeErrorResponse(c, err, '註冊失敗');
     }
   });
 
@@ -237,7 +293,7 @@ export function createApp() {
       return c.json({ ok: true, message: '密碼已重設完成，請以新密碼登入。' });
     } catch (err) {
       await recordLoginFailure(c.env.DB, rateKey);
-      return c.json({ error: err instanceof Error ? err.message : '重設密碼失敗' }, 400);
+      return routeErrorResponse(c, err, '重設密碼失敗');
     }
   });
 
@@ -289,7 +345,7 @@ export function createApp() {
       const options = await createPasskeyAuthenticationOptions(c.env.DB, rpID);
       return c.json(options);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '無法產生 Passkey 選項' }, 400);
+      return routeErrorResponse(c, err, '無法產生 Passkey 選項');
     }
   });
 
@@ -325,6 +381,23 @@ export function createApp() {
     }
     c.set('authUser', session.user);
     c.set('tokenHash', session.tokenHash || '');
+    // P2-S11: every authenticated write refuses a request made by a tab that believes it is another account
+    // (the session cookie is shared by all tabs, so another tab may have switched accounts).
+    const method = c.req.method.toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      const expected = (c.req.header('x-expected-user') || '').trim();
+      if (expected && expected !== session.user.id) {
+        return c.json(
+          {
+            error: '目前瀏覽器登入帳號已變更，已停止寫入以避免跨帳號污染。請重新整理或切換帳號。',
+            code: 'ACCOUNT_MISMATCH',
+            expectedUserId: expected,
+            actualUserId: session.user.id,
+          },
+          409
+        );
+      }
+    }
     await next();
   };
 
@@ -349,7 +422,7 @@ export function createApp() {
       const updated = await updateUserProfile(c.env.DB, user.id, body);
       return c.json({ ok: true, user: updated });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '更新個人資料失敗' }, 400);
+      return routeErrorResponse(c, err, '更新個人資料失敗');
     }
   });
 
@@ -369,7 +442,7 @@ export function createApp() {
       );
       return c.json({ ok: true, message: '主密碼已更新。' });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '變更密碼失敗' }, 400);
+      return routeErrorResponse(c, err, '變更密碼失敗');
     }
   });
 
@@ -422,7 +495,7 @@ export function createApp() {
       const result = await configureUserPin(c.env.DB, user.id, body);
       return c.json({ ok: true, ...result });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'PIN 設定失敗' }, 400);
+      return routeErrorResponse(c, err, 'PIN 設定失敗');
     }
   });
 
@@ -442,7 +515,7 @@ export function createApp() {
       const created = await createInviteCode(c.env.DB, admin.id, body);
       return c.json({ ok: true, ...created });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '產生邀請碼失敗' }, 400);
+      return routeErrorResponse(c, err, '產生邀請碼失敗');
     }
   });
 
@@ -466,7 +539,7 @@ export function createApp() {
       );
       return c.json({ ok: true, ...created });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '產生密碼重置碼失敗' }, 400);
+      return routeErrorResponse(c, err, '產生密碼重置碼失敗');
     }
   });
 
@@ -480,14 +553,13 @@ export function createApp() {
       const updated = await adminUpdateUser(c.env.DB, admin.id, c.req.param('id') || '', body);
       return c.json({ ok: true, user: updated });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '更新成員狀態失敗' }, 400);
+      return routeErrorResponse(c, err, '更新成員狀態失敗');
     }
   });
 
   // Core Offline-First Bidirectional Sync Endpoint (strictly scoped to authUser.id)
   const MAX_SYNC_BODY_BYTES = 2 * 1024 * 1024; // 2 MB UTF-8 bytes
   const MAX_SYNC_MUTATIONS = 200;
-  const textEncoder = new TextEncoder();
 
   const checkExpectedUserMismatch = (
     expectedHeader: string | undefined,
@@ -517,8 +589,10 @@ export function createApp() {
       return c.json({ error: '單次同步請求體積過大，請分批同步。' }, 413);
     }
 
-    const rawText = await c.req.text();
-    if (textEncoder.encode(rawText).byteLength > MAX_SYNC_BODY_BYTES) {
+    // P2-S11: read the body as a stream with a byte cap, so a chunked request without Content-Length
+    // is never buffered beyond the limit.
+    const rawText = await readBodyWithLimit(c.req.raw, MAX_SYNC_BODY_BYTES);
+    if (rawText === null) {
       return c.json({ error: '單次同步請求體積過大，請分批同步。' }, 413);
     }
     let body: SyncRequest = { mutations: [] };
@@ -600,7 +674,7 @@ export function createApp() {
       );
       return c.json({ ok: true, ...summary });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'JSON 匯入失敗' }, 400);
+      return routeErrorResponse(c, err, 'JSON 匯入失敗');
     }
   });
 
@@ -797,7 +871,7 @@ export function createApp() {
       await commitCsvBatch(stmts);
       return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'CSV 解析或匯入失敗' }, 400);
+      return routeErrorResponse(c, err, 'CSV 解析或匯入失敗');
     }
   });
 

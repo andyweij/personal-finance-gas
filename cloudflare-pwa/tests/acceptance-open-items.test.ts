@@ -567,3 +567,194 @@ describe('驗收：客戶端尚未修正項目', () => {
     localDb.close();
   });
 });
+
+/* ===================== v1.8.7 審查新增（docs/reviews/2026-11-26_v1.8.7_review.md） ===================== */
+
+describe('驗收：v1.8.7 審查新增項目', () => {
+  it('V1: 只有寫入路徑故障（帶 mutation 的請求 503、純拉取正常）時，不得把正常 mutation 當成毒丸隔離', async () => {
+    const db = createTestD1();
+    const localDb = new LocalFinanceDB(`v1-${crypto.randomUUID()}`);
+    let writesDown = true;
+    const realFetch = d1Fetch(db);
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const body = JSON.parse(String(init?.body || '{}')) as SyncRequest;
+      // 寫入路徑故障：任何寫入請求（帶 mutation，或 v1.8.9 起的 writeProbe 寫入健康檢查）都回 503，純讀取正常
+      if (writesDown && (body.mutations.length > 0 || (body as SyncRequest & { writeProbe?: boolean }).writeProbe)) {
+        return new Response(JSON.stringify({ error: 'D1 write unavailable' }), { status: 503 });
+      }
+      return realFetch(input, init);
+    };
+    const engine = newEngine(localDb, fetchImpl, { maxPoisonRetries: 3 });
+    await engine.init();
+    for (let i = 0; i < 5; i++) {
+      await engine.addCashFlow(cfPayload(`正常紀錄${i}`));
+    }
+
+    for (let i = 0; i < 12; i++) {
+      await engine.syncNow();
+    }
+    writesDown = false;
+    for (let i = 0; i < 3; i++) {
+      await engine.syncNow();
+    }
+
+    expect(engine.getRejections()).toHaveLength(0);
+    expect(await localDb.getOutbox()).toHaveLength(0);
+    const rows = await db
+      .prepare('SELECT COUNT(*) AS n FROM cashflow_logs WHERE user_id = ? AND deleted_at IS NULL')
+      .bind(UID)
+      .first<{ n: number }>();
+    expect(Number(rows?.n)).toBe(5);
+
+    engine.destroy();
+    localDb.close();
+  });
+
+  it('V2: 同一筆紀錄被延後時，後面依賴它的 mutation 不得插隊（刪除帳本並搬移紀錄不得被拒）', async () => {
+    const db = createTestD1();
+    const localDb = new LocalFinanceDB(`v2-${crypto.randomUUID()}`);
+    let online = true;
+    const realFetch = d1Fetch(db);
+    const fetchImpl: typeof fetch = async (input, init) => {
+      if (!online) throw new TypeError('Failed to fetch');
+      return realFetch(input, init);
+    };
+    const engine = newEngine(localDb, fetchImpl);
+    await engine.init();
+
+    const ledger = await engine.saveLedger({ name: '旅遊帳本' });
+    await engine.syncNow();
+
+    // 在新帳本新增一筆紀錄，送出時網路失敗（該筆已標記為送出過）
+    online = false;
+    await engine.addCashFlow({ ...cfPayload('旅遊餐費'), ledgerId: ledger.id });
+    await engine.syncNow();
+
+    // 網路恢復前，使用者刪除帳本並把紀錄搬到預設帳本
+    await engine.deleteLedger(ledger.id, { migrateToLedgerId: 'default' });
+    online = true;
+    for (let i = 0; i < 4; i++) {
+      await engine.syncNow();
+    }
+
+    expect(engine.getRejections()).toHaveLength(0);
+    expect(await localDb.getOutbox()).toHaveLength(0);
+    const ledgerRow = await db
+      .prepare('SELECT id FROM ledgers WHERE user_id = ? AND id = ? AND deleted_at IS NULL')
+      .bind(UID, ledger.id)
+      .first();
+    expect(ledgerRow).toBeNull();
+
+    engine.destroy();
+    localDb.close();
+  });
+
+  it('V3: 「重新套用」時因有較新編輯而被略過的凍結項目，必須保留給使用者檢視（不得靜默丟棄）', async () => {
+    const db = createTestD1();
+    const localDb = new LocalFinanceDB(`v3-${crypto.randomUUID()}`);
+    const engine = newEngine(localDb, d1Fetch(db));
+    await engine.init();
+
+    const created = await engine.saveAsset(manualAsset('v0'));
+    await engine.syncNow();
+    await engine.saveAsset({ ...manualAsset('offline-old'), id: created.id });
+
+    const full = await processSyncRequest(db, UID, { since: null, mutations: [] });
+    await importFullSnapshot(db, UID, { assetItems: full.delta.assetItems }, 'replace');
+    await engine.syncNow();
+    expect(engine.getFrozenOutbox().length).toBeGreaterThan(0);
+
+    await engine.saveAsset({ ...manualAsset('newer'), id: created.id });
+    await engine.syncNow();
+    await engine.reapplyFrozenOutbox();
+
+    // 被略過的 'offline-old' 編輯必須仍可取得（建議以 rejection / 狀態 'skipped_newer' 保存 clientPayload）
+    const kept = engine
+      .getRejections()
+      .some((r) => r.recordId === created.id && (r.clientPayload as Record<string, unknown> | undefined)?.note === 'offline-old');
+    expect(kept).toBe(true);
+
+    engine.destroy();
+    localDb.close();
+  });
+
+  it('V4: 請求途中 replace 後，舊 epoch 的 mutation 不得依還原後的資料被「拒絕」（應凍結，而非顯示錯誤並丟棄）', async () => {
+    const db = createTestD1();
+    // 舊 epoch：帳本 L2 與其中一筆紀錄
+    await processSyncRequest(db, UID, {
+      sinceSeq: 0,
+      clientEpoch: 1,
+      mutations: [
+        {
+          mutationId: 'mk-ledger',
+          entity: 'ledger',
+          op: 'upsert',
+          recordId: 'L2',
+          clientTimestamp: '2026-11-26T00:00:00.000Z',
+          baseVersion: null,
+          isNewRecord: true,
+          payload: { name: '旅遊帳本' },
+        } as SyncMutation,
+        {
+          mutationId: 'mk-cf',
+          entity: 'cashflow',
+          op: 'upsert',
+          recordId: 'cf-l2',
+          clientTimestamp: '2026-11-26T00:00:01.000Z',
+          baseVersion: null,
+          payload: { ...cfPayload('旅遊餐費'), ledgerId: 'L2' },
+        },
+      ],
+    });
+    const backup = await processSyncRequest(db, UID, { since: null, mutations: [] }); // 含 L2 與 cf-l2 的備份
+    // 舊 epoch 中刪掉那筆紀錄 → L2 變成空帳本，可以刪除
+    await processSyncRequest(db, UID, {
+      sinceSeq: 0,
+      clientEpoch: 1,
+      mutations: [
+        {
+          mutationId: 'rm-cf',
+          entity: 'cashflow',
+          op: 'delete',
+          recordId: 'cf-l2',
+          clientTimestamp: '2026-11-26T00:00:02.000Z',
+          baseVersion: 1,
+        },
+      ],
+    });
+
+    let fired = false;
+    const hooked = hookDb(db, async (sql, phase, method) => {
+      if (phase === 'before' && method === 'first' && !fired && /SELECT mutation_id FROM sync_idempotency/.test(sql)) {
+        fired = true;
+        // 另一台裝置用備份還原（L2 仍有關聯紀錄）
+        await importFullSnapshot(
+          db,
+          UID,
+          { ledgers: backup.delta.ledgers, cashflowLogs: backup.delta.cashflowLogs },
+          'replace'
+        );
+      }
+      return undefined;
+    });
+
+    const res = await processSyncRequest(hooked, UID, {
+      sinceSeq: 0,
+      clientEpoch: 1,
+      mutations: [
+        {
+          mutationId: 'stale-del-ledger',
+          entity: 'ledger',
+          op: 'delete',
+          recordId: 'L2',
+          clientTimestamp: '2026-11-26T00:00:03.000Z',
+          baseVersion: 1,
+        },
+      ],
+    });
+    expect(fired).toBe(true);
+    expect(res.epochMismatch).toBe(true);
+    expect(res.rejected.map((r) => r.mutationId)).not.toContain('stale-del-ledger');
+    expect(res.ackedMutationIds).not.toContain('stale-del-ledger');
+  });
+});

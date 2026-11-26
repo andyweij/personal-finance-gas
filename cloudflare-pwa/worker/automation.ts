@@ -52,6 +52,19 @@ export async function runMonthlyRecurringD1(
   const usdRate = settings.usdTwdRate;
   const nowIso = new Date().toISOString();
 
+  // R-5: Capture the data epoch together with the reads below. Every insert is guarded by it, so a replace
+  // import landing mid-run can never receive entries generated from the pre-restore recurring items.
+  await db
+    .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+    .bind(uid, nowIso)
+    .run();
+  const epochRow = await db
+    .prepare('SELECT data_epoch FROM user_sync_state WHERE user_id = ?')
+    .bind(uid)
+    .first<{ data_epoch: number }>();
+  const expectedEpoch = Number(epochRow?.data_epoch ?? 1);
+  const epochGuard = '(SELECT data_epoch FROM user_sync_state WHERE user_id = ?) = ?';
+
   const existingRows = await db
     .prepare(
       `SELECT type, item_name, recurring_dedup_key, ledger_id
@@ -120,7 +133,8 @@ export async function runMonthlyRecurringD1(
       .prepare(
         `INSERT INTO cashflow_logs
           (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, NULL, 1, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0))`
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, NULL, 1, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
+         WHERE ${epochGuard}`
       )
       .bind(
         uid,
@@ -140,7 +154,9 @@ export async function runMonthlyRecurringD1(
         ledgerId,
         nowIso,
         nowIso,
-        uid
+        uid,
+        uid,
+        expectedEpoch
       );
 
     if (item.cycle === '一次性') {
@@ -150,13 +166,15 @@ export async function runMonthlyRecurringD1(
         .prepare(
           `UPDATE recurring_items SET status = '停用', note = ?, updated_at = ?, version = version + 1,
               change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
-           WHERE user_id = ? AND id = ?`
+           WHERE user_id = ? AND id = ? AND ${epochGuard}`
         )
-        .bind(updatedNote, nowIso, uid, uid, item.id);
-      await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt, deactivateStmt]);
+        .bind(updatedNote, nowIso, uid, uid, item.id, uid, expectedEpoch);
+      const results = await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt, deactivateStmt]);
+      if (Number(results[2]?.meta?.changes ?? 0) === 0) break; // R-5: epoch changed — stop this run
       deactivatedOneTimeCount++;
     } else {
-      await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt]);
+      const results = await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt]);
+      if (Number(results[2]?.meta?.changes ?? 0) === 0) break; // R-5: epoch changed — stop this run
     }
 
     existingKeys.add(dedupKey);

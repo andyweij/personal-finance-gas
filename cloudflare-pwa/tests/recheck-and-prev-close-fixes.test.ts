@@ -166,6 +166,8 @@ describe('Phase 1 Recheck (R1-R7) & v1.8.4 Previous-Close Review (F1-F9)', () =>
       }
       const res: SyncResponse = {
         ok: true,
+        // v1.8.9 (V1): a healthy server confirms the harmless write-health probe
+        ...((body as SyncRequest & { writeProbe?: boolean }).writeProbe ? { writeProbeOk: true } : {}),
         serverTime: '2026-11-26T01:00:00.000Z',
         syncCursor: 2,
         dataEpoch: 1,

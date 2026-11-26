@@ -196,11 +196,14 @@ export function openConflictsModal(ctx: UiContext): void {
       if (res.ok) {
         if (res.skippedCount && res.skippedCount > 0) {
           showToast(
-            `已重新套用 ${res.appliedCount ?? 0} 筆變更，並保留 ${res.skippedCount} 筆凍結後較新的紀錄`,
+            `已重新套用 ${res.appliedCount ?? 0} 筆變更；${res.skippedCount} 筆因雲端已有較新版本未套用，已列入清單供檢視`,
             'success'
           );
+        } else if ((res.appliedCount ?? 0) > 0) {
+          showToast(`已將 ${res.appliedCount} 筆待送變更重新套用至目前帳本`, 'success');
         } else {
-          showToast('已將待送變更重新套用至目前帳本', 'success');
+          // R-7: another tab already handled the frozen changes
+          showToast('沒有需要重新套用的變更（可能已在其他分頁處理）', 'success');
         }
       } else if (!res.authRequired) {
         showToast(res.error || '重新套用同步未完全完成，稍後將自動重試', 'error');
@@ -365,7 +368,10 @@ export function openConflictsModal(ctx: UiContext): void {
       title.textContent = itemTitle ? `${entityLabel} · ${itemTitle}` : `${entityLabel} (${r.recordId})`;
       const badge = document.createElement('span');
       badge.className =
-        r.resolutionStatus === 'pending_resync' || r.resolutionStatus === 'quarantined'
+        r.resolutionStatus === 'pending_resync' ||
+        r.resolutionStatus === 'quarantined' ||
+        r.resolutionStatus === 'skipped_newer' ||
+        r.resolutionStatus === 'held_after_reject'
           ? 'badge warn'
           : 'badge red';
       badge.style.marginRight = '0';
@@ -378,7 +384,11 @@ export function openConflictsModal(ctx: UiContext): void {
               ? '異動遭拒（待重整雲端）'
               : r.resolutionStatus === 'quarantined'
                 ? '反覆失敗（已移出佇列）'
-                : r.isNewRecord
+                : r.resolutionStatus === 'skipped_newer'
+                  ? '還原前的編輯（已有較新版本，未套用）'
+                  : r.resolutionStatus === 'held_after_reject'
+                    ? '後續編輯（因前一筆遭拒已暫停）'
+                    : r.isNewRecord
                   ? '新建遭拒（已回滾）'
                   : '異動遭拒（待重整雲端）';
       badge.textContent = statusLabel;

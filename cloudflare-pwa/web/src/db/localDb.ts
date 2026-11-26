@@ -71,6 +71,33 @@ export interface LocalMeta {
   passkeys?: CachedPasskeyDto[];
 }
 
+/**
+ * P2-C6: Lock-screen fields owned by updateLocalPinCache / updateLocalBiometricCache. Every other meta write
+ * keeps the stored values of these fields, so a tab holding a stale in-memory meta (e.g. while syncing)
+ * can never revert a PIN or biometric change made in another tab.
+ */
+const AUTH_META_FIELDS = ['pinEnabled', 'pinSalt', 'pinHash', 'biometricLockEnabled', 'passkeys'] as const;
+type AuthMetaPatch = Partial<Pick<LocalMeta, (typeof AUTH_META_FIELDS)[number]>>;
+
+function pickAuthMeta(meta: Partial<LocalMeta>): AuthMetaPatch {
+  const out: Record<string, unknown> = {};
+  for (const k of AUTH_META_FIELDS) {
+    if (k in meta) out[k] = (meta as Record<string, unknown>)[k];
+  }
+  return out as AuthMetaPatch;
+}
+
+/**
+ * P2-C6: Thrown by commitLocalMutation when another tab wrote the snapshot after this tab last read it.
+ * The engine reloads from IndexedDB and recomputes the edit instead of overwriting the other tab's data.
+ */
+export class StaleSnapshotError extends Error {
+  constructor() {
+    super('Local snapshot changed in another tab');
+    this.name = 'StaleSnapshotError';
+  }
+}
+
 export class LocalFinanceDB {
   private db: IDBDatabase | null = null;
 
@@ -123,6 +150,11 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readonly');
+      // P2-C6: read the revision first so it is known before the snapshot request resolves
+      const revReq = tx.objectStore(STORE_KV).get('snapshot_rev');
+      revReq.onsuccess = () => {
+        this.lastSnapshotRev = Number(revReq.result) || 0;
+      };
       const req = tx.objectStore(STORE_KV).get('snapshot');
       req.onsuccess = () => {
         const raw = req.result as Partial<FinanceSnapshot> | undefined;
@@ -164,9 +196,14 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readwrite');
-      tx.objectStore(STORE_KV).put(snapshot, 'snapshot');
+      {
+        const kvSnap = tx.objectStore(STORE_KV);
+        kvSnap.put(snapshot, 'snapshot');
+        this.bumpSnapshotRev(kvSnap);
+      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -192,9 +229,10 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readwrite');
-      tx.objectStore(STORE_KV).put(meta, 'meta');
+      this.putMetaKeepingAuth(tx.objectStore(STORE_KV), meta);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -215,6 +253,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(conflicts, 'conflicts');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -235,10 +274,51 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(rejections, 'rejections');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
   private outboxSeq = 0;
+  /** P2-C6: snapshot revision this instance last read or wrote (stored under KV key 'snapshot_rev'). */
+  private lastSnapshotRev = 0;
+
+  /** P2-C6: write meta but keep the stored lock-screen fields (see AUTH_META_FIELDS). */
+  private putMetaKeepingAuth(kv: IDBObjectStore, meta: LocalMeta): void {
+    const req = kv.get('meta');
+    req.onsuccess = () => {
+      const stored = req.result as LocalMeta | undefined;
+      kv.put(stored ? { ...meta, ...pickAuthMeta(stored) } : meta, 'meta');
+    };
+  }
+
+  /** P2-C6: update only the lock-screen fields, merged into the stored meta (cursor etc. untouched). */
+  async patchAuthMeta(patch: AuthMetaPatch): Promise<LocalMeta | null> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      const kv = tx.objectStore(STORE_KV);
+      let merged: LocalMeta | null = null;
+      const req = kv.get('meta');
+      req.onsuccess = () => {
+        const stored = req.result as LocalMeta | undefined;
+        if (!stored) return;
+        merged = { ...stored, ...patch };
+        kv.put(merged, 'meta');
+      };
+      tx.oncomplete = () => resolve(merged);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+    });
+  }
+
+  private bumpSnapshotRev(kv: IDBObjectStore): void {
+    const req = kv.get('snapshot_rev');
+    req.onsuccess = () => {
+      const next = (Number(req.result) || 0) + 1;
+      kv.put(next, 'snapshot_rev');
+      this.lastSnapshotRev = next;
+    };
+  }
 
   async getOutbox(): Promise<SyncMutation[]> {
     const db = this.getDb();
@@ -274,6 +354,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(items, 'frozen_outbox');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -299,6 +380,7 @@ export class LocalFinanceDB {
       };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -331,6 +413,7 @@ export class LocalFinanceDB {
       };
       tx.oncomplete = () => resolve(updated);
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -349,10 +432,12 @@ export class LocalFinanceDB {
       }
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
-      kv.put(meta, 'meta');
+      this.bumpSnapshotRev(kv);
+      this.putMetaKeepingAuth(kv, meta);
       kv.put(rejections, 'rejections');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -445,17 +530,40 @@ export class LocalFinanceDB {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
-      tx.objectStore(STORE_KV).put(snapshot, 'snapshot');
+      const kv = tx.objectStore(STORE_KV);
       const outboxStore = tx.objectStore(STORE_OUTBOX);
-      const getAllReq = outboxStore.getAll();
-
-      getAllReq.onsuccess = () => {
-        const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
-        this.applyMutationsToOutboxStore(outboxStore, existingList, mutations, inFlightIds);
+      let stale = false;
+      let newRev = this.lastSnapshotRev;
+      // P2-C6: only write if no other tab changed the snapshot since this tab last read/wrote it
+      const revReq = kv.get('snapshot_rev');
+      revReq.onsuccess = () => {
+        const cur = Number(revReq.result) || 0;
+        if (cur !== this.lastSnapshotRev) {
+          stale = true;
+          try {
+            tx.abort();
+          } catch {
+            /* already aborted */
+          }
+          return;
+        }
+        newRev = cur + 1;
+        kv.put(snapshot, 'snapshot');
+        kv.put(newRev, 'snapshot_rev');
+        const getAllReq = outboxStore.getAll();
+        getAllReq.onsuccess = () => {
+          const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
+          this.applyMutationsToOutboxStore(outboxStore, existingList, mutations, inFlightIds);
+        };
       };
 
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.oncomplete = () => {
+        this.lastSnapshotRev = newRev;
+        resolve();
+      };
+      tx.onerror = () => reject(stale ? new StaleSnapshotError() : tx.error);
+      tx.onabort = () =>
+        reject(stale ? new StaleSnapshotError() : tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -468,9 +576,11 @@ export class LocalFinanceDB {
       const tx = db.transaction(STORE_KV, 'readwrite');
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
+      this.bumpSnapshotRev(kv);
       kv.put(conflicts, 'conflicts');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -485,6 +595,7 @@ export class LocalFinanceDB {
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
+      this.bumpSnapshotRev(kv);
       kv.put(conflicts, 'conflicts');
       const outboxStore = tx.objectStore(STORE_OUTBOX);
       const getAllReq = outboxStore.getAll();
@@ -494,6 +605,7 @@ export class LocalFinanceDB {
       };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -538,7 +650,8 @@ export class LocalFinanceDB {
         outboxStore.clear();
         kv.put(mergedFrozen, 'frozen_outbox');
         kv.put(snapshot, 'snapshot');
-        kv.put(meta, 'meta');
+        this.bumpSnapshotRev(kv);
+        this.putMetaKeepingAuth(kv, meta);
         if (conflicts !== undefined) kv.put(conflicts, 'conflicts');
         if (rejections !== undefined) kv.put(rejections, 'rejections');
       };
@@ -554,6 +667,7 @@ export class LocalFinanceDB {
 
       tx.oncomplete = () => resolve(mergedFrozen);
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -567,6 +681,8 @@ export class LocalFinanceDB {
       mutationsToEnqueue: SyncMutation[];
       appliedCount: number;
       skippedCount: number;
+      /** V3: frozen mutations skipped because the record changed after the freeze — kept for the user to review. */
+      skippedRejections?: SyncRejection[];
     },
     inFlightIds?: ReadonlySet<string>
   ): Promise<{
@@ -574,6 +690,7 @@ export class LocalFinanceDB {
     appliedCount: number;
     skippedCount: number;
     remainingOutboxCount: number;
+    rejections: SyncRejection[] | null;
   }> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
@@ -584,10 +701,14 @@ export class LocalFinanceDB {
       const snapReq = kv.get('snapshot');
       const frozenReq = kv.get('frozen_outbox');
       const outboxReq = outboxStore.getAll();
+      const rejectionsReq = kv.get('rejections');
 
       let snapLoaded = false;
       let frozenLoaded = false;
       let outboxLoaded = false;
+      let rejectionsLoaded = false;
+      let existingRejections: SyncRejection[] = [];
+      let resultRejections: SyncRejection[] | null = null;
       let rawSnap: FinanceSnapshot | undefined;
       let freshFrozen: SyncMutation[] = [];
       let existingList: Array<SyncMutation & { _seq?: number }> = [];
@@ -596,9 +717,10 @@ export class LocalFinanceDB {
       let appliedCount = 0;
       let skippedCount = 0;
       let remainingOutboxCount = 0;
+      let failure: unknown = null;
 
       const tryFinalize = () => {
-        if (!snapLoaded || !frozenLoaded || !outboxLoaded) return;
+        if (!snapLoaded || !frozenLoaded || !outboxLoaded || !rejectionsLoaded) return;
         const freshSnapshot = rawSnap
           ? {
               ...createEmptySnapshot(),
@@ -626,13 +748,33 @@ export class LocalFinanceDB {
           return;
         }
 
-        const transformed = transform(freshSnapshot, freshFrozen, cleanOutbox);
+        let transformed: ReturnType<typeof transform>;
+        try {
+          transformed = transform(freshSnapshot, freshFrozen, cleanOutbox);
+        } catch (err) {
+          // R-1: An exception inside an IndexedDB callback would abort the transaction without settling
+          // this promise, deadlocking the engine's serialized lock. Abort explicitly and reject.
+          failure = err;
+          try {
+            tx.abort();
+          } catch {
+            /* already aborted */
+          }
+          return;
+        }
         resultSnapshot = transformed.nextSnapshot;
         appliedCount = transformed.appliedCount;
         skippedCount = transformed.skippedCount;
 
         kv.put(transformed.nextSnapshot, 'snapshot');
+        this.bumpSnapshotRev(kv);
         kv.put([], 'frozen_outbox');
+        if (transformed.skippedRejections && transformed.skippedRejections.length > 0) {
+          const byId = new Map(existingRejections.map((r) => [r.mutationId, r]));
+          for (const r of transformed.skippedRejections) byId.set(r.mutationId, r);
+          resultRejections = Array.from(byId.values());
+          kv.put(resultRejections, 'rejections');
+        }
         if (transformed.mutationsToEnqueue.length > 0) {
           this.applyMutationsToOutboxStore(
             outboxStore,
@@ -662,6 +804,11 @@ export class LocalFinanceDB {
         outboxLoaded = true;
         tryFinalize();
       };
+      rejectionsReq.onsuccess = () => {
+        existingRejections = Array.isArray(rejectionsReq.result) ? (rejectionsReq.result as SyncRejection[]) : [];
+        rejectionsLoaded = true;
+        tryFinalize();
+      };
 
       tx.oncomplete = () =>
         resolve({
@@ -669,8 +816,10 @@ export class LocalFinanceDB {
           appliedCount,
           skippedCount,
           remainingOutboxCount,
+          rejections: resultRejections,
         });
-      tx.onerror = () => reject(tx.error);
+      tx.onerror = () => reject(failure ?? tx.error);
+      tx.onabort = () => reject(failure ?? tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -691,14 +840,27 @@ export class LocalFinanceDB {
       }
       if (rebasedMutations && rebasedMutations.length > 0) {
         for (const item of rebasedMutations) {
-          outboxStore.delete(item.oldMutationId);
-          this.outboxSeq += 1;
-          outboxStore.put({ ...item.replacement, _seq: this.outboxSeq });
+          // V2: Keep the original queue position (_seq) so a rebased mutation never moves behind mutations
+          // that were queued after it (e.g. "move records out of ledger" must stay before "delete ledger").
+          // P2-C5: If the old mutation is gone (coalesced/removed by another tab meanwhile), do not resurrect it.
+          const getReq = outboxStore.get(item.oldMutationId);
+          getReq.onsuccess = () => {
+            const old = getReq.result as (SyncMutation & { _seq?: number }) | undefined;
+            if (!old) return;
+            outboxStore.delete(item.oldMutationId);
+            let seq = old._seq;
+            if (seq === undefined) {
+              this.outboxSeq += 1;
+              seq = this.outboxSeq;
+            }
+            outboxStore.put({ ...item.replacement, _seq: seq });
+          };
         }
       }
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
-      kv.put(meta, 'meta');
+      this.bumpSnapshotRev(kv);
+      this.putMetaKeepingAuth(kv, meta);
       if (conflicts !== undefined) {
         kv.put(conflicts, 'conflicts');
       }
@@ -707,6 +869,7 @@ export class LocalFinanceDB {
       }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -718,6 +881,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_OUTBOX).clear();
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 }

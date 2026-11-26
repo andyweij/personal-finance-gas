@@ -383,13 +383,22 @@ export async function ensureRentUtilitySettings(
   }
 
   const nowIso = new Date().toISOString();
-  await db
-    .prepare(
-      `INSERT OR IGNORE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
-       VALUES (?, 0, 0, 0, 0, ?, 1)`
-    )
-    .bind(uid, nowIso)
-    .run();
+  // P2-S12: allocate a change_seq like every other synced row, so a lazily created row is never invisible
+  // to a device that already holds a cursor.
+  await db.batch([
+    db
+      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+      .bind(uid, nowIso),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version, change_seq)
+         VALUES (?, 0, 0, 0, 0, ?, 1, ${NEXT_SEQ_SQL})`
+      )
+      .bind(uid, nowIso, uid),
+    db
+      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+      .bind(nowIso, uid),
+  ]);
 
   return { ...DEFAULT_UTILITY_RENTS, updatedAt: nowIso, version: 1 };
 }
@@ -565,6 +574,8 @@ async function recordIdempotencyOnly(
     if (currEpoch !== expectedEpoch) {
       throw new EpochMismatchError();
     }
+    // R-8: Neither recorded nor an epoch change — never ack silently; let the request fail and be retried.
+    throw new Error('sync_idempotency row could not be recorded');
   }
 }
 
@@ -1924,6 +1935,11 @@ async function applySingleMutation(
 
   if (mutation.entity === 'utility_record') {
     const normalizedPeriod = mutation.recordId.trim();
+    // validateUtilityRecordInput truncates period to 20 characters; reject longer keys up front so lookups,
+    // writes and sync_lww_timestamps all use the same key (no spurious conflicts on a truncated key).
+    if (!normalizedPeriod || normalizedPeriod.length > 20 || normalizedPeriod !== mutation.recordId) {
+      throw new RejectError('水電期別鍵值格式不符（不得含前後空白，且長度不得超過 20 字）。');
+    }
     if (mutation.op !== 'delete') {
       const pEarly = mutation.payload || {};
       const payloadPeriodEarly =
@@ -2235,13 +2251,26 @@ export async function processSyncRequest(
     // Q2 / N2: Read change_seq & data_epoch BEFORE querying full snapshot so any concurrent write
     // committed during querySyncDelta(null) has change_seq > stateBeforeQuery.changeSeq and is
     // guaranteed to be returned either in this snapshot or in the next incremental sync.
+    // R-4: Retry (bounded) until no replace import lands while the snapshot is being read, so the
+    // response never mixes rows from two epochs.
     let stateBeforeQuery = await ensureUserSyncState(db, uid);
     let fullDelta = await querySyncDelta(db, uid, null);
-    const stateAfterQuery = await ensureUserSyncState(db, uid);
-    if (stateAfterQuery.dataEpoch !== stateBeforeQuery.dataEpoch) {
-      // Another replace import committed mid-snapshot: retry once reading state before query
+    let stable = false;
+    for (let attempt = 0; attempt < 3 && !stable; attempt++) {
+      const stateAfterQuery = await ensureUserSyncState(db, uid);
+      if (stateAfterQuery.dataEpoch === stateBeforeQuery.dataEpoch) {
+        stable = true;
+        break;
+      }
       stateBeforeQuery = stateAfterQuery;
       fullDelta = await querySyncDelta(db, uid, null);
+    }
+    if (!stable) {
+      const finalState = await ensureUserSyncState(db, uid);
+      if (finalState.dataEpoch !== stateBeforeQuery.dataEpoch) {
+        // Back-to-back restores: fail the request (5xx → client retries) rather than return a mixed snapshot
+        throw new Error('data epoch kept changing while building the full snapshot');
+      }
     }
     return {
       ok: true,
@@ -2267,6 +2296,17 @@ export async function processSyncRequest(
     // P2-C4 & Q2/N2: Do NOT dump mutations into rejected[]; return epochMismatch: true + full snapshot
     // with pre-query changeSeq cursor so the client freezes ALL pending outbox items and misses 0 writes.
     return buildFullResyncResponse(true);
+  }
+
+  // V1: Harmless write used by clients as evidence that the D1 write path is healthy. If this write fails the
+  // whole request fails (5xx), so a client never mistakes a write outage for a broken mutation.
+  let writeProbeOk = false;
+  if (req.writeProbe === true && mutations.length === 0) {
+    await db
+      .prepare('UPDATE user_sync_state SET updated_at = ? WHERE user_id = ?')
+      .bind(serverTime, uid)
+      .run();
+    writeProbeOk = true;
   }
 
   let epochChangedDuringMutations = false;
@@ -2343,6 +2383,12 @@ export async function processSyncRequest(
           conflicts.push(err.conflict);
         }
       } else if (err instanceof RejectError) {
+        // V4: A rejection evaluated against data restored by a concurrent replace import is meaningless
+        // for a stale-epoch client — stop and let the client freeze it instead of dropping it as an error.
+        if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+          epochChangedDuringMutations = true;
+          break;
+        }
         rejected.push({
           mutationId: mut.mutationId,
           reason: err.message || '資料驗證失敗，伺服器拒絕此筆異動',
@@ -2356,6 +2402,11 @@ export async function processSyncRequest(
             errMsg
           )
         ) {
+          // V4: same epoch re-check as the RejectError branch
+          if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+            epochChangedDuringMutations = true;
+            break;
+          }
           console.warn('[sync] deterministic constraint rejected:', mut.entity, mut.recordId, errMsg);
           rejected.push({
             mutationId: mut.mutationId,
@@ -2405,6 +2456,7 @@ export async function processSyncRequest(
     rejected,
     conflicts,
     delta,
+    ...(writeProbeOk ? { writeProbeOk: true } : {}),
   };
 }
 
@@ -2672,6 +2724,7 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_logs_start = stmts.length;
   for (const { id, v, createdAt } of validatedLogs) {
     stmts.push(
       db
@@ -2721,6 +2774,8 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_logs_end = stmts.length;
+  const range_recurring_start = stmts.length;
   for (const { id, v, createdAt } of validatedRecurring) {
     stmts.push(
       db
@@ -2768,6 +2823,8 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_recurring_end = stmts.length;
+  const range_sinking_start = stmts.length;
   for (const { id, v, createdAt } of validatedSinking) {
     stmts.push(
       db
@@ -2807,6 +2864,8 @@ export async function importFullSnapshot(
     );
   }
 
+  const range_sinking_end = stmts.length;
+  const range_assets_start = stmts.length;
   for (const { id, v, priceUpdatedAt, createdAt } of validatedAssets) {
     stmts.push(
       db
@@ -2881,6 +2940,7 @@ export async function importFullSnapshot(
         )
     );
   }
+  const range_assets_end = stmts.length;
 
   for (const { id, v, twdAmount, createdAt } of validatedAdjs) {
     stmts.push(
@@ -3054,14 +3114,19 @@ export async function importFullSnapshot(
     );
   }
 
-  if (stmts.length > 0) {
-    await db.batch(stmts);
-  }
+  const results = stmts.length > 0 ? await db.batch(stmts) : [];
+  // Count rows actually written: merge mode skips rows that are soft-deleted on the server
+  // (ON CONFLICT ... WHERE deleted_at IS NULL), and those must not be reported as imported.
+  const countChanged = (start: number, end: number) => {
+    let n = 0;
+    for (let i = start; i < end; i++) n += Number(results[i]?.meta?.changes ?? 0) > 0 ? 1 : 0;
+    return n;
+  };
 
   return {
-    importedLogs: validatedLogs.length,
-    importedRecurring: validatedRecurring.length,
-    importedSinking: validatedSinking.length,
-    importedAssets: validatedAssets.length,
+    importedLogs: countChanged(range_logs_start, range_logs_end),
+    importedRecurring: countChanged(range_recurring_start, range_recurring_end),
+    importedSinking: countChanged(range_sinking_start, range_sinking_end),
+    importedAssets: countChanged(range_assets_start, range_assets_end),
   };
 }

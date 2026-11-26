@@ -204,7 +204,8 @@ function formatUtcOffsetDateKey(epochSec: number, gmtOffsetSec: number): string 
 async function fetchYahoo1dPreviousClose(
   host: string,
   symbol: string,
-  fetchImpl: FetchLike
+  fetchImpl: FetchLike,
+  expectedMarketDay?: string | null
 ): Promise<number | null> {
   try {
     const url = `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
@@ -218,11 +219,22 @@ async function fetchYahoo1dPreviousClose(
           meta?: {
             previousClose?: number;
             chartPreviousClose?: number;
+            regularMarketTime?: number;
+            gmtoffset?: number;
           };
         }>;
       };
     };
     const meta = json?.chart?.result?.[0]?.meta;
+    // F11: the extra request may land after the session rolled over. Its previous close only pairs with the
+    // 5d price when both describe the same trading day; otherwise return null rather than mismatch them.
+    if (expectedMarketDay) {
+      const t = Number(meta?.regularMarketTime);
+      const off = Number.isFinite(Number(meta?.gmtoffset)) ? Number(meta?.gmtoffset) : 0;
+      if (Number.isFinite(t) && t > 0 && formatUtcOffsetDateKey(t, off) !== expectedMarketDay) {
+        return null;
+      }
+    }
     // On range=1d, both meta.previousClose and meta.chartPreviousClose represent the previous trading day's close
     const candidate = Number(meta?.previousClose ?? meta?.chartPreviousClose);
     if (Number.isFinite(candidate) && candidate > 0) {
@@ -322,7 +334,9 @@ async function fetchYahooChartQuote(
           } else {
             // Do NOT use range=5d meta.chartPreviousClose (that is ~1 week prior to the chart window).
             // Query range=1d where meta.previousClose / chartPreviousClose is the true previous trading day's close.
-            prevClose = await fetchYahoo1dPreviousClose(host, symbol, fetchImpl);
+            const expectedDay =
+              Number.isFinite(marketTime) && marketTime > 0 ? formatUtcOffsetDateKey(marketTime, gmtOffset) : null;
+            prevClose = await fetchYahoo1dPreviousClose(host, symbol, fetchImpl, expectedDay);
           }
         }
 
@@ -499,7 +513,13 @@ async function fetchTwseMisQuote(
 
       let price: number | null = validZ;
 
-      // 2. When z === '-' (e.g., 5s snapshot without trade or closing call auction), try best bid/ask (b / a)
+      // F2/F3: From the closing call auction (13:25) onwards, resting bid/ask are trial or leftover quotes, not
+      // traded prices. Without a trade price, let Yahoo (daily close) take over instead of writing a midpoint.
+      if (price === null && hasValidTime && tStr >= '13:25:00') {
+        continue;
+      }
+
+      // 2. When z === '-' (e.g., 5s snapshot without trade), try best bid/ask (b / a)
       if (price === null) {
         const bestBid = parseFirstMisBookPrice(entry?.b);
         const bestAsk = parseFirstMisBookPrice(entry?.a);
