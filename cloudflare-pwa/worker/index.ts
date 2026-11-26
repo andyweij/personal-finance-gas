@@ -10,6 +10,9 @@ import {
   changeUserPassword,
   checkAndRecordFixedWindowRateLimit,
   checkRateLimit,
+  peekRateLimit,
+  cleanupExpiredAuthData,
+  listRecentSecurityEvents,
   clearRateLimit,
   configureUserPin,
   constantTimeEqual,
@@ -24,7 +27,6 @@ import {
   listAdminUsers,
   listInvites,
   PasskeyClientError,
-  recordLoginFailure,
   registerWithInviteCode,
   resetPasswordWithCode,
   revokeInviteCode,
@@ -39,17 +41,25 @@ import {
   ensureAppSettings,
   exportFullSnapshot,
   importFullSnapshot,
+  IMPORT_CHUNK_ROWS,
   processSyncRequest,
+  SYNC_AUTH_QUERY_RESERVE,
 } from './sync';
 import {
-  getTaiwanDateParts,
-  isTaiwanMonthEnd,
-  runMonthEndSnapshotAllUsersD1,
   runMonthEndSnapshotD1,
-  runMonthlyRecurringAllUsersD1,
   runMonthlyRecurringD1,
+  runScheduledAutomation,
+  setAppTimeZone,
+  validateRecurringPeriod,
 } from './automation';
-import { refreshMarketData } from './market';
+import { countD1Queries } from './d1Budget';
+import { createBudgetedFetch, refreshMarketData } from './market';
+import { D1_QUERIES_PER_INVOCATION_FREE } from '../shared/constants';
+
+function parsePositiveInt(v: unknown): number | undefined {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
 import {
   detectGoogleSheetCsvKind,
   parseAssetsCsv,
@@ -75,6 +85,21 @@ function getClientIp(c: AppContext): string {
     c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
     'local'
   );
+}
+
+/**
+ * H2: Key for IP-based rate limits. An IPv6 client controls a whole /64, so group by that prefix — otherwise
+ * every address in it gets its own counter and the limit is trivial to sidestep.
+ */
+function getRateLimitIp(c: AppContext): string {
+  const ip = getClientIp(c);
+  if (!ip.includes(':')) return ip;
+  const [head, tail = ''] = ip.toLowerCase().split('::');
+  const headParts = head ? head.split(':') : [];
+  const tailParts = tail ? tail.split(':') : [];
+  const fill = ip.includes('::') ? Math.max(0, 8 - headParts.length - tailParts.length) : 0;
+  const groups = [...headParts, ...Array(fill).fill('0'), ...tailParts];
+  return `${groups.slice(0, 4).map((g) => g || '0').join(':')}::/64`;
 }
 
 function getOriginAndRpId(c: AppContext): { origin: string; rpID: string; isHttps: boolean } {
@@ -109,6 +134,29 @@ async function readBodyWithLimit(req: Request, maxBytes: number): Promise<string
     offset += ch.byteLength;
   }
   return new TextDecoder().decode(buf);
+}
+
+/**
+ * M13 (v1.8.13): import endpoints read their JSON body with the same streaming byte cap as /api/sync.
+ * Returns the parsed body, or a ready-made 413 / 400 response.
+ */
+async function readJsonBodyLimited(
+  c: AppContext,
+  maxBytes: number
+): Promise<{ ok: true; body: unknown } | { ok: false; response: Response }> {
+  const contentLength = Number(c.req.header('content-length') || '');
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    return { ok: false, response: c.json({ error: '匯入內容過大（上限 2 MB），請分批匯入。' }, 413) };
+  }
+  const raw = await readBodyWithLimit(c.req.raw, maxBytes);
+  if (raw === null) {
+    return { ok: false, response: c.json({ error: '匯入內容過大（上限 2 MB），請分批匯入。' }, 413) };
+  }
+  try {
+    return { ok: true, body: raw ? JSON.parse(raw) : {} };
+  } catch {
+    return { ok: false, response: c.json({ error: '匯入內容不是有效的 JSON。' }, 400) };
+  }
 }
 
 /**
@@ -147,11 +195,47 @@ export function createApp() {
 
   // Security headers for all API responses
   app.use('/api/*', async (c, next) => {
+    setAppTimeZone(c.env?.APP_TIMEZONE); // v1.8.13: dates follow APP_TIMEZONE
+    await next();
+  });
+
+  app.use('/api/*', async (c, next) => {
     await next();
     c.header('X-Content-Type-Options', 'nosniff');
     c.header('X-Frame-Options', 'DENY');
     c.header('Referrer-Policy', 'no-referrer');
     c.header('Cache-Control', 'no-store');
+  });
+
+  // M10: CSRF guard for every state-changing API call. Browsers always send Origin / Sec-Fetch-Site on
+  // cross-site POSTs; reject those, and require a JSON body so a plain HTML form cannot reach the API.
+  app.use('/api/*', async (c, next) => {
+    const method = c.req.method.toUpperCase();
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next();
+    const fetchSite = (c.req.header('sec-fetch-site') || '').toLowerCase();
+    if (fetchSite === 'cross-site') {
+      return c.json({ error: '拒絕跨站請求。' }, 403);
+    }
+    const origin = c.req.header('origin');
+    if (origin) {
+      let sameOrigin = false;
+      try {
+        sameOrigin = new URL(origin).origin === new URL(c.req.url).origin;
+      } catch {
+        sameOrigin = false;
+      }
+      if (!sameOrigin) {
+        return c.json({ error: '拒絕跨站請求。' }, 403);
+      }
+    }
+    // Decide from headers only: in workerd a bodyless POST (Content-Length: 0) still has a non-null req.body
+    const contentLength = Number(c.req.header('content-length') || '0');
+    const hasBody = contentLength > 0 || Boolean(c.req.header('transfer-encoding'));
+    const contentType = (c.req.header('content-type') || '').toLowerCase();
+    if (hasBody && !contentType.startsWith('application/json')) {
+      return c.json({ error: '請求內容必須為 JSON。' }, 415);
+    }
+    return next();
   });
 
   // Auth status (public when unauthenticated — NEVER leaks tenant/user/passkey info)
@@ -167,6 +251,10 @@ export function createApp() {
     }
 
     const user = session.user;
+    if (session.refreshedCookie) {
+      const { isHttps } = getOriginAndRpId(c);
+      c.header('Set-Cookie', buildSessionCookie(session.refreshedCookie.token, isHttps, false, session.refreshedCookie.maxAgeSec));
+    }
     const passkeyRows = await c.env.DB.prepare(
       'SELECT credential_id, public_key, transports FROM auth_passkeys WHERE user_id = ?'
     )
@@ -186,6 +274,7 @@ export function createApp() {
         publicKey: p.public_key,
         transports: JSON.parse(p.transports || '[]'),
       })),
+      securityNotices: await listRecentSecurityEvents(c.env.DB, user.id),
     });
   });
 
@@ -194,6 +283,11 @@ export function createApp() {
     const alreadyInit = await hasAnyUser(c.env.DB);
     if (alreadyInit) {
       return c.json({ error: '系統已完成初始化，禁止重複設定。' }, 403);
+    }
+    // H2: SETUP_SECRET must not be guessable online before the first admin exists
+    const setupLimit = await checkRateLimit(c.env.DB, `setup:${getRateLimitIp(c)}`, 10);
+    if (setupLimit.blocked) {
+      return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
     }
 
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -232,7 +326,7 @@ export function createApp() {
 
   // One-time invite code registration
   app.post('/api/auth/register-invite', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const rateKey = `reg:${ip}`;
     const limit = await checkRateLimit(c.env.DB, rateKey);
     if (limit.blocked) {
@@ -263,14 +357,13 @@ export function createApp() {
       c.header('Set-Cookie', buildSessionCookie(token, isHttps));
       return c.json({ ok: true, user: toAuthUser(created) });
     } catch (err) {
-      await recordLoginFailure(c.env.DB, rateKey);
       return routeErrorResponse(c, err, '註冊失敗');
     }
   });
 
   // Zero-knowledge one-time password reset (user chooses new password; admin never sees it)
   app.post('/api/auth/reset-password', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const rateKey = `rst:${ip}`;
     const limit = await checkRateLimit(c.env.DB, rateKey);
     if (limit.blocked) {
@@ -292,7 +385,6 @@ export function createApp() {
       await clearRateLimit(c.env.DB, rateKey);
       return c.json({ ok: true, message: '密碼已重設完成，請以新密碼登入。' });
     } catch (err) {
-      await recordLoginFailure(c.env.DB, rateKey);
       return routeErrorResponse(c, err, '重設密碼失敗');
     }
   });
@@ -300,23 +392,27 @@ export function createApp() {
   // Master password login with D1 brute-force rate limit
   app.post('/api/auth/login', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { username?: string; password?: string };
-    const ip = getClientIp(c);
-    const rateKey = body.username ? `${ip}:${String(body.username).trim().toLowerCase()}` : ip;
+    const ip = getRateLimitIp(c);
+    const uname = String(body.username || '').trim().toLowerCase();
+    const rateKey = uname ? `${ip}:${uname}` : ip;
+    // H2: per IP+account, plus a per-account budget across all IPs (bounds distributed guessing)
+    // The per-account budget only counts VERIFIED failures (peek first, count after a wrong password), so a
+    // single blocked IP cannot keep spending it to lock the real user out.
     const limit = await checkRateLimit(c.env.DB, rateKey);
-    if (limit.blocked) {
-      return c.json(
-        { error: `登入失敗次數過多，請於 ${Math.ceil((limit.retryAfterSec || 900) / 60)} 分鐘後再試。` },
-        429
-      );
+    const userLimit = uname && !limit.blocked ? await peekRateLimit(c.env.DB, `user:${uname}`, 20) : { blocked: false };
+    if (limit.blocked || userLimit.blocked) {
+      const retry = Math.max(limit.retryAfterSec || 0, userLimit.retryAfterSec || 0) || 900;
+      return c.json({ error: `登入嘗試次數過多，請於 ${Math.ceil(retry / 60)} 分鐘後再試。` }, 429);
     }
 
     const user = await verifyUserPassword(c.env.DB, body.username, String(body.password || ''));
     if (!user) {
-      await recordLoginFailure(c.env.DB, rateKey);
+      if (uname) await checkRateLimit(c.env.DB, `user:${uname}`, 20);
       return c.json({ error: '帳號或主密碼不正確。' }, 401);
     }
 
     await clearRateLimit(c.env.DB, rateKey);
+    if (uname) await clearRateLimit(c.env.DB, `user:${uname}`);
     const token = await createSession(c.env.DB, user.id, c.req.header('user-agent') || 'browser');
     const { isHttps } = getOriginAndRpId(c);
     c.header('Set-Cookie', buildSessionCookie(token, isHttps));
@@ -335,7 +431,7 @@ export function createApp() {
 
   // Discoverable Passkey login (username-less 1-tap Face ID / Touch ID)
   app.post('/api/auth/passkey/login/options', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const limit = await checkAndRecordFixedWindowRateLimit(c.env.DB, `pk_opt:${ip}`, 20, 60_000);
     if (limit.blocked) {
       return c.json({ error: '請求過於頻繁，請稍後再試。' }, 429);
@@ -350,7 +446,7 @@ export function createApp() {
   });
 
   app.post('/api/auth/passkey/login/verify', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const limit = await checkRateLimit(c.env.DB, `pk:${ip}`);
     if (limit.blocked) {
       return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
@@ -365,7 +461,6 @@ export function createApp() {
       return c.json({ ok: true, user: toAuthUser(user) });
     } catch (err) {
       if (err instanceof PasskeyClientError) {
-        await recordLoginFailure(c.env.DB, `pk:${ip}`);
         return c.json({ error: err.message || 'Passkey 登入失敗' }, 401);
       }
       console.error('[auth] passkey login verify unexpected error:', err);
@@ -381,6 +476,10 @@ export function createApp() {
     }
     c.set('authUser', session.user);
     c.set('tokenHash', session.tokenHash || '');
+    if (session.refreshedCookie) {
+      const { isHttps } = getOriginAndRpId(c);
+      c.header('Set-Cookie', buildSessionCookie(session.refreshedCookie.token, isHttps, false, session.refreshedCookie.maxAgeSec));
+    }
     // P2-S11: every authenticated write refuses a request made by a tab that believes it is another account
     // (the session cookie is shared by all tabs, so another tab may have switched accounts).
     const method = c.req.method.toUpperCase();
@@ -429,6 +528,11 @@ export function createApp() {
   app.post('/api/auth/change-password', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
+      // M2: a stolen session must not be able to guess the current password online
+      const limit = await checkRateLimit(c.env.DB, `pwchg:${user.id}`);
+      if (limit.blocked) {
+        return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
+      }
       const body = (await c.req.json().catch(() => ({}))) as {
         currentPassword?: string;
         newPassword?: string;
@@ -440,6 +544,7 @@ export function createApp() {
         String(body.newPassword || ''),
         c.get('tokenHash')
       );
+      await clearRateLimit(c.env.DB, `pwchg:${user.id}`);
       return c.json({ ok: true, message: '主密碼已更新。' });
     } catch (err) {
       return routeErrorResponse(c, err, '變更密碼失敗');
@@ -487,12 +592,18 @@ export function createApp() {
   app.post('/api/auth/pin', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
+      // M2: changing / disabling the PIN checks the current PIN — limit guesses
+      const limit = await checkRateLimit(c.env.DB, `pin:${user.id}`);
+      if (limit.blocked) {
+        return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
+      }
       const body = (await c.req.json()) as {
         enable: boolean;
         currentPin?: string;
         newPin?: string;
       };
       const result = await configureUserPin(c.env.DB, user.id, body);
+      await clearRateLimit(c.env.DB, `pin:${user.id}`);
       return c.json({ ok: true, ...result });
     } catch (err) {
       return routeErrorResponse(c, err, 'PIN 設定失敗');
@@ -606,7 +717,13 @@ export function createApp() {
       return c.json({ error: `單次同步上限為 ${MAX_SYNC_MUTATIONS} 筆異動，請分批同步。` }, 400);
     }
 
-    const res = await processSyncRequest(c.env.DB, user.id, body);
+    const budget = parsePositiveInt(c.env.D1_QUERY_BUDGET);
+    const res = await processSyncRequest(
+      c.env.DB,
+      user.id,
+      body,
+      budget ? { queryBudget: budget - SYNC_AUTH_QUERY_RESERVE } : {}
+    );
     return c.json(res);
   });
 
@@ -615,8 +732,10 @@ export function createApp() {
     const user = c.get('authUser');
     const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
     if (mismatch) return c.json(mismatch, 409);
-    const body = (await c.req.json().catch(() => ({}))) as { year?: number; month?: number };
-    const result = await runMonthlyRecurringD1(c.env.DB, user.id, body.year, body.month);
+    const body = (await c.req.json().catch(() => ({}))) as { year?: unknown; month?: unknown };
+    const period = validateRecurringPeriod(body?.year, body?.month);
+    if (!period.ok) return c.json({ error: period.error }, 400);
+    const result = await runMonthlyRecurringD1(c.env.DB, user.id, period.year, period.month);
     return c.json({ ok: true, ...result });
   });
 
@@ -640,12 +759,15 @@ export function createApp() {
         ? body.assetIds.filter((x): x is string => typeof x === 'string' && x.trim() !== '').slice(0, 50)
         : undefined;
     // Respect user's autoFxEnabled setting instead of forcing FX overwrite
-    const result = await refreshMarketData(
-      c.env.DB,
-      fetch,
-      user.id,
-      assetIds && assetIds.length > 0 ? { assetIds } : undefined
-    );
+    // H6: bounded by the invocation's subrequest / D1 budgets; assets that do not fit are refreshed later
+    const fetchBudget = createBudgetedFetch(fetch, (parsePositiveInt(c.env.SUBREQUEST_BUDGET) ?? 50) - 2);
+    const counter = countD1Queries(c.env.DB);
+    const d1Budget = (parsePositiveInt(c.env.D1_QUERY_BUDGET) ?? D1_QUERIES_PER_INVOCATION_FREE) - 8;
+    const result = await refreshMarketData(counter.db, fetchBudget.fetch, user.id, {
+      ...(assetIds && assetIds.length > 0 ? { assetIds } : {}),
+      fetchBudget,
+      shouldStop: () => counter.used() + 2 > d1Budget,
+    });
     return c.json({ ok: true, ...result });
   });
 
@@ -665,7 +787,12 @@ export function createApp() {
       const user = c.get('authUser');
       const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
       if (mismatch) return c.json(mismatch, 409);
-      const body = (await c.req.json()) as { mode?: 'merge' | 'replace'; data?: Record<string, unknown> };
+      const parsed = await readJsonBodyLimited(c, MAX_SYNC_BODY_BYTES);
+      if (!parsed.ok) return parsed.response;
+      const body = (parsed.body && typeof parsed.body === 'object' ? parsed.body : {}) as {
+        mode?: 'merge' | 'replace';
+        data?: Record<string, unknown>;
+      };
       const summary = await importFullSnapshot(
         c.env.DB,
         user.id,
@@ -683,8 +810,16 @@ export function createApp() {
       const user = c.get('authUser');
       const mismatch = checkExpectedUserMismatch(c.req.header('x-expected-user'), user.id);
       if (mismatch) return c.json(mismatch, 409);
-      const body = (await c.req.json()) as { csvText?: string; kind?: GoogleSheetCsvKind };
-      const csvText = String(body.csvText || '');
+      const parsed = await readJsonBodyLimited(c, MAX_SYNC_BODY_BYTES);
+      if (!parsed.ok) return parsed.response;
+      const body = (parsed.body && typeof parsed.body === 'object' ? parsed.body : {}) as {
+        csvText?: unknown;
+        kind?: GoogleSheetCsvKind;
+      };
+      if (typeof body.csvText !== 'string') {
+        return c.json({ error: 'CSV 內容格式錯誤（csvText 必須是文字）。' }, 400);
+      }
+      const csvText = body.csvText;
       const kind = body.kind || detectGoogleSheetCsvKind(csvText);
       if (!kind) {
         return c.json(
@@ -705,11 +840,34 @@ export function createApp() {
         networth: '淨資產歷史快照 (NetWorth_History)',
       };
 
-      // P2-S1: Bump change_seq and insert all CSV rows atomically inside a single D1 batch
+      // P2-S1 / M13: one atomic D1 batch — bump change_seq, then the rows in chunks of IMPORT_CHUNK_ROWS through
+      // `INSERT … SELECT … FROM json_each(?)`. Row ids are deterministic (SHA-256 of the normalized row plus its
+      // occurrence number among identical rows), and `ON CONFLICT DO NOTHING` makes re-importing the same CSV a
+      // no-op (never duplicating, never resurrecting a row the user deleted meanwhile).
       const currSeqExpr = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)';
-      const commitCsvBatch = async (rowStmts: D1PreparedStatement[]) => {
-        if (rowStmts.length === 0) return;
-        await c.env.DB.batch([
+      const occurrences = new Map<string, number>();
+      const deterministicId = async (prefix: string, row: unknown): Promise<string> => {
+        const normalized = JSON.stringify(row);
+        const n = (occurrences.get(normalized) ?? 0) + 1;
+        occurrences.set(normalized, n);
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${user.id}|${prefix}|${normalized}|${n}`));
+        const hex = Array.from(new Uint8Array(digest), (x) => x.toString(16).padStart(2, '0')).join('');
+        return `csv-${prefix}-${hex.slice(0, 32)}`;
+      };
+      const commitCsvRows = async (insertHead: string, jsonColumns: number, rows: unknown[][]): Promise<number> => {
+        if (rows.length === 0) return 0;
+        const selectCols = Array.from({ length: jsonColumns }, (_, i) => `json_extract(value, '$[${i}]')`).join(', ');
+        const rowStmts: D1PreparedStatement[] = [];
+        for (let i = 0; i < rows.length; i += IMPORT_CHUNK_ROWS) {
+          rowStmts.push(
+            c.env.DB
+              .prepare(
+                `${insertHead} SELECT ?, ${selectCols}, NULL, 1, ${currSeqExpr} FROM json_each(?) WHERE true ON CONFLICT DO NOTHING`
+              )
+              .bind(user.id, user.id, JSON.stringify(rows.slice(i, i + IMPORT_CHUNK_ROWS)))
+          );
+        }
+        const results = await c.env.DB.batch([
           c.env.DB
             .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
             .bind(user.id, nowIso),
@@ -718,157 +876,104 @@ export function createApp() {
             .bind(nowIso, user.id),
           ...rowStmts,
         ]);
+        return results.slice(2).reduce((sum, r) => sum + Number(r?.meta?.changes ?? 0), 0);
       };
 
       if (kind === 'cashflow') {
         const settings = await ensureAppSettings(c.env.DB, user.id);
         const rows = parseCashFlowCsv(csvText, settings.usdTwdRate);
-        const stmts = rows.map((v) =>
-          c.env.DB
-            .prepare(
-              `INSERT INTO cashflow_logs
-                (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at, version, change_seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
-            )
-            .bind(
-              user.id,
-              crypto.randomUUID(),
-              v.date,
-              v.yearMonth,
-              v.type,
-              v.category,
-              v.itemName,
-              v.amount,
-              v.currency,
-              v.fxRate,
-              v.twdAmount,
-              v.source,
-              v.note,
-              nowIso,
-              nowIso,
-              user.id
-            )
+        const values: unknown[][] = [];
+        for (const v of rows) {
+          const id = await deterministicId('cf', [v.date, v.type, v.category, v.itemName, v.amount, v.currency, v.fxRate, v.source, v.note]);
+          values.push([id, v.date, v.yearMonth, v.type, v.category, v.itemName, v.amount, v.currency, v.fxRate, v.twdAmount, v.source, v.note, v.ledgerId || 'default', nowIso, nowIso]);
+        }
+        const written = await commitCsvRows(
+          `INSERT INTO cashflow_logs
+            (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, ledger_id, created_at, updated_at, deleted_at, version, change_seq)`,
+          15,
+          values
         );
-        await commitCsvBatch(stmts);
-        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: written, parsedCount: rows.length });
       }
 
       if (kind === 'recurring') {
         const rows = parseRecurringCsv(csvText);
-        const stmts = rows.map((v) =>
-          c.env.DB
-            .prepare(
-              `INSERT INTO recurring_items
-                (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at, version, change_seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
-            )
-            .bind(
-              user.id,
-              crypto.randomUUID(),
-              v.itemName,
-              v.category,
-              v.type,
-              v.amount,
-              v.currency,
-              v.cycle,
-              v.billingSpec,
-              v.status,
-              v.note,
-              nowIso,
-              nowIso,
-              user.id
-            )
+        const values: unknown[][] = [];
+        for (const v of rows) {
+          const id = await deterministicId('rc', [v.itemName, v.category, v.type, v.amount, v.currency, v.cycle, v.billingSpec, v.status, v.note]);
+          values.push([id, v.itemName, v.category, v.type, v.amount, v.currency, v.cycle, v.billingSpec, v.status, v.note, v.ledgerId || 'default', nowIso, nowIso]);
+        }
+        const written = await commitCsvRows(
+          `INSERT INTO recurring_items
+            (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, ledger_id, created_at, updated_at, deleted_at, version, change_seq)`,
+          13,
+          values
         );
-        await commitCsvBatch(stmts);
-        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: written, parsedCount: rows.length });
       }
 
       if (kind === 'sinking') {
         const rows = parseSinkingFundCsv(csvText);
-        const stmts = rows.map((v) =>
-          c.env.DB
-            .prepare(
-              `INSERT INTO sinking_fund_items
-                (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version, change_seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
-            )
-            .bind(
-              user.id,
-              crypto.randomUUID(),
-              v.itemName,
-              v.category,
-              v.totalAmount,
-              v.months,
-              v.dueNote,
-              v.status,
-              v.note,
-              nowIso,
-              nowIso,
-              user.id
-            )
+        const values: unknown[][] = [];
+        for (const v of rows) {
+          const id = await deterministicId('sk', [v.itemName, v.category, v.totalAmount, v.months, v.dueNote, v.status, v.note]);
+          values.push([id, v.itemName, v.category, v.totalAmount, v.months, v.dueNote, v.status, v.note, nowIso, nowIso]);
+        }
+        const written = await commitCsvRows(
+          `INSERT INTO sinking_fund_items
+            (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version, change_seq)`,
+          10,
+          values
         );
-        await commitCsvBatch(stmts);
-        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: written, parsedCount: rows.length });
       }
 
       if (kind === 'asset') {
         const rows = parseAssetsCsv(csvText);
-        const stmts = rows.map((v) =>
-          c.env.DB
-            .prepare(
-              `INSERT INTO asset_items
-                (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at, version, change_seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
-            )
-            .bind(
-              user.id,
-              crypto.randomUUID(),
-              v.updateMode,
-              v.majorType,
-              v.subCategory,
-              v.liquidity,
-              v.itemName,
-              v.ticker,
-              v.quantityOrAmount,
-              v.currency,
-              v.unitPrice,
-              v.note,
-              nowIso,
-              nowIso,
-              user.id
-            )
+        const values: unknown[][] = [];
+        for (const v of rows) {
+          const id = await deterministicId('as', [v.updateMode, v.majorType, v.subCategory, v.liquidity, v.itemName, v.ticker, v.quantityOrAmount, v.currency, v.unitPrice, v.note]);
+          values.push([id, v.updateMode, v.majorType, v.subCategory, v.liquidity, v.itemName, v.ticker, v.quantityOrAmount, v.currency, v.unitPrice, v.note, v.ledgerId || 'default', nowIso, nowIso]);
+        }
+        const written = await commitCsvRows(
+          `INSERT INTO asset_items
+            (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, ledger_id, created_at, updated_at, deleted_at, version, change_seq)`,
+          14,
+          values
         );
-        await commitCsvBatch(stmts);
-        return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
+        return c.json({ ok: true, kind, label: labels[kind], importedCount: written, parsedCount: rows.length });
       }
 
+      // NetWorth_History is keyed by (user_id, year_month): re-importing replaces the same month (deterministic)
       const rows = parseNetWorthHistoryCsv(csvText);
-      const stmts = rows.map((h) =>
-        c.env.DB
-          .prepare(
-            `INSERT OR REPLACE INTO networth_history
-              (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at, change_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${currSeqExpr})`
-          )
-          .bind(
-            user.id,
-            h.yearMonth,
-            h.snapshotDate,
-            h.totalAssets,
-            h.totalLiabilities,
-            h.netWorth,
-            h.highLiquidityAssets,
-            h.investmentAssets,
-            h.insuranceAssets,
-            h.monthlyIncome,
-            h.monthlyConsumption,
-            h.savingsRate,
-            h.note,
-            nowIso,
-            user.id
-          )
-      );
-      await commitCsvBatch(stmts);
+      const histStmts: D1PreparedStatement[] = [];
+      for (let i = 0; i < rows.length; i += IMPORT_CHUNK_ROWS) {
+        const chunk = rows.slice(i, i + IMPORT_CHUNK_ROWS).map((h) => [
+          h.yearMonth, h.snapshotDate, h.totalAssets, h.totalLiabilities, h.netWorth, h.highLiquidityAssets,
+          h.investmentAssets, h.insuranceAssets, h.monthlyIncome, h.monthlyConsumption, h.savingsRate, h.note, nowIso,
+        ]);
+        const selectCols = Array.from({ length: 13 }, (_, k) => `json_extract(value, '$[${k}]')`).join(', ');
+        histStmts.push(
+          c.env.DB
+            .prepare(
+              `INSERT OR REPLACE INTO networth_history
+                (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at, change_seq)
+               SELECT ?, ${selectCols}, ${currSeqExpr} FROM json_each(?) WHERE true`
+            )
+            .bind(user.id, user.id, JSON.stringify(chunk))
+        );
+      }
+      if (histStmts.length > 0) {
+        await c.env.DB.batch([
+          c.env.DB
+            .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+            .bind(user.id, nowIso),
+          c.env.DB
+            .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
+            .bind(nowIso, user.id),
+          ...histStmts,
+        ]);
+      }
       return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
     } catch (err) {
       return routeErrorResponse(c, err, 'CSV 解析或匯入失敗');
@@ -891,30 +996,14 @@ const app = createApp();
 export default {
   fetch: app.fetch,
   async scheduled(controller: ScheduledController, env: WorkerEnv): Promise<void> {
+    // H6 (v1.8.13): ordering, isolation, catch-up and per-invocation budgets live in runScheduledAutomation
     const now = new Date(controller.scheduledTime || Date.now());
-    const tw = getTaiwanDateParts(now);
-
-    if (controller.cron === '0 0 1 * *') {
-      // Monthly 1st 08:00 Asia/Taipei (before TW open): refresh US & FX only, then post monthly recurring
-      await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'us' });
-      await runMonthlyRecurringAllUsersD1(env.DB, tw.year, tw.month);
-      return;
-    }
-
-    if (controller.cron === '0 22 * * *') {
-      // Daily 06:00 Asia/Taipei (22:00 UTC): refresh ONLY US closing prices & FX after US market close
-      // (avoid touching TW stocks while TWSE MIS may have rolled over pre-market)
-      await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'us' });
-      return;
-    }
-
-    // Daily 23:00 Asia/Taipei (15:00 UTC): refresh TW closing prices & FX for all active users, snapshot on month-end.
-    // Q6 / F8: 23:00 Taipei falls inside US regular trading hours (22:30/21:30 – 05:00/04:00 Taipei), so US quotes
-    // would be intraday prices. US closes are owned exclusively by the 06:00 run; keep them untouched here so the
-    // month-end net-worth snapshot records the last US CLOSE rather than a mid-session price.
-    await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'tw' });
-    if (isTaiwanMonthEnd(now)) {
-      await runMonthEndSnapshotAllUsersD1(env.DB, now);
-    }
+    const summary = await runScheduledAutomation(env.DB, controller.cron, now, {
+      fetchImpl: fetch,
+      timeZone: env.APP_TIMEZONE,
+      d1QueryBudget: parsePositiveInt(env.D1_QUERY_BUDGET) ?? D1_QUERIES_PER_INVOCATION_FREE,
+      subrequestBudget: parsePositiveInt(env.SUBREQUEST_BUDGET) ?? 50,
+    });
+    console.log('[cron]', controller.cron, JSON.stringify(summary));
   },
 };

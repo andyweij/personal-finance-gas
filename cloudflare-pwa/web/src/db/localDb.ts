@@ -93,7 +93,7 @@ function pickAuthMeta(meta: Partial<LocalMeta>): AuthMetaPatch {
  */
 export class StaleSnapshotError extends Error {
   constructor() {
-    super('Local snapshot changed in another tab');
+    super('其他分頁剛更新了本機資料');
     this.name = 'StaleSnapshotError';
   }
 }
@@ -129,8 +129,45 @@ export class LocalFinanceDB {
           outbox.createIndex('clientTimestamp', 'clientTimestamp', { unique: false });
         }
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const opened = req.result;
+        // H3: let another tab delete this database on logout instead of being blocked by our open handle
+        opened.onversionchange = () => {
+          opened.close();
+          if (this.db === opened) this.db = null;
+        };
+        resolve(opened);
+      };
       req.onerror = () => reject(req.error);
+    });
+  }
+
+  /** H3: close and permanently delete this account's local database (used on logout). */
+  /**
+   * Returns 'blocked' when another tab (e.g. one still running an older version) keeps the database open for
+   * more than 3 s; the delete stays queued and completes once that tab closes.
+   */
+  async deleteDatabase(): Promise<'deleted' | 'blocked'> {
+    this.close();
+    return new Promise<'deleted' | 'blocked'>((resolve, reject) => {
+      let settled = false;
+      const req = indexedDB.deleteDatabase(this.dbName);
+      req.onsuccess = () => {
+        settled = true;
+        resolve('deleted');
+      };
+      req.onerror = () => {
+        settled = true;
+        reject(req.error);
+      };
+      req.onblocked = () => {
+        setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            resolve('blocked');
+          }
+        }, 3000);
+      };
     });
   }
 
@@ -292,7 +329,7 @@ export class LocalFinanceDB {
   }
 
   /** P2-C6: update only the lock-screen fields, merged into the stored meta (cursor etc. untouched). */
-  async patchAuthMeta(patch: AuthMetaPatch): Promise<LocalMeta | null> {
+  async patchAuthMeta(patch: AuthMetaPatch, fallbackMeta?: LocalMeta): Promise<LocalMeta | null> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_KV, 'readwrite');
@@ -301,8 +338,10 @@ export class LocalFinanceDB {
       const req = kv.get('meta');
       req.onsuccess = () => {
         const stored = req.result as LocalMeta | undefined;
-        if (!stored) return;
-        merged = { ...stored, ...patch };
+        if (!stored && !fallbackMeta) return;
+        // v1.8.15: no stored meta yet → create it here, inside the same transaction (no separate write that
+        // could overwrite defaults another tab created meanwhile)
+        merged = { ...(stored ?? fallbackMeta!), ...patch };
         kv.put(merged, 'meta');
       };
       tx.oncomplete = () => resolve(merged);
@@ -316,8 +355,69 @@ export class LocalFinanceDB {
     req.onsuccess = () => {
       const next = (Number(req.result) || 0) + 1;
       kv.put(next, 'snapshot_rev');
-      this.lastSnapshotRev = next;
+      // v1.8.15: the in-memory revision only moves once the write is durable (an aborted transaction keeps it)
+      kv.transaction.addEventListener('complete', () => {
+        this.lastSnapshotRev = next;
+      });
     };
+  }
+
+  /** v1.8.15: remember the stored revision once this transaction completes (state was read, not written). */
+  private adoptSnapshotRev(kv: IDBObjectStore): void {
+    const req = kv.get('snapshot_rev');
+    req.onsuccess = () => {
+      const cur = Number(req.result) || 0;
+      kv.transaction.addEventListener('complete', () => {
+        this.lastSnapshotRev = cur;
+      });
+    };
+  }
+
+  /**
+   * v1.8.15: reads the outbox, lets `select` pick the batch, and marks the picked mutations as sent — all in ONE
+   * readwrite transaction (another tab cannot coalesce or cancel a picked mutation in between).
+   */
+  async takeOutboxBatch(
+    select: (outbox: SyncMutation[]) => string[],
+    sentAtIso: string
+  ): Promise<{ outbox: SyncMutation[]; batch: SyncMutation[] }> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_OUTBOX, 'readwrite');
+      const store = tx.objectStore(STORE_OUTBOX);
+      let outbox: SyncMutation[] = [];
+      let batch: SyncMutation[] = [];
+      let failure: unknown = null;
+      const req = store.getAll();
+      req.onsuccess = () => {
+        const list = ((req.result as Array<SyncMutation & { _seq?: number }>) || []).slice();
+        list.sort((a, b) => a.clientTimestamp.localeCompare(b.clientTimestamp) || (a._seq ?? 0) - (b._seq ?? 0));
+        outbox = list.map(({ _seq: _ignored, ...rest }) => rest);
+        let ids: string[];
+        try {
+          ids = select(outbox);
+        } catch (err) {
+          failure = err;
+          try {
+            tx.abort();
+          } catch {
+            /* already aborted */
+          }
+          return;
+        }
+        const idSet = new Set(ids);
+        const byId = new Map(outbox.map((m) => [m.mutationId, m]));
+        batch = ids.map((id) => byId.get(id)).filter((m): m is SyncMutation => Boolean(m));
+        for (const item of list) {
+          if (!idSet.has(item.mutationId)) continue;
+          store.put({ ...item, sentAt: item.sentAt || sentAtIso, attempts: (item.attempts ?? 0) + 1 });
+        }
+        batch = batch.map((m) => ({ ...m, sentAt: m.sentAt || sentAtIso, attempts: (m.attempts ?? 0) + 1 }));
+      };
+      tx.oncomplete = () => resolve({ outbox, batch });
+      tx.onerror = () => reject(failure ?? tx.error);
+      tx.onabort = () => reject(failure ?? tx.error ?? new Error('IndexedDB transaction aborted'));
+    });
   }
 
   async getOutbox(): Promise<SyncMutation[]> {
@@ -472,7 +572,14 @@ export class LocalFinanceDB {
 
     for (const mut of mutations) {
       const key = `${mut.entity}:${mut.recordId}`;
-      const prev = byKey.get(key);
+      let prev = byKey.get(key);
+      // M4 / review R-C: never coalesce across atomic groups (including grouped ↔ ungrouped). A merged mutation
+      // would carry the other edit into the group (an offline-created account would be rolled back together with
+      // a rejected transfer from it) — keep both; the batch selector sends them one after the other and the ack
+      // rebases the later one.
+      if (prev && (prev.atomicGroupId || undefined) !== (mut.atomicGroupId || undefined)) {
+        prev = undefined;
+      }
       if (prev) {
         outboxStore.delete(prev.mutationId);
         const prevIsNewUnsynced =
@@ -745,6 +852,8 @@ export class LocalFinanceDB {
         if (freshFrozen.length === 0) {
           resultSnapshot = freshSnapshot;
           remainingOutboxCount = cleanOutbox.length;
+          // v1.8.15: the engine adopts this snapshot, so it must also adopt its revision (no spurious reload)
+          this.adoptSnapshotRev(kv);
           return;
         }
 

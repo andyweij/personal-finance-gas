@@ -22,8 +22,7 @@ import {
   makeInputField,
   makeSelectField,
   openModal,
-  showToast,
-} from './helpers';
+  showToast, bindSubmit } from './helpers';
 import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
@@ -371,7 +370,7 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
   btns.appendChild(save);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     try {
       await ctx.engine.saveRecurring({
@@ -463,7 +462,7 @@ export function openSinkingModal(ctx: UiContext, existing: SinkingFundItem | nul
   btns.appendChild(save);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     try {
       await ctx.engine.saveSinking({

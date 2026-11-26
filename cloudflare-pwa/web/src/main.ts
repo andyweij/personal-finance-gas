@@ -1,3 +1,5 @@
+/// <reference types="vite/client" />
+import { getDatePartsInTimeZone } from '../../shared/dates';
 import './styles.css';
 import { DEFAULT_LEDGER_ID } from '../../shared/constants';
 import { computeAllSavingsSummary } from '../../shared/calculations';
@@ -5,9 +7,16 @@ import type { PnlColorScheme } from '../../shared/types';
 import { normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
-import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount, setAuthExpectedUser } from './auth/authClient';
+import {
+  fetchAuthStatus,
+  getRememberedAccount,
+  logoutSession,
+  PENDING_SERVER_LOGOUT_KEY,
+  saveRememberedAccount,
+  setAuthExpectedUser,
+} from './auth/authClient';
 import { createCrossTabChannel } from './sync/crossTab';
-import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast } from './ui/helpers';
+import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast, bindSubmit } from './ui/helpers';
 import {
   getTodayYmd,
   renderLogCategories,
@@ -44,6 +53,7 @@ import {
   isAnyLockEnabled,
   openAuthScreen,
   openLockScreen,
+  showSecurityNotices,
   openSecurityModal,
   triggerPinKey,
   unlockLockScreenWithFaceId,
@@ -60,23 +70,120 @@ import type {
   StockChartType,
   UiContext,
 } from './ui/state';
+import { applyAuthMetaToState } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
 
+/**
+ * M12 (v1.8.14): register the Service Worker and offer updates. A new version installs in the background and
+ * waits; the user is asked ("有新版本") and only on confirmation does the page send SKIP_WAITING, after which the
+ * page reloads once when the new worker takes control. Unsynced data is safe: it lives in IndexedDB.
+ */
+function showUpdateBanner(worker: ServiceWorker, activatedElsewhere = false): void {
+  const existing = document.getElementById('swUpdateBanner');
+  if (existing && !activatedElsewhere) return;
+  existing?.remove();
+  const bar = document.createElement('div');
+  bar.id = 'swUpdateBanner';
+  bar.className = 'update-banner';
+  bar.setAttribute('role', 'status');
+  bar.setAttribute('aria-live', 'polite');
+  const text = document.createElement('span');
+  text.textContent = activatedElsewhere ? '新版本已在其他分頁啟用，請重新整理' : '有新版本可以使用';
+  const later = document.createElement('button');
+  later.type = 'button';
+  later.className = 'btn btn-sm';
+  later.textContent = '稍後';
+  later.addEventListener('click', () => bar.remove());
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.className = 'btn btn-tinted btn-sm';
+  apply.textContent = activatedElsewhere ? '重新整理' : '立即更新';
+  apply.addEventListener('click', () => {
+    apply.disabled = true;
+    // Review (M12): another tab may already have activated this worker — then only a reload is needed
+    if (activatedElsewhere || worker.state === 'activated' || worker.state === 'redundant') {
+      window.location.reload();
+      return;
+    }
+    updateRequested = true;
+    worker.postMessage({ type: 'SKIP_WAITING' });
+  });
+  bar.appendChild(text);
+  bar.appendChild(later);
+  bar.appendChild(apply);
+  document.body.appendChild(bar);
+}
+
+let updateRequested = false;
+
 function registerServiceWorker(): void {
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js').catch(() => {
+  // Review (M12): the dev server serves untransformed sources; never let a Service Worker cache them
+  if (!import.meta.env.PROD) return;
+  if (!('serviceWorker' in navigator)) return;
+  const hadControllerAtLoad = Boolean(navigator.serviceWorker.controller);
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (updateRequested) {
+      updateRequested = false;
+      window.location.reload();
+      return;
+    }
+    // First install (clients.claim) — nothing to do. Otherwise another tab activated a new version while this
+    // tab still runs the old bundle: ask for a reload instead of silently continuing with old code.
+    if (hadControllerAtLoad && navigator.serviceWorker.controller) {
+      showUpdateBanner(navigator.serviceWorker.controller, true);
+    }
+  });
+  window.addEventListener('load', () => {
+    navigator.serviceWorker
+      .register('/sw.js')
+      .then((reg) => {
+        const offer = (worker: ServiceWorker | null) => {
+          if (worker && navigator.serviceWorker.controller) showUpdateBanner(worker);
+        };
+        const track = (incoming: ServiceWorker) => {
+          if (incoming.state === 'installed') offer(incoming);
+          incoming.addEventListener('statechange', () => {
+            if (incoming.state === 'installed') offer(incoming);
+          });
+        };
+        if (reg.waiting) offer(reg.waiting);
+        if (reg.installing) track(reg.installing); // an update that started before `load`
+        reg.addEventListener('updatefound', () => {
+          if (reg.installing) track(reg.installing);
+        });
+        // Check for a new version when the app comes back to the foreground
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible') void reg.update().catch(() => undefined);
+        });
+      })
+      .catch(() => {
         // Ignore registration errors in unsupported dev contexts
       });
-    });
-  }
+  });
+}
+
+type AppTab = AppUiState['activeTab'];
+const ALL_TABS: AppTab[] = ['log', 'overview', 'assets', 'stocks', 'tools'];
+const dirtyTabs = new Set<AppTab>(ALL_TABS);
+let renderTabImpl: ((tab: AppTab) => void) | null = null;
+
+function renderTabIfDirty(tab: AppTab): void {
+  if (!dirtyTabs.has(tab) || !renderTabImpl) return;
+  dirtyTabs.delete(tab);
+  renderTabImpl(tab);
 }
 
 function renderSyncPill(status: SyncStatus): void {
   const pill = el('syncStatusPill');
   pill.className = `sync-pill ${status.state}`;
-  if (status.state === 'conflict') {
+  // v1.8.15: rejections no longer turn the engine state into 'conflict' (so offline / pending stay visible);
+  // the pill still shows them as a warning together with that state
+  const rejectionOnly =
+    (status.rejectedCount || 0) > 0 &&
+    (status.state === 'synced' || status.state === 'pending' || status.state === 'offline');
+  if (rejectionOnly) pill.className = 'sync-pill conflict';
+  if (status.state === 'conflict' || rejectionOnly) {
     const cCount = status.conflictCount || 0;
     const rCount = status.rejectedCount || 0;
     const fCount = status.frozenOutboxCount || 0;
@@ -118,6 +225,38 @@ function renderSyncPill(status: SyncStatus): void {
     pill.textContent = status.pendingCount > 0 ? `🔒 需登入 (${status.pendingCount})` : '🔒 請重新登入';
     pill.title = '點擊重新登入以同步';
   }
+}
+
+/**
+ * H3 / M11: While the sign-in or lock screen is open, the app behind it must be neither readable (the overlay
+ * is only a blur) nor reachable by keyboard / screen readers. Watches both overlays' `open` class.
+ */
+function concealAppWhileOverlayOpen(): void {
+  const overlayIds = ['authScreen', 'lockScreen'];
+  // M12: the update prompt stays usable on the sign-in screen (it is hidden while the lock screen is open)
+  const keepVisible = new Set([...overlayIds, 'toast', 'loadingBar', 'swUpdateBanner']);
+  const overlays = overlayIds
+    .map((id) => document.getElementById(id))
+    .filter((n): n is HTMLElement => Boolean(n));
+  const apply = () => {
+    const covered = overlays.some((o) => o.classList.contains('open'));
+    document.body.classList.toggle('app-concealed', covered);
+    document.body.classList.toggle('lock-open', Boolean(document.getElementById('lockScreen')?.classList.contains('open')));
+    // Every other top-level element (topbar, content, nav, modal sheet, calculator…) is hidden and inert
+    for (const part of Array.from(document.body.children) as HTMLElement[]) {
+      if (keepVisible.has(part.id) || part.tagName === 'SCRIPT') continue;
+      if (covered) {
+        part.setAttribute('inert', '');
+        part.setAttribute('aria-hidden', 'true');
+      } else {
+        part.removeAttribute('inert');
+        part.removeAttribute('aria-hidden');
+      }
+    }
+  };
+  const observer = new MutationObserver(apply);
+  for (const o of overlays) observer.observe(o, { attributes: true, attributeFilter: ['class'] });
+  apply();
 }
 
 async function bootstrap(): Promise<void> {
@@ -182,8 +321,8 @@ async function bootstrap(): Promise<void> {
     pnlColorScheme: storedPnlScheme,
     reorderSection: null,
     reorderDraftIds: [],
-    selectedYear: now.getFullYear(),
-    selectedMonth: now.getMonth() + 1,
+    selectedYear: getDatePartsInTimeZone(now).year, // review (v1.8.15): APP_TIMEZONE month
+    selectedMonth: getDatePartsInTimeZone(now).month,
     logType: '日常花費',
     logCurrency: 'TWD',
     logCategory: '餐飲',
@@ -207,11 +346,18 @@ async function bootstrap(): Promise<void> {
   let activeDb = new LocalFinanceDB(LocalFinanceDB.dbNameForUser(remembered?.id));
   const accountChannel = createCrossTabChannel('personal-finance-account-sync');
 
-  const createSyncEngineForDb = (db: LocalFinanceDB, expectedUserId?: string): SyncEngine =>
-    new SyncEngine(db, {
+  const createSyncEngineForDb = (db: LocalFinanceDB, expectedUserId?: string): SyncEngine => {
+    const engine: SyncEngine = new SyncEngine(db, {
       expectedUserId,
       onStatusChange: (status) => renderSyncPill(status),
-      onSnapshotChange: () => ctx.renderAll(),
+      onSnapshotChange: () => {
+        // M9: a PIN / Face ID change made in another tab reloads this engine — pick the new lock settings up
+        if (ctx.engine === engine) {
+          applyAuthMetaToState(ctx.state, engine.getMeta());
+          updateSecurityButtons(ctx);
+        }
+        ctx.renderAll();
+      },
       onError: (msg) => showToast(`本機資料儲存失敗：${msg}`, 'error'),
       onAuthRequired: () => {
         ctx.state.authenticated = false;
@@ -232,6 +378,8 @@ async function bootstrap(): Promise<void> {
         });
       },
     });
+    return engine;
+  };
 
   const applyPnlSchemeDom = (scheme: PnlColorScheme) => {
     const normalized = normalizePnlColorScheme(scheme);
@@ -257,12 +405,10 @@ async function bootstrap(): Promise<void> {
       const fxEl = el('fxTopPill');
       fxEl.textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}${autoFx ? '' : ' · 手動'}`;
       fxEl.title = autoFx ? '自動更新美元匯率（點擊調整）' : '手動固定美元匯率（點擊調整）';
-      renderLogTab(ctx);
-      renderOverviewTab(ctx);
-      renderAssetsTab(ctx);
-      renderStocksTab(ctx);
-      renderConfigTab(ctx);
-      renderUtilityTab(ctx);
+      // v1.8.15 performance: only the visible tab is rendered now; the others are marked dirty and rendered
+      // when they are opened (each tab reads the engine snapshot, not another tab's DOM)
+      for (const tab of ALL_TABS) dirtyTabs.add(tab);
+      renderTabIfDirty(ctx.state.activeTab);
     },
     scheduleSync: () => {
       window.clearTimeout(syncDebounce);
@@ -301,19 +447,14 @@ async function bootstrap(): Promise<void> {
       saveRememberedAccount(user);
       const nextDbName = LocalFinanceDB.dbNameForUser(user.id);
       if (activeDb.getDbName() !== nextDbName) {
-        ctx.engine?.destroy();
+        // v1.8.15: let queued local operations finish before the database is closed
+        await ctx.engine?.destroy();
         activeDb.close();
         activeDb = new LocalFinanceDB(nextDbName);
         const nextEngine = createSyncEngineForDb(activeDb, user.id);
         ctx.engine = nextEngine;
         await nextEngine.init();
-        const nextMeta = nextEngine.getMeta();
-        state.pinEnabled = nextMeta.pinEnabled;
-        state.pinSalt = nextMeta.pinSalt;
-        state.pinHash = nextMeta.pinHash;
-        state.passkeys = nextMeta.passkeys || [];
-        state.passkeyCount = state.passkeys.length;
-        state.biometricLockEnabled = Boolean(nextMeta.biometricLockEnabled);
+        applyAuthMetaToState(state, nextEngine.getMeta());
         state.activeLedgerId = DEFAULT_LEDGER_ID;
         localStorage.setItem('finance_active_ledger_id', DEFAULT_LEDGER_ID);
         state.assetsLedgerScope = 'net_worth';
@@ -332,6 +473,16 @@ async function bootstrap(): Promise<void> {
     },
   };
 
+  renderTabImpl = (tab) => {
+    if (tab === 'log') renderLogTab(ctx);
+    else if (tab === 'overview') renderOverviewTab(ctx);
+    else if (tab === 'assets') renderAssetsTab(ctx);
+    else if (tab === 'stocks') renderStocksTab(ctx);
+    else {
+      renderConfigTab(ctx);
+      renderUtilityTab(ctx);
+    }
+  };
   ctx.engine = createSyncEngineForDb(activeDb, remembered?.id);
 
   if (accountChannel) {
@@ -339,17 +490,12 @@ async function bootstrap(): Promise<void> {
       const msg = data as { type?: string; userId?: string } | null;
       if (!msg) return;
       if (msg.type === 'logout') {
+        // H3: the other tab deletes this account's local data on logout — reload into the clean state
         ctx.engine.haltForAccountMismatch();
+        ctx.engine.destroy();
         ctx.state.authenticated = false;
-        showToast('其他分頁已登出帳號，已停止同步', 'error');
-        openAuthScreen(ctx, 'login', '其他分頁已登出帳號，請重新登入', () => {
-          void fetchAuthStatus().then(async (auth) => {
-            if (auth.authenticated && auth.user) {
-              await ctx.switchAccountDb(auth.user);
-              void ctx.engine.syncNow(true);
-            }
-          });
-        });
+        document.body.classList.add('app-concealed');
+        window.location.reload();
         return;
       }
       if (msg.type !== 'account_changed') return;
@@ -376,13 +522,7 @@ async function bootstrap(): Promise<void> {
 
   // 1. 0ms 立即從該帳號專屬的本機 IndexedDB 載入畫面（離線也能秒開）
   await ctx.engine.init();
-  const meta = ctx.engine.getMeta();
-  state.pinEnabled = meta.pinEnabled;
-  state.pinSalt = meta.pinSalt;
-  state.pinHash = meta.pinHash;
-  state.passkeys = meta.passkeys || [];
-  state.passkeyCount = state.passkeys.length;
-  state.biometricLockEnabled = Boolean(meta.biometricLockEnabled);
+  applyAuthMetaToState(state, ctx.engine.getMeta());
 
   el<HTMLInputElement>('dateInput').value = getTodayYmd();
   renderLogCategories(ctx);
@@ -400,6 +540,7 @@ async function bootstrap(): Promise<void> {
   }
 
   bindEvents(ctx);
+  concealAppWhileOverlayOpen();
 
   // 網址帶入邀請碼或密碼重置碼時，直接開啟對應畫面
   if (inviteParam) {
@@ -416,6 +557,22 @@ async function bootstrap(): Promise<void> {
     return;
   }
 
+  // H3: a logout that could not reach the server must be completed before the session cookie is trusted again
+  let pendingServerLogout = false;
+  try {
+    pendingServerLogout = localStorage.getItem(PENDING_SERVER_LOGOUT_KEY) === '1';
+  } catch {
+    pendingServerLogout = false;
+  }
+  if (pendingServerLogout) {
+    const done = navigator.onLine ? await logoutSession(false, false) : false;
+    if (!done) {
+      closeLockScreen(ctx);
+      openAuthScreen(ctx, 'login', '已登出，請重新登入', () => void ctx.engine.syncNow(true));
+      return;
+    }
+  }
+
   // 2. 背景檢查雲端登入狀態並自動同步
   if (navigator.onLine) {
     try {
@@ -424,33 +581,34 @@ async function bootstrap(): Promise<void> {
       state.authenticated = auth.authenticated;
       if (auth.authenticated && auth.user) {
         await ctx.switchAccountDb(auth.user);
-        state.pinEnabled = Boolean(auth.pinEnabled);
-        state.pinSalt = auth.pinSalt || null;
-        state.pinHash = auth.pinHash || null;
-        state.passkeys = auth.passkeys || [];
-        state.passkeyCount = auth.passkeyCount || 0;
-        await ctx.engine.updateLocalPinCache(state.pinEnabled, state.pinSalt, state.pinHash);
-        await ctx.engine.updateLocalBiometricCache(state.biometricLockEnabled, state.passkeys);
+        // M9: write the server's PIN / passkeys first, then read every lock setting back from the stored meta
+        // (the per-device Face ID toggle may have been changed by another tab and is not overwritten here)
+        await ctx.engine.updateLocalPinCache(Boolean(auth.pinEnabled), auth.pinSalt || null, auth.pinHash || null);
+        await ctx.engine.updateLocalPasskeysCache(auth.passkeys || []);
+        applyAuthMetaToState(state, ctx.engine.getMeta());
         updateSecurityButtons(ctx);
         if (!isAnyLockEnabled(ctx)) {
           closeLockScreen(ctx);
         }
+        showSecurityNotices(auth.securityNotices);
         void ctx.engine.syncNow();
       } else if (!auth.initialized) {
-        state.pinEnabled = false;
-        state.pinSalt = null;
-        state.pinHash = null;
-        state.biometricLockEnabled = false;
-        state.passkeys = [];
         await ctx.engine.updateLocalPinCache(false, null, null);
         await ctx.engine.updateLocalBiometricCache(false, []);
+        applyAuthMetaToState(state, ctx.engine.getMeta());
         updateSecurityButtons(ctx);
         closeLockScreen(ctx);
         openAuthScreen(ctx, 'setup', '', () => void ctx.engine.syncNow(true));
-      } else if (!meta.lastSyncedAt) {
-        // 首次使用無本機快取時要求登入
+      } else {
+        // H3: the server is reachable and says this device is not signed in (logged out or session expired).
+        // Never show the cached ledger without signing in again — offline-first viewing is only for real offline.
         closeLockScreen(ctx);
-        openAuthScreen(ctx, 'login', '', () => void ctx.engine.syncNow(true));
+        openAuthScreen(
+          ctx,
+          'login',
+          ctx.engine.getMeta().lastSyncedAt ? '登入已失效，請重新登入後繼續使用' : '',
+          () => void ctx.engine.syncNow(true)
+        );
       }
     } catch {
       // 離線或伺服器暫時無法連線，維持本機模式運作
@@ -471,6 +629,7 @@ function bindEvents(ctx: UiContext): void {
       cancelReorder(ctx);
     }
     ctx.state.activeTab = tab;
+    renderTabIfDirty(tab); // v1.8.15: tabs are rendered lazily
     navButtons.forEach((b, i) => b.classList.toggle('active', i === safeIdx));
     document.querySelectorAll('.tab-view').forEach((v) => v.classList.toggle('active', v.id === 'tab-' + tab));
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -716,7 +875,7 @@ function bindEvents(ctx: UiContext): void {
   el('amountInput').addEventListener('input', () => updateFxPreview(ctx));
   el('dateInput').addEventListener('change', () => updateSavingsPreview(ctx));
 
-  el('expenseForm').addEventListener('submit', async (e) => {
+  bindSubmit(el('expenseForm'), async (e) => {
     e.preventDefault();
     const amount = parseFloat(el<HTMLInputElement>('amountInput').value);
     const date = el<HTMLInputElement>('dateInput').value;
@@ -792,7 +951,7 @@ function bindEvents(ctx: UiContext): void {
     });
   });
 
-  el('budgetForm').addEventListener('submit', async (e) => {
+  bindSubmit(el('budgetForm'), async (e) => {
     e.preventDefault();
     try {
       await ctx.engine.saveBudgetSettings(
@@ -1026,8 +1185,31 @@ function bindEvents(ctx: UiContext): void {
       state: 'offline',
     });
   });
+  const BACKGROUND_LOCK_GRACE_MS = 30_000;
+  let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
+    // M11: when the app goes to the background, conceal it at once (the OS app-switcher snapshot must not show
+    // balances) but only lock if it stays away for a while — a quick switch to copy an OTP or a file picker
+    // must not discard the open form or force an unlock.
+    if (document.visibilityState === 'hidden') {
+      if (isAnyLockEnabled(ctx)) {
+        hiddenAt = Date.now();
+        document.body.classList.add('app-backgrounded');
+      }
+      return;
+    }
     if (document.visibilityState === 'visible') {
+      const awayMs = hiddenAt ? Date.now() - hiddenAt : 0;
+      hiddenAt = 0;
+      document.body.classList.remove('app-backgrounded');
+      if (
+        awayMs > BACKGROUND_LOCK_GRACE_MS &&
+        isAnyLockEnabled(ctx) &&
+        !el('lockScreen').classList.contains('open') &&
+        !el('authScreen').classList.contains('open')
+      ) {
+        openLockScreen(ctx, '已自動鎖定');
+      }
       checkIdle();
       if (navigator.onLine) {
         void ctx.engine.syncNow();

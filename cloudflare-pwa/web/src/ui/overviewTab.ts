@@ -7,7 +7,7 @@ import {
   computeSinkingMonthlyReserve,
   filterCashFlowsByLedgerScope,
 } from '../../../shared/calculations';
-import { el, fmtMoney } from './helpers';
+import { el, fmtMoney, fmtPct } from './helpers';
 import { getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { getSelectedYearMonth } from './logTab';
 import type { UiContext } from './state';
@@ -75,7 +75,7 @@ export function renderOverviewTab(ctx: UiContext): void {
     { label: '投資流出（強制儲蓄）', val: fmtMoney(m.investment, ctx.state.masked), cls: 'inv' },
     {
       label: '真實儲蓄率',
-      val: ctx.state.masked ? '••%' : `${m.savingsRate.toFixed(1)}%`,
+      val: ctx.state.masked ? '••%' : `${fmtPct(m.savingsRate, 1)}`,
       cls: m.savingsRate >= 30 ? 'pos' : m.savingsRate < 10 ? 'neg' : '',
     },
     {

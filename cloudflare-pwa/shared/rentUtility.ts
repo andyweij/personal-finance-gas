@@ -1,3 +1,4 @@
+import { escapeCsvCell } from './format';
 import type { RentUtilityRecord, RentUtilityRents } from './types';
 
 export const UTILITY_SUB_METER_MOD = 10000;   // 6F 與 5F A/B/C 四位數電表（滿 10,000 歸零）
@@ -244,7 +245,7 @@ export function buildUtilityCsv(chained: ChainedUtilityRecord[]): string {
       r.f6Elec, r.f6Water, r.f6Total, r.f5Elec, r.f5Water,
       rec.prevA, rec.curA, r.aKwh, rec.prevB, rec.curB, r.bKwh, rec.prevC, rec.curC, r.cKwh,
       r.pubKwh, r.aTotal.toFixed(2), r.bTotal.toFixed(2), r.cTotal.toFixed(2),
-    ].join(','));
+    ].map(escapeCsvCell).join(','));
   }
   return '\uFEFF' + lines.join('\n');
 }

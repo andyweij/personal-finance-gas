@@ -1,3 +1,4 @@
+import { todayInTimeZone } from '../../../shared/dates';
 import { ASSET_SUB_CATEGORIES, DEFAULT_LEDGER_ID } from '../../../shared/constants';
 import {
   compareBySortOrder,
@@ -19,6 +20,7 @@ import { resolveStockModalPriceFields } from '../../../shared/validation';
 import {
   closeModal,
   el,
+  escapeHtml,
   fmtMoney,
   fmtNum,
   fmtRaw,
@@ -26,8 +28,7 @@ import {
   makeSelectField,
   openModal,
   showToast,
-  TRASH_SVG,
-} from './helpers';
+  TRASH_SVG, fmtPct, bindSubmit } from './helpers';
 import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
@@ -65,13 +66,12 @@ export function getAssetSectionIds(
 }
 
 function todayYmdLocal(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return todayInTimeZone(); // v1.8.15: "today" is the APP_TIMEZONE date, like the server
 }
 
 function fmtSignedMoney(n: number, masked: boolean): string {
   if (masked) return '•••••';
+  n = Math.round(Number(n) || 0); // v1.8.15: sign of the displayed (whole-dollar) value
   if (n > 0) return '+' + fmtMoney(n, false, '');
   if (n < 0) return '-' + fmtMoney(Math.abs(n), false, '');
   return '0';
@@ -132,7 +132,7 @@ export function renderAssetsTab(ctx: UiContext): void {
   el('netWorthHero').textContent = fmtMoney(nw.netWorth, ctx.state.masked);
   el('totalAssetsText').textContent = fmtMoney(nw.totalAssets, ctx.state.masked);
   el('totalLiabText').textContent = fmtMoney(nw.totalLiabilities, ctx.state.masked);
-  el('debtRatioBadge').textContent = `負債比 ${nw.debtRatio.toFixed(1)}%`;
+  el('debtRatioBadge').textContent = `負債比 ${fmtPct(nw.debtRatio, 1)}`;
 
   document.querySelectorAll<HTMLButtonElement>('#allocModeToggle .mini-seg-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.allocMode === ctx.state.allocMode);
@@ -156,7 +156,7 @@ export function renderAssetsTab(ctx: UiContext): void {
 
   for (const a of alloc) {
     const pctNum = nw.totalAssets > 0 ? (a.val / base) * 100 : 0;
-    const pctStr = pctNum.toFixed(1) + '%';
+    const pctStr = fmtPct(pctNum, 1);
     const isHl = ctx.state.allocHighlight === a.key;
     const isDim = Boolean(ctx.state.allocHighlight && !isHl);
 
@@ -744,7 +744,7 @@ export function renderAssetsTab(ctx: UiContext): void {
       t.textContent = `${h.yearMonth} 淨資產快照`;
       const sub = document.createElement('div');
       sub.className = 'item-sub tnum';
-      sub.textContent = `總資產 ${fmtMoney(h.totalAssets, ctx.state.masked)} ｜ 總負債 ${fmtMoney(h.totalLiabilities, ctx.state.masked)} ｜ 儲蓄率 ${(h.savingsRate * 100).toFixed(1)}%`;
+      sub.textContent = `總資產 ${fmtMoney(h.totalAssets, ctx.state.masked)} ｜ 總負債 ${fmtMoney(h.totalLiabilities, ctx.state.masked)} ｜ 儲蓄率 ${fmtPct((h.savingsRate * 100), 1)}`;
       main.appendChild(t);
       main.appendChild(sub);
 
@@ -864,7 +864,7 @@ export function openSavingsAccountModal(
   btns.appendChild(save);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     try {
       const anchorDate = el<HTMLInputElement>('svAnchorDate').value || today;
@@ -981,7 +981,7 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
     updateModeUi();
   });
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const rawAmt = parseFloat(el<HTMLInputElement>('adjAmt').value);
     const date = el<HTMLInputElement>('adjDate').value;
@@ -1134,9 +1134,7 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
         snap.savingsAdjustments || [],
         rate
       );
-      return acc.currency === 'USD'
-        ? Math.round((s.currentBalanceTwd / rate) * 100) / 100
-        : s.currentBalanceTwd;
+      return s.currentBalanceNative;
     }
     return acc.quantityOrAmount;
   };
@@ -1330,15 +1328,15 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
       return;
     }
 
-    const fromLine = `<div>轉出 <strong>${fromAcc.itemName}</strong>：${fmtRaw(fromBefore, fromAcc.currency, ctx.state.masked)} → <strong style="color:${fromAfter < 0 ? 'var(--neg)' : 'var(--text)'}">${fmtRaw(fromAfter, fromAcc.currency, ctx.state.masked)}</strong></div>`;
-    const toLine = `<div>轉入 <strong>${toAcc.itemName}</strong>：${fmtRaw(toBefore, toAcc.currency, ctx.state.masked)} → <strong style="color:var(--pos)">${fmtRaw(toAfter, toAcc.currency, ctx.state.masked)}</strong></div>`;
+    const fromLine = `<div>轉出 <strong>${escapeHtml(fromAcc.itemName)}</strong>：${fmtRaw(fromBefore, fromAcc.currency, ctx.state.masked)} → <strong style="color:${fromAfter < 0 ? 'var(--neg)' : 'var(--text)'}">${fmtRaw(fromAfter, fromAcc.currency, ctx.state.masked)}</strong></div>`;
+    const toLine = `<div>轉入 <strong>${escapeHtml(toAcc.itemName)}</strong>：${fmtRaw(toBefore, toAcc.currency, ctx.state.masked)} → <strong style="color:var(--pos)">${fmtRaw(toAfter, toAcc.currency, ctx.state.masked)}</strong></div>`;
     const feeLine =
       fee > 0
         ? `<div style="color:var(--text-secondary)">含轉帳手續費 ${fmtRaw(fee, fromAcc.currency, ctx.state.masked)}（同步記為流水帳支出）</div>`
         : '';
     const crossLedgerHint =
       getEffectiveLedgerId(fromAcc) !== getEffectiveLedgerId(toAcc)
-        ? `<div style="color:var(--warning)">跨帳本轉帳：${ledgerNameMap.get(getEffectiveLedgerId(fromAcc)) || '主帳本'} → ${ledgerNameMap.get(getEffectiveLedgerId(toAcc)) || '主帳本'}</div>`
+        ? `<div style="color:var(--warning)">跨帳本轉帳：${escapeHtml(ledgerNameMap.get(getEffectiveLedgerId(fromAcc)) || '主帳本')} → ${escapeHtml(ledgerNameMap.get(getEffectiveLedgerId(toAcc)) || '主帳本')}</div>`
         : '';
     const twdHint =
       !hasAmt
@@ -1377,7 +1375,7 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
 
   updatePreview(true);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const fromAcc = findAcc(fromSel.value);
     const toAcc = findAcc(toSel.value);
@@ -1423,10 +1421,8 @@ export function openReconcileModal(ctx: UiContext, account: AssetItem): void {
   body.appendChild(info);
 
   const form = document.createElement('form');
-  const defaultVal =
-    account.currency === 'USD'
-      ? Math.round((summary.currentBalanceTwd / rate) * 100) / 100
-      : summary.currentBalanceTwd;
+  // M8: the prefilled balance is the account's own-currency balance (no TWD round trip)
+  const defaultVal = summary.currentBalanceNative;
   form.appendChild(
     makeInputField(`網銀實際餘額 (${account.currency})`, 'recActual', 'number', defaultVal, '0', true)
   );
@@ -1446,7 +1442,7 @@ export function openReconcileModal(ctx: UiContext, account: AssetItem): void {
   btns.appendChild(save);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const actual = parseFloat(el<HTMLInputElement>('recActual').value);
     if (Number.isNaN(actual)) {
@@ -1527,7 +1523,7 @@ export function openLoanReconcileModal(ctx: UiContext, item: AssetItem): void {
   btns.appendChild(save);
   form.appendChild(btns);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const actualBal = parseFloat(el<HTMLInputElement>('lnRecBal').value);
     const anchorDate = el<HTMLInputElement>('lnRecDate').value || today;
@@ -1577,7 +1573,7 @@ export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
       : `剩餘約 ${loan.remainingPeriods} 期${loan.estimatedPayoffYm ? `（預計 ${loan.estimatedPayoffYm} 清償）` : ''}`;
   banner.innerHTML =
     `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span>截至今日預估餘額</span><strong class="tnum" style="font-size:17px;color:var(--neg)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong></div>` +
-    `<div class="tnum">年利率 ${item.loanAnnualRate ?? 0}% · 月付 ${fmtRaw(item.loanMonthlyPayment || 0, item.currency, ctx.state.masked)} · 每月 ${item.loanBillingDay || 1} 號扣款<br/>基準單據 ${fmtRaw(loan.baseBalance, item.currency, ctx.state.masked)} (${item.balanceAnchorDate || '-'}) · 已推算 ${loan.elapsedPeriods} 期 · ${remainText}</div>`;
+    `<div class="tnum">年利率 ${escapeHtml(item.loanAnnualRate ?? 0)}% · 月付 ${fmtRaw(item.loanMonthlyPayment || 0, item.currency, ctx.state.masked)} · 每月 ${escapeHtml(item.loanBillingDay || 1)} 號扣款<br/>基準單據 ${fmtRaw(loan.baseBalance, item.currency, ctx.state.masked)} (${escapeHtml(item.balanceAnchorDate || '-')}) · 已推算 ${loan.elapsedPeriods} 期 · ${remainText}</div>`;
   body.appendChild(banner);
 
   let showAll = false;
@@ -1861,7 +1857,7 @@ export function openAssetModal(
     loanFields.style.display = isLiab && loanCb.checked ? 'block' : 'none';
   };
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     try {
       const majorType = el<HTMLSelectElement>('asMajor').value;

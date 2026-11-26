@@ -60,3 +60,12 @@ export function buildMonthlyDedupKey(
   const lid = String(ledgerId || 'default').trim() || 'default';
   return lid === 'default' ? base : `${lid}||${base}`;
 }
+
+/**
+ * M5 (v1.8.12): dedup key of an auto-posted entry — one entry per recurring item per month, so two items that
+ * share a name and type are both posted. Rows posted before v1.8.12 carry the legacy name-based key
+ * (`buildMonthlyDedupKey`) and are still honoured when deciding what has already been posted.
+ */
+export function buildRecurringItemMonthKey(recurringItemId: string, yearMonth: string): string {
+  return `rec:${String(recurringItemId).trim()}:${yearMonth.trim()}`;
+}

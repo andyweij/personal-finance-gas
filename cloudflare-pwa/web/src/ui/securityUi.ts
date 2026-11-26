@@ -1,3 +1,4 @@
+import { todayInTimeZone } from '../../../shared/dates';
 import { exportCashFlowCsv } from '../../../shared/csv';
 import {
   changeMyPassword,
@@ -27,13 +28,65 @@ import {
   makeInputField,
   openModal,
   setLoading,
-  showToast,
-} from './helpers';
+  showToast, bindSubmit } from './helpers';
 import { APP_VERSION, BUILD_COMMIT, DB_SCHEMA_VERSION } from '../version';
 import type { UiContext } from './state';
+import { applyAuthMetaToState } from './state';
 
 let pinInput = '';
 let pinVerifySeq = 0;
+
+/**
+ * M11: local PIN attempt throttling (per device, survives reload). After 5 wrong PINs the keypad is locked
+ * for 30 s, doubling with each further failure up to 15 minutes. A successful unlock resets it.
+ */
+const PIN_ATTEMPTS_KEY = 'pf_pin_attempts';
+const PIN_FREE_ATTEMPTS = 5;
+
+function readPinAttempts(): { fails: number; lockedUntil: number } {
+  try {
+    const raw = localStorage.getItem(PIN_ATTEMPTS_KEY);
+    if (!raw) return { fails: 0, lockedUntil: 0 };
+    const parsed = JSON.parse(raw) as { fails?: number; lockedUntil?: number };
+    return { fails: Number(parsed.fails) || 0, lockedUntil: Number(parsed.lockedUntil) || 0 };
+  } catch {
+    return { fails: 0, lockedUntil: 0 };
+  }
+}
+
+function pinLockRemainingSec(): number {
+  const { lockedUntil } = readPinAttempts();
+  return Math.max(0, Math.ceil((lockedUntil - Date.now()) / 1000));
+}
+
+function recordPinFailure(): void {
+  const cur = readPinAttempts();
+  const fails = cur.fails + 1;
+  const over = fails - PIN_FREE_ATTEMPTS;
+  const lockedUntil = over >= 0 ? Date.now() + Math.min(15 * 60_000, 30_000 * 2 ** over) : 0;
+  try {
+    localStorage.setItem(PIN_ATTEMPTS_KEY, JSON.stringify({ fails, lockedUntil }));
+  } catch {
+    // storage unavailable — throttling falls back to none
+  }
+}
+
+function resetPinFailures(): void {
+  try {
+    localStorage.removeItem(PIN_ATTEMPTS_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function showPinLockedMessage(): boolean {
+  const wait = pinLockRemainingSec();
+  if (wait <= 0) return false;
+  pinInput = '';
+  renderPinDots();
+  el('pinError').textContent = `PIN 錯誤次數過多，請於 ${wait} 秒後再試`;
+  return true;
+}
 
 export type AuthScreenMode = 'setup' | 'login' | 'register' | 'reset';
 
@@ -138,14 +191,12 @@ export function openAuthScreen(
         }
         ctx.state.currentUser = status.user;
         setAuthExpectedUser(ctx.state.currentUser?.id ?? null);
-        ctx.state.pinEnabled = Boolean(status.pinEnabled);
-        ctx.state.pinSalt = status.pinSalt || null;
-        ctx.state.pinHash = status.pinHash || null;
-        ctx.state.passkeys = status.passkeys || [];
-        ctx.state.passkeyCount = status.passkeyCount || 0;
-        await ctx.engine.updateLocalPinCache(ctx.state.pinEnabled, ctx.state.pinSalt, ctx.state.pinHash);
-        await ctx.engine.updateLocalBiometricCache(ctx.state.biometricLockEnabled, ctx.state.passkeys);
+        // M9: store the server's PIN / passkeys, then read all lock settings back from the shared meta
+        await ctx.engine.updateLocalPinCache(Boolean(status.pinEnabled), status.pinSalt || null, status.pinHash || null);
+        await ctx.engine.updateLocalPasskeysCache(status.passkeys || []);
+        applyAuthMetaToState(ctx.state, ctx.engine.getMeta());
         ctx.applyUtilityTabVisibility();
+        showSecurityNotices(status.securityNotices);
         updateSecurityButtons(ctx);
       }
     } catch {
@@ -231,7 +282,8 @@ export function openAuthScreen(
     form.appendChild(submit);
 
     // 若已有本機離線快取資料，允許上次登入者在離線時繼續檢視與記帳
-    if (ctx.engine.getMeta().lastSyncedAt && remembered) {
+    // H3: only when the device is really offline — when the server is reachable, signing in is required
+    if (ctx.engine.getMeta().lastSyncedAt && remembered && typeof navigator !== 'undefined' && navigator.onLine === false) {
       const offlineBtn = document.createElement('button');
       offlineBtn.type = 'button';
       offlineBtn.className = 'btn btn-outline btn-block';
@@ -243,7 +295,7 @@ export function openAuthScreen(
       form.appendChild(offlineBtn);
     }
 
-    form.addEventListener('submit', async (e) => {
+    bindSubmit(form, async (e) => {
       e.preventDefault();
       el('authError').textContent = '';
       setLoading(true);
@@ -279,7 +331,7 @@ export function openAuthScreen(
     submit.textContent = '完成初始化並進入系統';
     form.appendChild(submit);
 
-    form.addEventListener('submit', async (e) => {
+    bindSubmit(form, async (e) => {
       e.preventDefault();
       el('authError').textContent = '';
       setLoading(true);
@@ -319,7 +371,7 @@ export function openAuthScreen(
     submit.textContent = '完成註冊並建立專屬帳本';
     form.appendChild(submit);
 
-    form.addEventListener('submit', async (e) => {
+    bindSubmit(form, async (e) => {
       e.preventDefault();
       el('authError').textContent = '';
       const pwd = el<HTMLInputElement>('regPwd').value;
@@ -364,7 +416,7 @@ export function openAuthScreen(
   submit.textContent = '重設密碼';
   form.appendChild(submit);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     el('authError').textContent = '';
     const pwd = el<HTMLInputElement>('rstPwd').value;
@@ -486,8 +538,54 @@ export async function unlockLockScreenWithFaceId(ctx: UiContext): Promise<void> 
   }
 }
 
+/**
+ * H1: tell the member when their password was reset with an admin-issued code (and that passkeys and PIN were
+ * cleared). Shown once per device per event; the event itself stays on the server for 30 days.
+ */
+const ACK_NOTICES_KEY = 'pf_ack_security_notices';
+
+export function showSecurityNotices(
+  notices: Array<{ id: string; kind: string; createdAt: string; actorDisplayName: string | null }> | undefined
+): void {
+  if (!notices || notices.length === 0) return;
+  let acked: string[] = [];
+  try {
+    acked = JSON.parse(localStorage.getItem(ACK_NOTICES_KEY) || '[]') as string[];
+  } catch {
+    acked = [];
+  }
+  const fresh = notices.filter((n) => !acked.includes(n.id));
+  if (fresh.length === 0) return;
+
+  const body = openModal('帳號安全通知');
+  for (const n of fresh) {
+    const p = document.createElement('p');
+    p.style.margin = '0 0 10px';
+    const when = new Date(n.createdAt).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+    p.textContent =
+      n.kind === 'password_reset_with_admin_code'
+        ? `你的主密碼曾於 ${when} 透過管理員${n.actorDisplayName ? `「${n.actorDisplayName}」` : ''}產生的重置碼重設；為了安全，原有的 Passkey 與 PIN 已一併清除。若這不是你本人操作，請立即變更主密碼並與管理員確認。`
+        : `帳號安全事件（${n.kind}）：${when}`;
+    body.appendChild(p);
+  }
+  const ok = document.createElement('button');
+  ok.type = 'button';
+  ok.className = 'btn btn-primary btn-block';
+  ok.textContent = '我知道了';
+  ok.addEventListener('click', () => {
+    try {
+      localStorage.setItem(ACK_NOTICES_KEY, JSON.stringify([...acked, ...fresh.map((n) => n.id)].slice(-50)));
+    } catch {
+      // ignore
+    }
+    closeModal();
+  });
+  body.appendChild(ok);
+}
+
 export async function triggerPinKey(ctx: UiContext, k: string): Promise<void> {
   el('pinError').textContent = '';
+  if (k !== 'del' && showPinLockedMessage()) return;
   if (k === 'del') {
     pinVerifySeq += 1;
     pinInput = pinInput.slice(0, -1);
@@ -505,12 +603,14 @@ export async function triggerPinKey(ctx: UiContext, k: string): Promise<void> {
     const ok = await verifyOfflinePin(candidate, ctx.state.pinSalt || '', ctx.state.pinHash || '');
     if (seq !== pinVerifySeq) return;
     if (ok) {
+      resetPinFailures();
       closeLockScreen(ctx);
       ctx.scheduleSync();
     } else {
+      recordPinFailure();
       pinInput = '';
       renderPinDots();
-      el('pinError').textContent = 'PIN 碼不正確，請重試';
+      if (!showPinLockedMessage()) el('pinError').textContent = 'PIN 碼不正確，請重試';
     }
     return;
   }
@@ -525,15 +625,17 @@ export async function triggerPinKey(ctx: UiContext, k: string): Promise<void> {
       const candidate = pinInput;
       const ok = await verifyOfflinePin(candidate, ctx.state.pinSalt, ctx.state.pinHash);
       if (ok && el('lockScreen').classList.contains('open') && pinInput.startsWith(candidate)) {
+        resetPinFailures();
         closeLockScreen(ctx);
         ctx.scheduleSync();
         return;
       }
       // Only auto-clear and show error if user has reached the 6-digit maximum and still no match
       if (!ok && candidate.length === 6 && seq === pinVerifySeq) {
+        recordPinFailure();
         pinInput = '';
         renderPinDots();
-        el('pinError').textContent = 'PIN 碼不正確，請重試';
+        if (!showPinLockedMessage()) el('pinError').textContent = 'PIN 碼不正確，請重試';
       }
     }
   }
@@ -555,7 +657,7 @@ function openProfileEditModal(ctx: UiContext): void {
   submit.textContent = '儲存個人資料';
   form.appendChild(submit);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     setLoading(true);
     try {
@@ -589,7 +691,7 @@ function openChangePasswordModal(ctx: UiContext): void {
   submit.textContent = '更新主密碼';
   form.appendChild(submit);
 
-  form.addEventListener('submit', async (e) => {
+  bindSubmit(form, async (e) => {
     e.preventDefault();
     const cur = el<HTMLInputElement>('chgCurPwd').value;
     const next = el<HTMLInputElement>('chgNewPwd').value;
@@ -852,7 +954,7 @@ export function openSecurityModal(ctx: UiContext): void {
     const bioRow = document.createElement('div');
     bioRow.style.cssText =
       'display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px;padding-top:10px;border-top:0.5px solid var(--sep)';
-    bioRow.innerHTML = `<div><div style="font-size:13px;font-weight:600">啟動與閒置時用 Face ID 解鎖</div><div class="muted" style="font-size:11px">支援飛航模式離線刷臉解鎖</div></div>`;
+    bioRow.innerHTML = `<div><div style="font-size:13px;font-weight:600">啟動與閒置時用 Face ID 解鎖</div><div class="muted" style="font-size:11px">支援飛航模式離線刷臉解鎖；部分裝置的 Passkey（例如某些 Windows Hello）無法離線驗證，建議同時設定 PIN 作為備援</div></div>`;
     const sw = document.createElement('label');
     sw.className = 'switch';
     const cb = document.createElement('input');
@@ -950,7 +1052,7 @@ export function openSecurityModal(ctx: UiContext): void {
     pinBtns.appendChild(offBtn);
   }
   pinForm.appendChild(pinBtns);
-  pinForm.addEventListener('submit', async (e) => {
+  bindSubmit(pinForm, async (e) => {
     e.preventDefault();
     const cur = ctx.state.pinEnabled ? el<HTMLInputElement>('secCurPin').value.trim() : '';
     const nextPin = el<HTMLInputElement>('secNewPin').value.trim();
@@ -989,7 +1091,7 @@ export function openSecurityModal(ctx: UiContext): void {
   expJsonBtn.textContent = '匯出完整 JSON';
   expJsonBtn.addEventListener('click', () => {
     const data = ctx.engine.getSnapshot();
-    const ymd = new Date().toISOString().slice(0, 10);
+    const ymd = todayInTimeZone(); // v1.8.15: file name uses the APP_TIMEZONE date (not UTC)
     const suffix = user ? `-${user.username}` : '';
     downloadTextFile(
       `personal-finance-backup${suffix}-${ymd}.json`,
@@ -1005,7 +1107,7 @@ export function openSecurityModal(ctx: UiContext): void {
   expCsvBtn.textContent = '匯出流水帳 CSV';
   expCsvBtn.addEventListener('click', () => {
     const csv = exportCashFlowCsv(ctx.engine.getSnapshot().cashflowLogs);
-    const ymd = new Date().toISOString().slice(0, 10);
+    const ymd = todayInTimeZone();
     downloadTextFile(`CashFlow_Log-${ymd}.csv`, csv, 'text/csv;charset=utf-8');
     showToast('已匯出 UTF-8 BOM CSV', 'success');
   });
@@ -1114,14 +1216,37 @@ export function openSecurityModal(ctx: UiContext): void {
   logoutBtn.style.marginTop = '6px';
   logoutBtn.textContent = '登出此裝置';
   logoutBtn.addEventListener('click', async () => {
-    await logoutSession(false);
-    ctx.state.authenticated = false;
-    ctx.state.currentUser = null;
-    setAuthExpectedUser(null);
-    closeModal();
-    openAuthScreen(ctx, 'login', '已登出，請重新登入以同步雲端資料', () => {
-      void ctx.engine.syncNow(true);
-    });
+    // H3: logging out deletes this account's local data, so first try to upload pending changes
+    let pending = ctx.engine.getStatus().pendingCount || 0;
+    if (pending > 0) {
+      await ctx.engine.syncNow().catch(() => undefined);
+      pending = ctx.engine.getStatus().pendingCount || 0;
+    }
+    if (
+      pending > 0 &&
+      !confirm(`還有 ${pending} 筆變更尚未同步到雲端，登出會刪除這台裝置上的資料，這些變更將會遺失。確定要登出？`)
+    ) {
+      return;
+    }
+    setLoading(true);
+    let wipe: 'deleted' | 'blocked' = 'deleted';
+    try {
+      // If the server cannot be reached, logoutSession records a pending server logout that the next start
+      // completes before showing anything (the HttpOnly cookie cannot be cleared from script)
+      await logoutSession(false);
+      ctx.state.authenticated = false;
+      ctx.state.currentUser = null;
+      setAuthExpectedUser(null);
+      clearRememberedAccount();
+      wipe = await ctx.engine.wipeLocalData();
+    } finally {
+      setLoading(false);
+    }
+    if (wipe === 'blocked') {
+      alert('此網站還有其他分頁開著，請關閉其他分頁，才能完成刪除這台裝置上的資料。');
+    }
+    // Reload into a clean state: no remembered account and no local ledger left on this device
+    window.location.reload();
   });
   dataBox.appendChild(logoutBtn);
 

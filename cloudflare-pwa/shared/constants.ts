@@ -92,3 +92,12 @@ export const WEBAPP_CATEGORY_MAP: Record<string, string[]> = {
   投資流出: ['台股投資', '中信基金', '美股/ETF', '其他投資'],
   固定支出: ['房貸', '車貸', '房租支出', '水電瓦斯/管理費', '電信費', '其他'],
 };
+
+/**
+ * H5 (v1.8.13): Cloudflare D1 allows 50 queries per Worker invocation on the Workers Free plan (1000 on Paid).
+ * The client sends at most this many mutations per sync request and the server processes at most this many per
+ * request (it also stops early when its per-request query budget would run out — unprocessed mutations are simply
+ * not acked and are sent again with the next request).
+ */
+export const SYNC_MAX_MUTATIONS_PER_REQUEST = 20;
+export const D1_QUERIES_PER_INVOCATION_FREE = 50;

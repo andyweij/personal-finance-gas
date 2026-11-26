@@ -10,13 +10,9 @@ import {
 
 export type GoogleSheetCsvKind = 'cashflow' | 'recurring' | 'sinking' | 'asset' | 'networth';
 
-function escapeCsvCell(val: unknown): string {
-  const str = val === null || val === undefined ? '' : String(val);
-  if (/[",\r\n]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
+// v1.8.15: shared escaping with CSV formula-injection protection (= + - @ prefixed with ')
+import { escapeCsvCell } from './format';
+export { escapeCsvCell };
 
 function cleanNumber(raw: unknown, fallback = 0): number {
   const s = String(raw ?? '')
@@ -36,7 +32,7 @@ function normalizeYmd(raw: unknown): string {
   return dateRaw;
 }
 
-export function parseCsvRows(csvText: string): string[][] {
+function parseCsvRowsRaw(csvText: string): string[][] {
   const cleaned = csvText.replace(/^\uFEFF/, '');
   const rows: string[][] = [];
   let row: string[] = [];
@@ -83,6 +79,11 @@ export function parseCsvRows(csvText: string): string[][] {
   }
 
   return rows.filter((r) => r.some((c) => c.trim() !== ''));
+}
+
+/** v1.8.15 review: undo the formula-injection prefix of our own export ("'=x" → "=x") */
+export function parseCsvRows(csvText: string): string[][] {
+  return parseCsvRowsRaw(csvText).map((row) => row.map((cell) => (/^'[=+\-@\t\r]/.test(cell) ? cell.slice(1) : cell)));
 }
 
 export function detectGoogleSheetCsvKind(csvText: string): GoogleSheetCsvKind | null {

@@ -1,6 +1,9 @@
+import { todayInTimeZone } from '../../../shared/dates';
+import { mutationReferenceKeys, orderMutationsByDependencies } from '../../../shared/syncOrder';
 import {
   applySubsetReorder,
   compareBySortOrder,
+  computeStockPositionSummary,
   ensureActiveLedgers,
   getEffectiveLedgerId,
   isTransferableAccount,
@@ -10,6 +13,7 @@ import {
   DEFAULT_LEDGER_ID,
   RECURRING_CASHFLOW_TYPES,
   STOCK_TX_TYPES,
+  SYNC_MAX_MUTATIONS_PER_REQUEST,
 } from '../../../shared/constants';
 import {
   sortUtilityRecords,
@@ -241,6 +245,9 @@ function mergeUtilityRecords(
   return sortUtilityRecords(Array.from(map.values()));
 }
 
+/** v1.8.15: cross-tab reload debounce */
+const CROSS_TAB_RELOAD_DEBOUNCE_MS = 150;
+
 export class SyncEngine {
   private snapshot: FinanceSnapshot = createEmptySnapshot();
   private meta: LocalMeta = {
@@ -283,6 +290,7 @@ export class SyncEngine {
   private readonly requestTimeoutMs: number;
   private readonly retryBaseDelayMs: number;
   private readonly maxBatchSize: number;
+  private crossTabReloadTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly maxPoisonRetries: number;
   private readonly requestLockImpl: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
 
@@ -297,7 +305,8 @@ export class SyncEngine {
     this.expectedUserId = opts.expectedUserId;
     this.requestTimeoutMs = Math.max(20, opts.requestTimeoutMs ?? 20_000);
     this.retryBaseDelayMs = Math.max(50, opts.retryBaseDelayMs ?? 2_000);
-    this.maxBatchSize = Math.max(1, Math.min(200, opts.maxBatchSize ?? 50));
+    // H5: never more than the server processes per request (D1 query budget)
+    this.maxBatchSize = Math.max(1, Math.min(SYNC_MAX_MUTATIONS_PER_REQUEST, opts.maxBatchSize ?? SYNC_MAX_MUTATIONS_PER_REQUEST));
     this.maxPoisonRetries = Math.max(2, Math.min(20, opts.maxPoisonRetries ?? 5));
     this.requestLockImpl =
       opts.requestLock ||
@@ -321,8 +330,13 @@ export class SyncEngine {
         const msg = data as { type?: string; senderId?: string } | null;
         if (!msg || msg.senderId === this.instanceId || this.destroyed) return;
         if (msg.type === 'snapshot_changed') {
-          // Reload may race with init/destroy; errors here must not become unhandled rejections
-          void this.reloadFromIndexedDb().catch(() => undefined);
+          // v1.8.15: a burst of writes in another tab (e.g. a sync applying many batches) reloads once
+          if (this.crossTabReloadTimer !== null) clearTimeout(this.crossTabReloadTimer);
+          this.crossTabReloadTimer = setTimeout(() => {
+            this.crossTabReloadTimer = null;
+            // Reload may race with init/destroy; errors here must not become unhandled rejections
+            void this.reloadFromIndexedDb().catch(() => undefined);
+          }, CROSS_TAB_RELOAD_DEBOUNCE_MS);
         }
       };
     }
@@ -332,6 +346,7 @@ export class SyncEngine {
     const serializedMethods = [
       'updateLocalPinCache',
       'updateLocalBiometricCache',
+      'updateLocalPasskeysCache',
       'saveLedger',
       'deleteLedger',
       'addCashFlow',
@@ -367,16 +382,19 @@ export class SyncEngine {
       const orig = self[methodName].bind(this);
       self[methodName] = (...args: unknown[]) =>
         this.runSerialized(async () => {
-          try {
-            return await orig(...args);
-          } catch (err) {
-            // P2-C6: another tab wrote the snapshot after this tab last read it. Reload and recompute the edit
-            // on top of the latest data instead of overwriting it (nothing was written: the commit aborted).
-            if (err instanceof StaleSnapshotError) {
+          // P2-C6: another tab wrote the snapshot after this tab last read it. Reload and recompute the edit
+          // on top of the latest data instead of overwriting it (nothing was written: the commit aborted).
+          // v1.8.15: retry a few times (busy tabs), then fail with a message the user can act on.
+          for (let attempt = 0; ; attempt++) {
+            try {
+              return await orig(...args);
+            } catch (err) {
+              if (!(err instanceof StaleSnapshotError)) throw err;
+              if (attempt >= 2) {
+                throw new Error('其他分頁正在同時修改資料，這次變更尚未儲存，請再試一次。');
+              }
               await this.reloadStateUnlocked();
-              return orig(...args);
             }
-            throw err;
           }
         });
     }
@@ -435,8 +453,17 @@ export class SyncEngine {
     this.clearScheduledRetry();
   }
 
-  destroy(): void {
+  /**
+   * Stops the engine. v1.8.15: returns a promise that settles once already-queued local operations have finished,
+   * so a caller that closes the database afterwards (account switch) never makes them fail with
+   * "LocalFinanceDB is not open".
+   */
+  destroy(): Promise<void> {
     this.destroyed = true;
+    if (this.crossTabReloadTimer !== null) {
+      clearTimeout(this.crossTabReloadTimer);
+      this.crossTabReloadTimer = null;
+    }
     // P2-C10: stop an in-flight sync so it does not keep working against a database that is being closed
     try {
       this.activeSyncController?.abort();
@@ -456,6 +483,16 @@ export class SyncEngine {
       }
       this.dbChannel = null;
     }
+    return this.stateChain.catch(() => undefined);
+  }
+
+  /**
+   * H3: stop syncing and permanently delete this account's local data (logout on a possibly shared device).
+   * Waits for queued local operations first so nothing writes to the database while it is being deleted.
+   */
+  async wipeLocalData(): Promise<'deleted' | 'blocked'> {
+    await this.destroy();
+    return this.db.deleteDatabase();
   }
 
   async init(): Promise<void> {
@@ -543,12 +580,12 @@ export class SyncEngine {
           });
         };
 
-        for (const m of freshFrozen) {
+        // M4: decide first, then skip a frozen transfer as a whole if any of its parts cannot be re-applied
+        const decideSkip = (m: SyncMutation): string | null => {
           const key = `${m.entity}:${m.recordId}`;
           // N3: Never overwrite a record that has a newer pending edit in the live outbox
           if (liveOutboxKeys.has(key)) {
-            keepSkipped(m, '此紀錄在雲端還原後已有尚未同步的較新編輯，未套用還原前的這筆編輯');
-            continue;
+            return '此紀錄在雲端還原後已有尚未同步的較新編輯，未套用還原前的這筆編輯';
           }
 
           // N3: Compare against the post-restore baseline captured when this mutation was frozen.
@@ -558,13 +595,9 @@ export class SyncEngine {
           if (m.frozenBaselineExisted !== undefined) {
             const currentExisted = Boolean(currentInFresh);
             if (currentExisted !== m.frozenBaselineExisted) {
-              keepSkipped(
-                m,
-                currentExisted
+              return currentExisted
                   ? '此紀錄在雲端還原後已被重新建立，未套用還原前的這筆編輯'
-                  : '此紀錄在雲端還原後已被刪除，未套用還原前的這筆編輯'
-              );
-              continue;
+                  : '此紀錄在雲端還原後已被刪除，未套用還原前的這筆編輯';
             }
             if (currentExisted) {
               const currentVersion = currentInFresh?.version ?? null;
@@ -573,8 +606,7 @@ export class SyncEngine {
                 (m.frozenBaselineVersion !== undefined && currentVersion !== m.frozenBaselineVersion) ||
                 (m.frozenBaselineUpdatedAt !== undefined && currentUpdatedAt !== m.frozenBaselineUpdatedAt)
               ) {
-                keepSkipped(m, '此紀錄在雲端還原後已有較新的版本，未套用還原前的這筆編輯');
-                continue;
+                return '此紀錄在雲端還原後已有較新的版本，未套用還原前的這筆編輯';
               }
             }
           } else if (
@@ -586,13 +618,31 @@ export class SyncEngine {
           ) {
             // Restored rows get a fresh updated_at, so this conservatively skips most legacy items; the edit is
             // kept in the list (with its payload) for the user to review and re-enter if still wanted.
-            keepSkipped(
-              m,
-              '此筆為舊版本凍結的編輯，無法判斷雲端還原後是否已有較新版本，為避免覆蓋已暫不套用；如仍需要請參考內容手動重新輸入'
-            );
-            continue;
+            return '此筆為舊版本凍結的編輯，無法判斷雲端還原後是否已有較新版本，為避免覆蓋已暫不套用；如仍需要請參考內容手動重新輸入';
           }
 
+          return null;
+        };
+        const skipReasons = new Map<string, string>();
+        for (const m of freshFrozen) {
+          const reason = decideSkip(m);
+          if (reason) skipReasons.set(m.mutationId, reason);
+        }
+        const skippedGroups = new Set(
+          freshFrozen.filter((m) => m.atomicGroupId && skipReasons.has(m.mutationId)).map((m) => m.atomicGroupId!)
+        );
+        for (const m of freshFrozen) {
+          if (m.atomicGroupId && skippedGroups.has(m.atomicGroupId) && !skipReasons.has(m.mutationId)) {
+            skipReasons.set(m.mutationId, '同一筆轉帳的另一部分無法重新套用，為避免只成立一邊，整筆轉帳一併略過');
+          }
+        }
+
+        for (const m of freshFrozen) {
+          const skipReason = skipReasons.get(m.mutationId);
+          if (skipReason) {
+            keepSkipped(m, skipReason);
+            continue;
+          }
           const existingInNext = this.findRecordInSnapshot(nextSnap, m.entity, m.recordId);
           const freshMut: SyncMutation = {
             mutationId: crypto.randomUUID(),
@@ -603,6 +653,7 @@ export class SyncEngine {
             baseVersion: existingInNext?.version ?? null,
             isNewRecord: m.op === 'upsert' && !existingInNext,
             ...(m.payload ? { payload: { ...m.payload, updatedAt: nowIso } } : {}),
+            ...(m.atomicGroupId ? { atomicGroupId: m.atomicGroupId } : {}),
           };
           if (freshMut.op === 'delete') {
             nextSnap = this.removeRecordFromSnapshot(nextSnap, freshMut.entity, freshMut.recordId);
@@ -704,12 +755,20 @@ export class SyncEngine {
     });
   }
 
+  /** v1.8.15: the single-item success streak always restarts when isolation mode is entered or left */
+  private setPoisonSearch(active: boolean): void {
+    if (this.poisonSearchActive !== active) this.singleItemSuccessStreak = 0;
+    this.poisonSearchActive = active;
+  }
+
   private computeStatus(pendingCount: number, lastError?: string): SyncStatus {
     const conflictCount = this.conflicts.length;
     const rejectedCount = this.rejections.length;
     const frozenOutboxCount = this.frozenOutbox.length;
+    // v1.8.15: only items that need a decision (conflicts, frozen edits) take over the state; rejections are
+    // reported through rejectedCount and no longer hide "offline" / "pending"
     const state: SyncStateKind =
-      conflictCount > 0 || rejectedCount > 0 || frozenOutboxCount > 0
+      conflictCount > 0 || frozenOutboxCount > 0
         ? 'conflict'
         : !this.isOnline()
           ? 'offline'
@@ -733,9 +792,19 @@ export class SyncEngine {
 
   /** P2-C6: patch only the lock-screen fields in the stored meta and tell other tabs to reload. */
   private async applyAuthMetaPatch(patch: Partial<LocalMeta>): Promise<void> {
-    const merged = await this.db.patchAuthMeta(patch);
+    // v1.8.15: when no meta is stored yet, patchAuthMeta creates it (from this.meta) in the same transaction
+    const merged = await this.db.patchAuthMeta(patch, this.meta);
     if (merged) {
-      this.meta = { ...this.meta, ...patch };
+      // M9: take every lock-screen field from the stored meta (another tab may have changed the ones not patched)
+      this.meta = {
+        ...this.meta,
+        pinEnabled: merged.pinEnabled,
+        pinSalt: merged.pinSalt,
+        pinHash: merged.pinHash,
+        biometricLockEnabled: merged.biometricLockEnabled,
+        passkeys: merged.passkeys,
+        ...patch,
+      };
     } else {
       // No stored meta yet (first run): write the full meta once
       const nextMeta: LocalMeta = { ...this.meta, ...patch };
@@ -743,6 +812,14 @@ export class SyncEngine {
       this.meta = nextMeta;
     }
     this.broadcastDbChanged();
+  }
+
+  /**
+   * M9: refresh only the cached passkey list (login / startup). The Face ID lock toggle is a per-device choice that
+   * may have been changed in another tab, so it is never written from a possibly stale in-memory copy.
+   */
+  async updateLocalPasskeysCache(passkeys: LocalMeta['passkeys']): Promise<void> {
+    await this.applyAuthMetaPatch({ passkeys: passkeys || [] });
   }
 
   async updateLocalBiometricCache(
@@ -1335,7 +1412,7 @@ export class SyncEngine {
   private async saveAssetInner(payload: AssetInputPayload & { id?: string }): Promise<AssetItem> {
     const v = validateAssetInput(payload);
     const nowIso = new Date().toISOString();
-    const todayYmd = nowIso.slice(0, 10);
+    const todayYmd = todayInTimeZone(); // review (v1.8.15): APP_TIMEZONE date, not UTC
     const id = payload.id || crypto.randomUUID();
     const existing = this.snapshot.assetItems.find((a) => a.id === id);
 
@@ -1542,7 +1619,7 @@ export class SyncEngine {
     if (!existing) throw new Error('找不到指定的負債項目。');
     const ymd =
       anchorDate ||
-      `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+      todayInTimeZone();
     const keepAuto = opts?.disableAutoAmortize ? false : Boolean(existing.isAmortizingLoan);
     return this.saveAssetInner({
       ...existing,
@@ -1561,7 +1638,7 @@ export class SyncEngine {
     const existing = this.snapshot.assetItems.find((a) => a.id === accountId && !a.deletedAt);
     if (!existing) throw new Error('找不到指定的活存帳戶。');
     const nowIso = new Date().toISOString();
-    const ymd = anchorDate || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+    const ymd = anchorDate || todayInTimeZone();
     return this.saveAssetInner({
       ...existing,
       id: existing.id,
@@ -1629,6 +1706,7 @@ export class SyncEngine {
       savingsAdjustments: this.snapshot.savingsAdjustments.filter((a) => !deleteIds.has(a.id)),
     };
 
+    const mutationsShareTransfer = deletePairedTransfer && targets.length > 1;
     const mutations: SyncMutation[] = (targets.length > 0 ? targets : [{ id, version: undefined }]).map(
       (t) => ({
         mutationId: crypto.randomUUID(),
@@ -1638,6 +1716,8 @@ export class SyncEngine {
         clientTimestamp: nowIso,
         baseVersion: t.version ?? null,
         isNewRecord: false,
+        // M4: deleting both sides of a transfer is all-or-nothing
+        ...(mutationsShareTransfer && existing?.transferGroupId ? { atomicGroupId: existing.transferGroupId } : {}),
       })
     );
     await this.commitAndMaybeSync(nextSnapshot, mutations);
@@ -1851,7 +1931,9 @@ export class SyncEngine {
         : this.snapshot.cashflowLogs,
     };
 
-    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    // M4: every leg (and the fee) of a transfer is applied by the server all-or-nothing and sent in one batch
+    const groupedMutations = mutations.map((m) => ({ ...m, atomicGroupId: transferGroupId }));
+    await this.commitAndMaybeSync(nextSnapshot, groupedMutations);
     return {
       transferGroupId,
       fromAdjustment,
@@ -1872,6 +1954,13 @@ export class SyncEngine {
     const asset = this.snapshot.assetItems.find((a) => a.id === payload.assetId && !a.deletedAt);
     if (!asset) throw new Error('找不到對應的持股項目。');
     const v = validateStockTransactionInput(payload);
+    if (v.txType === STOCK_TX_TYPES.SELL) {
+      // v1.8.15: refuse to sell more shares than currently held
+      const held = computeStockPositionSummary(asset, this.snapshot.stockTransactions || [], 1).currentShares;
+      if (v.shares > held + 1e-9) {
+        throw new Error(`賣出股數 (${v.shares}) 超過目前持有股數 (${held})。`);
+      }
+    }
     const nowIso = new Date().toISOString();
     const txId = crypto.randomUUID();
     const mutations: SyncMutation[] = [];
@@ -2163,6 +2252,8 @@ export class SyncEngine {
     } catch (err) {
       if (err instanceof StaleSnapshotError) throw err; // handled by the serialized wrapper (reload + retry)
       const msg = err instanceof Error ? err.message : '本機儲存失敗，變更未寫入';
+      // v1.8.15: the caller usually shows the same error again — showToast drops a toast whose text is already
+      // part of the visible one, so the user sees it once
       this.opts.onError?.(msg);
       throw err;
     }
@@ -2540,18 +2631,76 @@ export class SyncEngine {
    * the same record are never sent together and cause a self-conflict.
    */
   private selectSyncBatch(outbox: SyncMutation[], maxCount: number): SyncMutation[] {
+    return this.selectSyncUnits(outbox, maxCount).batch;
+  }
+
+  /**
+   * M4: the outbox is consumed in units. A unit is one mutation, or — when it belongs to an atomic group — the run of
+   * the outbox from it up to the last member of its group (transitively), so a group is never split across requests.
+   * `maxCount` counts mutations, but the first unit is always taken whole (single-item isolation sends one unit).
+   */
+  private selectSyncUnits(
+    rawOutbox: SyncMutation[],
+    maxCount: number
+  ): { batch: SyncMutation[]; unitCount: number } {
+    // Review R-A: send records before the mutations that reference them (coalescing moves an edited record to
+    // the end of the queue; with the M3 reference guards a linked cashflow would otherwise be rejected)
+    const outbox = orderMutationsByDependencies(rawOutbox);
+    const lastIndexOfGroup = new Map<string, number>();
+    outbox.forEach((m, i) => {
+      if (m.atomicGroupId) lastIndexOfGroup.set(m.atomicGroupId, i);
+    });
     const selected: SyncMutation[] = [];
     const seenKeys = new Set<string>();
-    for (const m of outbox) {
+    let unitCount = 0;
+    let i = 0;
+    while (i < outbox.length) {
+      let end = i;
+      for (let j = i; j <= end; j++) {
+        const g = outbox[j].atomicGroupId;
+        if (g) end = Math.max(end, lastIndexOfGroup.get(g) ?? j);
+      }
+      let unit = outbox.slice(i, end + 1);
+      if (maxCount === 1 && unit.length > 1) {
+        // Review R-B: while isolating a poison pill, send only the atomic group(s) — plus any item in the span a
+        // member references — so an unrelated item between the members is not quarantined with the transfer.
+        const groups = new Set(unit.filter((m) => m.atomicGroupId).map((m) => m.atomicGroupId!));
+        const memberRefs = new Set(
+          unit.filter((m) => m.atomicGroupId && groups.has(m.atomicGroupId)).flatMap((m) => mutationReferenceKeys(m))
+        );
+        unit = unit.filter(
+          (m) =>
+            (m.atomicGroupId && groups.has(m.atomicGroupId)) ||
+            (m.op === 'upsert' && memberRefs.has(`${m.entity}:${m.recordId}`))
+        );
+      }
+      const unitKeys: string[] = [];
+      let dupAt = -1;
+      for (let k = 0; k < unit.length; k++) {
+        const key = `${unit[k].entity}:${unit[k].recordId}`;
+        // V2: Stop at the first duplicate key so every batch is a strict prefix of the outbox.
+        if (seenKeys.has(key) || unitKeys.includes(key)) {
+          dupAt = k;
+          break;
+        }
+        unitKeys.push(key);
+      }
+      if (dupAt >= 0) {
+        if (selected.length === 0 && dupAt > 0) {
+          // Pathological: a duplicate key inside the first unit. Send the prefix up to it rather than stall.
+          selected.push(...unit.slice(0, dupAt));
+          unitCount += 1;
+        }
+        break;
+      }
+      if (selected.length > 0 && selected.length + unit.length > maxCount) break;
+      selected.push(...unit);
+      unitKeys.forEach((k) => seenKeys.add(k));
+      unitCount += 1;
+      i = end + 1;
       if (selected.length >= maxCount) break;
-      const key = `${m.entity}:${m.recordId}`;
-      // V2: Stop at the first duplicate key so every batch is a strict prefix of the outbox.
-      // Skipping (`continue`) would let later mutations that depend on the deferred one jump ahead of it.
-      if (seenKeys.has(key)) break;
-      seenKeys.add(key);
-      selected.push(m);
     }
-    return selected;
+    return { batch: selected, unitCount };
   }
 
   /**
@@ -2669,26 +2818,30 @@ export class SyncEngine {
       if (this.destroyed) return { ok: false, error: '同步已停止（帳號已切換或頁面已關閉）' };
       let outbox: SyncMutation[] = [];
       let batch: SyncMutation[] = [];
+      let batchUnitCount = 0;
       let hadMoreBatches = false;
       let reqSince: string | null = null;
       let reqSinceSeq: number | null = null;
       let reqClientEpoch: number | null = null;
 
       await this.runSerialized(async () => {
-        outbox = await this.db.getOutbox();
         // R2 & Q1: Shrink batch size to 1 after a failure or while isolating a poison-pill mutation
         const effectiveBatchSize =
           this.consecutiveFailures >= 1 || this.poisonSearchActive ? 1 : this.maxBatchSize;
         // Q4 / N1 & V2: strict queue prefix, at most one mutation per entity:recordId per HTTP batch
-        batch = this.selectSyncBatch(outbox, effectiveBatchSize);
+        // v1.8.15: select the batch and mark it sent in ONE IndexedDB transaction, so another tab cannot
+        // coalesce / cancel a selected mutation in between
+        const sentAtIso = new Date().toISOString();
+        const taken = await this.db.takeOutboxBatch((list) => {
+          const selection = this.selectSyncUnits(list, effectiveBatchSize);
+          batchUnitCount = selection.unitCount;
+          return selection.batch.map((m) => m.mutationId);
+        }, sentAtIso);
+        outbox = taken.outbox;
+        batch = taken.batch;
         hadMoreBatches = outbox.length > batch.length;
         // P2-C2: Persist sentAt & attempts to IndexedDB BEFORE sending HTTP request so timeout/reload never coalesces sent mutations
         if (batch.length > 0) {
-          const sentAtIso = new Date().toISOString();
-          await this.db.markOutboxBatchSent(
-            batch.map((m) => m.mutationId),
-            sentAtIso
-          );
           for (const m of batch) {
             this.inFlightMutationIds.add(m.mutationId);
           }
@@ -2873,7 +3026,7 @@ export class SyncEngine {
             this.meta = nextMeta;
             this.conflicts = nextConflicts;
             this.frozenOutbox = mergedFrozen;
-            this.poisonSearchActive = false;
+            this.setPoisonSearch(false);
             this.emitSnapshot();
             this.broadcastDbChanged();
             this.updateStatus(this.computeStatus(0));
@@ -2935,6 +3088,18 @@ export class SyncEngine {
                       preservedPayload = dep.payload;
                     }
                   }
+                  // Review R-D: queued members of any atomic group touched here are held as a whole
+                  const groupExtras = this.collectHeldClosure(
+                    [orig, ...dependentPending],
+                    currentOutbox,
+                    new Set([...clearedSet, ...batchIdSet])
+                  );
+                  for (const dep of groupExtras) {
+                    outboxIdsToClear.push(dep.mutationId);
+                    clearedSet.add(dep.mutationId);
+                    byMutId.set(dep.mutationId, this.heldGroupRejection(dep, rejectedAt));
+                  }
+                  if (groupExtras.length > 0 && !applyAsFull) needsFullResyncAfterRejection = true;
                   rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
                 }
                 byMutId.set(r.mutationId, {
@@ -2980,7 +3145,18 @@ export class SyncEngine {
                         rejectedAt,
                       });
                     }
-                    if (followUps.length > 0) needsFullResyncAfterRejection = true;
+                    // Review R-D: the held follow-ups' atomic groups are held as a whole
+                    const groupExtras = this.collectHeldClosure(
+                      [orig, ...followUps],
+                      currentOutbox,
+                      new Set([...clearedSet, ...batchIdSet])
+                    );
+                    for (const dep of groupExtras) {
+                      outboxIdsToClear.push(dep.mutationId);
+                      clearedSet.add(dep.mutationId);
+                      byMutId.set(dep.mutationId, this.heldGroupRejection(dep, rejectedAt));
+                    }
+                    if (followUps.length > 0 || groupExtras.length > 0) needsFullResyncAfterRejection = true;
                   }
                 }
                 byMutId.set(r.mutationId, {
@@ -3121,7 +3297,7 @@ export class SyncEngine {
 
           const remainingOutbox = await this.db.getOutbox();
           if (remainingOutbox.length === 0) {
-            this.poisonSearchActive = false;
+            this.setPoisonSearch(false);
           }
           this.emitSnapshot();
           this.broadcastDbChanged();
@@ -3141,10 +3317,10 @@ export class SyncEngine {
         }
 
         // R-3: Leave single-item isolation mode after a streak of healthy single-item writes
-        if (batch.length === 1 && this.poisonSearchActive && passOutcome.madeForwardProgress) {
+        if (batchUnitCount === 1 && this.poisonSearchActive && passOutcome.madeForwardProgress) {
           this.singleItemSuccessStreak += 1;
           if (this.singleItemSuccessStreak >= 5) {
-            this.poisonSearchActive = false;
+            this.setPoisonSearch(false);
             this.singleItemSuccessStreak = 0;
           }
         }
@@ -3208,34 +3384,40 @@ export class SyncEngine {
             return { ok: true, epochMismatch: true };
           }
 
-          const isDeterministicPayloadError = httpStatus === 400 || httpStatus === 413;
-          const isItemSpecificFailure =
-            isDeterministicPayloadError || (pullRes.ok && pullRes.writeProbeOk);
+          // M7: 400 / 413 are only item-specific when the read-only pull AND the write probe succeed. A request-level
+          // 400 / 413 (Worker regression, WAF, version skew) also fails the bare pull, so nothing is quarantined —
+          // we only back off and retry.
+          const isItemSpecificFailure = Boolean(pullRes.ok && pullRes.writeProbeOk);
 
           if (isItemSpecificFailure) {
             this.singleItemSuccessStreak = 0;
-            if (batch.length > 1) {
+            if (batchUnitCount > 1) {
               // Server is healthy (or rejected payload size/format), so a specific mutation in this batch is poison.
               // Switch to single-item isolation mode without penalizing innocent items in the batch.
-              this.poisonSearchActive = true;
+              this.setPoisonSearch(true);
             } else {
+              // M4: a single unit may be an atomic group (e.g. both legs of a transfer) — it is isolated as a whole
               const updatedBatch = await this.db.incrementOutboxRetryCounts(
-                [batch[0].mutationId],
+                batch.map((m) => m.mutationId),
                 msg
               );
-              const singleFailed = updatedBatch[0] || batch[0];
+              const unitRetryCount = Math.max(
+                0,
+                ...batch.map((m) => updatedBatch.find((u) => u.mutationId === m.mutationId)?.retryCount ?? m.retryCount ?? 0)
+              );
+              const failedUnit = batch.map((m) => updatedBatch.find((u) => u.mutationId === m.mutationId) || m);
               if (
-                singleFailed &&
-                (singleFailed.retryCount ?? 0) >= this.maxPoisonRetries &&
+                failedUnit.length > 0 &&
+                unitRetryCount >= this.maxPoisonRetries &&
                 !quarantinedInThisSync
               ) {
                 // R2 & Q1: Confirmed item-specific poison-pill mutation hit retry ceiling — quarantine it!
-                const remainingAfterQuarantine = await this.quarantinePoisonMutation(singleFailed, msg);
+                const remainingAfterQuarantine = await this.quarantinePoisonMutations(failedUnit, msg);
 
                 // Q1: Do NOT reset consecutiveFailures to 0 on quarantine (keep backoff & single-item
                 // batching until a subsequent mutation actually succeeds), and cap at 1 quarantine per sync.
                 quarantinedInThisSync = true;
-                this.poisonSearchActive = false;
+                this.setPoisonSearch(false);
                 if (remainingAfterQuarantine > 0) {
                   fullPullPass = false;
                   continue;
@@ -3285,58 +3467,147 @@ export class SyncEngine {
    * Moves a confirmed poison-pill mutation out of the outbox into the rejection list (keeping its payload).
    * Returns the number of mutations still queued afterwards.
    */
-  private async quarantinePoisonMutation(singleFailed: SyncMutation, msg: string): Promise<number> {
+  private async quarantinePoisonMutations(failedUnit: SyncMutation[], msg: string): Promise<number> {
     let remainingAfterQuarantine = 0;
     await this.runSerialized(async () => {
-                  const currentOutbox = await this.db.getOutbox();
-                  const isCreate =
-                    singleFailed.isNewRecord !== undefined
-                      ? singleFailed.isNewRecord
-                      : singleFailed.op === 'upsert' &&
-                        (singleFailed.baseVersion === null || singleFailed.baseVersion === 0);
-                  const idsToRemove = [singleFailed.mutationId];
-                  let preservedPayload = singleFailed.payload;
-                  if (isCreate) {
-                    const key = `${singleFailed.entity}:${singleFailed.recordId}`;
-                    for (const m of currentOutbox) {
-                      if (m.mutationId !== singleFailed.mutationId && `${m.entity}:${m.recordId}` === key) {
-                        idsToRemove.push(m.mutationId);
-                        if (m.op === 'upsert' && m.payload) {
-                          preservedPayload = m.payload;
-                        }
-                      }
-                    }
-                  }
-                  const nextSnap = isCreate
-                    ? this.removeRecordFromSnapshot(this.snapshot, singleFailed.entity, singleFailed.recordId)
-                    : this.snapshot;
-                  const nextMeta: LocalMeta = {
-                    ...this.meta,
-                    ...(!isCreate ? { pendingFullResync: true } : {}),
-                  };
-                  const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
-                  byMutId.set(singleFailed.mutationId, {
-                    mutationId: singleFailed.mutationId,
-                    entity: singleFailed.entity,
-                    op: singleFailed.op,
-                    recordId: singleFailed.recordId,
-                    isNewRecord: isCreate,
-                    resolutionStatus: 'quarantined',
-                    reason: `多次同步失敗已自動移出待上傳佇列：${msg}`,
-                    clientPayload: preservedPayload,
-                    rejectedAt: new Date().toISOString(),
-                  });
-                  const nextRejections = Array.from(byMutId.values());
-                  await this.db.quarantineOutboxMutation(idsToRemove, nextSnap, nextMeta, nextRejections);
-                  this.snapshot = nextSnap;
-                  this.meta = nextMeta;
-                  this.rejections = nextRejections;
-                  remainingAfterQuarantine = (await this.db.getOutbox()).length;
-                  this.emitSnapshot();
-                  this.broadcastDbChanged();
-                  this.updateStatus(this.computeStatus(remainingAfterQuarantine));
-                });
+      const currentOutbox = await this.db.getOutbox();
+      const unitIds = new Set(failedUnit.map((m) => m.mutationId));
+      const idsToRemove: string[] = [];
+      let nextSnap = this.snapshot;
+      let needsFullResync = false;
+      const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
+      const rejectedAt = new Date().toISOString();
+      for (const singleFailed of failedUnit) {
+        const isCreate =
+          singleFailed.isNewRecord !== undefined
+            ? singleFailed.isNewRecord
+            : singleFailed.op === 'upsert' &&
+              (singleFailed.baseVersion === null || singleFailed.baseVersion === 0);
+        idsToRemove.push(singleFailed.mutationId);
+        let preservedPayload = singleFailed.payload;
+        const heldFollowUps: SyncMutation[] = [];
+        const key = `${singleFailed.entity}:${singleFailed.recordId}`;
+        for (const m of currentOutbox) {
+          if (unitIds.has(m.mutationId) || `${m.entity}:${m.recordId}` !== key) continue;
+          if (idsToRemove.includes(m.mutationId)) continue;
+          idsToRemove.push(m.mutationId);
+          if (isCreate) {
+            if (m.op === 'upsert' && m.payload) {
+              preservedPayload = m.payload;
+            }
+          } else {
+            // M6 (same as R6): later edits of this record were built on top of the quarantined value;
+            // sending them would write it to the server. Hold them for review and re-pull the cloud copy.
+            heldFollowUps.push(m);
+          }
+        }
+        if (isCreate) {
+          nextSnap = this.removeRecordFromSnapshot(nextSnap, singleFailed.entity, singleFailed.recordId);
+        } else {
+          needsFullResync = true;
+        }
+        byMutId.set(singleFailed.mutationId, {
+          mutationId: singleFailed.mutationId,
+          entity: singleFailed.entity,
+          op: singleFailed.op,
+          recordId: singleFailed.recordId,
+          isNewRecord: isCreate,
+          resolutionStatus: 'quarantined',
+          reason: `多次同步失敗已自動移出待上傳佇列：${msg}`,
+          clientPayload: preservedPayload,
+          rejectedAt,
+        });
+        for (const dep of heldFollowUps) {
+          byMutId.set(dep.mutationId, {
+            mutationId: dep.mutationId,
+            entity: dep.entity,
+            op: dep.op,
+            recordId: dep.recordId,
+            isNewRecord: false,
+            resolutionStatus: 'held_after_reject',
+            reason:
+              '前一筆編輯多次同步失敗已移出佇列，這筆後續編輯包含該內容，已暫停送出並還原雲端資料；如仍需要請參考內容重新輸入',
+            ...(dep.payload ? { clientPayload: dep.payload } : {}),
+            rejectedAt,
+          });
+        }
+      }
+      // Review R-D: queued members of any atomic group touched by this quarantine are held as a whole
+      const seed = currentOutbox.filter((m) => idsToRemove.includes(m.mutationId));
+      const groupExtras = this.collectHeldClosure(
+        [...failedUnit, ...seed],
+        currentOutbox,
+        new Set(idsToRemove)
+      );
+      for (const dep of groupExtras) {
+        idsToRemove.push(dep.mutationId);
+        byMutId.set(dep.mutationId, this.heldGroupRejection(dep, rejectedAt));
+        needsFullResync = true;
+      }
+      const nextMeta: LocalMeta = {
+        ...this.meta,
+        ...(needsFullResync ? { pendingFullResync: true } : {}),
+      };
+      const nextRejections = Array.from(byMutId.values());
+      await this.db.quarantineOutboxMutation(idsToRemove, nextSnap, nextMeta, nextRejections);
+      this.snapshot = nextSnap;
+      this.meta = nextMeta;
+      this.rejections = nextRejections;
+      remainingAfterQuarantine = (await this.db.getOutbox()).length;
+      this.emitSnapshot();
+      this.broadcastDbChanged();
+      this.updateStatus(this.computeStatus(remainingAfterQuarantine));
+    });
     return remainingAfterQuarantine;
+  }
+
+  /**
+   * Review R-D (v1.8.12): when mutations are held / rolled back / quarantined, every still-queued member of the
+   * same atomic group must go with them (and, transitively, later mutations of any record held that way),
+   * otherwise the other leg of a transfer would be sent alone. `seed` items are treated as coming first.
+   */
+  private collectHeldClosure(seed: SyncMutation[], pool: SyncMutation[], excluded: ReadonlySet<string>): SyncMutation[] {
+    const held = new Map<string, { m: SyncMutation; idx: number }>();
+    for (const m of seed) held.set(m.mutationId, { m, idx: -1 });
+    const extras: SyncMutation[] = [];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      pool.forEach((m, idx) => {
+        if (excluded.has(m.mutationId) || held.has(m.mutationId)) return;
+        const key = `${m.entity}:${m.recordId}`;
+        for (const h of held.values()) {
+          const sameGroup = Boolean(m.atomicGroupId) && h.m.atomicGroupId === m.atomicGroupId;
+          const laterSameRecord = `${h.m.entity}:${h.m.recordId}` === key && h.idx < idx;
+          if (sameGroup || laterSameRecord) {
+            held.set(m.mutationId, { m, idx });
+            extras.push(m);
+            changed = true;
+            return;
+          }
+        }
+      });
+    }
+    return extras;
+  }
+
+  private heldGroupRejection(dep: SyncMutation, rejectedAt: string): SyncRejection {
+    const isCreate =
+      dep.isNewRecord !== undefined
+        ? dep.isNewRecord
+        : dep.op === 'upsert' && (dep.baseVersion === null || dep.baseVersion === 0);
+    return {
+      mutationId: dep.mutationId,
+      entity: dep.entity,
+      op: dep.op,
+      recordId: dep.recordId,
+      isNewRecord: isCreate,
+      resolutionStatus: 'held_after_reject',
+      reason:
+        '同一筆轉帳（或同一筆紀錄）的另一部分未能同步，為避免只成立一邊，這筆已暫停送出並還原雲端資料；如仍需要請參考內容重新輸入',
+      ...(dep.payload ? { clientPayload: dep.payload } : {}),
+      rejectedAt,
+    };
   }
 
   private removeRecordFromSnapshot(

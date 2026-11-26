@@ -265,6 +265,8 @@ export interface SavingsAccountSummary {
   cashflowNetTwd: number;
   linkedLogCount: number;
   adjustmentCount: number;
+  /** M8: balance in the account's own currency (equal to currentBalanceTwd for TWD accounts) */
+  currentBalanceNative: number;
   currentBalanceTwd: number;
 }
 
@@ -353,6 +355,11 @@ export interface SyncMutation {
   baseVersion?: number | null;
   isNewRecord?: boolean;
   payload?: Record<string, unknown>;
+  /**
+   * M4 (v1.8.12): mutations sharing this id (e.g. both legs and the fee of an account transfer) are applied by the
+   * server in one D1 batch — all succeed or none do — and the client never splits them across requests.
+   */
+  atomicGroupId?: string;
   sentAt?: string;
   attempts?: number;
   retryCount?: number;
@@ -539,5 +546,7 @@ export interface AuthStatusResponse {
   pinHash?: string | null;
   passkeyCount?: number;
   passkeys?: CachedPasskeyDto[];
+  /** H1: security events of the last 30 days (e.g. password reset with an admin-issued code) */
+  securityNotices?: Array<{ id: string; kind: string; createdAt: string; actorDisplayName: string | null }>;
 }
 

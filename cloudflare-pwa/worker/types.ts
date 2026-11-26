@@ -5,6 +5,10 @@ export interface WorkerEnv {
   ASSETS?: Fetcher;
   SETUP_SECRET?: string;
   APP_TIMEZONE?: string;
+  /** H5 / H6: D1 queries allowed per invocation (default 50 = Workers Free; Paid allows 1000) */
+  D1_QUERY_BUDGET?: string;
+  /** H6: external subrequests allowed per invocation (default 50 = Workers Free) */
+  SUBREQUEST_BUDGET?: string;
 }
 
 export interface UserRow {
