@@ -76,8 +76,18 @@ function renderSyncPill(status: SyncStatus): void {
   const pill = el('syncStatusPill');
   pill.className = `sync-pill ${status.state}`;
   if (status.state === 'conflict') {
-    pill.textContent = `⚠ 衝突 (${status.conflictCount || 1})`;
-    pill.title = '偵測到離線與雲端版本衝突，點擊選擇保留版本';
+    const cCount = status.conflictCount || 0;
+    const rCount = status.rejectedCount || 0;
+    if (cCount > 0 && rCount > 0) {
+      pill.textContent = `⚠ 異常 (${cCount + rCount})`;
+      pill.title = `有 ${cCount} 筆版本衝突與 ${rCount} 筆同步失敗，點擊處理`;
+    } else if (rCount > 0) {
+      pill.textContent = `⚠ 同步失敗 (${rCount})`;
+      pill.title = `有 ${rCount} 筆異動被伺服器拒絕，點擊檢視原因`;
+    } else {
+      pill.textContent = `⚠ 衝突 (${cCount || 1})`;
+      pill.title = '偵測到離線與雲端版本衝突，點擊選擇保留版本';
+    }
   } else if (status.state === 'synced') {
     pill.textContent = '● 已同步';
     pill.title = '點擊立即同步';
@@ -409,7 +419,7 @@ function bindEvents(ctx: UiContext): void {
 
   // Topbar actions
   el('syncStatusPill').addEventListener('click', async () => {
-    if (ctx.engine.getConflicts().length > 0) {
+    if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
       openConflictsModal(ctx);
       return;
     }
@@ -418,8 +428,15 @@ function bindEvents(ctx: UiContext): void {
       return;
     }
     const res = await ctx.engine.syncNow();
-    if (ctx.engine.getConflicts().length > 0) {
-      showToast(`偵測到 ${ctx.engine.getConflicts().length} 筆離線版本衝突，請選擇保留版本`, 'error');
+    if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+      const cCnt = ctx.engine.getConflicts().length;
+      const rCnt = ctx.engine.getRejections().length;
+      showToast(
+        rCnt > 0
+          ? `偵測到 ${rCnt} 筆同步被拒${cCnt > 0 ? `與 ${cCnt} 筆衝突` : ''}，請檢視原因`
+          : `偵測到 ${cCnt} 筆離線版本衝突，請選擇保留版本`,
+        'error'
+      );
       openConflictsModal(ctx);
     } else if (res.ok) {
       showToast('雲端同步完成', 'success');

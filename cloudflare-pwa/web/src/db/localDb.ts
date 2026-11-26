@@ -7,7 +7,14 @@ import {
   DEFAULT_USD_TWD_RATE,
 } from '../../../shared/constants';
 import { DEFAULT_UTILITY_RENTS } from '../../../shared/rentUtility';
-import type { CachedPasskeyDto, FinanceSnapshot, Ledger, SyncConflict, SyncMutation } from '../../../shared/types';
+import type {
+  CachedPasskeyDto,
+  FinanceSnapshot,
+  Ledger,
+  SyncConflict,
+  SyncMutation,
+  SyncRejection,
+} from '../../../shared/types';
 
 const DB_VERSION = 1;
 const STORE_KV = 'kv';
@@ -207,6 +214,26 @@ export class LocalFinanceDB {
     });
   }
 
+  async getRejections(): Promise<SyncRejection[]> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readonly');
+      const req = tx.objectStore(STORE_KV).get('rejections');
+      req.onsuccess = () => resolve(Array.isArray(req.result) ? (req.result as SyncRejection[]) : []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async saveRejections(rejections: SyncRejection[]): Promise<void> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      tx.objectStore(STORE_KV).put(rejections, 'rejections');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   private outboxSeq = 0;
 
   async getOutbox(): Promise<SyncMutation[]> {
@@ -283,7 +310,8 @@ export class LocalFinanceDB {
     ackedIds: string[],
     snapshot: FinanceSnapshot,
     meta: LocalMeta,
-    conflicts?: SyncConflict[]
+    conflicts?: SyncConflict[],
+    rejections?: SyncRejection[]
   ): Promise<void> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
@@ -297,6 +325,9 @@ export class LocalFinanceDB {
       kv.put(meta, 'meta');
       if (conflicts !== undefined) {
         kv.put(conflicts, 'conflicts');
+      }
+      if (rejections !== undefined) {
+        kv.put(rejections, 'rejections');
       }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);

@@ -8,6 +8,7 @@ import {
   adminUpdateUser,
   buildSessionCookie,
   changeUserPassword,
+  checkAndRecordFixedWindowRateLimit,
   checkRateLimit,
   clearRateLimit,
   configureUserPin,
@@ -277,10 +278,14 @@ export function createApp() {
 
   // Discoverable Passkey login (username-less 1-tap Face ID / Touch ID)
   app.post('/api/auth/passkey/login/options', async (c) => {
+    const ip = getClientIp(c);
+    const limit = await checkAndRecordFixedWindowRateLimit(c.env.DB, `pk_opt:${ip}`, 20, 60_000);
+    if (limit.blocked) {
+      return c.json({ error: '請求過於頻繁，請稍後再試。' }, 429);
+    }
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { username?: string };
       const { rpID } = getOriginAndRpId(c);
-      const options = await createPasskeyAuthenticationOptions(c.env.DB, rpID, body.username);
+      const options = await createPasskeyAuthenticationOptions(c.env.DB, rpID);
       return c.json(options);
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : '無法產生 Passkey 選項' }, 400);

@@ -753,8 +753,62 @@ async function saveChallenge(
     .run();
 }
 
-async function consumeChallenge(
+export async function checkAndRecordFixedWindowRateLimit(
   db: D1Database,
+  ipKey: string,
+  maxRequests = 20,
+  windowMs = 60_000
+): Promise<{ blocked: boolean; retryAfterSec?: number }> {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const row = await db
+    .prepare('SELECT fail_count, locked_until, updated_at FROM auth_rate_limits WHERE ip_key = ?')
+    .bind(ipKey)
+    .first<{ fail_count: number; locked_until: string | null; updated_at: string }>();
+
+  if (row?.locked_until && Date.parse(row.locked_until) > nowMs) {
+    return {
+      blocked: true,
+      retryAfterSec: Math.max(1, Math.ceil((Date.parse(row.locked_until) - nowMs) / 1000)),
+    };
+  }
+
+  const windowExpired = !row || nowMs - Date.parse(row.updated_at) >= windowMs;
+  const nextCount = windowExpired ? 1 : row.fail_count + 1;
+  const blocked = nextCount > maxRequests;
+  const lockedUntil = blocked ? new Date(nowMs + windowMs).toISOString() : null;
+
+  await db
+    .prepare(
+      `INSERT INTO auth_rate_limits (ip_key, fail_count, locked_until, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(ip_key) DO UPDATE SET
+         fail_count = excluded.fail_count,
+         locked_until = excluded.locked_until,
+         updated_at = excluded.updated_at`
+    )
+    .bind(ipKey, nextCount, lockedUntil, nowIso)
+    .run();
+
+  return blocked ? { blocked: true, retryAfterSec: Math.ceil(windowMs / 1000) } : { blocked: false };
+}
+
+function extractChallengeFromClientDataJSON(clientDataJSON: string | undefined): string | null {
+  if (!clientDataJSON || typeof clientDataJSON !== 'string') return null;
+  try {
+    const decoded = isoBase64URL.toUTF8String(clientDataJSON);
+    const parsed = JSON.parse(decoded) as { challenge?: unknown };
+    return typeof parsed.challenge === 'string' && parsed.challenge.length > 0
+      ? parsed.challenge
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function consumeChallengeByValue(
+  db: D1Database,
+  challenge: string,
   purpose: 'register' | 'authenticate',
   userId?: string | null
 ): Promise<string | null> {
@@ -763,19 +817,50 @@ async function consumeChallenge(
     userId !== undefined && userId !== null
       ? await db
           .prepare(
-            'SELECT challenge FROM auth_challenges WHERE purpose = ? AND user_id = ? AND expires_at > ? ORDER BY expires_at DESC LIMIT 1'
+            'DELETE FROM auth_challenges WHERE challenge = ? AND purpose = ? AND user_id = ? AND expires_at > ? RETURNING challenge'
           )
-          .bind(purpose, userId, nowIso)
+          .bind(challenge, purpose, userId, nowIso)
           .first<{ challenge: string }>()
       : await db
           .prepare(
-            'SELECT challenge FROM auth_challenges WHERE purpose = ? AND expires_at > ? ORDER BY expires_at DESC LIMIT 1'
+            'DELETE FROM auth_challenges WHERE challenge = ? AND purpose = ? AND expires_at > ? RETURNING challenge'
           )
-          .bind(purpose, nowIso)
+          .bind(challenge, purpose, nowIso)
           .first<{ challenge: string }>();
-  if (!row) return null;
-  await db.prepare('DELETE FROM auth_challenges WHERE challenge = ?').bind(row.challenge).run();
-  return row.challenge;
+  return row ? row.challenge : null;
+}
+
+export async function insertPasskeyCredentialOrThrow(
+  db: D1Database,
+  params: {
+    credentialId: string;
+    userId: string;
+    publicKeyB64: string;
+    counter: number;
+    transports: string;
+    deviceName: string;
+    nowIso: string;
+  }
+): Promise<void> {
+  const res = await db
+    .prepare(
+      `INSERT OR IGNORE INTO auth_passkeys (credential_id, user_id, public_key, counter, transports, device_name, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      params.credentialId,
+      params.userId,
+      params.publicKeyB64,
+      params.counter,
+      params.transports,
+      params.deviceName.slice(0, 60),
+      params.nowIso
+    )
+    .run();
+
+  if ((res.meta?.changes ?? 0) !== 1) {
+    throw new Error('此 Passkey 憑證已被綁定，無法覆蓋既有憑證。');
+  }
 }
 
 export async function createPasskeyRegistrationOptions(
@@ -817,7 +902,11 @@ export async function finishPasskeyRegistration(
   response: RegistrationResponseJSON,
   deviceName = '我的裝置'
 ) {
-  const expectedChallenge = await consumeChallenge(db, 'register', user.id);
+  const clientChallenge = extractChallengeFromClientDataJSON(response?.response?.clientDataJSON);
+  if (!clientChallenge) {
+    throw new Error('Passkey 驗證資料格式無效。');
+  }
+  const expectedChallenge = await consumeChallengeByValue(db, clientChallenge, 'register', user.id);
   if (!expectedChallenge) throw new Error('Passkey 驗證已過期，請重試。');
 
   const verification = await verifyRegistrationResponse({
@@ -837,13 +926,15 @@ export async function finishPasskeyRegistration(
   const transports = JSON.stringify(response.response.transports || []);
   const nowIso = new Date().toISOString();
 
-  await db
-    .prepare(
-      `INSERT OR REPLACE INTO auth_passkeys (credential_id, user_id, public_key, counter, transports, device_name, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(credential.id, user.id, publicKeyB64, credential.counter, transports, deviceName.slice(0, 60), nowIso)
-    .run();
+  await insertPasskeyCredentialOrThrow(db, {
+    credentialId: credential.id,
+    userId: user.id,
+    publicKeyB64,
+    counter: credential.counter,
+    transports,
+    deviceName,
+    nowIso,
+  });
 
   return { verified: true, credentialId: credential.id };
 }
@@ -851,36 +942,17 @@ export async function finishPasskeyRegistration(
 export async function createPasskeyAuthenticationOptions(
   db: D1Database,
   rpID: string,
-  username?: string
+  _username?: string
 ) {
-  let allowCredentials: Array<{ id: string; transports: AuthenticatorTransportFuture[] }> | undefined;
-  const cleanedUsername = String(username || '').trim();
-  if (cleanedUsername) {
-    const user = await getUserByUsername(db, cleanedUsername);
-    if (user && user.is_active === 1) {
-      const rows = await db
-        .prepare('SELECT credential_id, transports FROM auth_passkeys WHERE user_id = ?')
-        .bind(user.id)
-        .all<PasskeyRow>();
-      if (rows.results.length > 0) {
-        allowCredentials = rows.results.map((p) => ({
-          id: p.credential_id,
-          transports: JSON.parse(p.transports || '[]') as AuthenticatorTransportFuture[],
-        }));
-      }
-    }
-  } else {
-    const anyPk = await db.prepare('SELECT credential_id FROM auth_passkeys LIMIT 1').first<{ credential_id: string }>();
-    if (!anyPk) {
-      throw new Error('尚未綁定任何 Passkey。');
-    }
+  // Always use Discoverable Credential flow (never return allowCredentials by username to prevent credential enumeration)
+  const anyPk = await db.prepare('SELECT credential_id FROM auth_passkeys LIMIT 1').first<{ credential_id: string }>();
+  if (!anyPk) {
+    throw new Error('尚未綁定任何 Passkey。');
   }
 
-  // Omit allowCredentials for Discoverable Credential (username-less 1-tap Face ID login)
   const options = await generateAuthenticationOptions({
     rpID,
     userVerification: 'required',
-    ...(allowCredentials ? { allowCredentials } : {}),
   });
   await saveChallenge(db, options.challenge, 'authenticate', null);
   return options;
@@ -892,7 +964,11 @@ export async function finishPasskeyAuthentication(
   origin: string,
   response: AuthenticationResponseJSON
 ): Promise<{ verified: true; user: UserRow }> {
-  const expectedChallenge = await consumeChallenge(db, 'authenticate', null);
+  const clientChallenge = extractChallengeFromClientDataJSON(response?.response?.clientDataJSON);
+  if (!clientChallenge) {
+    throw new Error('Passkey 驗證資料格式無效。');
+  }
+  const expectedChallenge = await consumeChallengeByValue(db, clientChallenge, 'authenticate', null);
   if (!expectedChallenge) throw new Error('Passkey 驗證已過期，請重試。');
 
   const passkey = await db

@@ -33,6 +33,7 @@ import type {
   SyncConflict,
   SyncDelta,
   SyncMutation,
+  SyncRejection,
   SyncResponse,
 } from '../../../shared/types';
 import {
@@ -65,6 +66,7 @@ export interface SyncStatus {
   state: SyncStateKind;
   pendingCount: number;
   conflictCount?: number;
+  rejectedCount?: number;
   lastSyncedAt: string | null;
   lastError?: string;
 }
@@ -143,10 +145,12 @@ export class SyncEngine {
     pinHash: null,
   };
   private conflicts: SyncConflict[] = [];
+  private rejections: SyncRejection[] = [];
   private status: SyncStatus = {
     state: 'synced',
     pendingCount: 0,
     conflictCount: 0,
+    rejectedCount: 0,
     lastSyncedAt: null,
   };
   private syncingPromise: Promise<{ ok: boolean; authRequired?: boolean; error?: string }> | null =
@@ -170,6 +174,7 @@ export class SyncEngine {
     this.snapshot = await this.db.getSnapshot();
     this.meta = await this.db.getMeta();
     this.conflicts = await this.db.getConflicts();
+    this.rejections = await this.db.getRejections();
     const outbox = await this.db.getOutbox();
     this.updateStatus(this.computeStatus(outbox.length));
   }
@@ -190,10 +195,29 @@ export class SyncEngine {
     return this.conflicts.slice();
   }
 
+  getRejections(): SyncRejection[] {
+    return this.rejections.slice();
+  }
+
+  async dismissRejection(mutationId: string): Promise<void> {
+    this.rejections = this.rejections.filter((r) => r.mutationId !== mutationId);
+    await this.db.saveRejections(this.rejections);
+    const outbox = await this.db.getOutbox();
+    this.updateStatus(this.computeStatus(outbox.length));
+  }
+
+  async clearRejections(): Promise<void> {
+    this.rejections = [];
+    await this.db.saveRejections(this.rejections);
+    const outbox = await this.db.getOutbox();
+    this.updateStatus(this.computeStatus(outbox.length));
+  }
+
   private computeStatus(pendingCount: number, lastError?: string): SyncStatus {
     const conflictCount = this.conflicts.length;
+    const rejectedCount = this.rejections.length;
     const state: SyncStateKind =
-      conflictCount > 0
+      conflictCount > 0 || rejectedCount > 0
         ? 'conflict'
         : !this.isOnline()
           ? 'offline'
@@ -204,6 +228,7 @@ export class SyncEngine {
       state,
       pendingCount,
       conflictCount,
+      rejectedCount,
       lastSyncedAt: this.meta.lastSyncedAt,
       ...(lastError ? { lastError } : {}),
     };
@@ -1720,7 +1745,35 @@ export class SyncEngine {
         this.conflicts = Array.from(byKey.values());
       }
 
-      const merged = this.mergeDelta(this.snapshot, data.delta, forceFullPull);
+      const incomingRejected = Array.isArray(data.rejected) ? data.rejected : [];
+      const outboxById = new Map(outbox.map((m) => [m.mutationId, m]));
+      const rejectedCreatesToRollback: Array<{ entity: string; recordId: string }> = [];
+      if (incomingRejected.length > 0) {
+        const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
+        const rejectedAt = data.serverTime || new Date().toISOString();
+        for (const r of incomingRejected) {
+          const orig = outboxById.get(r.mutationId);
+          byMutId.set(r.mutationId, {
+            mutationId: r.mutationId,
+            entity: orig?.entity || 'unknown',
+            op: orig?.op || 'upsert',
+            recordId: orig?.recordId || r.mutationId,
+            reason: r.reason || '伺服器拒絕此筆異動',
+            clientPayload: orig?.payload,
+            rejectedAt,
+          });
+          if (orig && orig.op === 'upsert' && (orig.baseVersion === null || orig.baseVersion === 0)) {
+            rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
+          }
+        }
+        this.rejections = Array.from(byMutId.values());
+      }
+
+      let merged = this.mergeDelta(this.snapshot, data.delta, forceFullPull);
+      for (const rb of rejectedCreatesToRollback) {
+        merged = this.removeRecordFromSnapshot(merged, rb.entity, rb.recordId);
+      }
+
       this.meta = {
         ...this.meta,
         lastSyncedAt: data.serverTime,
@@ -1729,6 +1782,7 @@ export class SyncEngine {
       const outboxIdsToClear = [
         ...(data.ackedMutationIds || []),
         ...incomingConflicts.map((c) => c.mutationId),
+        ...incomingRejected.map((r) => r.mutationId),
       ];
       const clearedSet = new Set(outboxIdsToClear);
       const currentOutbox = await this.db.getOutbox();
@@ -1752,7 +1806,8 @@ export class SyncEngine {
           [...outboxIdsToClear, pendingSettingsMut.mutationId],
           this.snapshot,
           this.meta,
-          this.conflicts
+          this.conflicts,
+          this.rejections
         );
         await this.db.commitLocalMutation(this.snapshot, [
           {
@@ -1764,7 +1819,13 @@ export class SyncEngine {
         ]);
       } else {
         this.snapshot = merged;
-        await this.db.acknowledgeOutboxAndSave(outboxIdsToClear, this.snapshot, this.meta, this.conflicts);
+        await this.db.acknowledgeOutboxAndSave(
+          outboxIdsToClear,
+          this.snapshot,
+          this.meta,
+          this.conflicts,
+          this.rejections
+        );
       }
 
       const remainingOutbox = await this.db.getOutbox();
@@ -1775,6 +1836,45 @@ export class SyncEngine {
       const msg = err instanceof Error ? err.message : '網路同步失敗';
       this.updateStatus(this.computeStatus(outbox.length, msg));
       return { ok: false, error: msg };
+    }
+  }
+
+  private removeRecordFromSnapshot(
+    snap: FinanceSnapshot,
+    entity: string,
+    recordId: string
+  ): FinanceSnapshot {
+    switch (entity) {
+      case 'ledger':
+        return {
+          ...snap,
+          ledgers: ensureActiveLedgers((snap.ledgers || []).filter((l) => l.id !== recordId)),
+        };
+      case 'cashflow':
+        return { ...snap, cashflowLogs: snap.cashflowLogs.filter((c) => c.id !== recordId) };
+      case 'recurring':
+        return { ...snap, recurringItems: snap.recurringItems.filter((r) => r.id !== recordId) };
+      case 'sinking':
+        return { ...snap, sinkingItems: snap.sinkingItems.filter((s) => s.id !== recordId) };
+      case 'asset':
+        return { ...snap, assetItems: snap.assetItems.filter((a) => a.id !== recordId) };
+      case 'savings_adjustment':
+        return {
+          ...snap,
+          savingsAdjustments: (snap.savingsAdjustments || []).filter((a) => a.id !== recordId),
+        };
+      case 'stock_tx':
+        return {
+          ...snap,
+          stockTransactions: (snap.stockTransactions || []).filter((t) => t.id !== recordId),
+        };
+      case 'utility_record':
+        return {
+          ...snap,
+          rentUtilityRecords: (snap.rentUtilityRecords || []).filter((u) => u.period !== recordId),
+        };
+      default:
+        return snap;
     }
   }
 

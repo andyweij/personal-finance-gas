@@ -57,7 +57,7 @@ class MockD1PreparedStatement {
     };
   }
 
-  async run<T = Record<string, unknown>>(): Promise<D1Result<T>> {
+  runSync<T = Record<string, unknown>>(): D1Result<T> {
     const stmt = this.db.prepare(this.query);
     const res = stmt.run(...this.boundParams);
     return {
@@ -73,6 +73,10 @@ class MockD1PreparedStatement {
         changes: Number(res.changes ?? 0),
       },
     };
+  }
+
+  async run<T = Record<string, unknown>>(): Promise<D1Result<T>> {
+    return this.runSync<T>();
   }
 
   async raw<T = unknown[]>(): Promise<T[]> {
@@ -102,7 +106,7 @@ export function createTestD1(): D1Database {
       sqlite.exec('BEGIN');
       try {
         for (const stmt of statements) {
-          results.push(await stmt.run<T>());
+          results.push(stmt.runSync<T>());
         }
         sqlite.exec('COMMIT');
         return results;

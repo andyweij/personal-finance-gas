@@ -122,127 +122,215 @@ function computeChangedFields(conflict: SyncConflict): Array<{ label: string; lo
 
 export function openConflictsModal(ctx: UiContext): void {
   const conflicts = ctx.engine.getConflicts();
-  const body = openModal(`同步衝突處理 (${conflicts.length})`);
+  const rejections = ctx.engine.getRejections();
+  const body = openModal(
+    conflicts.length > 0 && rejections.length > 0
+      ? `同步異常處理（衝突 ${conflicts.length} · 失敗 ${rejections.length}）`
+      : rejections.length > 0
+        ? `同步失敗紀錄 (${rejections.length})`
+        : `同步衝突處理 (${conflicts.length})`
+  );
 
-  if (!conflicts.length) {
+  if (!conflicts.length && !rejections.length) {
     const empty = document.createElement('div');
     empty.className = 'list-empty';
-    empty.textContent = '目前沒有任何同步衝突，所有裝置資料一致。';
+    empty.textContent = '目前沒有任何同步衝突或失敗紀錄，所有裝置資料一致。';
     body.appendChild(empty);
     return;
   }
 
-  const intro = document.createElement('div');
-  intro.style.cssText =
-    'padding:10px 12px;border-radius:11px;background:var(--surface-alt);margin-bottom:12px;font-size:12.5px;line-height:1.55;color:var(--text-secondary)';
-  intro.textContent =
-    '偵測到同一筆資料在你離線期間，另一台裝置也修改了雲端版本。為避免靜默覆蓋，請逐筆確認要保留哪一版：';
-  body.appendChild(intro);
+  if (conflicts.length > 0) {
+    const intro = document.createElement('div');
+    intro.style.cssText =
+      'padding:10px 12px;border-radius:11px;background:var(--surface-alt);margin-bottom:12px;font-size:12.5px;line-height:1.55;color:var(--text-secondary)';
+    intro.textContent =
+      '偵測到同一筆資料在你離線期間，另一台裝置也修改了雲端版本。為避免靜默覆蓋，請逐筆確認要保留哪一版：';
+    body.appendChild(intro);
 
-  const list = document.createElement('div');
-  list.className = 'conflict-list';
+    const list = document.createElement('div');
+    list.className = 'conflict-list';
 
-  for (const c of conflicts) {
-    const card = document.createElement('div');
-    card.className = 'conflict-card';
+    for (const c of conflicts) {
+      const card = document.createElement('div');
+      card.className = 'conflict-card';
 
-    const head = document.createElement('div');
-    head.className = 'conflict-head';
-    const title = document.createElement('div');
-    title.className = 'conflict-title';
-    title.textContent = getConflictTitle(c);
-    const ver = document.createElement('span');
-    ver.className = 'badge warn';
-    ver.style.marginRight = '0';
-    ver.textContent = `本機基於 v${c.baseVersion} vs 雲端 v${c.serverVersion}`;
-    head.appendChild(title);
-    head.appendChild(ver);
-    card.appendChild(head);
+      const head = document.createElement('div');
+      head.className = 'conflict-head';
+      const title = document.createElement('div');
+      title.className = 'conflict-title';
+      title.textContent = getConflictTitle(c);
+      const ver = document.createElement('span');
+      ver.className = 'badge warn';
+      ver.style.marginRight = '0';
+      ver.textContent = `本機基於 v${c.baseVersion} vs 雲端 v${c.serverVersion}`;
+      head.appendChild(title);
+      head.appendChild(ver);
+      card.appendChild(head);
 
-    if (c.op === 'delete') {
-      const msg = document.createElement('div');
-      msg.className = 'conflict-del-note';
-      msg.textContent = '本機在離線時「刪除」了此筆紀錄，但雲端期間已被更新。';
-      card.appendChild(msg);
-    } else if (!c.serverRecord || c.serverRecord.deletedAt) {
-      const msg = document.createElement('div');
-      msg.className = 'conflict-del-note';
-      msg.textContent = '雲端已將此筆紀錄刪除，但本機離線時有修改內容。';
-      card.appendChild(msg);
-    } else {
-      const diffs = computeChangedFields(c);
-      if (diffs.length) {
-        const table = document.createElement('table');
-        table.className = 'conflict-diff-table tnum';
-        table.innerHTML = '<thead><tr><th>欄位</th><th>本機離線版</th><th>雲端最新版</th></tr></thead>';
-        const tbody = document.createElement('tbody');
-        for (const d of diffs) {
-          const tr = document.createElement('tr');
-          const td1 = document.createElement('td');
-          td1.textContent = d.label;
-          const td2 = document.createElement('td');
-          td2.className = 'conflict-local-val';
-          td2.textContent = d.localVal;
-          const td3 = document.createElement('td');
-          td3.className = 'conflict-server-val';
-          td3.textContent = d.serverVal;
-          tr.appendChild(td1);
-          tr.appendChild(td2);
-          tr.appendChild(td3);
-          tbody.appendChild(tr);
-        }
-        table.appendChild(tbody);
-        card.appendChild(table);
+      if (c.op === 'delete') {
+        const msg = document.createElement('div');
+        msg.className = 'conflict-del-note';
+        msg.textContent = '本機在離線時「刪除」了此筆紀錄，但雲端期間已被更新。';
+        card.appendChild(msg);
+      } else if (!c.serverRecord || c.serverRecord.deletedAt) {
+        const msg = document.createElement('div');
+        msg.className = 'conflict-del-note';
+        msg.textContent = '雲端已將此筆紀錄刪除，但本機離線時有修改內容。';
+        card.appendChild(msg);
       } else {
-        const same = document.createElement('div');
-        same.className = 'muted';
-        same.style.fontSize = '12px';
-        same.textContent = '兩邊內容幾乎相同（僅版號不同），建議直接採用雲端最新版。';
-        card.appendChild(same);
+        const diffs = computeChangedFields(c);
+        if (diffs.length) {
+          const table = document.createElement('table');
+          table.className = 'conflict-diff-table tnum';
+          table.innerHTML = '<thead><tr><th>欄位</th><th>本機離線版</th><th>雲端最新版</th></tr></thead>';
+          const tbody = document.createElement('tbody');
+          for (const d of diffs) {
+            const tr = document.createElement('tr');
+            const td1 = document.createElement('td');
+            td1.textContent = d.label;
+            const td2 = document.createElement('td');
+            td2.className = 'conflict-local-val';
+            td2.textContent = d.localVal;
+            const td3 = document.createElement('td');
+            td3.className = 'conflict-server-val';
+            td3.textContent = d.serverVal;
+            tr.appendChild(td1);
+            tr.appendChild(td2);
+            tr.appendChild(td3);
+            tbody.appendChild(tr);
+          }
+          table.appendChild(tbody);
+          card.appendChild(table);
+        } else {
+          const same = document.createElement('div');
+          same.className = 'muted';
+          same.style.fontSize = '12px';
+          same.textContent = '兩邊內容幾乎相同（僅版號不同），建議直接採用雲端最新版。';
+          card.appendChild(same);
+        }
       }
+
+      const actions = document.createElement('div');
+      actions.className = 'conflict-actions';
+
+      const keepServerBtn = document.createElement('button');
+      keepServerBtn.type = 'button';
+      keepServerBtn.className = 'btn btn-outline btn-sm';
+      keepServerBtn.textContent = '採用雲端最新版';
+      keepServerBtn.addEventListener('click', async () => {
+        await ctx.engine.resolveConflictKeepServer(c.mutationId);
+        showToast('已採用雲端最新版', 'success');
+        if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+          openConflictsModal(ctx);
+        } else {
+          closeModal();
+        }
+      });
+
+      const keepLocalBtn = document.createElement('button');
+      keepLocalBtn.type = 'button';
+      keepLocalBtn.className = 'btn btn-primary btn-sm';
+      keepLocalBtn.textContent = '保留本機離線版';
+      keepLocalBtn.addEventListener('click', async () => {
+        keepLocalBtn.disabled = true;
+        const res = await ctx.engine.resolveConflictKeepLocal(c.mutationId);
+        if (res.ok) {
+          showToast('已以本機離線版升版並同步至雲端', 'success');
+        } else if (!res.authRequired) {
+          showToast(res.error || '已排入同步佇列，連網後自動上傳');
+        }
+        if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+          openConflictsModal(ctx);
+        } else {
+          closeModal();
+        }
+      });
+
+      actions.appendChild(keepServerBtn);
+      actions.appendChild(keepLocalBtn);
+      card.appendChild(actions);
+      list.appendChild(card);
     }
 
-    const actions = document.createElement('div');
-    actions.className = 'conflict-actions';
-
-    const keepServerBtn = document.createElement('button');
-    keepServerBtn.type = 'button';
-    keepServerBtn.className = 'btn btn-outline btn-sm';
-    keepServerBtn.textContent = '採用雲端最新版';
-    keepServerBtn.addEventListener('click', async () => {
-      await ctx.engine.resolveConflictKeepServer(c.mutationId);
-      showToast('已採用雲端最新版', 'success');
-      if (ctx.engine.getConflicts().length > 0) {
-        openConflictsModal(ctx);
-      } else {
-        closeModal();
-      }
-    });
-
-    const keepLocalBtn = document.createElement('button');
-    keepLocalBtn.type = 'button';
-    keepLocalBtn.className = 'btn btn-primary btn-sm';
-    keepLocalBtn.textContent = '保留本機離線版';
-    keepLocalBtn.addEventListener('click', async () => {
-      keepLocalBtn.disabled = true;
-      const res = await ctx.engine.resolveConflictKeepLocal(c.mutationId);
-      if (res.ok) {
-        showToast('已以本機離線版升版並同步至雲端', 'success');
-      } else if (!res.authRequired) {
-        showToast(res.error || '已排入同步佇列，連網後自動上傳');
-      }
-      if (ctx.engine.getConflicts().length > 0) {
-        openConflictsModal(ctx);
-      } else {
-        closeModal();
-      }
-    });
-
-    actions.appendChild(keepServerBtn);
-    actions.appendChild(keepLocalBtn);
-    card.appendChild(actions);
-    list.appendChild(card);
+    body.appendChild(list);
   }
 
-  body.appendChild(list);
+  if (rejections.length > 0) {
+    const rejIntro = document.createElement('div');
+    rejIntro.style.cssText =
+      'padding:10px 12px;border-radius:11px;background:var(--surface-alt);margin-bottom:12px;font-size:12.5px;line-height:1.55;color:var(--text-secondary)';
+    if (conflicts.length > 0) rejIntro.style.marginTop = '14px';
+    rejIntro.textContent =
+      '以下本機異動被伺服器拒絕並已移出待同步佇列（未成功建立的項目已自動回滾）。請檢視原因或點擊從雲端重整：';
+    body.appendChild(rejIntro);
+
+    const rejList = document.createElement('div');
+    rejList.className = 'conflict-list';
+
+    for (const r of rejections) {
+      const card = document.createElement('div');
+      card.className = 'conflict-card';
+
+      const head = document.createElement('div');
+      head.className = 'conflict-head';
+      const title = document.createElement('div');
+      title.className = 'conflict-title';
+      const entityLabel = ENTITY_LABELS[r.entity as SyncEntity] || r.entity;
+      const itemTitle = String(
+        r.clientPayload?.itemName || r.clientPayload?.name || r.clientPayload?.period || ''
+      ).trim();
+      title.textContent = itemTitle ? `${entityLabel} · ${itemTitle}` : `${entityLabel} (${r.recordId})`;
+      const badge = document.createElement('span');
+      badge.className = 'badge red';
+      badge.style.marginRight = '0';
+      badge.textContent = '同步遭拒';
+      head.appendChild(title);
+      head.appendChild(badge);
+      card.appendChild(head);
+
+      const reason = document.createElement('div');
+      reason.className = 'conflict-del-note';
+      reason.textContent = `拒絕原因：${r.reason}`;
+      card.appendChild(reason);
+
+      const actions = document.createElement('div');
+      actions.className = 'conflict-actions';
+
+      const dismissBtn = document.createElement('button');
+      dismissBtn.type = 'button';
+      dismissBtn.className = 'btn btn-outline btn-sm';
+      dismissBtn.textContent = '清除此通知';
+      dismissBtn.addEventListener('click', async () => {
+        await ctx.engine.dismissRejection(r.mutationId);
+        if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+          openConflictsModal(ctx);
+        } else {
+          closeModal();
+        }
+      });
+
+      const resyncBtn = document.createElement('button');
+      resyncBtn.type = 'button';
+      resyncBtn.className = 'btn btn-primary btn-sm';
+      resyncBtn.textContent = '從雲端重整並清除';
+      resyncBtn.addEventListener('click', async () => {
+        resyncBtn.disabled = true;
+        await ctx.engine.dismissRejection(r.mutationId);
+        await ctx.engine.syncNow(true);
+        showToast('已從雲端重整最新帳本', 'success');
+        if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+          openConflictsModal(ctx);
+        } else {
+          closeModal();
+        }
+      });
+
+      actions.appendChild(dismissBtn);
+      actions.appendChild(resyncBtn);
+      card.appendChild(actions);
+      rejList.appendChild(card);
+    }
+
+    body.appendChild(rejList);
+  }
 }

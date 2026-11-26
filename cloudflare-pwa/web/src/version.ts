@@ -2,13 +2,14 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.0';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.1';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0012';
-export const SW_CACHE_VERSION = 'finance-pwa-v20';
+export const SW_CACHE_VERSION = 'finance-pwa-v21';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.8.1：安全性與同步核心強化（Passkey 登入 challenge 原子綁定與速率限制、防覆寫他人憑證、D1 樂觀鎖條件寫入與批次原子交易、匯入前全量驗證、未知同步類型白名單拒絕，以及客戶端顯示並清理遭伺服器拒絕的同步異動）',
   'v1.8.0：新增「帳戶互轉（活存 ↔ 活存 / 定存・現金）」功能（支援跨幣別換匯自訂成交金額、跨帳本轉帳、選填轉帳手續費自動記支出不重複扣款，以及活存互轉配對一鍵雙向撤銷）',
   'v1.7.1：新增全域可拖曳「懸浮隨手計算機」（不中斷既有表單與編輯彈窗，支援四則運算／括號／百分比、近期計算紀錄，以及一鍵帶入剛剛輸入的金額或股數欄位並自動重算）',
   'v1.7.0：新增多帳本隔離管理（可建立獨立帳本隔離流水帳、多項活存與資產，並自由設定是否計入個人總資產／淨值與月底快照；支援單筆資產排除、各帳本獨立預設連動活存與常態收支跨帳本自動入帳）',

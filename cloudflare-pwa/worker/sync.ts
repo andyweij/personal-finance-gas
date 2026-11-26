@@ -442,6 +442,78 @@ function checkVersionOrThrow(
   return { shouldApply: true, nextVersion: serverVersion + 1, writeTs };
 }
 
+const ALLOWED_SYNC_ENTITIES = new Set<string>([
+  'settings',
+  'ledger',
+  'cashflow',
+  'recurring',
+  'sinking',
+  'asset',
+  'savings_adjustment',
+  'stock_tx',
+  'utility_record',
+  'utility_rents',
+]);
+
+const ALLOWED_SYNC_OPS = new Set<string>(['upsert', 'delete']);
+
+async function recordIdempotencyOnly(
+  db: D1Database,
+  uid: string,
+  mutationId: string,
+  serverTime: string
+): Promise<void> {
+  await db
+    .prepare('INSERT OR IGNORE INTO sync_idempotency (user_id, mutation_id, applied_at) VALUES (?, ?, ?)')
+    .bind(uid, mutationId, serverTime)
+    .run();
+}
+
+async function commitAtomicMutation(
+  db: D1Database,
+  uid: string,
+  mutation: SyncMutation,
+  serverTime: string,
+  primaryWriteStmt: D1PreparedStatement,
+  postStatements: D1PreparedStatement[],
+  refetchCurrent: () => Promise<{ row: Record<string, unknown> | null; mapped: Record<string, unknown> | null }>
+): Promise<void> {
+  const idempStmt = db
+    .prepare(
+      'INSERT INTO sync_idempotency (user_id, mutation_id, applied_at) SELECT ?, ?, ? WHERE changes() > 0'
+    )
+    .bind(uid, mutation.mutationId, serverTime);
+
+  const batchStmts = [primaryWriteStmt, idempStmt, ...postStatements];
+  try {
+    const results = await db.batch(batchStmts);
+    const changed = Number(results[0]?.meta?.changes ?? 0);
+    if (changed !== 1) {
+      const latest = await refetchCurrent();
+      const serverVersion = Number(latest.row?.version ?? 1);
+      throw new VersionConflictError({
+        mutationId: mutation.mutationId,
+        entity: mutation.entity,
+        op: mutation.op,
+        recordId: mutation.recordId,
+        baseVersion: mutation.baseVersion ?? 0,
+        serverVersion,
+        clientPayload: mutation.payload,
+        serverRecord: latest.mapped,
+        detectedAt: serverTime,
+      });
+    }
+  } catch (err) {
+    if (err instanceof VersionConflictError) throw err;
+    const already = await db
+      .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
+      .bind(uid, mutation.mutationId)
+      .first();
+    if (already) return;
+    throw err;
+  }
+}
+
 async function applySingleMutation(
   db: D1Database,
   userId: string,
@@ -452,6 +524,9 @@ async function applySingleMutation(
   const uid = assertUserId(userId);
 
   if (mutation.entity === 'settings') {
+    if (mutation.op !== 'upsert') {
+      throw new Error('不支援刪除系統設定。');
+    }
     const p = mutation.payload || {};
     const existing = await ensureAppSettings(db, uid);
     const existingRow = await db
@@ -464,7 +539,11 @@ async function applySingleMutation(
       existing as unknown as Record<string, unknown>,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+    const expectedVersion = Number(existingRow?.version ?? 1);
     const budget = Math.max(0, Math.round(toSafeNumber(p.monthlyDailyBudget, existing.monthlyDailyBudget)));
     const months = Math.min(60, Math.max(1, Math.round(toSafeNumber(p.emergencyTargetMonths, existing.emergencyTargetMonths))));
     const fx = toSafeNumber(p.usdTwdRate, existing.usdTwdRate);
@@ -477,11 +556,11 @@ async function applySingleMutation(
       p.customStockCategories !== undefined
         ? normalizeCustomStockCategories(p.customStockCategories)
         : existing.customStockCategories || [];
-    await db
+    const writeStmt = db
       .prepare(
         `UPDATE app_settings
          SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = ?
-         WHERE user_id = ?`
+         WHERE user_id = ? AND version = ?`
       )
       .bind(
         budget,
@@ -491,9 +570,20 @@ async function applySingleMutation(
         JSON.stringify(customStockCats),
         check.writeTs,
         check.nextVersion,
-        uid
-      )
-      .run();
+        uid,
+        expectedVersion
+      );
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], async () => {
+      const row = await db
+        .prepare('SELECT * FROM app_settings WHERE user_id = ?')
+        .bind(uid)
+        .first<Record<string, unknown>>();
+      const mapped = await ensureAppSettings(db, uid);
+      return {
+        row,
+        mapped: mapped as unknown as Record<string, unknown>,
+      };
+    });
     return;
   }
 
@@ -509,13 +599,27 @@ async function applySingleMutation(
       existing ? (mapLedgerRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchLedger = async () => {
+      const row = await db
+        .prepare('SELECT * FROM ledgers WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return { row, mapped: row ? (mapLedgerRow(row) as unknown as Record<string, unknown>) : null };
+    };
 
     if (mutation.op === 'delete') {
       if (mutation.recordId === DEFAULT_LEDGER_ID) {
         throw new Error('不可刪除預設個人主帳本。');
       }
-      if (!existing) return;
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
       const [cfCnt, asCnt, recCnt] = await Promise.all([
         db
           .prepare('SELECT COUNT(*) AS cnt FROM cashflow_logs WHERE user_id = ? AND ledger_id = ? AND deleted_at IS NULL')
@@ -534,10 +638,13 @@ async function applySingleMutation(
       if (remaining > 0) {
         throw new Error(`此帳本仍有 ${remaining} 筆關聯紀錄，請先轉移至其他帳本或刪除紀錄後再移除帳本。`);
       }
-      await db
-        .prepare('UPDATE ledgers SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      const expectedVersion = Number(existing.version ?? 1);
+      const delStmt = db
+        .prepare(
+          'UPDATE ledgers SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, expectedVersion);
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchLedger);
       return;
     }
 
@@ -567,34 +674,46 @@ async function applySingleMutation(
             : 0,
     });
 
-    await db
-      .prepare(
-        `INSERT INTO ledgers
-          (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, id) DO UPDATE SET
-           name = excluded.name,
-           include_in_net_worth = excluded.include_in_net_worth,
-           monthly_daily_budget = excluded.monthly_daily_budget,
-           note = excluded.note,
-           sort_order = excluded.sort_order,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        mutation.recordId,
-        v.name,
-        v.includeInNetWorth ? 1 : 0,
-        v.monthlyDailyBudget,
-        v.note,
-        v.sortOrder,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE ledgers
+             SET name = ?, include_in_net_worth = ?, monthly_daily_budget = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND id = ? AND version = ?`
+          )
+          .bind(
+            v.name,
+            v.includeInNetWorth ? 1 : 0,
+            v.monthlyDailyBudget,
+            v.note,
+            v.sortOrder,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO ledgers
+              (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.name,
+            v.includeInNetWorth ? 1 : 0,
+            v.monthlyDailyBudget,
+            v.note,
+            v.sortOrder,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchLedger);
     return;
   }
 
@@ -609,14 +728,30 @@ async function applySingleMutation(
       existing ? (mapCashFlowRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchCashflow = async () => {
+      const row = await db
+        .prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return { row, mapped: row ? (mapCashFlowRow(row) as unknown as Record<string, unknown>) : null };
+    };
 
     if (mutation.op === 'delete') {
-      if (!existing) return;
-      await db
-        .prepare('UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          'UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchCashflow);
       return;
     }
 
@@ -641,50 +776,62 @@ async function applySingleMutation(
       defaultFxRate
     );
 
-    await db
-      .prepare(
-        `INSERT INTO cashflow_logs
-          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, id) DO UPDATE SET
-           date = excluded.date,
-           year_month = excluded.year_month,
-           type = excluded.type,
-           category = excluded.category,
-           item_name = excluded.item_name,
-           amount = excluded.amount,
-           currency = excluded.currency,
-           fx_rate = excluded.fx_rate,
-           twd_amount = excluded.twd_amount,
-           source = excluded.source,
-           note = excluded.note,
-           linked_account_id = excluded.linked_account_id,
-           ledger_id = excluded.ledger_id,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        mutation.recordId,
-        v.date,
-        v.yearMonth,
-        v.type,
-        v.category,
-        v.itemName,
-        v.amount,
-        v.currency,
-        v.fxRate,
-        v.twdAmount,
-        v.source,
-        v.note,
-        v.linkedAccountId,
-        v.ledgerId,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE cashflow_logs
+             SET date = ?, year_month = ?, type = ?, category = ?, item_name = ?, amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, source = ?, note = ?, linked_account_id = ?, ledger_id = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND id = ? AND version = ?`
+          )
+          .bind(
+            v.date,
+            v.yearMonth,
+            v.type,
+            v.category,
+            v.itemName,
+            v.amount,
+            v.currency,
+            v.fxRate,
+            v.twdAmount,
+            v.source,
+            v.note,
+            v.linkedAccountId,
+            v.ledgerId,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO cashflow_logs
+              (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.date,
+            v.yearMonth,
+            v.type,
+            v.category,
+            v.itemName,
+            v.amount,
+            v.currency,
+            v.fxRate,
+            v.twdAmount,
+            v.source,
+            v.note,
+            v.linkedAccountId,
+            v.ledgerId,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchCashflow);
     return;
   }
 
@@ -699,14 +846,30 @@ async function applySingleMutation(
       existing ? (mapRecurringRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchRecurring = async () => {
+      const row = await db
+        .prepare('SELECT * FROM recurring_items WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return { row, mapped: row ? (mapRecurringRow(row) as unknown as Record<string, unknown>) : null };
+    };
 
     if (mutation.op === 'delete') {
-      if (!existing) return;
-      await db
-        .prepare('UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          'UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchRecurring);
       return;
     }
 
@@ -734,48 +897,60 @@ async function applySingleMutation(
             : 0,
     });
 
-    await db
-      .prepare(
-        `INSERT INTO recurring_items
-          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, id) DO UPDATE SET
-           item_name = excluded.item_name,
-           category = excluded.category,
-           type = excluded.type,
-           amount = excluded.amount,
-           currency = excluded.currency,
-           cycle = excluded.cycle,
-           billing_spec = excluded.billing_spec,
-           status = excluded.status,
-           note = excluded.note,
-           linked_account_id = excluded.linked_account_id,
-           ledger_id = excluded.ledger_id,
-           sort_order = excluded.sort_order,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        mutation.recordId,
-        v.itemName,
-        v.category,
-        v.type,
-        v.amount,
-        v.currency,
-        v.cycle,
-        v.billingSpec,
-        v.status,
-        v.note,
-        v.linkedAccountId,
-        v.ledgerId,
-        v.sortOrder,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE recurring_items
+             SET item_name = ?, category = ?, type = ?, amount = ?, currency = ?, cycle = ?, billing_spec = ?, status = ?, note = ?, linked_account_id = ?, ledger_id = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND id = ? AND version = ?`
+          )
+          .bind(
+            v.itemName,
+            v.category,
+            v.type,
+            v.amount,
+            v.currency,
+            v.cycle,
+            v.billingSpec,
+            v.status,
+            v.note,
+            v.linkedAccountId,
+            v.ledgerId,
+            v.sortOrder,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO recurring_items
+              (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.itemName,
+            v.category,
+            v.type,
+            v.amount,
+            v.currency,
+            v.cycle,
+            v.billingSpec,
+            v.status,
+            v.note,
+            v.linkedAccountId,
+            v.ledgerId,
+            v.sortOrder,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchRecurring);
     return;
   }
 
@@ -790,14 +965,30 @@ async function applySingleMutation(
       existing ? (mapSinkingRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchSinking = async () => {
+      const row = await db
+        .prepare('SELECT * FROM sinking_fund_items WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return { row, mapped: row ? (mapSinkingRow(row) as unknown as Record<string, unknown>) : null };
+    };
 
     if (mutation.op === 'delete') {
-      if (!existing) return;
-      await db
-        .prepare('UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          'UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchSinking);
       return;
     }
 
@@ -818,40 +1009,52 @@ async function applySingleMutation(
             : 0,
     });
 
-    await db
-      .prepare(
-        `INSERT INTO sinking_fund_items
-          (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, id) DO UPDATE SET
-           item_name = excluded.item_name,
-           category = excluded.category,
-           total_amount = excluded.total_amount,
-           months = excluded.months,
-           due_note = excluded.due_note,
-           status = excluded.status,
-           note = excluded.note,
-           sort_order = excluded.sort_order,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        mutation.recordId,
-        v.itemName,
-        v.category,
-        v.totalAmount,
-        v.months,
-        v.dueNote,
-        v.status,
-        v.note,
-        v.sortOrder,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE sinking_fund_items
+             SET item_name = ?, category = ?, total_amount = ?, months = ?, due_note = ?, status = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND id = ? AND version = ?`
+          )
+          .bind(
+            v.itemName,
+            v.category,
+            v.totalAmount,
+            v.months,
+            v.dueNote,
+            v.status,
+            v.note,
+            v.sortOrder,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO sinking_fund_items
+              (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.itemName,
+            v.category,
+            v.totalAmount,
+            v.months,
+            v.dueNote,
+            v.status,
+            v.note,
+            v.sortOrder,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchSinking);
     return;
   }
 
@@ -866,14 +1069,30 @@ async function applySingleMutation(
       existing ? (mapAssetRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchAsset = async () => {
+      const row = await db
+        .prepare('SELECT * FROM asset_items WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return { row, mapped: row ? (mapAssetRow(row) as unknown as Record<string, unknown>) : null };
+    };
 
     if (mutation.op === 'delete') {
-      if (!existing) return;
-      await db
-        .prepare('UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          'UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAsset);
       return;
     }
 
@@ -945,83 +1164,100 @@ async function applySingleMutation(
             : 0,
     });
 
+    const postStatements: D1PreparedStatement[] = [];
     if (v.isDefaultSavings) {
-      await db
-        .prepare(
-          'UPDATE asset_items SET is_default_savings = 0, updated_at = ?, version = version + 1 WHERE user_id = ? AND ledger_id = ? AND is_default_savings = 1 AND id != ?'
-        )
-        .bind(check.writeTs, uid, v.ledgerId, mutation.recordId)
-        .run();
+      postStatements.push(
+        db
+          .prepare(
+            `UPDATE asset_items
+             SET is_default_savings = 0, updated_at = ?, version = version + 1
+             WHERE user_id = ? AND ledger_id = ? AND is_default_savings = 1 AND id != ?
+               AND EXISTS (SELECT 1 FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?)`
+          )
+          .bind(check.writeTs, uid, v.ledgerId, mutation.recordId, uid, mutation.mutationId)
+      );
     }
 
-    await db
-      .prepare(
-        `INSERT INTO asset_items
-          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, id) DO UPDATE SET
-           update_mode = excluded.update_mode,
-           major_type = excluded.major_type,
-           sub_category = excluded.sub_category,
-           liquidity = excluded.liquidity,
-           item_name = excluded.item_name,
-           ticker = excluded.ticker,
-           quantity_or_amount = excluded.quantity_or_amount,
-           currency = excluded.currency,
-           unit_price = excluded.unit_price,
-           previous_close = excluded.previous_close,
-           cost_basis = excluded.cost_basis,
-           note = excluded.note,
-           is_linked_savings = excluded.is_linked_savings,
-           balance_anchor_date = excluded.balance_anchor_date,
-           balance_anchor_at = excluded.balance_anchor_at,
-           is_default_savings = excluded.is_default_savings,
-           is_amortizing_loan = excluded.is_amortizing_loan,
-           loan_annual_rate = excluded.loan_annual_rate,
-           loan_monthly_payment = excluded.loan_monthly_payment,
-           loan_billing_day = excluded.loan_billing_day,
-           stock_category = excluded.stock_category,
-           is_watchlist = excluded.is_watchlist,
-           ledger_id = excluded.ledger_id,
-           exclude_from_net_worth = excluded.exclude_from_net_worth,
-           sort_order = excluded.sort_order,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        mutation.recordId,
-        v.updateMode,
-        v.majorType,
-        v.subCategory,
-        v.liquidity,
-        v.itemName,
-        v.ticker,
-        v.quantityOrAmount,
-        v.currency,
-        v.unitPrice,
-        v.previousClose,
-        v.costBasis,
-        v.note,
-        v.isLinkedSavings ? 1 : 0,
-        v.balanceAnchorDate,
-        v.balanceAnchorAt,
-        v.isDefaultSavings ? 1 : 0,
-        v.isAmortizingLoan ? 1 : 0,
-        v.loanAnnualRate,
-        v.loanMonthlyPayment,
-        v.loanBillingDay,
-        v.stockCategory,
-        v.isWatchlist ? 1 : 0,
-        v.ledgerId,
-        v.excludeFromNetWorth ? 1 : 0,
-        v.sortOrder,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE asset_items
+             SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND id = ? AND version = ?`
+          )
+          .bind(
+            v.updateMode,
+            v.majorType,
+            v.subCategory,
+            v.liquidity,
+            v.itemName,
+            v.ticker,
+            v.quantityOrAmount,
+            v.currency,
+            v.unitPrice,
+            v.previousClose,
+            v.costBasis,
+            v.note,
+            v.isLinkedSavings ? 1 : 0,
+            v.balanceAnchorDate,
+            v.balanceAnchorAt,
+            v.isDefaultSavings ? 1 : 0,
+            v.isAmortizingLoan ? 1 : 0,
+            v.loanAnnualRate,
+            v.loanMonthlyPayment,
+            v.loanBillingDay,
+            v.stockCategory,
+            v.isWatchlist ? 1 : 0,
+            v.ledgerId,
+            v.excludeFromNetWorth ? 1 : 0,
+            v.sortOrder,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO asset_items
+              (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.updateMode,
+            v.majorType,
+            v.subCategory,
+            v.liquidity,
+            v.itemName,
+            v.ticker,
+            v.quantityOrAmount,
+            v.currency,
+            v.unitPrice,
+            v.previousClose,
+            v.costBasis,
+            v.note,
+            v.isLinkedSavings ? 1 : 0,
+            v.balanceAnchorDate,
+            v.balanceAnchorAt,
+            v.isDefaultSavings ? 1 : 0,
+            v.isAmortizingLoan ? 1 : 0,
+            v.loanAnnualRate,
+            v.loanMonthlyPayment,
+            v.loanBillingDay,
+            v.stockCategory,
+            v.isWatchlist ? 1 : 0,
+            v.ledgerId,
+            v.excludeFromNetWorth ? 1 : 0,
+            v.sortOrder,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, postStatements, refetchAsset);
     return;
   }
 
@@ -1036,14 +1272,33 @@ async function applySingleMutation(
       existing ? (mapSavingsAdjustmentRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchAdj = async () => {
+      const row = await db
+        .prepare('SELECT * FROM savings_adjustments WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return {
+        row,
+        mapped: row ? (mapSavingsAdjustmentRow(row) as unknown as Record<string, unknown>) : null,
+      };
+    };
 
     if (mutation.op === 'delete') {
-      if (!existing) return;
-      await db
-        .prepare('UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          'UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAdj);
       return;
     }
 
@@ -1061,36 +1316,48 @@ async function applySingleMutation(
     );
     const twdAmount = p.twdAmount !== undefined ? Math.round(Number(p.twdAmount)) : v.twdAmount;
 
-    await db
-      .prepare(
-        `INSERT INTO savings_adjustments
-          (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, id) DO UPDATE SET
-           account_id = excluded.account_id,
-           date = excluded.date,
-           amount = excluded.amount,
-           twd_amount = excluded.twd_amount,
-           note = excluded.note,
-           transfer_group_id = excluded.transfer_group_id,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        mutation.recordId,
-        v.accountId,
-        v.date,
-        v.amount,
-        twdAmount,
-        v.note,
-        v.transferGroupId,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE savings_adjustments
+             SET account_id = ?, date = ?, amount = ?, twd_amount = ?, note = ?, transfer_group_id = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND id = ? AND version = ?`
+          )
+          .bind(
+            v.accountId,
+            v.date,
+            v.amount,
+            twdAmount,
+            v.note,
+            v.transferGroupId,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO savings_adjustments
+              (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.accountId,
+            v.date,
+            v.amount,
+            twdAmount,
+            v.note,
+            v.transferGroupId,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchAdj);
     return;
   }
 
@@ -1105,14 +1372,33 @@ async function applySingleMutation(
       existing ? (mapStockTransactionRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchStockTx = async () => {
+      const row = await db
+        .prepare('SELECT * FROM stock_transactions WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return {
+        row,
+        mapped: row ? (mapStockTransactionRow(row) as unknown as Record<string, unknown>) : null,
+      };
+    };
 
     if (mutation.op === 'delete') {
-      if (!existing) return;
-      await db
-        .prepare('UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          'UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchStockTx);
       return;
     }
 
@@ -1128,44 +1414,59 @@ async function applySingleMutation(
       note: String(p.note || ''),
     });
 
-    await db
-      .prepare(
-        `INSERT INTO stock_transactions
-          (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, id) DO UPDATE SET
-           asset_id = excluded.asset_id,
-           date = excluded.date,
-           tx_type = excluded.tx_type,
-           shares = excluded.shares,
-           total_amount = excluded.total_amount,
-           fee = excluded.fee,
-           linked_cashflow_id = excluded.linked_cashflow_id,
-           note = excluded.note,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        mutation.recordId,
-        v.assetId,
-        v.date,
-        v.txType,
-        v.shares,
-        v.totalAmount,
-        v.fee,
-        v.linkedCashflowId,
-        v.note,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE stock_transactions
+             SET asset_id = ?, date = ?, tx_type = ?, shares = ?, total_amount = ?, fee = ?, linked_cashflow_id = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND id = ? AND version = ?`
+          )
+          .bind(
+            v.assetId,
+            v.date,
+            v.txType,
+            v.shares,
+            v.totalAmount,
+            v.fee,
+            v.linkedCashflowId,
+            v.note,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO stock_transactions
+              (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.assetId,
+            v.date,
+            v.txType,
+            v.shares,
+            v.totalAmount,
+            v.fee,
+            v.linkedCashflowId,
+            v.note,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchStockTx);
     return;
   }
 
   if (mutation.entity === 'utility_rents') {
+    if (mutation.op !== 'upsert') {
+      throw new Error('不支援刪除固定房租設定。');
+    }
     const existing = await ensureRentUtilitySettings(db, uid);
     const existingRow = await db
       .prepare('SELECT * FROM rent_utility_settings WHERE user_id = ?')
@@ -1177,22 +1478,31 @@ async function applySingleMutation(
       existing as unknown as Record<string, unknown>,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
     const v = validateUtilityRentsInput((mutation.payload || {}) as Partial<RentUtilityRents>);
-    await db
+    const expectedVersion = Number(existingRow?.version ?? 1);
+    const writeStmt = db
       .prepare(
-        `INSERT INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET
-           rent_6f = excluded.rent_6f,
-           rent_a = excluded.rent_a,
-           rent_b = excluded.rent_b,
-           rent_c = excluded.rent_c,
-           updated_at = excluded.updated_at,
-           version = excluded.version`
+        `UPDATE rent_utility_settings
+         SET rent_6f = ?, rent_a = ?, rent_b = ?, rent_c = ?, updated_at = ?, version = ?
+         WHERE user_id = ? AND version = ?`
       )
-      .bind(uid, v.rent6F, v.rentA, v.rentB, v.rentC, check.writeTs, check.nextVersion)
-      .run();
+      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, check.writeTs, check.nextVersion, uid, expectedVersion);
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], async () => {
+      const row = await db
+        .prepare('SELECT * FROM rent_utility_settings WHERE user_id = ?')
+        .bind(uid)
+        .first<Record<string, unknown>>();
+      const mapped = await ensureRentUtilitySettings(db, uid);
+      return {
+        row,
+        mapped: mapped as unknown as Record<string, unknown>,
+      };
+    });
     return;
   }
 
@@ -1207,17 +1517,36 @@ async function applySingleMutation(
       existing ? (mapUtilityRecordRow(existing) as unknown as Record<string, unknown>) : null,
       serverTime
     );
-    if (!check.shouldApply) return;
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+      return;
+    }
+
+    const refetchUtil = async () => {
+      const row = await db
+        .prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND period = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return {
+        row,
+        mapped: row ? (mapUtilityRecordRow(row) as unknown as Record<string, unknown>) : null,
+      };
+    };
 
     if (mutation.op === 'delete') {
       if (existing && Number(existing.is_baseline) === 1) {
         throw new Error('不可刪除起始表底紀錄。');
       }
-      if (!existing) return;
-      await db
-        .prepare('UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND period = ?')
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId)
-        .run();
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          'UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND period = ? AND version = ?'
+        )
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchUtil);
       return;
     }
 
@@ -1236,45 +1565,60 @@ async function applySingleMutation(
       curC: Number(p.curC),
     });
 
-    await db
-      .prepare(
-        `INSERT INTO rent_utility_records
-          (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-         ON CONFLICT(user_id, period) DO UPDATE SET
-           is_baseline = excluded.is_baseline,
-           cur_total = excluded.cur_total,
-           cur_6f = excluded.cur_6f,
-           total_elec = excluded.total_elec,
-           total_water = excluded.total_water,
-           f6_people = excluded.f6_people,
-           f5_people = excluded.f5_people,
-           cur_a = excluded.cur_a,
-           cur_b = excluded.cur_b,
-           cur_c = excluded.cur_c,
-           updated_at = excluded.updated_at,
-           deleted_at = NULL,
-           version = excluded.version`
-      )
-      .bind(
-        uid,
-        v.period,
-        v.isBaseline ? 1 : 0,
-        v.curTotal,
-        v.cur6F,
-        v.totalElec,
-        v.totalWater,
-        v.f6People,
-        v.f5People,
-        v.curA,
-        v.curB,
-        v.curC,
-        String(p.createdAt || check.writeTs),
-        check.writeTs,
-        check.nextVersion
-      )
-      .run();
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE rent_utility_records
+             SET is_baseline = ?, cur_total = ?, cur_6f = ?, total_elec = ?, total_water = ?, f6_people = ?, f5_people = ?, cur_a = ?, cur_b = ?, cur_c = ?, updated_at = ?, deleted_at = NULL, version = ?
+             WHERE user_id = ? AND period = ? AND version = ?`
+          )
+          .bind(
+            v.isBaseline ? 1 : 0,
+            v.curTotal,
+            v.cur6F,
+            v.totalElec,
+            v.totalWater,
+            v.f6People,
+            v.f5People,
+            v.curA,
+            v.curB,
+            v.curC,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            v.period,
+            Number(existing.version ?? 1)
+          )
+      : db
+          .prepare(
+            `INSERT INTO rent_utility_records
+              (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(user_id, period) DO NOTHING`
+          )
+          .bind(
+            uid,
+            v.period,
+            v.isBaseline ? 1 : 0,
+            v.curTotal,
+            v.cur6F,
+            v.totalElec,
+            v.totalWater,
+            v.f6People,
+            v.f5People,
+            v.curA,
+            v.curB,
+            v.curC,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion
+          );
+
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchUtil);
+    return;
   }
+
+  throw new Error(`不支援的同步資料類型：${String(mutation.entity)}`);
 }
 
 export async function querySyncDelta(
@@ -1363,6 +1707,13 @@ export async function processSyncRequest(
       rejected.push({ mutationId: mut?.mutationId || 'unknown', reason: 'Invalid mutation format' });
       continue;
     }
+    if (!ALLOWED_SYNC_ENTITIES.has(String(mut.entity)) || !ALLOWED_SYNC_OPS.has(String(mut.op))) {
+      rejected.push({
+        mutationId: mut.mutationId,
+        reason: `不支援的同步類型或操作：${String(mut.entity)}:${String(mut.op)}`,
+      });
+      continue;
+    }
 
     const already = await db
       .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
@@ -1376,10 +1727,6 @@ export async function processSyncRequest(
 
     try {
       await applySingleMutation(db, uid, mut, settings.usdTwdRate, serverTime);
-      await db
-        .prepare('INSERT INTO sync_idempotency (user_id, mutation_id, applied_at) VALUES (?, ?, ?)')
-        .bind(uid, mut.mutationId, serverTime)
-        .run();
       ackedMutationIds.push(mut.mutationId);
     } catch (err) {
       if (err instanceof VersionConflictError) {
@@ -1433,315 +1780,462 @@ export async function importFullSnapshot(
 ): Promise<{ importedLogs: number; importedRecurring: number; importedSinking: number; importedAssets: number }> {
   const uid = assertUserId(userId);
   const nowIso = new Date().toISOString();
+  const currentSettings = await ensureAppSettings(db, uid);
+
+  // 1. Pre-validate ALL records in memory BEFORE mutating any database table
+  const fxForImport = data.settings
+    ? toSafeNumber(data.settings.usdTwdRate, currentSettings.usdTwdRate)
+    : currentSettings.usdTwdRate;
+
+  const validatedLedgers: Array<{
+    id: string;
+    v: ReturnType<typeof validateLedgerInput>;
+    createdAt: string;
+  }> = [];
+  for (const lg of data.ledgers || []) {
+    if (!lg || lg.deletedAt) continue;
+    validatedLedgers.push({
+      id: normalizeLedgerId(lg.id),
+      v: validateLedgerInput(lg),
+      createdAt: lg.createdAt || nowIso,
+    });
+  }
+
+  const validatedLogs: Array<{
+    id: string;
+    v: ReturnType<typeof validateCashFlowInput>;
+    createdAt: string;
+  }> = [];
+  for (const log of data.cashflowLogs || []) {
+    validatedLogs.push({
+      id: log.id || crypto.randomUUID(),
+      v: validateCashFlowInput(log, fxForImport),
+      createdAt: log.createdAt || nowIso,
+    });
+  }
+
+  const validatedRecurring: Array<{
+    id: string;
+    v: ReturnType<typeof validateRecurringInput>;
+    createdAt: string;
+  }> = [];
+  for (const r of data.recurringItems || []) {
+    validatedRecurring.push({
+      id: r.id || crypto.randomUUID(),
+      v: validateRecurringInput(r),
+      createdAt: r.createdAt || nowIso,
+    });
+  }
+
+  const validatedSinking: Array<{
+    id: string;
+    v: ReturnType<typeof validateSinkingInput>;
+    createdAt: string;
+  }> = [];
+  for (const s of data.sinkingItems || []) {
+    validatedSinking.push({
+      id: s.id || crypto.randomUUID(),
+      v: validateSinkingInput(s),
+      createdAt: s.createdAt || nowIso,
+    });
+  }
+
+  const validatedAssets: Array<{
+    id: string;
+    v: ReturnType<typeof validateAssetInput>;
+    priceUpdatedAt: string | null;
+    createdAt: string;
+  }> = [];
+  for (const a of data.assetItems || []) {
+    validatedAssets.push({
+      id: a.id || crypto.randomUUID(),
+      v: validateAssetInput(a),
+      priceUpdatedAt: a.priceUpdatedAt || null,
+      createdAt: a.createdAt || nowIso,
+    });
+  }
+
+  const validatedAdjs: Array<{
+    id: string;
+    v: ReturnType<typeof validateSavingsAdjustmentInput>;
+    twdAmount: number;
+    createdAt: string;
+  }> = [];
+  for (const adj of data.savingsAdjustments || []) {
+    const v = validateSavingsAdjustmentInput(adj, fxForImport);
+    validatedAdjs.push({
+      id: adj.id || crypto.randomUUID(),
+      v,
+      twdAmount: adj.twdAmount !== undefined ? Math.round(adj.twdAmount) : v.twdAmount,
+      createdAt: adj.createdAt || nowIso,
+    });
+  }
+
+  const validatedStockTxs: Array<{
+    id: string;
+    v: ReturnType<typeof validateStockTransactionInput>;
+    createdAt: string;
+  }> = [];
+  for (const tx of data.stockTransactions || []) {
+    validatedStockTxs.push({
+      id: tx.id || crypto.randomUUID(),
+      v: validateStockTransactionInput(tx),
+      createdAt: tx.createdAt || nowIso,
+    });
+  }
+
+  const validatedUtilityRents = data.rentUtilityRents
+    ? validateUtilityRentsInput(data.rentUtilityRents)
+    : null;
+
+  const validatedUtilityRecords: Array<{
+    v: ReturnType<typeof validateUtilityRecordInput>;
+    createdAt: string;
+  }> = [];
+  for (const u of data.rentUtilityRecords || []) {
+    validatedUtilityRecords.push({
+      v: validateUtilityRecordInput(u),
+      createdAt: u.createdAt || nowIso,
+    });
+  }
+
+  // 2. Assemble ALL DELETE + INSERT statements into a single atomic D1 batch
+  const stmts: D1PreparedStatement[] = [];
 
   if (mode === 'replace') {
-    await db.prepare('DELETE FROM ledgers WHERE user_id = ?').bind(uid).run();
-    await db.prepare('DELETE FROM cashflow_logs WHERE user_id = ?').bind(uid).run();
-    await db.prepare('DELETE FROM recurring_items WHERE user_id = ?').bind(uid).run();
-    await db.prepare('DELETE FROM sinking_fund_items WHERE user_id = ?').bind(uid).run();
-    await db.prepare('DELETE FROM asset_items WHERE user_id = ?').bind(uid).run();
-    await db.prepare('DELETE FROM savings_adjustments WHERE user_id = ?').bind(uid).run();
-    await db.prepare('DELETE FROM stock_transactions WHERE user_id = ?').bind(uid).run();
-    await db.prepare('DELETE FROM networth_history WHERE user_id = ?').bind(uid).run();
-    if (Array.isArray(data.rentUtilityRecords) && data.rentUtilityRecords.length > 0) {
-      await db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid).run();
+    stmts.push(
+      db.prepare('DELETE FROM ledgers WHERE user_id = ?').bind(uid),
+      db.prepare('DELETE FROM cashflow_logs WHERE user_id = ?').bind(uid),
+      db.prepare('DELETE FROM recurring_items WHERE user_id = ?').bind(uid),
+      db.prepare('DELETE FROM sinking_fund_items WHERE user_id = ?').bind(uid),
+      db.prepare('DELETE FROM asset_items WHERE user_id = ?').bind(uid),
+      db.prepare('DELETE FROM savings_adjustments WHERE user_id = ?').bind(uid),
+      db.prepare('DELETE FROM stock_transactions WHERE user_id = ?').bind(uid),
+      db.prepare('DELETE FROM networth_history WHERE user_id = ?').bind(uid)
+    );
+    if (validatedUtilityRecords.length > 0) {
+      stmts.push(db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid));
     }
   }
 
-  await ensureDefaultLedger(db, uid);
-  for (const lg of data.ledgers || []) {
-    if (!lg || lg.deletedAt) continue;
-    const v = validateLedgerInput(lg);
-    const lid = normalizeLedgerId(lg.id);
-    await db
+  // Always ensure default primary ledger exists inside the batch
+  stmts.push(
+    db
       .prepare(
-        `INSERT OR REPLACE INTO ledgers
+        `INSERT OR IGNORE INTO ledgers
           (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+         VALUES (?, ?, ?, 1, NULL, ?, 1, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
-        lid,
-        v.name,
-        lid === DEFAULT_LEDGER_ID ? 1 : v.includeInNetWorth ? 1 : 0,
-        v.monthlyDailyBudget,
-        v.note,
-        v.sortOrder,
-        lg.createdAt || nowIso,
+        DEFAULT_LEDGER_ID,
+        DEFAULT_LEDGER_NAME,
+        '預設個人帳本（納入總資產與淨值統計）',
+        nowIso,
         nowIso
       )
-      .run();
+  );
+
+  for (const { id: lid, v, createdAt } of validatedLedgers) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO ledgers
+            (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          lid,
+          v.name,
+          lid === DEFAULT_LEDGER_ID ? 1 : v.includeInNetWorth ? 1 : 0,
+          v.monthlyDailyBudget,
+          v.note,
+          v.sortOrder,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
-  const currentSettings = await ensureAppSettings(db, uid);
   if (data.settings) {
     const customStockCategories = normalizeCustomStockCategories(
       data.settings.customStockCategories ?? currentSettings.customStockCategories
     );
-    await db
-      .prepare(
-        `UPDATE app_settings
-         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = 1
-         WHERE user_id = ?`
-      )
-      .bind(
-        Math.max(0, Math.round(toSafeNumber(data.settings.monthlyDailyBudget, currentSettings.monthlyDailyBudget))),
-        Math.min(60, Math.max(1, Math.round(toSafeNumber(data.settings.emergencyTargetMonths, currentSettings.emergencyTargetMonths)))),
-        toSafeNumber(data.settings.usdTwdRate, currentSettings.usdTwdRate),
-        normalizePnlColorScheme(data.settings.pnlColorScheme ?? currentSettings.pnlColorScheme),
-        JSON.stringify(customStockCategories),
-        nowIso,
-        uid
-      )
-      .run();
+    stmts.push(
+      db
+        .prepare(
+          `UPDATE app_settings
+           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = 1
+           WHERE user_id = ?`
+        )
+        .bind(
+          Math.max(0, Math.round(toSafeNumber(data.settings.monthlyDailyBudget, currentSettings.monthlyDailyBudget))),
+          Math.min(60, Math.max(1, Math.round(toSafeNumber(data.settings.emergencyTargetMonths, currentSettings.emergencyTargetMonths)))),
+          fxForImport,
+          normalizePnlColorScheme(data.settings.pnlColorScheme ?? currentSettings.pnlColorScheme),
+          JSON.stringify(customStockCategories),
+          nowIso,
+          uid
+        )
+    );
   }
 
-  let importedLogs = 0;
-  for (const log of data.cashflowLogs || []) {
-    const v = validateCashFlowInput(log, currentSettings.usdTwdRate);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO cashflow_logs
-          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
-      )
-      .bind(
-        uid,
-        log.id || crypto.randomUUID(),
-        v.date,
-        v.yearMonth,
-        v.type,
-        v.category,
-        v.itemName,
-        v.amount,
-        v.currency,
-        v.fxRate,
-        v.twdAmount,
-        v.source,
-        v.note,
-        v.linkedAccountId,
-        v.ledgerId,
-        log.createdAt || nowIso,
-        nowIso
-      )
-      .run();
-    importedLogs++;
+  for (const { id, v, createdAt } of validatedLogs) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO cashflow_logs
+            (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          id,
+          v.date,
+          v.yearMonth,
+          v.type,
+          v.category,
+          v.itemName,
+          v.amount,
+          v.currency,
+          v.fxRate,
+          v.twdAmount,
+          v.source,
+          v.note,
+          v.linkedAccountId,
+          v.ledgerId,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
-  let importedRecurring = 0;
-  for (const r of data.recurringItems || []) {
-    const v = validateRecurringInput(r);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO recurring_items
-          (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
-      )
-      .bind(
-        uid,
-        r.id || crypto.randomUUID(),
-        v.itemName,
-        v.category,
-        v.type,
-        v.amount,
-        v.currency,
-        v.cycle,
-        v.billingSpec,
-        v.status,
-        v.note,
-        v.linkedAccountId,
-        v.ledgerId,
-        v.sortOrder,
-        r.createdAt || nowIso,
-        nowIso
-      )
-      .run();
-    importedRecurring++;
+  for (const { id, v, createdAt } of validatedRecurring) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO recurring_items
+            (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          id,
+          v.itemName,
+          v.category,
+          v.type,
+          v.amount,
+          v.currency,
+          v.cycle,
+          v.billingSpec,
+          v.status,
+          v.note,
+          v.linkedAccountId,
+          v.ledgerId,
+          v.sortOrder,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
-  let importedSinking = 0;
-  for (const s of data.sinkingItems || []) {
-    const v = validateSinkingInput(s);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO sinking_fund_items
-          (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
-      )
-      .bind(
-        uid,
-        s.id || crypto.randomUUID(),
-        v.itemName,
-        v.category,
-        v.totalAmount,
-        v.months,
-        v.dueNote,
-        v.status,
-        v.note,
-        v.sortOrder,
-        s.createdAt || nowIso,
-        nowIso
-      )
-      .run();
-    importedSinking++;
+  for (const { id, v, createdAt } of validatedSinking) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO sinking_fund_items
+            (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          id,
+          v.itemName,
+          v.category,
+          v.totalAmount,
+          v.months,
+          v.dueNote,
+          v.status,
+          v.note,
+          v.sortOrder,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
-  let importedAssets = 0;
-  for (const a of data.assetItems || []) {
-    const v = validateAssetInput(a);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO asset_items
-          (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
-      )
-      .bind(
-        uid,
-        a.id || crypto.randomUUID(),
-        v.updateMode,
-        v.majorType,
-        v.subCategory,
-        v.liquidity,
-        v.itemName,
-        v.ticker,
-        v.quantityOrAmount,
-        v.currency,
-        v.unitPrice,
-        v.previousClose,
-        v.costBasis,
-        a.priceUpdatedAt || null,
-        v.note,
-        v.isLinkedSavings ? 1 : 0,
-        v.balanceAnchorDate,
-        v.balanceAnchorAt,
-        v.isDefaultSavings ? 1 : 0,
-        v.isAmortizingLoan ? 1 : 0,
-        v.loanAnnualRate,
-        v.loanMonthlyPayment,
-        v.loanBillingDay,
-        v.sortOrder,
-        v.stockCategory,
-        v.isWatchlist ? 1 : 0,
-        v.ledgerId,
-        v.excludeFromNetWorth ? 1 : 0,
-        a.createdAt || nowIso,
-        nowIso
-      )
-      .run();
-    importedAssets++;
+  for (const { id, v, priceUpdatedAt, createdAt } of validatedAssets) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO asset_items
+            (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          id,
+          v.updateMode,
+          v.majorType,
+          v.subCategory,
+          v.liquidity,
+          v.itemName,
+          v.ticker,
+          v.quantityOrAmount,
+          v.currency,
+          v.unitPrice,
+          v.previousClose,
+          v.costBasis,
+          priceUpdatedAt,
+          v.note,
+          v.isLinkedSavings ? 1 : 0,
+          v.balanceAnchorDate,
+          v.balanceAnchorAt,
+          v.isDefaultSavings ? 1 : 0,
+          v.isAmortizingLoan ? 1 : 0,
+          v.loanAnnualRate,
+          v.loanMonthlyPayment,
+          v.loanBillingDay,
+          v.sortOrder,
+          v.stockCategory,
+          v.isWatchlist ? 1 : 0,
+          v.ledgerId,
+          v.excludeFromNetWorth ? 1 : 0,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
-  for (const adj of data.savingsAdjustments || []) {
-    const v = validateSavingsAdjustmentInput(adj, currentSettings.usdTwdRate);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO savings_adjustments
-          (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
-      )
-      .bind(
-        uid,
-        adj.id || crypto.randomUUID(),
-        v.accountId,
-        v.date,
-        v.amount,
-        adj.twdAmount !== undefined ? Math.round(adj.twdAmount) : v.twdAmount,
-        v.note,
-        v.transferGroupId,
-        adj.createdAt || nowIso,
-        nowIso
-      )
-      .run();
+  for (const { id, v, twdAmount, createdAt } of validatedAdjs) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO savings_adjustments
+            (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          id,
+          v.accountId,
+          v.date,
+          v.amount,
+          twdAmount,
+          v.note,
+          v.transferGroupId,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
-  for (const tx of data.stockTransactions || []) {
-    const v = validateStockTransactionInput(tx);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO stock_transactions
-          (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
-      )
-      .bind(
-        uid,
-        tx.id || crypto.randomUUID(),
-        v.assetId,
-        v.date,
-        v.txType,
-        v.shares,
-        v.totalAmount,
-        v.fee,
-        v.linkedCashflowId,
-        v.note,
-        tx.createdAt || nowIso,
-        nowIso
-      )
-      .run();
+  for (const { id, v, createdAt } of validatedStockTxs) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO stock_transactions
+            (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          id,
+          v.assetId,
+          v.date,
+          v.txType,
+          v.shares,
+          v.totalAmount,
+          v.fee,
+          v.linkedCashflowId,
+          v.note,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
   for (const h of data.netWorthHistory || []) {
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO networth_history
-          (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        uid,
-        h.yearMonth,
-        h.snapshotDate,
-        Math.round(h.totalAssets),
-        Math.round(h.totalLiabilities),
-        Math.round(h.netWorth),
-        Math.round(h.highLiquidityAssets),
-        Math.round(h.investmentAssets),
-        Math.round(h.insuranceAssets),
-        Math.round(h.monthlyIncome),
-        Math.round(h.monthlyConsumption),
-        h.savingsRate,
-        h.note || '',
-        nowIso
-      )
-      .run();
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO networth_history
+            (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          uid,
+          h.yearMonth,
+          h.snapshotDate,
+          Math.round(h.totalAssets),
+          Math.round(h.totalLiabilities),
+          Math.round(h.netWorth),
+          Math.round(h.highLiquidityAssets),
+          Math.round(h.investmentAssets),
+          Math.round(h.insuranceAssets),
+          Math.round(h.monthlyIncome),
+          Math.round(h.monthlyConsumption),
+          h.savingsRate,
+          h.note || '',
+          nowIso
+        )
+    );
   }
 
-  if (data.rentUtilityRents) {
-    const v = validateUtilityRentsInput(data.rentUtilityRents);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, 1)`
-      )
-      .bind(uid, v.rent6F, v.rentA, v.rentB, v.rentC, nowIso)
-      .run();
+  if (validatedUtilityRents) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, 1)`
+        )
+        .bind(
+          uid,
+          validatedUtilityRents.rent6F,
+          validatedUtilityRents.rentA,
+          validatedUtilityRents.rentB,
+          validatedUtilityRents.rentC,
+          nowIso
+        )
+    );
   }
 
-  for (const u of data.rentUtilityRecords || []) {
-    const v = validateUtilityRecordInput(u);
-    await db
-      .prepare(
-        `INSERT OR REPLACE INTO rent_utility_records
-          (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
-      )
-      .bind(
-        uid,
-        v.period,
-        v.isBaseline ? 1 : 0,
-        v.curTotal,
-        v.cur6F,
-        v.totalElec,
-        v.totalWater,
-        v.f6People,
-        v.f5People,
-        v.curA,
-        v.curB,
-        v.curC,
-        u.createdAt || nowIso,
-        nowIso
-      )
-      .run();
+  for (const { v, createdAt } of validatedUtilityRecords) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO rent_utility_records
+            (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+        )
+        .bind(
+          uid,
+          v.period,
+          v.isBaseline ? 1 : 0,
+          v.curTotal,
+          v.cur6F,
+          v.totalElec,
+          v.totalWater,
+          v.f6People,
+          v.f5People,
+          v.curA,
+          v.curB,
+          v.curC,
+          createdAt,
+          nowIso
+        )
+    );
   }
 
-  return { importedLogs, importedRecurring, importedSinking, importedAssets };
+  if (stmts.length > 0) {
+    await db.batch(stmts);
+  }
+
+  return {
+    importedLogs: validatedLogs.length,
+    importedRecurring: validatedRecurring.length,
+    importedSinking: validatedSinking.length,
+    importedAssets: validatedAssets.length,
+  };
 }

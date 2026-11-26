@@ -367,6 +367,16 @@ export interface SyncConflict {
   detectedAt: string;
 }
 
+export interface SyncRejection {
+  mutationId: string;
+  entity: SyncEntity | string;
+  op: SyncOp | string;
+  recordId: string;
+  reason: string;
+  clientPayload?: Record<string, unknown>;
+  rejectedAt: string;
+}
+
 export interface SyncRequest {
   since?: string | null;
   mutations: SyncMutation[];

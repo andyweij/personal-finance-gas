@@ -247,15 +247,15 @@ erDiagram
 ```mermaid
 flowchart LR
   UI["PWA UI (0ms 秒開秒記)"] --> SE["SyncEngine"]
-  SE --> KV["IndexedDB Store: kv\n- snapshot (完整 FinanceSnapshot)\n- meta (lastSyncedAt / PIN / Passkey)\n- conflicts (SyncConflict[])"]
+  SE --> KV["IndexedDB Store: kv\n- snapshot (完整 FinanceSnapshot)\n- meta (lastSyncedAt / PIN / Passkey)\n- conflicts (SyncConflict[])\n- rejections (SyncRejection[])"]
   SE --> OB["IndexedDB Store: outbox\nkeyPath: mutationId\nindex: clientTimestamp\n(自動整併同筆離線修改)"]
   OB -- "POST /api/sync\n(帶 baseVersion + mutationId)" --> W["Cloudflare Worker\nworker/sync.ts"]
-  W -- "樂觀鎖驗證 & 增量 delta" --> D1["Cloudflare D1 (20 張表)"]
-  D1 -- "serverTime + delta + conflicts" --> SE
+  W -- "條件式樂觀鎖 & batch 原子寫入" --> D1["Cloudflare D1 (20 張表)"]
+  D1 -- "serverTime + delta + conflicts + rejected" --> SE
 ```
 
 - **單一 Transaction 原子寫入**：`commitLocalMutation()` 在同一筆 IndexedDB 交易內同步更新 `kv['snapshot']` 與 `outbox`，並將同一筆紀錄的多次離線編輯自動整併（保留最初伺服器 `baseVersion`；若離線新建後又刪除則自動抵銷）。
-- **衝突保護**：若兩台裝置離線同時修改同一筆紀錄，伺服器比對 `baseVersion !== currentVersion` 後回傳衝突詳情並存入 `kv['conflicts']`，由使用者透過衝突解決介面決定保留版本。
+- **衝突與拒絕保護**：伺服器以條件式 `UPDATE ... WHERE user_id = ? AND id = ? AND version = ?`（新建採 `INSERT ... ON CONFLICT DO NOTHING`）與 `sync_idempotency` 合併於同一 `db.batch()` 原子執行；版本不符回傳衝突詳情存入 `kv['conflicts']`，遭伺服器驗證或白名單拒絕的異動則移出 `outbox`、回滾未落庫的新建紀錄並存入 `kv['rejections']` 顯示於同步異常彈窗。
 
 ---
 

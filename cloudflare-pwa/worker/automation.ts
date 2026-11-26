@@ -109,7 +109,7 @@ export async function runMonthlyRecurringD1(
     else if (item.cycle === '一次性') cycleTag = '[一次性排程] ';
     const finalNote = `${cycleTag}${item.note || ''}`.trim();
 
-    await db
+    const insertStmt = db
       .prepare(
         `INSERT INTO cashflow_logs
           (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
@@ -133,23 +133,24 @@ export async function runMonthlyRecurringD1(
         ledgerId,
         nowIso,
         nowIso
-      )
-      .run();
-
-    existingKeys.add(dedupKey);
-    insertedCount++;
+      );
 
     if (item.cycle === '一次性') {
       const suffix = `[已一次性入帳 ${yearMonth}]`;
       const updatedNote = item.note ? `${item.note} ${suffix}` : suffix;
-      await db
+      const deactivateStmt = db
         .prepare(
           `UPDATE recurring_items SET status = '停用', note = ?, updated_at = ?, version = version + 1 WHERE user_id = ? AND id = ?`
         )
-        .bind(updatedNote, nowIso, uid, item.id)
-        .run();
+        .bind(updatedNote, nowIso, uid, item.id);
+      await db.batch([insertStmt, deactivateStmt]);
       deactivatedOneTimeCount++;
+    } else {
+      await insertStmt.run();
     }
+
+    existingKeys.add(dedupKey);
+    insertedCount++;
   }
 
   return {
