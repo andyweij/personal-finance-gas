@@ -589,7 +589,7 @@ describe('v1.8.12 client transfer atomicity (M4)', () => {
 });
 
 describe('v1.8.12 outbox coalescing keeps transfers atomic (M4)', () => {
-  it('two offline transfers touching the same fixed-deposit account end up in one atomic group', async () => {
+  it('two offline transfers touching the same fixed-deposit account keep separate groups; nothing is coalesced across groups', async () => {
     const localDb = new LocalFinanceDB(`v1812-m4-coalesce-${crypto.randomUUID()}`);
     const offline = (async () => new Response('{}', { status: 503 })) as typeof fetch;
     const engine = new SyncEngine(localDb, { fetchImpl: offline, isOnline: () => false, requestLock: async (_n, fn) => fn() });
@@ -600,11 +600,12 @@ describe('v1.8.12 outbox coalescing keeps transfers atomic (M4)', () => {
     const t1 = await engine.transferBetweenAccounts({ fromAccountId: fixed.id, toAccountId: a.id, date: '2026-11-26', amount: 100, fee: 0, note: '' });
     const t2 = await engine.transferBetweenAccounts({ fromAccountId: fixed.id, toAccountId: b.id, date: '2026-11-26', amount: 200, fee: 0, note: '' });
     const outbox = await localDb.getOutbox();
-    const transferMuts = outbox.filter((m) => m.atomicGroupId);
-    // fixed-deposit leg (coalesced) + leg to A + leg to B
-    expect(transferMuts.map((m) => m.entity).sort()).toEqual(['asset', 'savings_adjustment', 'savings_adjustment']);
-    expect(new Set(transferMuts.map((m) => m.atomicGroupId)).size).toBe(1);
-    expect([t1.transferGroupId, t2.transferGroupId]).toContain(transferMuts[0].atomicGroupId);
+    const fixedMuts = outbox.filter((m) => m.recordId === fixed.id);
+    // the offline create and each transfer's debit stay separate mutations (review R-C)
+    expect(fixedMuts.map((m) => m.atomicGroupId ?? null)).toEqual([null, t1.transferGroupId, t2.transferGroupId]);
+    for (const t of [t1, t2]) {
+      expect(outbox.filter((m) => m.atomicGroupId === t.transferGroupId).map((m) => m.entity).sort()).toEqual(['asset', 'savings_adjustment']);
+    }
     engine.destroy();
     localDb.close();
   });

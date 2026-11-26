@@ -1422,10 +1422,8 @@ export function openReconcileModal(ctx: UiContext, account: AssetItem): void {
   body.appendChild(info);
 
   const form = document.createElement('form');
-  const defaultVal =
-    account.currency === 'USD'
-      ? Math.round((summary.currentBalanceTwd / rate) * 100) / 100
-      : summary.currentBalanceTwd;
+  // M8: the prefilled balance is the account's own-currency balance (no TWD round trip)
+  const defaultVal = summary.currentBalanceNative;
   form.appendChild(
     makeInputField(`網銀實際餘額 (${account.currency})`, 'recActual', 'number', defaultVal, '0', true)
   );

@@ -1,3 +1,4 @@
+import { mutationReferenceKeys, orderMutationsByDependencies } from '../../../shared/syncOrder';
 import {
   applySubsetReorder,
   compareBySortOrder,
@@ -332,6 +333,7 @@ export class SyncEngine {
     const serializedMethods = [
       'updateLocalPinCache',
       'updateLocalBiometricCache',
+      'updateLocalPasskeysCache',
       'saveLedger',
       'deleteLedger',
       'addCashFlow',
@@ -553,12 +555,12 @@ export class SyncEngine {
           });
         };
 
-        for (const m of freshFrozen) {
+        // M4: decide first, then skip a frozen transfer as a whole if any of its parts cannot be re-applied
+        const decideSkip = (m: SyncMutation): string | null => {
           const key = `${m.entity}:${m.recordId}`;
           // N3: Never overwrite a record that has a newer pending edit in the live outbox
           if (liveOutboxKeys.has(key)) {
-            keepSkipped(m, '此紀錄在雲端還原後已有尚未同步的較新編輯，未套用還原前的這筆編輯');
-            continue;
+            return '此紀錄在雲端還原後已有尚未同步的較新編輯，未套用還原前的這筆編輯';
           }
 
           // N3: Compare against the post-restore baseline captured when this mutation was frozen.
@@ -568,13 +570,9 @@ export class SyncEngine {
           if (m.frozenBaselineExisted !== undefined) {
             const currentExisted = Boolean(currentInFresh);
             if (currentExisted !== m.frozenBaselineExisted) {
-              keepSkipped(
-                m,
-                currentExisted
+              return currentExisted
                   ? '此紀錄在雲端還原後已被重新建立，未套用還原前的這筆編輯'
-                  : '此紀錄在雲端還原後已被刪除，未套用還原前的這筆編輯'
-              );
-              continue;
+                  : '此紀錄在雲端還原後已被刪除，未套用還原前的這筆編輯';
             }
             if (currentExisted) {
               const currentVersion = currentInFresh?.version ?? null;
@@ -583,8 +581,7 @@ export class SyncEngine {
                 (m.frozenBaselineVersion !== undefined && currentVersion !== m.frozenBaselineVersion) ||
                 (m.frozenBaselineUpdatedAt !== undefined && currentUpdatedAt !== m.frozenBaselineUpdatedAt)
               ) {
-                keepSkipped(m, '此紀錄在雲端還原後已有較新的版本，未套用還原前的這筆編輯');
-                continue;
+                return '此紀錄在雲端還原後已有較新的版本，未套用還原前的這筆編輯';
               }
             }
           } else if (
@@ -596,13 +593,31 @@ export class SyncEngine {
           ) {
             // Restored rows get a fresh updated_at, so this conservatively skips most legacy items; the edit is
             // kept in the list (with its payload) for the user to review and re-enter if still wanted.
-            keepSkipped(
-              m,
-              '此筆為舊版本凍結的編輯，無法判斷雲端還原後是否已有較新版本，為避免覆蓋已暫不套用；如仍需要請參考內容手動重新輸入'
-            );
-            continue;
+            return '此筆為舊版本凍結的編輯，無法判斷雲端還原後是否已有較新版本，為避免覆蓋已暫不套用；如仍需要請參考內容手動重新輸入';
           }
 
+          return null;
+        };
+        const skipReasons = new Map<string, string>();
+        for (const m of freshFrozen) {
+          const reason = decideSkip(m);
+          if (reason) skipReasons.set(m.mutationId, reason);
+        }
+        const skippedGroups = new Set(
+          freshFrozen.filter((m) => m.atomicGroupId && skipReasons.has(m.mutationId)).map((m) => m.atomicGroupId!)
+        );
+        for (const m of freshFrozen) {
+          if (m.atomicGroupId && skippedGroups.has(m.atomicGroupId) && !skipReasons.has(m.mutationId)) {
+            skipReasons.set(m.mutationId, '同一筆轉帳的另一部分無法重新套用，為避免只成立一邊，整筆轉帳一併略過');
+          }
+        }
+
+        for (const m of freshFrozen) {
+          const skipReason = skipReasons.get(m.mutationId);
+          if (skipReason) {
+            keepSkipped(m, skipReason);
+            continue;
+          }
           const existingInNext = this.findRecordInSnapshot(nextSnap, m.entity, m.recordId);
           const freshMut: SyncMutation = {
             mutationId: crypto.randomUUID(),
@@ -613,6 +628,7 @@ export class SyncEngine {
             baseVersion: existingInNext?.version ?? null,
             isNewRecord: m.op === 'upsert' && !existingInNext,
             ...(m.payload ? { payload: { ...m.payload, updatedAt: nowIso } } : {}),
+            ...(m.atomicGroupId ? { atomicGroupId: m.atomicGroupId } : {}),
           };
           if (freshMut.op === 'delete') {
             nextSnap = this.removeRecordFromSnapshot(nextSnap, freshMut.entity, freshMut.recordId);
@@ -2580,7 +2596,13 @@ export class SyncEngine {
    * the outbox from it up to the last member of its group (transitively), so a group is never split across requests.
    * `maxCount` counts mutations, but the first unit is always taken whole (single-item isolation sends one unit).
    */
-  private selectSyncUnits(outbox: SyncMutation[], maxCount: number): { batch: SyncMutation[]; unitCount: number } {
+  private selectSyncUnits(
+    rawOutbox: SyncMutation[],
+    maxCount: number
+  ): { batch: SyncMutation[]; unitCount: number } {
+    // Review R-A: send records before the mutations that reference them (coalescing moves an edited record to
+    // the end of the queue; with the M3 reference guards a linked cashflow would otherwise be rejected)
+    const outbox = orderMutationsByDependencies(rawOutbox);
     const lastIndexOfGroup = new Map<string, number>();
     outbox.forEach((m, i) => {
       if (m.atomicGroupId) lastIndexOfGroup.set(m.atomicGroupId, i);
@@ -2595,7 +2617,20 @@ export class SyncEngine {
         const g = outbox[j].atomicGroupId;
         if (g) end = Math.max(end, lastIndexOfGroup.get(g) ?? j);
       }
-      const unit = outbox.slice(i, end + 1);
+      let unit = outbox.slice(i, end + 1);
+      if (maxCount === 1 && unit.length > 1) {
+        // Review R-B: while isolating a poison pill, send only the atomic group(s) — plus any item in the span a
+        // member references — so an unrelated item between the members is not quarantined with the transfer.
+        const groups = new Set(unit.filter((m) => m.atomicGroupId).map((m) => m.atomicGroupId!));
+        const memberRefs = new Set(
+          unit.filter((m) => m.atomicGroupId && groups.has(m.atomicGroupId)).flatMap((m) => mutationReferenceKeys(m))
+        );
+        unit = unit.filter(
+          (m) =>
+            (m.atomicGroupId && groups.has(m.atomicGroupId)) ||
+            (m.op === 'upsert' && memberRefs.has(`${m.entity}:${m.recordId}`))
+        );
+      }
       const unitKeys: string[] = [];
       let dupAt = -1;
       for (let k = 0; k < unit.length; k++) {
@@ -3009,6 +3044,18 @@ export class SyncEngine {
                       preservedPayload = dep.payload;
                     }
                   }
+                  // Review R-D: queued members of any atomic group touched here are held as a whole
+                  const groupExtras = this.collectHeldClosure(
+                    [orig, ...dependentPending],
+                    currentOutbox,
+                    new Set([...clearedSet, ...batchIdSet])
+                  );
+                  for (const dep of groupExtras) {
+                    outboxIdsToClear.push(dep.mutationId);
+                    clearedSet.add(dep.mutationId);
+                    byMutId.set(dep.mutationId, this.heldGroupRejection(dep, rejectedAt));
+                  }
+                  if (groupExtras.length > 0 && !applyAsFull) needsFullResyncAfterRejection = true;
                   rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
                 }
                 byMutId.set(r.mutationId, {
@@ -3054,7 +3101,18 @@ export class SyncEngine {
                         rejectedAt,
                       });
                     }
-                    if (followUps.length > 0) needsFullResyncAfterRejection = true;
+                    // Review R-D: the held follow-ups' atomic groups are held as a whole
+                    const groupExtras = this.collectHeldClosure(
+                      [orig, ...followUps],
+                      currentOutbox,
+                      new Set([...clearedSet, ...batchIdSet])
+                    );
+                    for (const dep of groupExtras) {
+                      outboxIdsToClear.push(dep.mutationId);
+                      clearedSet.add(dep.mutationId);
+                      byMutId.set(dep.mutationId, this.heldGroupRejection(dep, rejectedAt));
+                    }
+                    if (followUps.length > 0 || groupExtras.length > 0) needsFullResyncAfterRejection = true;
                   }
                 }
                 byMutId.set(r.mutationId, {
@@ -3430,6 +3488,18 @@ export class SyncEngine {
           });
         }
       }
+      // Review R-D: queued members of any atomic group touched by this quarantine are held as a whole
+      const seed = currentOutbox.filter((m) => idsToRemove.includes(m.mutationId));
+      const groupExtras = this.collectHeldClosure(
+        [...failedUnit, ...seed],
+        currentOutbox,
+        new Set(idsToRemove)
+      );
+      for (const dep of groupExtras) {
+        idsToRemove.push(dep.mutationId);
+        byMutId.set(dep.mutationId, this.heldGroupRejection(dep, rejectedAt));
+        needsFullResync = true;
+      }
       const nextMeta: LocalMeta = {
         ...this.meta,
         ...(needsFullResync ? { pendingFullResync: true } : {}),
@@ -3445,6 +3515,55 @@ export class SyncEngine {
       this.updateStatus(this.computeStatus(remainingAfterQuarantine));
     });
     return remainingAfterQuarantine;
+  }
+
+  /**
+   * Review R-D (v1.8.12): when mutations are held / rolled back / quarantined, every still-queued member of the
+   * same atomic group must go with them (and, transitively, later mutations of any record held that way),
+   * otherwise the other leg of a transfer would be sent alone. `seed` items are treated as coming first.
+   */
+  private collectHeldClosure(seed: SyncMutation[], pool: SyncMutation[], excluded: ReadonlySet<string>): SyncMutation[] {
+    const held = new Map<string, { m: SyncMutation; idx: number }>();
+    for (const m of seed) held.set(m.mutationId, { m, idx: -1 });
+    const extras: SyncMutation[] = [];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      pool.forEach((m, idx) => {
+        if (excluded.has(m.mutationId) || held.has(m.mutationId)) return;
+        const key = `${m.entity}:${m.recordId}`;
+        for (const h of held.values()) {
+          const sameGroup = Boolean(m.atomicGroupId) && h.m.atomicGroupId === m.atomicGroupId;
+          const laterSameRecord = `${h.m.entity}:${h.m.recordId}` === key && h.idx < idx;
+          if (sameGroup || laterSameRecord) {
+            held.set(m.mutationId, { m, idx });
+            extras.push(m);
+            changed = true;
+            return;
+          }
+        }
+      });
+    }
+    return extras;
+  }
+
+  private heldGroupRejection(dep: SyncMutation, rejectedAt: string): SyncRejection {
+    const isCreate =
+      dep.isNewRecord !== undefined
+        ? dep.isNewRecord
+        : dep.op === 'upsert' && (dep.baseVersion === null || dep.baseVersion === 0);
+    return {
+      mutationId: dep.mutationId,
+      entity: dep.entity,
+      op: dep.op,
+      recordId: dep.recordId,
+      isNewRecord: isCreate,
+      resolutionStatus: 'held_after_reject',
+      reason:
+        '同一筆轉帳（或同一筆紀錄）的另一部分未能同步，為避免只成立一邊，這筆已暫停送出並還原雲端資料；如仍需要請參考內容重新輸入',
+      ...(dep.payload ? { clientPayload: dep.payload } : {}),
+      rejectedAt,
+    };
   }
 
   private removeRecordFromSnapshot(

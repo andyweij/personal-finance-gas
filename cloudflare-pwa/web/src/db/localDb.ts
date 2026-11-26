@@ -507,10 +507,16 @@ export class LocalFinanceDB {
       }
     }
 
-    const groupAliases = new Map<string, string>();
     for (const mut of mutations) {
       const key = `${mut.entity}:${mut.recordId}`;
-      const prev = byKey.get(key);
+      let prev = byKey.get(key);
+      // M4 / review R-C: never coalesce across atomic groups (including grouped ↔ ungrouped). A merged mutation
+      // would carry the other edit into the group (an offline-created account would be rolled back together with
+      // a rejected transfer from it) — keep both; the batch selector sends them one after the other and the ack
+      // rebases the later one.
+      if (prev && (prev.atomicGroupId || undefined) !== (mut.atomicGroupId || undefined)) {
+        prev = undefined;
+      }
       if (prev) {
         outboxStore.delete(prev.mutationId);
         const prevIsNewUnsynced =
@@ -525,16 +531,8 @@ export class LocalFinanceDB {
         }
         // Coalesce while preserving the original server baseVersion and isNewRecord marker
         this.outboxSeq += 1;
-        // M4: the coalesced mutation carries the changes of both edits, so it must stay in (and join) both atomic
-        // groups: keep the earlier group and fold the new group into it.
-        let groupId = mut.atomicGroupId ?? prev.atomicGroupId;
-        if (prev.atomicGroupId && mut.atomicGroupId && prev.atomicGroupId !== mut.atomicGroupId) {
-          groupAliases.set(mut.atomicGroupId, prev.atomicGroupId);
-          groupId = prev.atomicGroupId;
-        }
         const coalesced: SyncMutation & { _seq: number } = {
           ...mut,
-          ...(groupId ? { atomicGroupId: groupId } : {}),
           baseVersion: prev.baseVersion !== undefined ? prev.baseVersion : mut.baseVersion,
           ...(prev.isNewRecord !== undefined
             ? { isNewRecord: prev.isNewRecord }
@@ -559,20 +557,6 @@ export class LocalFinanceDB {
         };
         outboxStore.put(record);
         byKey.set(key, record);
-      }
-    }
-
-    if (groupAliases.size > 0) {
-      const resolve = (g: string): string => {
-        let cur = g;
-        for (let i = 0; i < 16 && groupAliases.has(cur); i++) cur = groupAliases.get(cur)!;
-        return cur;
-      };
-      for (const item of byKey.values()) {
-        if (item.atomicGroupId && groupAliases.has(item.atomicGroupId)) {
-          const merged = { ...item, atomicGroupId: resolve(item.atomicGroupId) };
-          outboxStore.put(merged);
-        }
       }
     }
   }

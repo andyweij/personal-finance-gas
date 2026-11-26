@@ -1,3 +1,4 @@
+import { orderMutationsByDependencies } from '../shared/syncOrder';
 import {
   DEFAULT_EMERGENCY_MONTHS,
   DEFAULT_LEDGER_ID,
@@ -649,7 +650,7 @@ async function recordIdempotencyOnly(
  */
 const GROUP_COLLECTOR = Symbol('syncGroupCollector');
 interface GroupCollector {
-  items: Array<{ mutation: SyncMutation; statements: D1PreparedStatement[] }>;
+  items: Array<{ mutation: SyncMutation; statements: D1PreparedStatement[]; onZeroChanges?: () => Promise<void> }>;
   groupMutations: SyncMutation[];
 }
 
@@ -728,6 +729,15 @@ async function applyMutationGroup(
       throw new EpochMismatchError();
     }
     if (/malformed JSON/i.test(msg) || msg.includes(GROUP_GUARD_MARKER)) {
+      // Review R-F: report a missing reference (M3) precisely instead of the generic "changed elsewhere"
+      for (const item of collector.items) {
+        try {
+          await item.onZeroChanges?.();
+        } catch (refErr) {
+          if (refErr instanceof RejectError) throw new GroupRejectError(item.mutation.mutationId, refErr.message);
+          throw refErr;
+        }
+      }
       throw new GroupRejectError(null, '轉帳的部分資料已在其他裝置變更，整筆轉帳未套用並已還原雲端資料');
     }
     throw err;
@@ -793,7 +803,7 @@ async function commitAtomicMutation(
   const groupCollector = (db as unknown as { [GROUP_COLLECTOR]?: GroupCollector })[GROUP_COLLECTOR];
   if (groupCollector) {
     // M4: part of an atomic group — the group executor commits every member in one batch
-    groupCollector.items.push({ mutation, statements: batchStmts });
+    groupCollector.items.push({ mutation, statements: batchStmts, onZeroChanges });
     return;
   }
   try {
@@ -2536,7 +2546,9 @@ export async function processSyncRequest(
     ensureDefaultLedger(db, uid),
   ]);
   const syncStateBefore = await ensureUserSyncState(db, uid);
-  const mutations = Array.isArray(req.mutations) ? req.mutations : [];
+  // Review R-A (v1.8.12): apply records before the mutations that reference them (older clients can send a
+  // renamed/coalesced account after the cashflow that is linked to it), so the M3 guards do not reject them.
+  const mutations = Array.isArray(req.mutations) ? orderMutationsByDependencies(req.mutations) : [];
   const ackedMutationIds: string[] = [];
   const rejected: Array<{ mutationId: string; reason: string }> = [];
   const conflicts: SyncConflict[] = [];
