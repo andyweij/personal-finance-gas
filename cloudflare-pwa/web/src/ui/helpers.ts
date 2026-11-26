@@ -36,7 +36,8 @@ export function showToast(msg: string, variant?: 'success' | 'error'): void {
   const node = el('toast');
   // v1.8.15: the same error reported twice (engine onError + the caller's catch) is shown once
   const now = Date.now();
-  if (lastToast && now - lastToast.at < 1500 && msg && lastToast.text.includes(msg)) return;
+  // only errors are de-duplicated (two identical successful saves must both be confirmed)
+  if (variant === 'error' && lastToast && now - lastToast.at < 1500 && msg && lastToast.text.includes(msg)) return;
   lastToast = { text: msg, at: now };
   node.setAttribute('role', 'status');
   node.setAttribute('aria-live', 'polite');
@@ -51,7 +52,7 @@ export function setLoading(on: boolean): void {
 }
 
 export function fmtNum(n: number): string {
-  return Number(n || 0).toLocaleString('zh-TW', { maximumFractionDigits: 0 });
+  return roundTo(Number(n || 0), 0).toLocaleString('zh-TW', { maximumFractionDigits: 0 }); // never "-0"
 }
 
 export function fmtMoney(n: number, masked: boolean, prefix = 'NT$ '): string {
@@ -68,7 +69,7 @@ export function fmtPct(n: number, decimals = 1, signed = false): string {
 
 export function fmtRaw(n: number, curr: string, masked: boolean): string {
   if (masked) return curr + ' •••';
-  return (curr === 'USD' ? 'US$' : 'NT$ ') + Number(n || 0).toLocaleString('zh-TW', { maximumFractionDigits: 2 });
+  return (curr === 'USD' ? 'US$' : 'NT$ ') + roundTo(Number(n || 0), 2).toLocaleString('zh-TW', { maximumFractionDigits: 2 }); // never "-0"
 }
 
 /* v1.8.15 accessibility: Esc closes the modal, focus moves into it (and stays inside on Tab) and returns to
@@ -85,6 +86,11 @@ function bindModalKeys(): void {
   document.addEventListener('keydown', (e) => {
     const backdrop = document.getElementById('modalBackdrop');
     if (!backdrop?.classList.contains('open')) return;
+    // review (v1.8.15): the floating calculator / lock screen above the modal own the keyboard, and an Esc that
+    // cancels an IME composition (Chinese input) must not close the form
+    if (e.isComposing || e.keyCode === 229) return;
+    if (document.getElementById('calcBackdrop')?.classList.contains('open')) return;
+    if (document.getElementById('lockScreen')?.classList.contains('open')) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       closeModal();
@@ -124,6 +130,15 @@ export function openModal(title: string): HTMLElement {
   // the caller fills the body synchronously; focus its first control afterwards
   window.setTimeout(() => {
     if (!backdrop.classList.contains('open')) return;
+    // review (v1.8.15): on touch devices focusing an input pops the keyboard over the form — focus the sheet
+    if (window.matchMedia?.('(pointer: coarse)').matches) {
+      const sheet = document.getElementById('modalSheet');
+      if (sheet) {
+        sheet.setAttribute('tabindex', '-1');
+        sheet.focus();
+      }
+      return;
+    }
     const target =
       body.querySelector<HTMLElement>('input:not([type="hidden"]):not([disabled]), select, textarea') ||
       body.querySelector<HTMLElement>(FOCUSABLE) ||

@@ -1,4 +1,5 @@
 /// <reference types="vite/client" />
+import { getDatePartsInTimeZone } from '../../shared/dates';
 import './styles.css';
 import { DEFAULT_LEDGER_ID } from '../../shared/constants';
 import { computeAllSavingsSummary } from '../../shared/calculations';
@@ -320,8 +321,8 @@ async function bootstrap(): Promise<void> {
     pnlColorScheme: storedPnlScheme,
     reorderSection: null,
     reorderDraftIds: [],
-    selectedYear: now.getFullYear(),
-    selectedMonth: now.getMonth() + 1,
+    selectedYear: getDatePartsInTimeZone(now).year, // review (v1.8.15): APP_TIMEZONE month
+    selectedMonth: getDatePartsInTimeZone(now).month,
     logType: '日常花費',
     logCurrency: 'TWD',
     logCategory: '餐飲',

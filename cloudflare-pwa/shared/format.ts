@@ -35,7 +35,9 @@ export function formatPercent(n: number, decimals = 1, signed = false): string {
 export function escapeCsvCell(val: unknown): string {
   if (typeof val === 'number') return Number.isFinite(val) ? String(val) : '';
   let str = val === null || val === undefined ? '' : String(val);
-  if (/^[=+\-@\t\r]/.test(str)) str = `'${str}`;
+  // plain numbers written as text (e.g. "-12.00") stay numbers; anything else that could start a formula is
+  // prefixed — parseCsvRows removes that prefix again when the app re-imports its own export
+  if (/^[=+\-@\t\r]/.test(str) && !/^[+-]?\d+(\.\d+)?$/.test(str)) str = `'${str}`;
   if (/[",\r\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
   return str;
 }

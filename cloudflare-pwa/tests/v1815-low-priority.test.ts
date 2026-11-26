@@ -27,7 +27,8 @@ describe('v1.8.15 rounding and display', () => {
 describe('v1.8.15 CSV export', () => {
   it('escapes formula-looking text cells but keeps numbers numeric', () => {
     expect(escapeCsvCell('=HYPERLINK("http://x")')).toBe(`"'=HYPERLINK(""http://x"")"`);
-    expect(escapeCsvCell('+1')).toBe("'+1");
+    expect(escapeCsvCell('+1')).toBe('+1'); // numeric text stays a number (review follow-up)
+    expect(escapeCsvCell('+cmd')).toBe("'+cmd");
     expect(escapeCsvCell('-cmd')).toBe("'-cmd");
     expect(escapeCsvCell('@SUM(A1)')).toBe("'@SUM(A1)");
     expect(escapeCsvCell(-100)).toBe('-100');
@@ -362,5 +363,50 @@ describe('v1.8.15 B7 tenant column', () => {
     }
     expect(checked).toBeGreaterThan(20);
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('v1.8.15 review follow-ups', () => {
+  it('the app\'s own CSV export re-imports unchanged, and numeric text is never prefixed', async () => {
+    const { exportCashFlowCsv, parseCashFlowCsv } = await import('../shared/csv');
+    const { escapeCsvCell } = await import('../shared/format');
+    expect(escapeCsvCell('-12.00')).toBe('-12.00');
+    expect(escapeCsvCell('+3')).toBe('+3');
+    const log = {
+      id: 'x', date: '2026-11-26', yearMonth: '2026-11', type: '日常花費', category: '餐飲', itemName: '-午餐',
+      amount: 100, currency: 'TWD', fxRate: 1, twdAmount: 100, source: '手機記帳', note: '@小明 +1',
+      createdAt: '2026-11-26T00:00:00.000Z', updatedAt: '2026-11-26T00:00:00.000Z',
+    };
+    const csv = exportCashFlowCsv([log as never]);
+    expect(csv).toContain("'-午餐");
+    const back = parseCashFlowCsv(csv)[0];
+    expect(back.itemName).toBe('-午餐');
+    expect(back.note).toBe('@小明 +1');
+  });
+
+  it('fmtNum / fmtRaw never show "-0"', async () => {
+    const { fmtNum, fmtRaw } = await import('../web/src/ui/helpers');
+    expect(fmtNum(-0.4)).toBe('0');
+    expect(fmtRaw(-0.004, 'USD', false)).toBe('US$0');
+  });
+
+  it('modal Esc / Tab handling yields to the calculator, the lock screen and IME composition; touch devices do not auto-focus inputs; only errors are de-duplicated', async () => {
+    const { readFileSync } = await import('node:fs');
+    const h = readFileSync(new URL('../web/src/ui/helpers.ts', import.meta.url), 'utf8');
+    const keys = h.slice(h.indexOf('function bindModalKeys'), h.indexOf('export function openModal'));
+    expect(keys).toMatch(/e\.isComposing/);
+    expect(keys).toMatch(/calcBackdrop/);
+    expect(keys).toMatch(/lockScreen/);
+    expect(keys.indexOf('calcBackdrop')).toBeLessThan(keys.indexOf("e.key === 'Escape'"));
+    expect(h).toMatch(/pointer: coarse/);
+    expect(h).toMatch(/variant === 'error' && lastToast/);
+  });
+
+  it('asset anchors and the initial month use the APP_TIMEZONE date', async () => {
+    const { readFileSync } = await import('node:fs');
+    const eng = readFileSync(new URL('../web/src/sync/syncEngine.ts', import.meta.url), 'utf8');
+    expect(eng).not.toMatch(/nowIso\.slice\(0, 10\)/);
+    const main = readFileSync(new URL('../web/src/main.ts', import.meta.url), 'utf8');
+    expect(main).not.toMatch(/selectedYear: now\.getFullYear\(\)/);
   });
 });

@@ -1412,7 +1412,7 @@ export class SyncEngine {
   private async saveAssetInner(payload: AssetInputPayload & { id?: string }): Promise<AssetItem> {
     const v = validateAssetInput(payload);
     const nowIso = new Date().toISOString();
-    const todayYmd = nowIso.slice(0, 10);
+    const todayYmd = todayInTimeZone(); // review (v1.8.15): APP_TIMEZONE date, not UTC
     const id = payload.id || crypto.randomUUID();
     const existing = this.snapshot.assetItems.find((a) => a.id === id);
 
