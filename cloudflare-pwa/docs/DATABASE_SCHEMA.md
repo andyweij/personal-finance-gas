@@ -1,15 +1,15 @@
-# 資料庫 Schema 設計架構（v1.8.15 / D1 Schema `0016`）
+# 資料庫 Schema 設計架構（v1.8.16 / D1 Schema `0017`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（24 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0016_automation_runs.sql`](../migrations/0016_automation_runs.sql)  
-> **對應版本**：`APP_VERSION = 1.8.15` / `DB_SCHEMA_VERSION = 0016` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
+> **最新 Migration**：[`0017_drop_owner_default.sql`](../migrations/0017_drop_owner_default.sql)  
+> **對應版本**：`APP_VERSION = 1.8.16` / `DB_SCHEMA_VERSION = 0017` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
 
 ---
 
 ## 1. 核心架構原則
 
 1. **多租戶引擎層隔離（Multi-Tenant Composite PK）**：
-   - 所有業務資料表皆以 `user_id` 作為主鍵第一欄（`PRIMARY KEY (user_id, id)` 或 `PRIMARY KEY (user_id)`），搭配 `user_id` 前置索引，從儲存層確保家庭成員資料 100% 獨立隔離。
+   - 所有業務資料表皆以 `user_id` 作為主鍵第一欄（`NOT NULL`、無預設值，`0017` 起漏填即失敗）（`PRIMARY KEY (user_id, id)` 或 `PRIMARY KEY (user_id)`），搭配 `user_id` 前置索引，從儲存層確保家庭成員資料 100% 獨立隔離。
 2. **多帳本隔離（Multi-Ledger Isolation，v1.7.0）**：
    - 以 `ledgers` 作為帳本主實體，內建不可刪除的 `default`（「個人主帳本」，`include_in_net_worth = 1`）。
    - `cashflow_logs`、`asset_items`、`recurring_items` 皆透過 `ledger_id` 歸屬帳本；`asset_items` 另提供 `exclude_from_net_worth` 單筆覆寫開關與 `is_watchlist` 觀察清單開關。
@@ -95,7 +95,7 @@ erDiagram
 
 | 欄位 | 型別 | 預設／約束 | 說明 |
 | --- | --- | --- | --- |
-| `user_id` | `TEXT` | `PK, DEFAULT 'owner'` | 所屬使用者 |
+| `user_id` | `TEXT` | `PK, NOT NULL`（`0017` 起無預設值） | 所屬使用者 |
 | `id` | `TEXT` | `PK` | 帳本 ID（預設主帳本為 `'default'`） |
 | `name` | `TEXT` | `NOT NULL` | 帳本名稱（預設 `'個人主帳本'`） |
 | `include_in_net_worth` | `INTEGER` | `NOT NULL DEFAULT 1` | `1`＝計入個人總資產／淨值與月底快照；`0`＝完全獨立隔離 |
@@ -261,7 +261,7 @@ flowchart LR
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0016`）
+## 5. Migration 演進總覽（`0001` → `0017`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -281,6 +281,7 @@ flowchart LR
 | `0014` | `0014_auth_challenge_expiry_index.sql` | `auth_challenges(expires_at)` 索引，避免每次 Passkey options 請求清理過期 challenge 時全表掃描 |
 | `0015` | `0015_security_events.sql` | 新增 `auth_security_events` 稽核表（例如以管理員重置碼重設密碼），成員登入時顯示 30 天內的安全通知 |
 | `0016` | `0016_automation_runs.sql` | 新增 `automation_runs` 排程執行紀錄，支援錯過的常態入帳與月底快照自動補跑（v1.8.13） |
+| `0017` | `0017_drop_owner_default.sql` | 重建 12 張租戶資料表，移除 `0007` 留下的 `user_id DEFAULT 'owner'`；欄位、資料與索引不變，漏填 `user_id` 的 INSERT 改為直接失敗（v1.8.16） |
 
 ---
 

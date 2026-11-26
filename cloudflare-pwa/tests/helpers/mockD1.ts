@@ -103,11 +103,16 @@ class MockD1PreparedStatement {
   }
 }
 
-export function createTestD1(): D1Database {
+/**
+ * @param opts.stopBefore apply only migrations whose file name sorts before this prefix (e.g. '0017') — used to
+ *   build a database with an older schema, fill it, and then apply a newer migration with `db.exec`.
+ */
+export function createTestD1(opts: { stopBefore?: string } = {}): D1Database {
   const sqlite = new DatabaseSync(':memory:');
   const migrationsDir = resolve(currentDir, '../../migrations');
   const sqlFiles = readdirSync(migrationsDir)
     .filter((f) => f.endsWith('.sql'))
+    .filter((f) => !opts.stopBefore || f < opts.stopBefore)
     .sort();
   for (const file of sqlFiles) {
     const migrationSql = readFileSync(resolve(migrationsDir, file), 'utf8');
