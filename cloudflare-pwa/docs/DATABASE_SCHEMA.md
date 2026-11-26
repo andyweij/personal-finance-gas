@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.6 / D1 Schema `0013`）
+# 資料庫 Schema 設計架構（v1.8.9 / D1 Schema `0014`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（21 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0013_sync_cursor_epoch_and_auto_fx.sql`](../migrations/0013_sync_cursor_epoch_and_auto_fx.sql)  
-> **對應版本**：`APP_VERSION = 1.8.6` / `DB_SCHEMA_VERSION = 0013` / `SW_CACHE_VERSION = finance-pwa-v26`
+> **最新 Migration**：[`0014_auth_challenge_expiry_index.sql`](../migrations/0014_auth_challenge_expiry_index.sql)  
+> **對應版本**：`APP_VERSION = 1.8.9` / `DB_SCHEMA_VERSION = 0014` / `SW_CACHE_VERSION = finance-pwa-v29`
 
 ---
 
@@ -259,7 +259,7 @@ flowchart LR
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0013`）
+## 5. Migration 演進總覽（`0001` → `0014`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -276,10 +276,20 @@ flowchart LR
 | `0011` | `0011_multi_ledger.sql` | 新增 `ledgers` 表並種子 `default` 主帳本；`cashflow_logs`、`asset_items`、`recurring_items` 全面加入 `ledger_id`，`asset_items` 加入 `exclude_from_net_worth` |
 | `0012` | `0012_transfer_group.sql` | `savings_adjustments` 新增 `transfer_group_id` 欄位與局部索引，支援帳戶互轉雙向成對撤銷 |
 | `0013` | `0013_sync_cursor_epoch_and_auto_fx.sql` | 新增 `user_sync_state`（單調 `change_seq` 與 `data_epoch`）與 `sync_lww_timestamps`；11 張可同步表加入 `change_seq` 與複合索引；`app_settings` 加入 `auto_fx_enabled`（排程自動匯率開關） |
+| `0014` | `0014_auth_challenge_expiry_index.sql` | `auth_challenges(expires_at)` 索引，避免每次 Passkey options 請求清理過期 challenge 時全表掃描 |
 
 ---
 
 ## 6. 部署後維運備註（v1.8.4+ 歷史股價／昨收校正）
 
-- **一次性行情校正（F10）**：從 `v1.8.3` 或更早版本升級至 `v1.8.4+`／`v1.8.6` 部署完成後，雲端 D1 內既有 `asset_items` 可能仍殘留舊版排程或 Yahoo `range=5d` 寫入的歷史 `unit_price` / `previous_close` 汙染值。請於部署後至前端「持股」或「設定」頁點擊一次「更新股價匯率」（呼叫 `POST /api/market/refresh`），或等待下一次台股／美股排程執行，即可自動以新版報價邏輯覆寫修正所有自動更新標的。
+- **一次性行情校正（F10）**：從 `v1.8.3` 或更早版本升級後，雲端 D1 內既有 `asset_items` 可能殘留舊版排程或 Yahoo `range=5d` 寫入的錯誤 `unit_price` / `previous_close`。部署後請在前端「持股」或「設定」頁點擊一次「更新股價匯率」（`POST /api/market/refresh`）。**注意**：只有「這次報價抓取成功」的標的會被覆寫；一直抓不到報價（代號錯誤、資料來源失敗）的列會保留舊值。可用下列查詢找出部署日之後仍未成功更新的自動更新標的，逐一檢查代號或改為手動輸入：
+
+  ```sql
+  SELECT user_id, id, item_name, ticker, unit_price, previous_close, price_updated_at
+  FROM asset_items
+  WHERE update_mode = '自動更新' AND deleted_at IS NULL
+    AND (price_updated_at IS NULL OR price_updated_at < '<部署日期，例如 2026-11-26>');
+  ```
+- **沒有 `clientEpoch` 的客戶端（R-2）**：伺服器在發生過 replace 還原（`data_epoch > 1`）之後，若收到不帶 `clientEpoch` 且含 mutation 的請求，一律回傳 `epochMismatch` + 完整資料、不套用任何 mutation。目前的網頁客戶端會帶上本機 `dataEpoch`（新裝置為 `null` 時會先完整拉取並採用伺服器回傳的 epoch），因此只有極舊版本或 meta 遺失的裝置會走到這條路徑；其待送變更會被凍結並由使用者決定捨棄或重新套用。
+- **`auth_rate_limits.locked_until`**：自 v1.8.3 起限速改以固定時間窗計數，此欄位仍會寫入但已不再被讀取；保留欄位以免破壞既有資料，未來重建該表時可移除。
 

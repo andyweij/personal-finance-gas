@@ -499,7 +499,13 @@ async function fetchTwseMisQuote(
 
       let price: number | null = validZ;
 
-      // 2. When z === '-' (e.g., 5s snapshot without trade or closing call auction), try best bid/ask (b / a)
+      // F2/F3: From the closing call auction (13:25) onwards, resting bid/ask are trial or leftover quotes, not
+      // traded prices. Without a trade price, let Yahoo (daily close) take over instead of writing a midpoint.
+      if (price === null && hasValidTime && tStr >= '13:25:00') {
+        continue;
+      }
+
+      // 2. When z === '-' (e.g., 5s snapshot without trade), try best bid/ask (b / a)
       if (price === null) {
         const bestBid = parseFirstMisBookPrice(entry?.b);
         const bestAsk = parseFirstMisBookPrice(entry?.a);

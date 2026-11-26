@@ -86,6 +86,28 @@ function getOriginAndRpId(c: AppContext): { origin: string; rpID: string; isHttp
   };
 }
 
+/**
+ * R5: Route-level error response. Validation / business errors (plain messages written for users) are returned
+ * as 400. Database, driver and programming errors must never leak SQL or internal text and must not look
+ * permanent to the client, so they become a generic 500.
+ */
+const INTERNAL_ERROR_RE = /D1_|SQLITE|SQL\b|no such (table|column)|constraint failed|database|network connection|internal error|is not a function|Cannot read prop|undefined|null is not/i;
+
+function routeErrorResponse(c: AppContext, err: unknown, fallback: string) {
+  const isInternal =
+    !(err instanceof Error) ||
+    err instanceof TypeError ||
+    err instanceof RangeError ||
+    err instanceof SyntaxError ||
+    err instanceof ReferenceError ||
+    INTERNAL_ERROR_RE.test(err.message);
+  if (isInternal) {
+    console.error('[api] internal error:', c.req.path, err);
+    return c.json({ error: `${fallback}（伺服器暫時無法處理，請稍後再試）` }, 500);
+  }
+  return c.json({ error: err.message || fallback }, 400);
+}
+
 export function createApp() {
   const app = new Hono<{ Bindings: WorkerEnv; Variables: AppVariables }>();
 
@@ -170,7 +192,7 @@ export function createApp() {
       c.header('Set-Cookie', buildSessionCookie(token, isHttps));
       return c.json({ ok: true, user: toAuthUser(admin), message: '初始化完成並已登入。' });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '初始化失敗' }, 400);
+      return routeErrorResponse(c, err, '初始化失敗');
     }
   });
 
@@ -208,7 +230,7 @@ export function createApp() {
       return c.json({ ok: true, user: toAuthUser(created) });
     } catch (err) {
       await recordLoginFailure(c.env.DB, rateKey);
-      return c.json({ error: err instanceof Error ? err.message : '註冊失敗' }, 400);
+      return routeErrorResponse(c, err, '註冊失敗');
     }
   });
 
@@ -237,7 +259,7 @@ export function createApp() {
       return c.json({ ok: true, message: '密碼已重設完成，請以新密碼登入。' });
     } catch (err) {
       await recordLoginFailure(c.env.DB, rateKey);
-      return c.json({ error: err instanceof Error ? err.message : '重設密碼失敗' }, 400);
+      return routeErrorResponse(c, err, '重設密碼失敗');
     }
   });
 
@@ -289,7 +311,7 @@ export function createApp() {
       const options = await createPasskeyAuthenticationOptions(c.env.DB, rpID);
       return c.json(options);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '無法產生 Passkey 選項' }, 400);
+      return routeErrorResponse(c, err, '無法產生 Passkey 選項');
     }
   });
 
@@ -349,7 +371,7 @@ export function createApp() {
       const updated = await updateUserProfile(c.env.DB, user.id, body);
       return c.json({ ok: true, user: updated });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '更新個人資料失敗' }, 400);
+      return routeErrorResponse(c, err, '更新個人資料失敗');
     }
   });
 
@@ -369,7 +391,7 @@ export function createApp() {
       );
       return c.json({ ok: true, message: '主密碼已更新。' });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '變更密碼失敗' }, 400);
+      return routeErrorResponse(c, err, '變更密碼失敗');
     }
   });
 
@@ -422,7 +444,7 @@ export function createApp() {
       const result = await configureUserPin(c.env.DB, user.id, body);
       return c.json({ ok: true, ...result });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'PIN 設定失敗' }, 400);
+      return routeErrorResponse(c, err, 'PIN 設定失敗');
     }
   });
 
@@ -442,7 +464,7 @@ export function createApp() {
       const created = await createInviteCode(c.env.DB, admin.id, body);
       return c.json({ ok: true, ...created });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '產生邀請碼失敗' }, 400);
+      return routeErrorResponse(c, err, '產生邀請碼失敗');
     }
   });
 
@@ -466,7 +488,7 @@ export function createApp() {
       );
       return c.json({ ok: true, ...created });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '產生密碼重置碼失敗' }, 400);
+      return routeErrorResponse(c, err, '產生密碼重置碼失敗');
     }
   });
 
@@ -480,7 +502,7 @@ export function createApp() {
       const updated = await adminUpdateUser(c.env.DB, admin.id, c.req.param('id') || '', body);
       return c.json({ ok: true, user: updated });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : '更新成員狀態失敗' }, 400);
+      return routeErrorResponse(c, err, '更新成員狀態失敗');
     }
   });
 
@@ -600,7 +622,7 @@ export function createApp() {
       );
       return c.json({ ok: true, ...summary });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'JSON 匯入失敗' }, 400);
+      return routeErrorResponse(c, err, 'JSON 匯入失敗');
     }
   });
 
@@ -797,7 +819,7 @@ export function createApp() {
       await commitCsvBatch(stmts);
       return c.json({ ok: true, kind, label: labels[kind], importedCount: rows.length });
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'CSV 解析或匯入失敗' }, 400);
+      return routeErrorResponse(c, err, 'CSV 解析或匯入失敗');
     }
   });
 

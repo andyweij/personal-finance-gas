@@ -571,7 +571,7 @@ describe('驗收：客戶端尚未修正項目', () => {
 /* ===================== v1.8.7 審查新增（docs/reviews/2026-11-26_v1.8.7_review.md） ===================== */
 
 describe('驗收：v1.8.7 審查新增項目', () => {
-  it.fails('V1: 只有寫入路徑故障（帶 mutation 的請求 503、純拉取正常）時，不得把正常 mutation 當成毒丸隔離', async () => {
+  it('V1: 只有寫入路徑故障（帶 mutation 的請求 503、純拉取正常）時，不得把正常 mutation 當成毒丸隔離', async () => {
     const db = createTestD1();
     const localDb = new LocalFinanceDB(`v1-${crypto.randomUUID()}`);
     let writesDown = true;
@@ -609,7 +609,7 @@ describe('驗收：v1.8.7 審查新增項目', () => {
     localDb.close();
   });
 
-  it.fails('V2: 同一筆紀錄被延後時，後面依賴它的 mutation 不得插隊（刪除帳本並搬移紀錄不得被拒）', async () => {
+  it('V2: 同一筆紀錄被延後時，後面依賴它的 mutation 不得插隊（刪除帳本並搬移紀錄不得被拒）', async () => {
     const db = createTestD1();
     const localDb = new LocalFinanceDB(`v2-${crypto.randomUUID()}`);
     let online = true;
@@ -648,7 +648,7 @@ describe('驗收：v1.8.7 審查新增項目', () => {
     localDb.close();
   });
 
-  it.fails('V3: 「重新套用」時因有較新編輯而被略過的凍結項目，必須保留給使用者檢視（不得靜默丟棄）', async () => {
+  it('V3: 「重新套用」時因有較新編輯而被略過的凍結項目，必須保留給使用者檢視（不得靜默丟棄）', async () => {
     const db = createTestD1();
     const localDb = new LocalFinanceDB(`v3-${crypto.randomUUID()}`);
     const engine = newEngine(localDb, d1Fetch(db));
@@ -677,7 +677,7 @@ describe('驗收：v1.8.7 審查新增項目', () => {
     localDb.close();
   });
 
-  it.fails('V4: 請求途中 replace 後，舊 epoch 的 mutation 不得依還原後的資料被「拒絕」（應凍結，而非顯示錯誤並丟棄）', async () => {
+  it('V4: 請求途中 replace 後，舊 epoch 的 mutation 不得依還原後的資料被「拒絕」（應凍結，而非顯示錯誤並丟棄）', async () => {
     const db = createTestD1();
     // 舊 epoch：帳本 L2 與其中一筆紀錄
     await processSyncRequest(db, UID, {

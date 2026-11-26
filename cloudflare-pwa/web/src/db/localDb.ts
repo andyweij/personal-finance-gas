@@ -167,6 +167,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(snapshot, 'snapshot');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -195,6 +196,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(meta, 'meta');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -215,6 +217,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(conflicts, 'conflicts');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -235,6 +238,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(rejections, 'rejections');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -274,6 +278,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_KV).put(items, 'frozen_outbox');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -299,6 +304,7 @@ export class LocalFinanceDB {
       };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -331,6 +337,7 @@ export class LocalFinanceDB {
       };
       tx.oncomplete = () => resolve(updated);
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -353,6 +360,7 @@ export class LocalFinanceDB {
       kv.put(rejections, 'rejections');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -456,6 +464,7 @@ export class LocalFinanceDB {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -471,6 +480,7 @@ export class LocalFinanceDB {
       kv.put(conflicts, 'conflicts');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -494,6 +504,7 @@ export class LocalFinanceDB {
       };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -554,6 +565,7 @@ export class LocalFinanceDB {
 
       tx.oncomplete = () => resolve(mergedFrozen);
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -567,6 +579,8 @@ export class LocalFinanceDB {
       mutationsToEnqueue: SyncMutation[];
       appliedCount: number;
       skippedCount: number;
+      /** V3: frozen mutations skipped because the record changed after the freeze — kept for the user to review. */
+      skippedRejections?: SyncRejection[];
     },
     inFlightIds?: ReadonlySet<string>
   ): Promise<{
@@ -574,6 +588,7 @@ export class LocalFinanceDB {
     appliedCount: number;
     skippedCount: number;
     remainingOutboxCount: number;
+    rejections: SyncRejection[] | null;
   }> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
@@ -584,10 +599,14 @@ export class LocalFinanceDB {
       const snapReq = kv.get('snapshot');
       const frozenReq = kv.get('frozen_outbox');
       const outboxReq = outboxStore.getAll();
+      const rejectionsReq = kv.get('rejections');
 
       let snapLoaded = false;
       let frozenLoaded = false;
       let outboxLoaded = false;
+      let rejectionsLoaded = false;
+      let existingRejections: SyncRejection[] = [];
+      let resultRejections: SyncRejection[] | null = null;
       let rawSnap: FinanceSnapshot | undefined;
       let freshFrozen: SyncMutation[] = [];
       let existingList: Array<SyncMutation & { _seq?: number }> = [];
@@ -596,9 +615,10 @@ export class LocalFinanceDB {
       let appliedCount = 0;
       let skippedCount = 0;
       let remainingOutboxCount = 0;
+      let failure: unknown = null;
 
       const tryFinalize = () => {
-        if (!snapLoaded || !frozenLoaded || !outboxLoaded) return;
+        if (!snapLoaded || !frozenLoaded || !outboxLoaded || !rejectionsLoaded) return;
         const freshSnapshot = rawSnap
           ? {
               ...createEmptySnapshot(),
@@ -626,13 +646,32 @@ export class LocalFinanceDB {
           return;
         }
 
-        const transformed = transform(freshSnapshot, freshFrozen, cleanOutbox);
+        let transformed: ReturnType<typeof transform>;
+        try {
+          transformed = transform(freshSnapshot, freshFrozen, cleanOutbox);
+        } catch (err) {
+          // R-1: An exception inside an IndexedDB callback would abort the transaction without settling
+          // this promise, deadlocking the engine's serialized lock. Abort explicitly and reject.
+          failure = err;
+          try {
+            tx.abort();
+          } catch {
+            /* already aborted */
+          }
+          return;
+        }
         resultSnapshot = transformed.nextSnapshot;
         appliedCount = transformed.appliedCount;
         skippedCount = transformed.skippedCount;
 
         kv.put(transformed.nextSnapshot, 'snapshot');
         kv.put([], 'frozen_outbox');
+        if (transformed.skippedRejections && transformed.skippedRejections.length > 0) {
+          const byId = new Map(existingRejections.map((r) => [r.mutationId, r]));
+          for (const r of transformed.skippedRejections) byId.set(r.mutationId, r);
+          resultRejections = Array.from(byId.values());
+          kv.put(resultRejections, 'rejections');
+        }
         if (transformed.mutationsToEnqueue.length > 0) {
           this.applyMutationsToOutboxStore(
             outboxStore,
@@ -662,6 +701,11 @@ export class LocalFinanceDB {
         outboxLoaded = true;
         tryFinalize();
       };
+      rejectionsReq.onsuccess = () => {
+        existingRejections = Array.isArray(rejectionsReq.result) ? (rejectionsReq.result as SyncRejection[]) : [];
+        rejectionsLoaded = true;
+        tryFinalize();
+      };
 
       tx.oncomplete = () =>
         resolve({
@@ -669,8 +713,10 @@ export class LocalFinanceDB {
           appliedCount,
           skippedCount,
           remainingOutboxCount,
+          rejections: resultRejections,
         });
-      tx.onerror = () => reject(tx.error);
+      tx.onerror = () => reject(failure ?? tx.error);
+      tx.onabort = () => reject(failure ?? tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -691,9 +737,21 @@ export class LocalFinanceDB {
       }
       if (rebasedMutations && rebasedMutations.length > 0) {
         for (const item of rebasedMutations) {
-          outboxStore.delete(item.oldMutationId);
-          this.outboxSeq += 1;
-          outboxStore.put({ ...item.replacement, _seq: this.outboxSeq });
+          // V2: Keep the original queue position (_seq) so a rebased mutation never moves behind mutations
+          // that were queued after it (e.g. "move records out of ledger" must stay before "delete ledger").
+          // P2-C5: If the old mutation is gone (coalesced/removed by another tab meanwhile), do not resurrect it.
+          const getReq = outboxStore.get(item.oldMutationId);
+          getReq.onsuccess = () => {
+            const old = getReq.result as (SyncMutation & { _seq?: number }) | undefined;
+            if (!old) return;
+            outboxStore.delete(item.oldMutationId);
+            let seq = old._seq;
+            if (seq === undefined) {
+              this.outboxSeq += 1;
+              seq = this.outboxSeq;
+            }
+            outboxStore.put({ ...item.replacement, _seq: seq });
+          };
         }
       }
       const kv = tx.objectStore(STORE_KV);
@@ -707,6 +765,7 @@ export class LocalFinanceDB {
       }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -718,6 +777,7 @@ export class LocalFinanceDB {
       tx.objectStore(STORE_OUTBOX).clear();
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
     });
   }
 }

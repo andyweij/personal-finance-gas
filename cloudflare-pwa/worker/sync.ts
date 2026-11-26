@@ -565,6 +565,8 @@ async function recordIdempotencyOnly(
     if (currEpoch !== expectedEpoch) {
       throw new EpochMismatchError();
     }
+    // R-8: Neither recorded nor an epoch change — never ack silently; let the request fail and be retried.
+    throw new Error('sync_idempotency row could not be recorded');
   }
 }
 
@@ -1924,6 +1926,11 @@ async function applySingleMutation(
 
   if (mutation.entity === 'utility_record') {
     const normalizedPeriod = mutation.recordId.trim();
+    // validateUtilityRecordInput truncates period to 20 characters; reject longer keys up front so lookups,
+    // writes and sync_lww_timestamps all use the same key (no spurious conflicts on a truncated key).
+    if (!normalizedPeriod || normalizedPeriod.length > 20 || normalizedPeriod !== mutation.recordId) {
+      throw new RejectError('水電期別鍵值格式不符（不得含前後空白，且長度不得超過 20 字）。');
+    }
     if (mutation.op !== 'delete') {
       const pEarly = mutation.payload || {};
       const payloadPeriodEarly =
@@ -2235,11 +2242,13 @@ export async function processSyncRequest(
     // Q2 / N2: Read change_seq & data_epoch BEFORE querying full snapshot so any concurrent write
     // committed during querySyncDelta(null) has change_seq > stateBeforeQuery.changeSeq and is
     // guaranteed to be returned either in this snapshot or in the next incremental sync.
+    // R-4: Retry (bounded) until no replace import lands while the snapshot is being read, so the
+    // response never mixes rows from two epochs.
     let stateBeforeQuery = await ensureUserSyncState(db, uid);
     let fullDelta = await querySyncDelta(db, uid, null);
-    const stateAfterQuery = await ensureUserSyncState(db, uid);
-    if (stateAfterQuery.dataEpoch !== stateBeforeQuery.dataEpoch) {
-      // Another replace import committed mid-snapshot: retry once reading state before query
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const stateAfterQuery = await ensureUserSyncState(db, uid);
+      if (stateAfterQuery.dataEpoch === stateBeforeQuery.dataEpoch) break;
       stateBeforeQuery = stateAfterQuery;
       fullDelta = await querySyncDelta(db, uid, null);
     }
@@ -2343,6 +2352,12 @@ export async function processSyncRequest(
           conflicts.push(err.conflict);
         }
       } else if (err instanceof RejectError) {
+        // V4: A rejection evaluated against data restored by a concurrent replace import is meaningless
+        // for a stale-epoch client — stop and let the client freeze it instead of dropping it as an error.
+        if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+          epochChangedDuringMutations = true;
+          break;
+        }
         rejected.push({
           mutationId: mut.mutationId,
           reason: err.message || '資料驗證失敗，伺服器拒絕此筆異動',
@@ -2356,6 +2371,11 @@ export async function processSyncRequest(
             errMsg
           )
         ) {
+          // V4: same epoch re-check as the RejectError branch
+          if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+            epochChangedDuringMutations = true;
+            break;
+          }
           console.warn('[sync] deterministic constraint rejected:', mut.entity, mut.recordId, errMsg);
           rejected.push({
             mutationId: mut.mutationId,

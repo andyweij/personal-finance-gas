@@ -243,6 +243,14 @@ export class SyncEngine {
   private accountMismatchHalted = false;
   private consecutiveFailures = 0;
   private poisonSearchActive = false;
+  /**
+   * V1: A single mutation that just failed with 5xx while a read-only pull succeeded. It is only counted
+   * toward quarantine after a *different* mutation (the probe) is written successfully right after it —
+   * a successful read alone does not prove the write path is healthy (e.g. D1 write outage / quota).
+   */
+  private poisonSuspect: { mutationId: string; key: string; lastError: string } | null = null;
+  /** R-3: consecutive single-item successes while in poison-search mode; resets batching after a streak. */
+  private singleItemSuccessStreak = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly instanceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   private dbChannel: BroadcastChannel | null = null;
@@ -473,14 +481,30 @@ export class SyncEngine {
         const liveOutboxKeys = new Set(freshOutbox.map((m) => `${m.entity}:${m.recordId}`));
         let nextSnap = freshSnap;
         const mutationsToEnqueue: SyncMutation[] = [];
+        const skippedRejections: SyncRejection[] = [];
         let applied = 0;
         let skipped = 0;
+        // V3: A skipped pre-restore edit is kept as a reviewable rejection (with its payload), never silently dropped.
+        const keepSkipped = (m: SyncMutation, reason: string) => {
+          skipped += 1;
+          skippedRejections.push({
+            mutationId: m.mutationId,
+            entity: m.entity,
+            op: m.op,
+            recordId: m.recordId,
+            isNewRecord: m.op === 'upsert' && !this.findRecordInSnapshot(freshSnap, m.entity, m.recordId),
+            resolutionStatus: 'skipped_newer',
+            reason,
+            ...(m.payload ? { clientPayload: m.payload } : {}),
+            rejectedAt: nowIso,
+          });
+        };
 
         for (const m of freshFrozen) {
           const key = `${m.entity}:${m.recordId}`;
           // N3: Never overwrite a record that has a newer pending edit in the live outbox
           if (liveOutboxKeys.has(key)) {
-            skipped += 1;
+            keepSkipped(m, '此紀錄在雲端還原後已有尚未同步的較新編輯，未套用還原前的這筆編輯');
             continue;
           }
 
@@ -491,7 +515,12 @@ export class SyncEngine {
           if (m.frozenBaselineExisted !== undefined) {
             const currentExisted = Boolean(currentInFresh);
             if (currentExisted !== m.frozenBaselineExisted) {
-              skipped += 1;
+              keepSkipped(
+                m,
+                currentExisted
+                  ? '此紀錄在雲端還原後已被重新建立，未套用還原前的這筆編輯'
+                  : '此紀錄在雲端還原後已被刪除，未套用還原前的這筆編輯'
+              );
               continue;
             }
             if (currentExisted) {
@@ -501,10 +530,19 @@ export class SyncEngine {
                 (m.frozenBaselineVersion !== undefined && currentVersion !== m.frozenBaselineVersion) ||
                 (m.frozenBaselineUpdatedAt !== undefined && currentUpdatedAt !== m.frozenBaselineUpdatedAt)
               ) {
-                skipped += 1;
+                keepSkipped(m, '此紀錄在雲端還原後已有較新的版本，未套用還原前的這筆編輯');
                 continue;
               }
             }
+          } else if (
+            // R-6: Items frozen by v1.8.6 or earlier carry no baseline. Fall back to timestamps: if the current
+            // record was updated after this edit was made, the edit is older and must not overwrite it.
+            currentInFresh?.updatedAt &&
+            m.clientTimestamp &&
+            currentInFresh.updatedAt > m.clientTimestamp
+          ) {
+            keepSkipped(m, '此紀錄在雲端還原後已有較新的版本，未套用還原前的這筆編輯');
+            continue;
           }
 
           const existingInNext = this.findRecordInSnapshot(nextSnap, m.entity, m.recordId);
@@ -538,12 +576,16 @@ export class SyncEngine {
           mutationsToEnqueue,
           appliedCount: applied,
           skippedCount: skipped,
+          skippedRejections,
         };
       }, this.inFlightMutationIds);
 
       appliedCount = txRes.appliedCount;
       skippedCount = txRes.skippedCount;
       this.snapshot = txRes.snapshot;
+      if (txRes.rejections) {
+        this.rejections = txRes.rejections;
+      }
       this.frozenOutbox = [];
       this.emitSnapshot();
       this.broadcastDbChanged();
@@ -2437,7 +2479,9 @@ export class SyncEngine {
     for (const m of outbox) {
       if (selected.length >= maxCount) break;
       const key = `${m.entity}:${m.recordId}`;
-      if (seenKeys.has(key)) continue;
+      // V2: Stop at the first duplicate key so every batch is a strict prefix of the outbox.
+      // Skipping (`continue`) would let later mutations that depend on the deferred one jump ahead of it.
+      if (seenKeys.has(key)) break;
       seenKeys.add(key);
       selected.push(m);
     }
@@ -2561,13 +2605,29 @@ export class SyncEngine {
       let reqSinceSeq: number | null = null;
       let reqClientEpoch: number | null = null;
 
+      let probeMutationId: string | null = null;
+
       await this.runSerialized(async () => {
         outbox = await this.db.getOutbox();
         // R2 & Q1: Shrink batch size to 1 after a failure or while isolating a poison-pill mutation
         const effectiveBatchSize =
           this.consecutiveFailures >= 1 || this.poisonSearchActive ? 1 : this.maxBatchSize;
-        // Q4 / N1: At most one mutation per entity:recordId per HTTP batch
-        batch = this.selectSyncBatch(outbox, effectiveBatchSize);
+        // V1: While a poison suspect is pending, send ONE mutation of a different record as a write-path probe
+        if (this.poisonSuspect && !outbox.some((m) => m.mutationId === this.poisonSuspect!.mutationId)) {
+          this.poisonSuspect = null;
+        }
+        const suspectKey = this.poisonSuspect?.key;
+        const probe = suspectKey
+          ? outbox.find((m) => `${m.entity}:${m.recordId}` !== suspectKey)
+          : undefined;
+        if (probe) {
+          batch = [probe];
+          probeMutationId = probe.mutationId;
+        } else {
+          this.poisonSuspect = null;
+          // Q4 / N1: At most one mutation per entity:recordId per HTTP batch
+          batch = this.selectSyncBatch(outbox, effectiveBatchSize);
+        }
         hadMoreBatches = outbox.length > batch.length;
         // P2-C2: Persist sentAt & attempts to IndexedDB BEFORE sending HTTP request so timeout/reload never coalesces sent mutations
         if (batch.length > 0) {
@@ -2684,6 +2744,16 @@ export class SyncEngine {
 
         const data = (await res.json()) as SyncResponse;
         this.consecutiveFailures = 0;
+
+        // V1: A probe is sent out of queue order. If the server rejects it, the rejection may only reflect
+        // that ordering (e.g. it depends on the suspect), so keep it queued instead of dropping it.
+        let probeAcked = false;
+        if (probeMutationId) {
+          if (Array.isArray(data.rejected)) {
+            data.rejected = data.rejected.filter((r) => r.mutationId !== probeMutationId);
+          }
+          probeAcked = (data.ackedMutationIds || []).includes(probeMutationId);
+        }
 
         let passOutcome: {
           epochFrozen: boolean;
@@ -2997,6 +3067,36 @@ export class SyncEngine {
           return { ok: true, epochMismatch: true };
         }
 
+        // V1: Probe result. A successful probe write right after the suspect failed proves the write path is
+        // healthy, so the suspect's failure is item-specific and counts toward quarantine.
+        if (probeMutationId && this.poisonSuspect) {
+          const suspect = this.poisonSuspect;
+          this.poisonSuspect = null;
+          if (probeAcked) {
+            const updated = await this.db.incrementOutboxRetryCounts([suspect.mutationId], suspect.lastError);
+            const suspectMut = updated[0];
+            if (
+              suspectMut &&
+              (suspectMut.retryCount ?? 0) >= this.maxPoisonRetries &&
+              !quarantinedInThisSync
+            ) {
+              quarantinedInThisSync = true;
+              await this.quarantinePoisonMutation(suspectMut, suspect.lastError);
+            }
+            fullPullPass = false;
+            continue;
+          }
+        }
+
+        // R-3: Leave single-item isolation mode after a streak of healthy single-item writes
+        if (batch.length === 1 && this.poisonSearchActive && !probeMutationId && passOutcome.madeForwardProgress) {
+          this.singleItemSuccessStreak += 1;
+          if (this.singleItemSuccessStreak >= 5) {
+            this.poisonSearchActive = false;
+            this.singleItemSuccessStreak = 0;
+          }
+        }
+
         // R6: Drain remaining outbox batches first, then perform ONE consolidated full pull if pendingFullResync is set
         if (hadMoreBatches && passOutcome.remainingOutboxCount > 0 && passOutcome.madeForwardProgress) {
           fullPullPass = false;
@@ -3051,9 +3151,31 @@ export class SyncEngine {
           }
 
           const isDeterministicPayloadError = httpStatus === 400 || httpStatus === 413;
-          const isItemSpecificFailure = isDeterministicPayloadError || pullRes.ok;
 
-          if (isItemSpecificFailure) {
+          if (!isDeterministicPayloadError && pullRes.ok) {
+            // V1: 5xx while reads work. This alone does NOT prove the mutation is poison (the write path may be down).
+            this.singleItemSuccessStreak = 0;
+            if (probeMutationId) {
+              // The probe failed too → server-wide write failure. Count nothing; back off below.
+              this.poisonSuspect = null;
+            } else if (batch.length > 1) {
+              this.poisonSearchActive = true;
+            } else {
+              const failed = batch[0];
+              const key = `${failed.entity}:${failed.recordId}`;
+              const currentOutbox = await this.db.getOutbox();
+              if (currentOutbox.some((m) => `${m.entity}:${m.recordId}` !== key)) {
+                // Probe with another record right away; the suspect is only counted if that write succeeds.
+                this.poisonSuspect = { mutationId: failed.mutationId, key, lastError: msg };
+                this.poisonSearchActive = true;
+                continue;
+              }
+              // Nothing else to probe with: keep it queued (it blocks no one) and back off.
+            }
+          }
+
+          if (isDeterministicPayloadError) {
+            this.singleItemSuccessStreak = 0;
             if (batch.length > 1) {
               // Server is healthy (or rejected payload size/format), so a specific mutation in this batch is poison.
               // Switch to single-item isolation mode without penalizing innocent items in the batch.
@@ -3070,56 +3192,7 @@ export class SyncEngine {
                 !quarantinedInThisSync
               ) {
                 // R2 & Q1: Confirmed item-specific poison-pill mutation hit retry ceiling — quarantine it!
-                let remainingAfterQuarantine = 0;
-                await this.runSerialized(async () => {
-                  const currentOutbox = await this.db.getOutbox();
-                  const isCreate =
-                    singleFailed.isNewRecord !== undefined
-                      ? singleFailed.isNewRecord
-                      : singleFailed.op === 'upsert' &&
-                        (singleFailed.baseVersion === null || singleFailed.baseVersion === 0);
-                  const idsToRemove = [singleFailed.mutationId];
-                  let preservedPayload = singleFailed.payload;
-                  if (isCreate) {
-                    const key = `${singleFailed.entity}:${singleFailed.recordId}`;
-                    for (const m of currentOutbox) {
-                      if (m.mutationId !== singleFailed.mutationId && `${m.entity}:${m.recordId}` === key) {
-                        idsToRemove.push(m.mutationId);
-                        if (m.op === 'upsert' && m.payload) {
-                          preservedPayload = m.payload;
-                        }
-                      }
-                    }
-                  }
-                  const nextSnap = isCreate
-                    ? this.removeRecordFromSnapshot(this.snapshot, singleFailed.entity, singleFailed.recordId)
-                    : this.snapshot;
-                  const nextMeta: LocalMeta = {
-                    ...this.meta,
-                    ...(!isCreate ? { pendingFullResync: true } : {}),
-                  };
-                  const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
-                  byMutId.set(singleFailed.mutationId, {
-                    mutationId: singleFailed.mutationId,
-                    entity: singleFailed.entity,
-                    op: singleFailed.op,
-                    recordId: singleFailed.recordId,
-                    isNewRecord: isCreate,
-                    resolutionStatus: 'quarantined',
-                    reason: `多次同步失敗已自動移出待上傳佇列：${msg}`,
-                    clientPayload: preservedPayload,
-                    rejectedAt: new Date().toISOString(),
-                  });
-                  const nextRejections = Array.from(byMutId.values());
-                  await this.db.quarantineOutboxMutation(idsToRemove, nextSnap, nextMeta, nextRejections);
-                  this.snapshot = nextSnap;
-                  this.meta = nextMeta;
-                  this.rejections = nextRejections;
-                  remainingAfterQuarantine = (await this.db.getOutbox()).length;
-                  this.emitSnapshot();
-                  this.broadcastDbChanged();
-                  this.updateStatus(this.computeStatus(remainingAfterQuarantine));
-                });
+                const remainingAfterQuarantine = await this.quarantinePoisonMutation(singleFailed, msg);
 
                 // Q1: Do NOT reset consecutiveFailures to 0 on quarantine (keep backoff & single-item
                 // batching until a subsequent mutation actually succeeds), and cap at 1 quarantine per sync.
@@ -3168,6 +3241,64 @@ export class SyncEngine {
       this.scheduleRetry(500);
     }
     return { ok: true };
+  }
+
+  /**
+   * Moves a confirmed poison-pill mutation out of the outbox into the rejection list (keeping its payload).
+   * Returns the number of mutations still queued afterwards.
+   */
+  private async quarantinePoisonMutation(singleFailed: SyncMutation, msg: string): Promise<number> {
+    let remainingAfterQuarantine = 0;
+    await this.runSerialized(async () => {
+                  const currentOutbox = await this.db.getOutbox();
+                  const isCreate =
+                    singleFailed.isNewRecord !== undefined
+                      ? singleFailed.isNewRecord
+                      : singleFailed.op === 'upsert' &&
+                        (singleFailed.baseVersion === null || singleFailed.baseVersion === 0);
+                  const idsToRemove = [singleFailed.mutationId];
+                  let preservedPayload = singleFailed.payload;
+                  if (isCreate) {
+                    const key = `${singleFailed.entity}:${singleFailed.recordId}`;
+                    for (const m of currentOutbox) {
+                      if (m.mutationId !== singleFailed.mutationId && `${m.entity}:${m.recordId}` === key) {
+                        idsToRemove.push(m.mutationId);
+                        if (m.op === 'upsert' && m.payload) {
+                          preservedPayload = m.payload;
+                        }
+                      }
+                    }
+                  }
+                  const nextSnap = isCreate
+                    ? this.removeRecordFromSnapshot(this.snapshot, singleFailed.entity, singleFailed.recordId)
+                    : this.snapshot;
+                  const nextMeta: LocalMeta = {
+                    ...this.meta,
+                    ...(!isCreate ? { pendingFullResync: true } : {}),
+                  };
+                  const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
+                  byMutId.set(singleFailed.mutationId, {
+                    mutationId: singleFailed.mutationId,
+                    entity: singleFailed.entity,
+                    op: singleFailed.op,
+                    recordId: singleFailed.recordId,
+                    isNewRecord: isCreate,
+                    resolutionStatus: 'quarantined',
+                    reason: `多次同步失敗已自動移出待上傳佇列：${msg}`,
+                    clientPayload: preservedPayload,
+                    rejectedAt: new Date().toISOString(),
+                  });
+                  const nextRejections = Array.from(byMutId.values());
+                  await this.db.quarantineOutboxMutation(idsToRemove, nextSnap, nextMeta, nextRejections);
+                  this.snapshot = nextSnap;
+                  this.meta = nextMeta;
+                  this.rejections = nextRejections;
+                  remainingAfterQuarantine = (await this.db.getOutbox()).length;
+                  this.emitSnapshot();
+                  this.broadcastDbChanged();
+                  this.updateStatus(this.computeStatus(remainingAfterQuarantine));
+                });
+    return remainingAfterQuarantine;
   }
 
   private removeRecordFromSnapshot(

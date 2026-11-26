@@ -237,13 +237,17 @@ describe('Phase 1 Recheck (R1-R7) & v1.8.4 Previous-Close Review (F1-F9)', () =>
     await engine.syncNow();
     expect(engine.getSnapshot().cashflowLogs.some((c) => c.id === 'cf-from-server')).toBe(true);
 
-    // After repeated failures, poison pill is isolated & quarantined into rejections, and 正常紀錄 succeeds!
+    // After repeated failures, the poison pill no longer blocks the queue: 正常紀錄 is written via a probe.
+    // v1.8.9 (V1): a 5xx alone never proves a mutation is poison (the write path may be down), so the poison
+    // is only counted when a probe write of another record succeeds right after it. With nothing left to probe
+    // it stays queued (blocking no one, never lost) instead of being quarantined.
     await engine.syncNow();
     await engine.syncNow();
     await engine.syncNow();
 
-    expect(engine.getRejections().some((r) => r.clientPayload?.itemName === '毒丸')).toBe(true);
-    expect(await localDb.getOutbox()).toHaveLength(0);
+    const remaining = await localDb.getOutbox();
+    expect(remaining.map((m) => m.payload?.itemName)).toEqual(['毒丸']);
+    expect(engine.getRejections()).toHaveLength(0);
 
     engine.destroy();
     localDb.close();

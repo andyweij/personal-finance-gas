@@ -83,9 +83,9 @@ describe('v1.8.7 Group 1 (Q1, Q2/N2, Q4/N1+R7, Q5/N4) & N3 Regression Tests', ()
 
     // 1st sync: batch of 4 fails -> read-only pull succeeds -> enters poisonSearchActive (batch size 1)
     await engine.syncNow();
-    // 2nd sync: drains 正常一 (1), 正常二 (1), then hits 毒丸中間 (1, retryCount=1)
+    // 2nd sync: drains 正常一 (1), 正常二 (1), then 毒丸中間 fails -> probe 正常三 succeeds (retryCount=1)
     await engine.syncNow();
-    // 3rd sync: hits 毒丸中間 (1, retryCount=2 -> quarantined!), then drains 正常三 (1)
+    // 3rd sync: 毒丸中間 fails again, nothing left to probe with -> stays queued (v1.8.9 / V1)
     await engine.syncNow();
 
     // After the initial 4-item batch failure, every batch until quarantine stayed at size 1 (no bounce back to 3)
@@ -93,8 +93,10 @@ describe('v1.8.7 Group 1 (Q1, Q2/N2, Q4/N1+R7, Q5/N4) & N3 Regression Tests', ()
     expect(batchSizesSeen.slice(1)).not.toContain(3);
     expect(batchSizesSeen.slice(1)).not.toContain(2);
 
-    expect(engine.getRejections().map((r) => r.clientPayload?.itemName)).toEqual(['毒丸中間']);
-    expect(await localDb.getOutbox()).toHaveLength(0);
+    // v1.8.9 (V1): only one probe write succeeded after the poison (retryCount 1 < maxPoisonRetries 2),
+    // so it is not quarantined; it stays queued without blocking the healthy items.
+    expect(engine.getRejections()).toHaveLength(0);
+    expect((await localDb.getOutbox()).map((m) => m.payload?.itemName)).toEqual(['毒丸中間']);
 
     const rows = await db
       .prepare('SELECT item_name FROM cashflow_logs WHERE user_id = ? AND deleted_at IS NULL')

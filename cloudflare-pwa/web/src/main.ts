@@ -86,8 +86,17 @@ function renderSyncPill(status: SyncStatus): void {
       pill.textContent = `⚠ 異常 (${cCount + rCount})`;
       pill.title = `有 ${cCount} 筆版本衝突與 ${rCount} 筆同步失敗，點擊處理`;
     } else if (rCount > 0) {
-      pill.textContent = `⚠ 同步失敗 (${rCount})`;
-      pill.title = `有 ${rCount} 筆異動被伺服器拒絕，點擊檢視原因`;
+      // Status pill: rejections must not hide offline / pending state
+      const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      const extra = offline
+        ? ' · 離線'
+        : status.pendingCount > 0
+          ? ` · 待同步 ${status.pendingCount}`
+          : '';
+      pill.textContent = `⚠ 同步失敗 (${rCount})${extra}`;
+      pill.title = `有 ${rCount} 筆異動被伺服器拒絕${
+        status.pendingCount > 0 ? `，另有 ${status.pendingCount} 筆待同步` : ''
+      }，點擊同步並檢視原因`;
     } else {
       pill.textContent = `⚠ 衝突 (${cCount || 1})`;
       pill.title = '偵測到離線與雲端版本衝突，點擊選擇保留版本';
@@ -491,7 +500,9 @@ function bindEvents(ctx: UiContext): void {
 
   // Topbar actions
   el('syncStatusPill').addEventListener('click', async () => {
-    if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+    // Conflicts and frozen (post-restore) changes need a decision first. Rejections alone do not block a
+    // manual sync: sync first, then the modal below lists the rejections.
+    if (ctx.engine.getConflicts().length > 0 || ctx.engine.getFrozenOutbox().length > 0) {
       openConflictsModal(ctx);
       return;
     }
