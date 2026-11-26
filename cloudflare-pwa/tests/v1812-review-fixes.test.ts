@@ -180,6 +180,7 @@ describe('v1.8.12 review fixes (server)', () => {
     const res = await processSyncRequest(db, UID, {
       sinceSeq: 0,
       clientEpoch: 1,
+      refsOrdered: true,
       mutations: [
         mut('savings_adjustment', 'a1', { accountId: 'A', date: '2026-11-26', amount: -100, transferGroupId: g }, { atomicGroupId: g }),
         mut('savings_adjustment', 'a2', { accountId: 'NOPE', date: '2026-11-26', amount: 100, transferGroupId: g }, { atomicGroupId: g }),

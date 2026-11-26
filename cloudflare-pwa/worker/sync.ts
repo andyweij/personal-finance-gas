@@ -1,4 +1,4 @@
-import { orderMutationsByDependencies } from '../shared/syncOrder';
+import { atomicGroupKeyOf, orderMutationsByDependencies } from '../shared/syncOrder';
 import { countD1Queries } from './d1Budget';
 import {
   DEFAULT_EMERGENCY_MONTHS,
@@ -571,25 +571,44 @@ function collectChangedRefs(
   return out;
 }
 
-function refGuardSql(uid: string, refs: RefCheck[]): { sql: string; binds: unknown[] } {
+/**
+ * Post-deploy review fix (v1.8.17): a v1.8.11 client (it does not send `refsOrdered`) can send a child record
+ * before the account / ledger it points at — its batches are strict outbox prefixes without dependency order, and
+ * after a failed request it sends one mutation at a time. Rejecting the child would roll it back for good, so for
+ * such requests a reference to a record that has NEVER existed on the server is accepted (the v1.8.11 behaviour;
+ * the referenced record is still in that client's outbox). A reference to a DELETED record is still rejected.
+ * Current clients send `refsOrdered: true` and always get the strict check.
+ */
+function refGuardSql(db: D1Database, uid: string, refs: RefCheck[]): { sql: string; binds: unknown[] } {
+  const lenient = isLegacyRefRequest(db);
   let sql = '';
   const binds: unknown[] = [];
   for (const ref of refs) {
     const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
-    sql += ` AND EXISTS (SELECT 1 FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL)`;
-    binds.push(uid, ref.id);
+    if (lenient) {
+      sql += ` AND (EXISTS (SELECT 1 FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL) OR NOT EXISTS (SELECT 1 FROM ${table} WHERE user_id = ? AND id = ?))`;
+      binds.push(uid, ref.id, uid, ref.id);
+    } else {
+      sql += ` AND EXISTS (SELECT 1 FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL)`;
+      binds.push(uid, ref.id);
+    }
   }
   return { sql, binds };
 }
 
 async function rejectMissingRefs(db: D1Database, uid: string, refs: RefCheck[]): Promise<void> {
+  const lenient = isLegacyRefRequest(db);
   for (const ref of refs) {
     const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
     const row = await db
-      .prepare(`SELECT id FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL`)
+      .prepare(
+        lenient
+          ? `SELECT id FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NOT NULL`
+          : `SELECT id FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL`
+      )
       .bind(uid, ref.id)
       .first();
-    if (!row) {
+    if (lenient ? Boolean(row) : !row) {
       throw new RejectError(`${ref.label}不存在或已刪除，伺服器拒絕此筆異動。`);
     }
   }
@@ -603,14 +622,22 @@ async function rejectMissingRefs(db: D1Database, uid: string, refs: RefCheck[]):
 const ROW_PREFETCH = Symbol('syncRowPrefetch');
 type RowPrefetch = Map<string, Record<string, unknown> | null>;
 
-function withRowPrefetch(db: D1Database, prefetch: RowPrefetch): D1Database {
+const LEGACY_REFS = Symbol('syncLegacyRefs');
+
+function withRowPrefetch(db: D1Database, prefetch: RowPrefetch, legacyRefs = false): D1Database {
   return new Proxy(db, {
     get(target, prop) {
       if (prop === ROW_PREFETCH) return prefetch;
+      if (prop === LEGACY_REFS) return legacyRefs;
       const value = Reflect.get(target, prop, target);
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
+}
+
+/** true for a request from a client that does not order mutations by their references (see refGuardSql) */
+function isLegacyRefRequest(db: D1Database): boolean {
+  return (db as unknown as { [LEGACY_REFS]?: boolean })[LEGACY_REFS] === true;
 }
 
 function getRowPrefetch(db: D1Database): RowPrefetch | undefined {
@@ -887,17 +914,7 @@ async function applyMutationGroup(
  * request: savings_adjustment upserts sharing `payload.transferGroupId` form an implicit group.
  */
 function groupKeyOf(m: SyncMutation): string | null {
-  if (typeof m.atomicGroupId === 'string' && m.atomicGroupId.trim()) return `g:${m.atomicGroupId}`;
-  if (
-    m.entity === 'savings_adjustment' &&
-    m.op === 'upsert' &&
-    m.payload &&
-    typeof m.payload.transferGroupId === 'string' &&
-    m.payload.transferGroupId
-  ) {
-    return `legacy-transfer:${m.payload.transferGroupId}`;
-  }
-  return null;
+  return atomicGroupKeyOf(m);
 }
 
 async function commitAtomicMutation(
@@ -1338,7 +1355,7 @@ async function applySingleMutation(
       { kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' },
       { kind: 'asset', value: v.linkedAccountId, column: 'linked_account_id', label: '連動的活存帳戶' },
     ]);
-    const refGuard = refGuardSql(uid, changedRefs);
+    const refGuard = refGuardSql(db, uid, changedRefs);
 
     const writeStmt = existing
       ? db
@@ -1496,7 +1513,7 @@ async function applySingleMutation(
       { kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' },
       { kind: 'asset', value: v.linkedAccountId, column: 'linked_account_id', label: '連動的活存帳戶' },
     ]);
-    const refGuard = refGuardSql(uid, changedRefs);
+    const refGuard = refGuardSql(db, uid, changedRefs);
 
     const writeStmt = existing
       ? db
@@ -1890,7 +1907,7 @@ async function applySingleMutation(
 
     // M3: only references changed by this write are checked; the guard is part of the write statement
     const changedRefs = collectChangedRefs(existing, [{ kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' }]);
-    const refGuard = refGuardSql(uid, changedRefs);
+    const refGuard = refGuardSql(db, uid, changedRefs);
 
     const writeStmt = existing
       ? db
@@ -2093,7 +2110,7 @@ async function applySingleMutation(
 
     // M3: only references changed by this write are checked; the guard is part of the write statement
     const changedRefs = collectChangedRefs(existing, [{ kind: 'asset', value: v.accountId, column: 'account_id', label: '對應的活存帳戶' }]);
-    const refGuard = refGuardSql(uid, changedRefs);
+    const refGuard = refGuardSql(db, uid, changedRefs);
 
     const writeStmt = existing
       ? db
@@ -2225,7 +2242,7 @@ async function applySingleMutation(
 
     // M3: only references changed by this write are checked; the guard is part of the write statement
     const changedRefs = collectChangedRefs(existing, [{ kind: 'asset', value: v.assetId, column: 'asset_id', label: '對應的持股標的' }]);
-    const refGuard = refGuardSql(uid, changedRefs);
+    const refGuard = refGuardSql(db, uid, changedRefs);
 
     const writeStmt = existing
       ? db
@@ -2819,7 +2836,7 @@ export async function processSyncRequest(
       });
     }
   }
-  db = withRowPrefetch(db, rowPrefetch);
+  db = withRowPrefetch(db, rowPrefetch, req.refsOrdered !== true);
 
   let processedMutations = 0;
   // H5: before starting a unit, make sure its worst case still fits the query budget (and the per-request

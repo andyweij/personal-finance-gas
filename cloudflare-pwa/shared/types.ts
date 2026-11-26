@@ -404,6 +404,12 @@ export interface SyncRequest {
    * "the write path is down". The response then carries writeProbeOk: true.
    */
   writeProbe?: boolean;
+  /**
+   * v1.8.17: the client orders mutations by their references before batching (orderMutationsByDependencies), so
+   * the server applies the strict M3 reference check. Requests without it (v1.8.11 clients) may reference a record
+   * that is still in their outbox; see refGuardSql in worker/sync.ts.
+   */
+  refsOrdered?: boolean;
 }
 
 export interface SyncDelta {

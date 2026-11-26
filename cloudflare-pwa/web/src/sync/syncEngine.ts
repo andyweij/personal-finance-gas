@@ -2881,6 +2881,7 @@ export class SyncEngine {
             sinceSeq: reqSinceSeq,
             clientEpoch: reqClientEpoch,
             mutations: batch,
+            refsOrdered: true,
           }),
         });
 

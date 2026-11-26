@@ -4,6 +4,7 @@
 - **前提**：已套用 migration 0014～0017 並部署；Cloudflare 免費方案；資料量很小（asset_items 56、cashflow_logs 37、recurring_items 25、ledgers 3、networth_history 1）
 - **方式**：唯讀審查，沒有修改產品程式碼。重現測試以新檔放在 `tests/`；仍存在的 bug 用 `it.fails` 標記，整套測試維持通過。
 - **日期**：2026-11-26
+- **後續**：發現 1、發現 2 已在 v1.8.17 修正，見 [`2026-11-26_v1.8.17_changes.md`](./2026-11-26_v1.8.17_changes.md)。下文保留審查當時的描述。
 
 ## 結論
 
@@ -42,11 +43,11 @@ workerd 實測的內容：
 
 本次新增的重現測試：
 - `tests/post-deploy-first-cron.test.ts`：上線路徑的排程模擬，2 項，皆通過。
-- `tests/post-deploy-sync-repro.test.ts`：發現 1，`it.fails` 2 項，另有 1 項記錄根因。
+- `tests/post-deploy-sync-repro.test.ts`：審查時為發現 1 的 `it.fails` 2 項＋1 項根因記錄；v1.8.17 修正後改為一般測試，並加入發現 2 的測試。
 
 ## 發現（依嚴重度排序）
 
-### 發現 1（中，已重現）：轉帳群組早於它參照的新帳戶被處理，整筆轉帳被拒絕並回滾
+### 發現 1（中，已重現；v1.8.17 已修正）：轉帳群組早於它參照的新帳戶被處理，整筆轉帳被拒絕並回滾
 
 **位置**
 - `worker/sync.ts:2847-2862`：在群組**第一個成員**所在的位置，就把整個群組交給 `processGroup`。
@@ -72,10 +73,10 @@ workerd 實測的內容：
 - 或者：伺服器在 `processGroup` 之前，先處理群組成員依賴、但還沒處理的 upsert。
 
 **重現**
-- `tests/post-deploy-sync-repro.test.ts`：有無 `atomicGroupId` 各 1 項 `it.fails`，另有 1 項記錄排序結果 `['adj-out', 'acc-new2', 'adj-in']`。
+- `tests/post-deploy-sync-repro.test.ts`：審查時為有無 `atomicGroupId` 各 1 項 `it.fails`，另有 1 項記錄排序結果 `['adj-out', 'acc-new2', 'adj-in']`（v1.8.17 修正後為 `['acc-new2', 'adj-out', 'adj-in']`）。
 - 端到端：v1.8.11 與 v1.8.16 客戶端（LocalFinanceDB＋SyncEngine）對新伺服器，都得到兩筆 `rolled_back`，伺服器上 savings_adjustments 為 0 筆。見附錄 O2。
 
-### 發現 2（中低，已重現；只影響仍在執行 v1.8.11 JS 的分頁）：子紀錄先送出，被 M3 永久拒絕
+### 發現 2（中低，已重現；只影響仍在執行 v1.8.11 JS 的分頁；v1.8.17 已修正）：子紀錄先送出，被 M3 永久拒絕
 
 **位置**
 - 舊版 `syncEngine.ts` 的 `selectSyncBatch`：嚴格依佇列前綴，沒有依賴排序。
