@@ -192,7 +192,7 @@ function mut(entity: string, recordId: string, payload: Record<string, unknown> 
 }
 
 async function syncOne(db: D1Database, m: SyncRequest['mutations'][number]) {
-  return processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: [m] });
+  return processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: [m] });
 }
 
 const savingsAcc = (name: string) => ({
@@ -349,7 +349,7 @@ describe('v1.8.12 server transfer atomicity (M4)', () => {
       mut('savings_adjustment', 'adj-out', adjPayload('acc-a', -100, 'tg-1')),
       mut('savings_adjustment', 'adj-in', adjPayload('acc-missing', 100, 'tg-1'))
     );
-    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: ms });
+    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: ms });
     expect(res.ackedMutationIds).toEqual([]);
     expect(res.rejected.map((r) => r.mutationId).sort()).toEqual(ms.map((m) => m.mutationId).sort());
     expect(await adjRows(db)).toEqual([]);
@@ -365,7 +365,7 @@ describe('v1.8.12 server transfer atomicity (M4)', () => {
       mut('savings_adjustment', 'adj-out', adjPayload('acc-a', -100, 'tg-2')),
       mut('asset', 'acc-fixed', { ...savingsAcc('定存'), subCategory: '定存', isLinkedSavings: false, quantityOrAmount: 1100 }, { baseVersion: 7 })
     );
-    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: ms });
+    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: ms });
     expect(res.ackedMutationIds).toEqual([]);
     expect(res.conflicts).toEqual([]);
     expect(res.rejected.map((r) => r.mutationId).sort()).toEqual(ms.map((m) => m.mutationId).sort());
@@ -397,7 +397,7 @@ describe('v1.8.12 server transfer atomicity (M4)', () => {
       }
       return realBatch(stmts);
     }) as typeof db.batch;
-    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: ms });
+    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: ms });
     expect(res.ackedMutationIds).toEqual([]);
     expect((await adjRows(db)).map((r) => [r.id, Number(r.amount)])).toEqual([['adj-in', 5]]);
   });
@@ -410,10 +410,10 @@ describe('v1.8.12 server transfer atomicity (M4)', () => {
       mut('savings_adjustment', 'adj-out', adjPayload('acc-a', -100, 'tg-3')),
       mut('savings_adjustment', 'adj-in', adjPayload('acc-b', 100, 'tg-3'))
     );
-    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: ms });
+    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: ms });
     expect(res.rejected).toEqual([]);
     expect(res.ackedMutationIds.sort()).toEqual(ms.map((m) => m.mutationId).sort());
-    const retry = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: ms });
+    const retry = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: ms });
     expect(retry.ackedMutationIds.sort()).toEqual(ms.map((m) => m.mutationId).sort());
     expect((await adjRows(db)).map((r) => [r.id, Number(r.amount)])).toEqual([
       ['adj-in', 100],
@@ -426,9 +426,13 @@ describe('v1.8.12 server transfer atomicity (M4)', () => {
     await seedAccounts(db);
     const ms = [
       mut('savings_adjustment', 'adj-out', adjPayload('acc-a', -100, 'tg-legacy')),
-      mut('savings_adjustment', 'adj-in', adjPayload('acc-missing', 100, 'tg-legacy')),
+      // v1.8.17: a legacy request may reference a record that never existed (still in its outbox), so the
+      // invalid leg points at a soft-deleted account instead
+      mut('savings_adjustment', 'adj-in', adjPayload('acc-gone', 100, 'tg-legacy')),
     ];
-    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: ms });
+    expect((await syncOne(db, mut('asset', 'acc-gone', savingsAcc('acc-gone')))).ackedMutationIds).toHaveLength(1);
+    expect((await syncOne(db, mut('asset', 'acc-gone', undefined, { op: 'delete', baseVersion: 1 }))).ackedMutationIds).toHaveLength(1);
+    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: ms } /* legacy client: no refsOrdered */);
     expect(res.ackedMutationIds).toEqual([]);
     expect(await adjRows(db)).toEqual([]);
   });
@@ -441,13 +445,13 @@ describe('v1.8.12 server transfer atomicity (M4)', () => {
       mut('savings_adjustment', 'adj-out', adjPayload('acc-a', -100, 'tg-4')),
       mut('savings_adjustment', 'adj-in', adjPayload('acc-b', 100, 'tg-4'))
     );
-    await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: create });
+    await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: create });
     const del = grouped(
       'tg-4',
       mut('savings_adjustment', 'adj-out', undefined, { op: 'delete', baseVersion: 1 }),
       mut('savings_adjustment', 'adj-in', undefined, { op: 'delete', baseVersion: 9 }) // stale version
     );
-    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, mutations: del });
+    const res = await processSyncRequest(db, UID, { sinceSeq: 0, clientEpoch: 1, refsOrdered: true, mutations: del });
     expect(res.ackedMutationIds).toEqual([]);
     expect((await adjRows(db)).every((r) => r.deleted_at === null)).toBe(true);
   });
