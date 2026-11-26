@@ -129,8 +129,28 @@ export class LocalFinanceDB {
           outbox.createIndex('clientTimestamp', 'clientTimestamp', { unique: false });
         }
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const opened = req.result;
+        // H3: let another tab delete this database on logout instead of being blocked by our open handle
+        opened.onversionchange = () => {
+          opened.close();
+          if (this.db === opened) this.db = null;
+        };
+        resolve(opened);
+      };
       req.onerror = () => reject(req.error);
+    });
+  }
+
+  /** H3: close and permanently delete this account's local database (used on logout). */
+  async deleteDatabase(): Promise<void> {
+    this.close();
+    await new Promise<void>((resolve, reject) => {
+      const req = indexedDB.deleteDatabase(this.dbName);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+      // Blocked means another tab still holds it open; it will close on versionchange and the delete proceeds
+      req.onblocked = () => undefined;
     });
   }
 

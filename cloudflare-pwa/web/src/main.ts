@@ -44,6 +44,7 @@ import {
   isAnyLockEnabled,
   openAuthScreen,
   openLockScreen,
+  showSecurityNotices,
   openSecurityModal,
   triggerPinKey,
   unlockLockScreenWithFaceId,
@@ -118,6 +119,35 @@ function renderSyncPill(status: SyncStatus): void {
     pill.textContent = status.pendingCount > 0 ? `🔒 需登入 (${status.pendingCount})` : '🔒 請重新登入';
     pill.title = '點擊重新登入以同步';
   }
+}
+
+/**
+ * H3 / M11: While the sign-in or lock screen is open, the app behind it must be neither readable (the overlay
+ * is only a blur) nor reachable by keyboard / screen readers. Watches both overlays' `open` class.
+ */
+function concealAppWhileOverlayOpen(): void {
+  const overlays = ['authScreen', 'lockScreen']
+    .map((id) => document.getElementById(id))
+    .filter((n): n is HTMLElement => Boolean(n));
+  const appParts = Array.from(
+    document.querySelectorAll<HTMLElement>('body > header.topbar, body > main.container, body > nav.bottom-nav')
+  );
+  const apply = () => {
+    const covered = overlays.some((o) => o.classList.contains('open'));
+    document.body.classList.toggle('app-concealed', covered);
+    for (const part of appParts) {
+      if (covered) {
+        part.setAttribute('inert', '');
+        part.setAttribute('aria-hidden', 'true');
+      } else {
+        part.removeAttribute('inert');
+        part.removeAttribute('aria-hidden');
+      }
+    }
+  };
+  const observer = new MutationObserver(apply);
+  for (const o of overlays) observer.observe(o, { attributes: true, attributeFilter: ['class'] });
+  apply();
 }
 
 async function bootstrap(): Promise<void> {
@@ -339,17 +369,12 @@ async function bootstrap(): Promise<void> {
       const msg = data as { type?: string; userId?: string } | null;
       if (!msg) return;
       if (msg.type === 'logout') {
+        // H3: the other tab deletes this account's local data on logout — reload into the clean state
         ctx.engine.haltForAccountMismatch();
+        ctx.engine.destroy();
         ctx.state.authenticated = false;
-        showToast('其他分頁已登出帳號，已停止同步', 'error');
-        openAuthScreen(ctx, 'login', '其他分頁已登出帳號，請重新登入', () => {
-          void fetchAuthStatus().then(async (auth) => {
-            if (auth.authenticated && auth.user) {
-              await ctx.switchAccountDb(auth.user);
-              void ctx.engine.syncNow(true);
-            }
-          });
-        });
+        document.body.classList.add('app-concealed');
+        window.location.reload();
         return;
       }
       if (msg.type !== 'account_changed') return;
@@ -400,6 +425,7 @@ async function bootstrap(): Promise<void> {
   }
 
   bindEvents(ctx);
+  concealAppWhileOverlayOpen();
 
   // 網址帶入邀請碼或密碼重置碼時，直接開啟對應畫面
   if (inviteParam) {
@@ -435,6 +461,7 @@ async function bootstrap(): Promise<void> {
         if (!isAnyLockEnabled(ctx)) {
           closeLockScreen(ctx);
         }
+        showSecurityNotices(auth.securityNotices);
         void ctx.engine.syncNow();
       } else if (!auth.initialized) {
         state.pinEnabled = false;
@@ -447,10 +474,16 @@ async function bootstrap(): Promise<void> {
         updateSecurityButtons(ctx);
         closeLockScreen(ctx);
         openAuthScreen(ctx, 'setup', '', () => void ctx.engine.syncNow(true));
-      } else if (!meta.lastSyncedAt) {
-        // 首次使用無本機快取時要求登入
+      } else {
+        // H3: the server is reachable and says this device is not signed in (logged out or session expired).
+        // Never show the cached ledger without signing in again — offline-first viewing is only for real offline.
         closeLockScreen(ctx);
-        openAuthScreen(ctx, 'login', '', () => void ctx.engine.syncNow(true));
+        openAuthScreen(
+          ctx,
+          'login',
+          meta.lastSyncedAt ? '登入已失效，請重新登入後繼續使用' : '',
+          () => void ctx.engine.syncNow(true)
+        );
       }
     } catch {
       // 離線或伺服器暫時無法連線，維持本機模式運作
@@ -1027,6 +1060,19 @@ function bindEvents(ctx: UiContext): void {
     });
   });
   document.addEventListener('visibilitychange', () => {
+    // M11: lock as soon as the app goes to the background, so the OS app-switcher snapshot shows the lock
+    // screen instead of balances (only when a PIN / Face ID lock is enabled)
+    if (document.visibilityState === 'hidden') {
+      if (
+        isAnyLockEnabled(ctx) &&
+        !el('lockScreen').classList.contains('open') &&
+        !el('authScreen').classList.contains('open')
+      ) {
+        closeModal();
+        openLockScreen(ctx, '已自動鎖定');
+      }
+      return;
+    }
     if (document.visibilityState === 'visible') {
       checkIdle();
       if (navigator.onLine) {

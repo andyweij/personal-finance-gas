@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.10 / D1 Schema `0014`）
+# 資料庫 Schema 設計架構（v1.8.11 / D1 Schema `0015`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（21 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0014_auth_challenge_expiry_index.sql`](../migrations/0014_auth_challenge_expiry_index.sql)  
-> **對應版本**：`APP_VERSION = 1.8.10` / `DB_SCHEMA_VERSION = 0014` / `SW_CACHE_VERSION = finance-pwa-v30`
+> **最新 Migration**：[`0015_security_events.sql`](../migrations/0015_security_events.sql)  
+> **對應版本**：`APP_VERSION = 1.8.11` / `DB_SCHEMA_VERSION = 0015` / `SW_CACHE_VERSION = finance-pwa-v31`
 
 ---
 
@@ -259,7 +259,7 @@ flowchart LR
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0014`）
+## 5. Migration 演進總覽（`0001` → `0015`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -277,6 +277,7 @@ flowchart LR
 | `0012` | `0012_transfer_group.sql` | `savings_adjustments` 新增 `transfer_group_id` 欄位與局部索引，支援帳戶互轉雙向成對撤銷 |
 | `0013` | `0013_sync_cursor_epoch_and_auto_fx.sql` | 新增 `user_sync_state`（單調 `change_seq` 與 `data_epoch`）與 `sync_lww_timestamps`；11 張可同步表加入 `change_seq` 與複合索引；`app_settings` 加入 `auto_fx_enabled`（排程自動匯率開關） |
 | `0014` | `0014_auth_challenge_expiry_index.sql` | `auth_challenges(expires_at)` 索引，避免每次 Passkey options 請求清理過期 challenge 時全表掃描 |
+| `0015` | `0015_security_events.sql` | 新增 `auth_security_events` 稽核表（例如以管理員重置碼重設密碼），成員登入時顯示 30 天內的安全通知 |
 
 ---
 

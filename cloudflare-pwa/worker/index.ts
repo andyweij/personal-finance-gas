@@ -10,6 +10,8 @@ import {
   changeUserPassword,
   checkAndRecordFixedWindowRateLimit,
   checkRateLimit,
+  cleanupExpiredAuthData,
+  listRecentSecurityEvents,
   clearRateLimit,
   configureUserPin,
   constantTimeEqual,
@@ -24,7 +26,6 @@ import {
   listAdminUsers,
   listInvites,
   PasskeyClientError,
-  recordLoginFailure,
   registerWithInviteCode,
   resetPasswordWithCode,
   revokeInviteCode,
@@ -75,6 +76,21 @@ function getClientIp(c: AppContext): string {
     c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
     'local'
   );
+}
+
+/**
+ * H2: Key for IP-based rate limits. An IPv6 client controls a whole /64, so group by that prefix — otherwise
+ * every address in it gets its own counter and the limit is trivial to sidestep.
+ */
+function getRateLimitIp(c: AppContext): string {
+  const ip = getClientIp(c);
+  if (!ip.includes(':')) return ip;
+  const [head, tail = ''] = ip.toLowerCase().split('::');
+  const headParts = head ? head.split(':') : [];
+  const tailParts = tail ? tail.split(':') : [];
+  const fill = ip.includes('::') ? Math.max(0, 8 - headParts.length - tailParts.length) : 0;
+  const groups = [...headParts, ...Array(fill).fill('0'), ...tailParts];
+  return `${groups.slice(0, 4).map((g) => g || '0').join(':')}::/64`;
 }
 
 function getOriginAndRpId(c: AppContext): { origin: string; rpID: string; isHttps: boolean } {
@@ -154,6 +170,37 @@ export function createApp() {
     c.header('Cache-Control', 'no-store');
   });
 
+  // M10: CSRF guard for every state-changing API call. Browsers always send Origin / Sec-Fetch-Site on
+  // cross-site POSTs; reject those, and require a JSON body so a plain HTML form cannot reach the API.
+  app.use('/api/*', async (c, next) => {
+    const method = c.req.method.toUpperCase();
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next();
+    const fetchSite = (c.req.header('sec-fetch-site') || '').toLowerCase();
+    if (fetchSite === 'cross-site') {
+      return c.json({ error: '拒絕跨站請求。' }, 403);
+    }
+    const origin = c.req.header('origin');
+    if (origin) {
+      let sameOrigin = false;
+      try {
+        sameOrigin = new URL(origin).origin === new URL(c.req.url).origin;
+      } catch {
+        sameOrigin = false;
+      }
+      if (!sameOrigin) {
+        return c.json({ error: '拒絕跨站請求。' }, 403);
+      }
+    }
+    const contentLength = Number(c.req.header('content-length') || '0');
+    // A body may arrive chunked without Content-Length, so also look at the request stream itself
+    const hasBody = contentLength > 0 || Boolean(c.req.header('transfer-encoding')) || c.req.raw.body !== null;
+    const contentType = (c.req.header('content-type') || '').toLowerCase();
+    if (hasBody && !contentType.startsWith('application/json')) {
+      return c.json({ error: '請求內容必須為 JSON。' }, 415);
+    }
+    return next();
+  });
+
   // Auth status (public when unauthenticated — NEVER leaks tenant/user/passkey info)
   app.get('/api/auth/status', async (c) => {
     const initialized = await hasAnyUser(c.env.DB);
@@ -186,6 +233,7 @@ export function createApp() {
         publicKey: p.public_key,
         transports: JSON.parse(p.transports || '[]'),
       })),
+      securityNotices: await listRecentSecurityEvents(c.env.DB, user.id),
     });
   });
 
@@ -194,6 +242,11 @@ export function createApp() {
     const alreadyInit = await hasAnyUser(c.env.DB);
     if (alreadyInit) {
       return c.json({ error: '系統已完成初始化，禁止重複設定。' }, 403);
+    }
+    // H2: SETUP_SECRET must not be guessable online before the first admin exists
+    const setupLimit = await checkRateLimit(c.env.DB, `setup:${getRateLimitIp(c)}`, 10);
+    if (setupLimit.blocked) {
+      return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
     }
 
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -232,7 +285,7 @@ export function createApp() {
 
   // One-time invite code registration
   app.post('/api/auth/register-invite', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const rateKey = `reg:${ip}`;
     const limit = await checkRateLimit(c.env.DB, rateKey);
     if (limit.blocked) {
@@ -263,14 +316,13 @@ export function createApp() {
       c.header('Set-Cookie', buildSessionCookie(token, isHttps));
       return c.json({ ok: true, user: toAuthUser(created) });
     } catch (err) {
-      await recordLoginFailure(c.env.DB, rateKey);
       return routeErrorResponse(c, err, '註冊失敗');
     }
   });
 
   // Zero-knowledge one-time password reset (user chooses new password; admin never sees it)
   app.post('/api/auth/reset-password', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const rateKey = `rst:${ip}`;
     const limit = await checkRateLimit(c.env.DB, rateKey);
     if (limit.blocked) {
@@ -292,7 +344,6 @@ export function createApp() {
       await clearRateLimit(c.env.DB, rateKey);
       return c.json({ ok: true, message: '密碼已重設完成，請以新密碼登入。' });
     } catch (err) {
-      await recordLoginFailure(c.env.DB, rateKey);
       return routeErrorResponse(c, err, '重設密碼失敗');
     }
   });
@@ -300,23 +351,24 @@ export function createApp() {
   // Master password login with D1 brute-force rate limit
   app.post('/api/auth/login', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { username?: string; password?: string };
-    const ip = getClientIp(c);
-    const rateKey = body.username ? `${ip}:${String(body.username).trim().toLowerCase()}` : ip;
+    const ip = getRateLimitIp(c);
+    const uname = String(body.username || '').trim().toLowerCase();
+    const rateKey = uname ? `${ip}:${uname}` : ip;
+    // H2: per IP+account, plus a per-account budget across all IPs (bounds distributed guessing)
     const limit = await checkRateLimit(c.env.DB, rateKey);
-    if (limit.blocked) {
-      return c.json(
-        { error: `登入失敗次數過多，請於 ${Math.ceil((limit.retryAfterSec || 900) / 60)} 分鐘後再試。` },
-        429
-      );
+    const userLimit = uname ? await checkRateLimit(c.env.DB, `user:${uname}`, 20) : { blocked: false };
+    if (limit.blocked || userLimit.blocked) {
+      const retry = Math.max(limit.retryAfterSec || 0, userLimit.retryAfterSec || 0) || 900;
+      return c.json({ error: `登入嘗試次數過多，請於 ${Math.ceil(retry / 60)} 分鐘後再試。` }, 429);
     }
 
     const user = await verifyUserPassword(c.env.DB, body.username, String(body.password || ''));
     if (!user) {
-      await recordLoginFailure(c.env.DB, rateKey);
       return c.json({ error: '帳號或主密碼不正確。' }, 401);
     }
 
     await clearRateLimit(c.env.DB, rateKey);
+    if (uname) await clearRateLimit(c.env.DB, `user:${uname}`);
     const token = await createSession(c.env.DB, user.id, c.req.header('user-agent') || 'browser');
     const { isHttps } = getOriginAndRpId(c);
     c.header('Set-Cookie', buildSessionCookie(token, isHttps));
@@ -335,7 +387,7 @@ export function createApp() {
 
   // Discoverable Passkey login (username-less 1-tap Face ID / Touch ID)
   app.post('/api/auth/passkey/login/options', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const limit = await checkAndRecordFixedWindowRateLimit(c.env.DB, `pk_opt:${ip}`, 20, 60_000);
     if (limit.blocked) {
       return c.json({ error: '請求過於頻繁，請稍後再試。' }, 429);
@@ -350,7 +402,7 @@ export function createApp() {
   });
 
   app.post('/api/auth/passkey/login/verify', async (c) => {
-    const ip = getClientIp(c);
+    const ip = getRateLimitIp(c);
     const limit = await checkRateLimit(c.env.DB, `pk:${ip}`);
     if (limit.blocked) {
       return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
@@ -365,7 +417,6 @@ export function createApp() {
       return c.json({ ok: true, user: toAuthUser(user) });
     } catch (err) {
       if (err instanceof PasskeyClientError) {
-        await recordLoginFailure(c.env.DB, `pk:${ip}`);
         return c.json({ error: err.message || 'Passkey 登入失敗' }, 401);
       }
       console.error('[auth] passkey login verify unexpected error:', err);
@@ -429,6 +480,11 @@ export function createApp() {
   app.post('/api/auth/change-password', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
+      // M2: a stolen session must not be able to guess the current password online
+      const limit = await checkRateLimit(c.env.DB, `pwchg:${user.id}`);
+      if (limit.blocked) {
+        return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
+      }
       const body = (await c.req.json().catch(() => ({}))) as {
         currentPassword?: string;
         newPassword?: string;
@@ -440,6 +496,7 @@ export function createApp() {
         String(body.newPassword || ''),
         c.get('tokenHash')
       );
+      await clearRateLimit(c.env.DB, `pwchg:${user.id}`);
       return c.json({ ok: true, message: '主密碼已更新。' });
     } catch (err) {
       return routeErrorResponse(c, err, '變更密碼失敗');
@@ -487,12 +544,18 @@ export function createApp() {
   app.post('/api/auth/pin', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
+      // M2: changing / disabling the PIN checks the current PIN — limit guesses
+      const limit = await checkRateLimit(c.env.DB, `pin:${user.id}`);
+      if (limit.blocked) {
+        return c.json({ error: '嘗試次數過多，請稍後再試。' }, 429);
+      }
       const body = (await c.req.json()) as {
         enable: boolean;
         currentPin?: string;
         newPin?: string;
       };
       const result = await configureUserPin(c.env.DB, user.id, body);
+      await clearRateLimit(c.env.DB, `pin:${user.id}`);
       return c.json({ ok: true, ...result });
     } catch (err) {
       return routeErrorResponse(c, err, 'PIN 設定失敗');
@@ -912,6 +975,13 @@ export default {
     // Q6 / F8: 23:00 Taipei falls inside US regular trading hours (22:30/21:30 – 05:00/04:00 Taipei), so US quotes
     // would be intraday prices. US closes are owned exclusively by the 06:00 run; keep them untouched here so the
     // month-end net-worth snapshot records the last US CLOSE rather than a mid-session price.
+    // M1: daily housekeeping of expired sessions, challenges, rate limits, used codes and old idempotency rows.
+    // Isolated so a failure here never blocks quote refresh or the month-end snapshot.
+    try {
+      await cleanupExpiredAuthData(env.DB);
+    } catch (err) {
+      console.error('[cron] auth data cleanup failed:', err);
+    }
     await refreshMarketData(env.DB, fetch, undefined, { marketScope: 'tw' });
     if (isTaiwanMonthEnd(now)) {
       await runMonthEndSnapshotAllUsersD1(env.DB, now);

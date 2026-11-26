@@ -19,6 +19,7 @@ import { resolveStockModalPriceFields } from '../../../shared/validation';
 import {
   closeModal,
   el,
+  escapeHtml,
   fmtMoney,
   fmtNum,
   fmtRaw,
@@ -1330,15 +1331,15 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
       return;
     }
 
-    const fromLine = `<div>轉出 <strong>${fromAcc.itemName}</strong>：${fmtRaw(fromBefore, fromAcc.currency, ctx.state.masked)} → <strong style="color:${fromAfter < 0 ? 'var(--neg)' : 'var(--text)'}">${fmtRaw(fromAfter, fromAcc.currency, ctx.state.masked)}</strong></div>`;
-    const toLine = `<div>轉入 <strong>${toAcc.itemName}</strong>：${fmtRaw(toBefore, toAcc.currency, ctx.state.masked)} → <strong style="color:var(--pos)">${fmtRaw(toAfter, toAcc.currency, ctx.state.masked)}</strong></div>`;
+    const fromLine = `<div>轉出 <strong>${escapeHtml(fromAcc.itemName)}</strong>：${fmtRaw(fromBefore, fromAcc.currency, ctx.state.masked)} → <strong style="color:${fromAfter < 0 ? 'var(--neg)' : 'var(--text)'}">${fmtRaw(fromAfter, fromAcc.currency, ctx.state.masked)}</strong></div>`;
+    const toLine = `<div>轉入 <strong>${escapeHtml(toAcc.itemName)}</strong>：${fmtRaw(toBefore, toAcc.currency, ctx.state.masked)} → <strong style="color:var(--pos)">${fmtRaw(toAfter, toAcc.currency, ctx.state.masked)}</strong></div>`;
     const feeLine =
       fee > 0
         ? `<div style="color:var(--text-secondary)">含轉帳手續費 ${fmtRaw(fee, fromAcc.currency, ctx.state.masked)}（同步記為流水帳支出）</div>`
         : '';
     const crossLedgerHint =
       getEffectiveLedgerId(fromAcc) !== getEffectiveLedgerId(toAcc)
-        ? `<div style="color:var(--warning)">跨帳本轉帳：${ledgerNameMap.get(getEffectiveLedgerId(fromAcc)) || '主帳本'} → ${ledgerNameMap.get(getEffectiveLedgerId(toAcc)) || '主帳本'}</div>`
+        ? `<div style="color:var(--warning)">跨帳本轉帳：${escapeHtml(ledgerNameMap.get(getEffectiveLedgerId(fromAcc)) || '主帳本')} → ${escapeHtml(ledgerNameMap.get(getEffectiveLedgerId(toAcc)) || '主帳本')}</div>`
         : '';
     const twdHint =
       !hasAmt
@@ -1577,7 +1578,7 @@ export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
       : `剩餘約 ${loan.remainingPeriods} 期${loan.estimatedPayoffYm ? `（預計 ${loan.estimatedPayoffYm} 清償）` : ''}`;
   banner.innerHTML =
     `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span>截至今日預估餘額</span><strong class="tnum" style="font-size:17px;color:var(--neg)">${fmtMoney(loan.currentBalanceTwd, ctx.state.masked)}</strong></div>` +
-    `<div class="tnum">年利率 ${item.loanAnnualRate ?? 0}% · 月付 ${fmtRaw(item.loanMonthlyPayment || 0, item.currency, ctx.state.masked)} · 每月 ${item.loanBillingDay || 1} 號扣款<br/>基準單據 ${fmtRaw(loan.baseBalance, item.currency, ctx.state.masked)} (${item.balanceAnchorDate || '-'}) · 已推算 ${loan.elapsedPeriods} 期 · ${remainText}</div>`;
+    `<div class="tnum">年利率 ${escapeHtml(item.loanAnnualRate ?? 0)}% · 月付 ${fmtRaw(item.loanMonthlyPayment || 0, item.currency, ctx.state.masked)} · 每月 ${escapeHtml(item.loanBillingDay || 1)} 號扣款<br/>基準單據 ${fmtRaw(loan.baseBalance, item.currency, ctx.state.masked)} (${escapeHtml(item.balanceAnchorDate || '-')}) · 已推算 ${loan.elapsedPeriods} 期 · ${remainText}</div>`;
   body.appendChild(banner);
 
   let showAll = false;

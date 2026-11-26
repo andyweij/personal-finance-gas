@@ -2,13 +2,14 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.10';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.11';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
-export const DB_SCHEMA_VERSION = '0014';
-export const SW_CACHE_VERSION = 'finance-pwa-v30';
+export const DB_SCHEMA_VERSION = '0015';
+export const SW_CACHE_VERSION = 'finance-pwa-v31';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.8.11：安全性強化（修正帳戶互轉預覽的 XSS；加入 CSP 等安全標頭與跨站請求檢查；登出時刪除本機帳本資料，伺服器回報未登入時必須重新登入才能檢視；登入、初始化、變更密碼與 PIN 改為原子限速並依 IPv6 /64 計算；離線 Face ID 驗證改為驗不過就拒絕；切到背景自動上鎖、PIN 錯誤次數限制、鎖定時隱藏背後內容；管理員重置碼重設密碼會留下稽核紀錄、通知成員並清除 Passkey 與 PIN；Session 自登入起 90 天強制過期並每日清理過期資料）',
   'v1.8.10：完成剩餘低優先審查項目（R6 編輯遭拒時同一筆的後續編輯暫停送出並列入清單，避免把遭拒內容寫上雲端；多分頁以快照版本號偵測其他分頁的寫入並自動重載重算，不再互相覆蓋；PIN 與生物辨識設定改為獨立欄位更新，同步不會還原其他分頁的變更；無 Web Locks 時的同步鎖改為寫入後確認，拿不到鎖就稍後重試；不支援 BroadcastChannel 的瀏覽器改用 storage 事件跨分頁通知；切換帳號時中止進行中的同步；所有需登入的寫入端點檢查 X-Expected-User；同步請求以串流方式限制大小；Yahoo 昨收補查需與現價同一交易日；水電租金設定配置同步序號；合併匯入只計入實際寫入的筆數）',
   'v1.8.9：修復 v1.8.7 審查項目（V1 伺服器只有寫入路徑故障時改以「另一筆紀錄單獨寫入成功」作為健康證據，絕不把正常待上傳異動誤判為毒丸；V2 同步批次改為佇列嚴格前綴且 rebase 保留原排序，刪除帳本並搬移紀錄不再被拒；V3 重新套用時因雲端已有較新版本而略過的還原前編輯改列入清單供檢視；V4 請求途中雲端還原時，舊版異動一律凍結而非依還原後資料拒絕；R-1 IndexedDB 交易例外不再卡死同步鎖；另含完整重抓多次還原重試、自動入帳 epoch 防護、舊版凍結項目時間比對、狀態膠囊同時顯示待同步數、路由錯誤脫敏、水電期別鍵值檢查、收盤競價後改用 Yahoo 收盤價，以及 auth_challenges 過期索引）',
   'v1.8.8：修復 v1.8.6 審查第二組行情與報價同步項目（Q6/F8 台北 23:00 排程改為僅更新台股與匯率，避免美股盤中價覆寫收盤價或寫入月底淨值快照；Q7/F7 排程與手動行情更新不再遞增 asset_items.version，改以 change_seq 驅動拉取，消除報價更新後離線編輯成本／備註的假衝突；Q8/F5 僅在「更換為另一非空代號且為自動更新」時清空舊報價，清空代號保留既有價格，並支援針對單一資產即時補抓報價與顯示「報價待更新」，新建／復活自動更新資產無價格時統一預設 0）',

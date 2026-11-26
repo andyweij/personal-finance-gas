@@ -9,7 +9,7 @@ import {
   nextUtilityPeriodCode,
   type ChainedUtilityRecord,
 } from '../../../shared/rentUtility';
-import { downloadTextFile, el, showToast } from './helpers';
+import { downloadTextFile, el, escapeHtml, showToast } from './helpers';
 import { getTodayYmd } from './logTab';
 import type { UiContext } from './state';
 
@@ -235,7 +235,7 @@ export function recalculateUtility(ctx: UiContext): void {
       const card = document.createElement('div');
       card.className = 'ut-res-card f5';
       card.innerHTML = `
-        <div class="ut-res-who"><span>🚪 ${rm.name}</span><span class="badge">${utFmt(rm.kwh)} 度</span></div>
+        <div class="ut-res-who"><span>🚪 ${escapeHtml(rm.name)}</span><span class="badge">${utFmt(rm.kwh)} 度</span></div>
         <div class="ut-res-amt">${utDollar(rounded, masked)}</div>
         <div class="ut-res-exact">精確：${utDollar(rm.total, masked, 2)}（四捨五入）</div>
         <ul class="ut-res-ul">

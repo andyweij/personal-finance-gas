@@ -458,6 +458,16 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * H3: stop syncing and permanently delete this account's local data (logout on a possibly shared device).
+   * Waits for queued local operations first so nothing writes to the database while it is being deleted.
+   */
+  async wipeLocalData(): Promise<void> {
+    this.destroy();
+    await this.stateChain.catch(() => undefined);
+    await this.db.deleteDatabase();
+  }
+
   async init(): Promise<void> {
     await this.db.open();
     await this.runSerialized(async () => {

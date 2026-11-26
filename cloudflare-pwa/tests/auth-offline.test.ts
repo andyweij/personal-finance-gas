@@ -117,6 +117,33 @@ describe('Offline WebAuthn Face ID / Passkey assertion verification', () => {
     expect(ok).toBe(true);
   });
 
+  it('M11: fails closed when the cached passkey has no public key or a key type that cannot be verified', async () => {
+    const challenge = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
+    const { cachedPasskey, assertion } = await createSignedAssertion({
+      rpId,
+      origin,
+      challenge,
+      flags: 0x05,
+      credentialId: 'cred-ios-faceid-1',
+    });
+    const verify = (pk: CachedPasskey) =>
+      verifyOfflineWebAuthnAssertion({
+        assertion,
+        expectedChallenge: challenge,
+        expectedOrigin: origin,
+        expectedRpId: rpId,
+        cachedPasskeys: [pk],
+      });
+
+    // Missing public key: flags and rpId alone must not unlock
+    expect(await verify({ ...cachedPasskey, publicKey: '' })).toBe(false);
+    // RS256 COSE key (kty=3, alg=-257): not verifiable offline → rejected instead of skipped
+    const rsaCose = new Uint8Array([0xa2, 0x01, 0x03, 0x03, 0x39, 0x01, 0x00]);
+    expect(await verify({ ...cachedPasskey, publicKey: base64UrlEncode(rsaCose) })).toBe(false);
+    // The genuine ES256 key still works
+    expect(await verify(cachedPasskey)).toBe(true);
+  });
+
   it('rejects assertion if User Verified (Face ID / UV bit) flag is missing', async () => {
     const challenge = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
     const { cachedPasskey, assertion } = await createSignedAssertion({

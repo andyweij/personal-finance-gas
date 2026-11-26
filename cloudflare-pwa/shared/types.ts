@@ -539,5 +539,7 @@ export interface AuthStatusResponse {
   pinHash?: string | null;
   passkeyCount?: number;
   passkeys?: CachedPasskeyDto[];
+  /** H1: security events of the last 30 days (e.g. password reset with an admin-issued code) */
+  securityNotices?: Array<{ id: string; kind: string; createdAt: string; actorDisplayName: string | null }>;
 }
 

@@ -221,21 +221,15 @@ export async function verifyOfflineWebAuthnAssertion(params: {
   const userVerified = (flags & 0x04) !== 0;
   if (!userPresent || !userVerified) return false;
 
-  // 3. Cryptographic ES256 signature verification
-  if (matched.publicKey) {
-    const clientDataBuf = new Uint8Array(new ArrayBuffer(assertion.clientDataJSON.length));
-    clientDataBuf.set(assertion.clientDataJSON);
-    const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', clientDataBuf));
-    const sigCheck = await verifyEs256Signature(
-      matched.publicKey,
-      authData,
-      clientDataHash,
-      assertion.signature
-    );
-    if (sigCheck === false) return false;
-  }
-
-  return true;
+  // 3. Cryptographic ES256 signature verification — fail closed (M11). Without a cached public key, or for a
+  // key type this verifier cannot check (null), the assertion is NOT accepted: flags and rpId alone can be
+  // forged by anyone who can call this code. Such passkeys unlock offline with the PIN instead.
+  if (!matched.publicKey) return false;
+  const clientDataBuf = new Uint8Array(new ArrayBuffer(assertion.clientDataJSON.length));
+  clientDataBuf.set(assertion.clientDataJSON);
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', clientDataBuf));
+  const sigCheck = await verifyEs256Signature(matched.publicKey, authData, clientDataHash, assertion.signature);
+  return sigCheck === true;
 }
 
 /**

@@ -15,7 +15,11 @@ import type { InviteRow, PasskeyRow, UserRow } from './types';
 
 export const DEFAULT_OWNER_ID = 'owner';
 export const SESSION_COOKIE_NAME = 'pf_session';
-const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days of inactivity
+/** M1: hard cap from sign-in, however often the session is used (a stolen cookie cannot live forever) */
+const SESSION_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+/** M1: extend the sliding expiry at most once per this interval instead of writing on every request */
+const SESSION_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const PBKDF2_ITERATIONS = 100_000;
 const MAX_LOGIN_FAILS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
@@ -186,11 +190,13 @@ export async function verifySessionCookie(
   const tokenHash = await sha256Hex(token);
   const nowIso = new Date().toISOString();
   const row = await db
-    .prepare('SELECT token_hash, user_id, expires_at FROM auth_sessions WHERE token_hash = ?')
+    .prepare('SELECT token_hash, user_id, expires_at, created_at, last_seen_at FROM auth_sessions WHERE token_hash = ?')
     .bind(tokenHash)
-    .first<{ token_hash: string; user_id: string; expires_at: string }>();
+    .first<{ token_hash: string; user_id: string; expires_at: string; created_at: string; last_seen_at: string }>();
 
-  if (!row || row.expires_at <= nowIso) {
+  const absoluteExpired =
+    row && Number.isFinite(Date.parse(row.created_at)) && Date.parse(row.created_at) + SESSION_MAX_AGE_MS <= Date.now();
+  if (!row || row.expires_at <= nowIso || absoluteExpired) {
     if (row) {
       await db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').bind(tokenHash).run();
     }
@@ -203,14 +209,41 @@ export async function verifySessionCookie(
     return { valid: false };
   }
 
-  // Sliding refresh
-  const nextExpires = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
-  await db
-    .prepare('UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?')
-    .bind(nowIso, nextExpires, tokenHash)
-    .run();
+  // Sliding refresh — M1: at most once a day (not a D1 write on every request), never past the absolute cap
+  const lastSeenMs = Date.parse(row.last_seen_at);
+  if (!Number.isFinite(lastSeenMs) || Date.now() - lastSeenMs >= SESSION_REFRESH_INTERVAL_MS) {
+    const createdMs = Date.parse(row.created_at);
+    const cap = Number.isFinite(createdMs) ? createdMs + SESSION_MAX_AGE_MS : Infinity;
+    const nextExpires = new Date(Math.min(Date.now() + SESSION_TTL_SECONDS * 1000, cap)).toISOString();
+    await db
+      .prepare('UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?')
+      .bind(nowIso, nextExpires, tokenHash)
+      .run();
+  }
 
   return { valid: true, tokenHash, user };
+}
+
+/**
+ * M1: delete rows that can never be used again, so auth / sync bookkeeping tables do not grow forever.
+ * Run once a day from the scheduled handler.
+ */
+export async function cleanupExpiredAuthData(db: D1Database): Promise<void> {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const day = 24 * 60 * 60 * 1000;
+  const iso = (ms: number) => new Date(ms).toISOString();
+  await db.batch([
+    db.prepare('DELETE FROM auth_sessions WHERE expires_at <= ? OR created_at <= ?').bind(nowIso, iso(now - SESSION_MAX_AGE_MS)),
+    db.prepare('DELETE FROM auth_challenges WHERE expires_at <= ?').bind(nowIso),
+    // Rate-limit windows are at most 15 minutes; a day-old row is stale
+    db.prepare('DELETE FROM auth_rate_limits WHERE updated_at <= ?').bind(iso(now - day)),
+    db.prepare('DELETE FROM auth_invites WHERE (used_at IS NOT NULL OR expires_at <= ?) AND created_at <= ?').bind(nowIso, iso(now - 30 * day)),
+    db.prepare('DELETE FROM auth_password_resets WHERE (used_at IS NOT NULL OR expires_at <= ?) AND created_at <= ?').bind(nowIso, iso(now - 30 * day)),
+    // Client retries of a mutation happen within minutes/hours; 30 days of idempotency history is ample
+    db.prepare('DELETE FROM sync_idempotency WHERE applied_at <= ?').bind(iso(now - 30 * day)),
+    db.prepare('DELETE FROM auth_security_events WHERE created_at <= ?').bind(iso(now - 365 * day)),
+  ]);
 }
 
 export async function revokeAllUserSessions(db: D1Database, userId: string): Promise<void> {
@@ -233,51 +266,43 @@ export async function revokeSession(
   await db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').bind(tokenHash).run();
 }
 
+/**
+ * H2: Atomically count one attempt for `key` BEFORE the credential is checked, and report whether the key is
+ * over its budget. A single INSERT … ON CONFLICT … RETURNING statement, so parallel requests can never all
+ * pass a check that was read before any of them recorded anything. A successful attempt calls
+ * clearRateLimit(). The window starts at the first attempt (stored in updated_at).
+ */
 export async function checkRateLimit(
   db: D1Database,
-  ipKey: string
+  key: string,
+  maxAttempts = MAX_LOGIN_FAILS,
+  windowMs = LOCKOUT_MS
 ): Promise<{ blocked: boolean; retryAfterSec?: number }> {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const windowStartIso = new Date(nowMs - windowMs).toISOString();
   const row = await db
-    .prepare('SELECT fail_count, locked_until FROM auth_rate_limits WHERE ip_key = ?')
-    .bind(ipKey)
-    .first<{ fail_count: number; locked_until: string | null }>();
-
-  if (!row || !row.locked_until) {
-    return { blocked: false };
-  }
-  const lockedMs = Date.parse(row.locked_until);
-  if (lockedMs > Date.now()) {
-    return { blocked: true, retryAfterSec: Math.ceil((lockedMs - Date.now()) / 1000) };
+    .prepare(
+      `INSERT INTO auth_rate_limits (ip_key, fail_count, locked_until, updated_at)
+       VALUES (?, 1, NULL, ?)
+       ON CONFLICT(ip_key) DO UPDATE SET
+         fail_count = CASE WHEN auth_rate_limits.updated_at <= ? THEN 1 ELSE auth_rate_limits.fail_count + 1 END,
+         updated_at = CASE WHEN auth_rate_limits.updated_at <= ? THEN excluded.updated_at ELSE auth_rate_limits.updated_at END
+       RETURNING fail_count, updated_at`
+    )
+    .bind(key, nowIso, windowStartIso, windowStartIso)
+    .first<{ fail_count: number; updated_at: string }>();
+  const count = Number(row?.fail_count ?? 1);
+  if (count > maxAttempts) {
+    const windowEnd = Date.parse(String(row?.updated_at || nowIso)) + windowMs;
+    return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((windowEnd - nowMs) / 1000)) };
   }
   return { blocked: false };
 }
 
-export async function recordLoginFailure(db: D1Database, ipKey: string): Promise<void> {
-  const nowIso = new Date().toISOString();
-  const row = await db
-    .prepare('SELECT fail_count, locked_until FROM auth_rate_limits WHERE ip_key = ?')
-    .bind(ipKey)
-    .first<{ fail_count: number; locked_until: string | null }>();
-
-  let nextFails = 1;
-  if (row) {
-    const expired = row.locked_until && Date.parse(row.locked_until) <= Date.now();
-    nextFails = expired ? 1 : row.fail_count + 1;
-  }
-  const lockedUntil =
-    nextFails >= MAX_LOGIN_FAILS ? new Date(Date.now() + LOCKOUT_MS).toISOString() : null;
-
-  await db
-    .prepare(
-      `INSERT INTO auth_rate_limits (ip_key, fail_count, locked_until, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(ip_key) DO UPDATE SET
-         fail_count = excluded.fail_count,
-         locked_until = excluded.locked_until,
-         updated_at = excluded.updated_at`
-    )
-    .bind(ipKey, nextFails, lockedUntil, nowIso)
-    .run();
+/** @deprecated attempts are now counted atomically by checkRateLimit(); kept as a no-op for callers. */
+export async function recordLoginFailure(_db: D1Database, _key: string): Promise<void> {
+  return;
 }
 
 export async function clearRateLimit(db: D1Database, ipKey: string): Promise<void> {
@@ -329,7 +354,12 @@ export async function verifyUserPassword(
     }
   }
 
-  if (!user || user.is_active !== 1) return null;
+  if (!user || user.is_active !== 1) {
+    // H2: spend the same PBKDF2 time for unknown / inactive users so response timing does not reveal
+    // which usernames exist
+    await hashSecretPbkdf2(String(password || ''), '00000000000000000000000000000000');
+    return null;
+  }
   const computed = await hashSecretPbkdf2(String(password || ''), user.password_salt);
   if (!constantTimeEqual(computed, user.password_hash)) return null;
 
@@ -648,31 +678,70 @@ export async function resetPasswordWithCode(
   const tokenHash = await sha256Hex(normalizedReset);
   const nowIso = new Date().toISOString();
 
-  const claimRes = await db
+  const claimed = await db
     .prepare(
       `UPDATE auth_password_resets
        SET used_at = ?
-       WHERE target_user_id = ? AND token_hash = ? AND used_at IS NULL AND expires_at > ?`
+       WHERE target_user_id = ? AND token_hash = ? AND used_at IS NULL AND expires_at > ?
+       RETURNING created_by`
     )
     .bind(nowIso, user.id, tokenHash, nowIso)
-    .run();
+    .first<{ created_by: string | null }>();
 
-  if ((claimRes.meta?.changes ?? 0) !== 1) {
+  if (!claimed) {
     throw new Error('帳號或重置碼無效、已過期或已被使用。');
   }
 
   const salt = generateRandomHex(16);
   const hash = await hashSecretPbkdf2(cleanedPwd, salt);
 
-  await db
-    .prepare('UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?')
-    .bind(hash, salt, nowIso, user.id)
-    .run();
+  // H1: a reset code is created by an admin, who could use it themselves. Make that visible and evicting:
+  // - record an audit event (shown to the member on every sign-in for 30 days),
+  // - remove the member's passkeys and PIN, so a passkey registered by whoever used the code stops working
+  //   and the member notices their own passkey no longer signs them in.
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE users SET password_hash = ?, password_salt = ?, pin_enabled = 0, pin_hash = NULL, pin_salt = NULL,
+           updated_at = ? WHERE id = ?`
+      )
+      .bind(hash, salt, nowIso, user.id),
+    db.prepare('DELETE FROM auth_passkeys WHERE user_id = ?').bind(user.id),
+    db
+      .prepare(
+        `INSERT INTO auth_security_events (id, user_id, kind, actor_user_id, created_at)
+         VALUES (?, ?, 'password_reset_with_admin_code', ?, ?)`
+      )
+      .bind(crypto.randomUUID(), user.id, claimed.created_by, nowIso),
+  ]);
 
   // Immediately revoke all existing sessions for security
   await revokeAllUserSessions(db, user.id);
 
   return { userId: user.id, username: user.username };
+}
+
+/** H1: recent security events for a user (last 30 days), with the actor's display name. */
+export async function listRecentSecurityEvents(
+  db: D1Database,
+  userId: string
+): Promise<Array<{ id: string; kind: string; createdAt: string; actorDisplayName: string | null }>> {
+  const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const rows = await db
+    .prepare(
+      `SELECT e.id, e.kind, e.created_at, u.display_name AS actor_display_name
+       FROM auth_security_events e LEFT JOIN users u ON u.id = e.actor_user_id
+       WHERE e.user_id = ? AND e.created_at > ?
+       ORDER BY e.created_at DESC LIMIT 10`
+    )
+    .bind(userId, since)
+    .all<{ id: string; kind: string; created_at: string; actor_display_name: string | null }>();
+  return rows.results.map((r) => ({
+    id: r.id,
+    kind: r.kind,
+    createdAt: r.created_at,
+    actorDisplayName: r.actor_display_name,
+  }));
 }
 
 /* ==================== Admin User Management (Metadata Only) ==================== */
