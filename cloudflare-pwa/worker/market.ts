@@ -734,7 +734,7 @@ export async function refreshMarketData(
         .prepare(
           `SELECT user_id, id, ticker, sub_category, currency FROM asset_items
            WHERE user_id = ? AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL
-           ORDER BY price_updated_at IS NOT NULL, price_updated_at ASC, rowid ASC`
+           ORDER BY quote_checked_at IS NOT NULL, quote_checked_at ASC, rowid ASC`
         )
         .bind(targetUserId)
         .all<{ user_id: string; id: string; ticker: string; sub_category?: string; currency?: string }>()
@@ -743,7 +743,7 @@ export async function refreshMarketData(
           `SELECT user_id, id, ticker, sub_category, currency FROM asset_items
            WHERE user_id IN (SELECT id FROM users WHERE is_active = 1)
              AND update_mode = '自動更新' AND ticker != '' AND deleted_at IS NULL
-           ORDER BY price_updated_at IS NOT NULL, price_updated_at ASC, rowid ASC`
+           ORDER BY quote_checked_at IS NOT NULL, quote_checked_at ASC, rowid ASC`
         )
         .all<{ user_id: string; id: string; ticker: string; sub_category?: string; currency?: string }>();
 
@@ -753,6 +753,7 @@ export async function refreshMarketData(
   const failedTickers: string[] = [];
   let deferredCount = 0;
   let stopped = false;
+  const attempted = new Map<string, string[]>(); // user_id -> asset ids looked up in this run
 
   for (const item of autoAssets.results) {
     if (stopped) {
@@ -788,6 +789,8 @@ export async function refreshMarketData(
       quote = await fetchStockQuote(item.ticker, fetchImpl, hint);
       quoteCache.set(cacheKey, quote);
     }
+
+    attempted.set(item.user_id, [...(attempted.get(item.user_id) || []), item.id]);
 
     if (quote !== null) {
       if (opts?.shouldStop?.()) {
@@ -835,6 +838,29 @@ export async function refreshMarketData(
       });
     } else {
       failedTickers.push(item.ticker);
+    }
+  }
+
+  // v1.8.13 review: stamp every attempted asset (success or failure) in ONE batch so the next run starts with the
+  // ones not tried for the longest time
+  if (attempted.size > 0) {
+    const stamps: D1PreparedStatement[] = [];
+    for (const [uid, ids] of attempted) {
+      for (let i = 0; i < ids.length; i += 90) {
+        const chunk = ids.slice(i, i + 90);
+        stamps.push(
+          db
+            .prepare(
+              `UPDATE asset_items SET quote_checked_at = ? WHERE user_id = ? AND id IN (${chunk.map(() => '?').join(', ')})`
+            )
+            .bind(nowIso, uid, ...chunk)
+        );
+      }
+    }
+    try {
+      await db.batch(stamps);
+    } catch (err) {
+      console.error('[market] quote rotation stamp failed:', err);
     }
   }
 

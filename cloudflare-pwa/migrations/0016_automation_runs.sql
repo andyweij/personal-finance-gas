@@ -25,3 +25,9 @@ INSERT OR IGNORE INTO automation_runs (user_id, kind, period, status, detail, up
 SELECT n.user_id, 'snapshot', n.year_month, 'done', 'baseline (migration 0016)', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 FROM networth_history n
 WHERE n.year_month <= strftime('%Y-%m', 'now', '+8 hours', 'start of month', '-1 day');
+
+-- v1.8.13 review: quote refresh rotation. Every quote ATTEMPT (success or failure) stamps the asset, and the
+-- refresh processes the least recently ATTEMPTED assets first — so permanently failing tickers rotate to the back
+-- instead of starving healthy ones when the per-invocation subrequest budget only covers part of the list.
+-- Server-only bookkeeping: never synced, never bumps change_seq / version.
+ALTER TABLE asset_items ADD COLUMN quote_checked_at TEXT;

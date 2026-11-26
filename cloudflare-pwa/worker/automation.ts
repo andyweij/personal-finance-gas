@@ -5,6 +5,8 @@ import { createBudgetedFetch, refreshMarketData, type FetchLike } from './market
 import { cleanupExpiredAuthData } from './auth';
 import {
   computeAssetEffectiveTwdValue,
+  computeAssetTwdValue,
+  computeSavingsAccountSummary,
   computeSinkingMonthlyReserve,
   getEffectiveLedgerId,
   isAssetIncludedInNetWorth,
@@ -67,7 +69,13 @@ export async function runMonthlyRecurringD1(
   userId: string,
   targetYear?: number,
   targetMonth?: number,
-  opts: { shouldStop?: () => boolean } = {}
+  opts: {
+    shouldStop?: () => boolean;
+    /** v1.8.13 review: catch-up after the 1st only posts items created before this local date (YYYY-MM-DD) */
+    itemsCreatedBeforeYmd?: string;
+    /** v1.8.13 review: a soft-deleted entry of this month counts as posted (scheduled runs never resurrect it) */
+    keepDeletedEntries?: boolean;
+  } = {}
 ): Promise<{
   yearMonth: string;
   insertedCount: number;
@@ -113,7 +121,7 @@ export async function runMonthlyRecurringD1(
     .prepare(
       `SELECT type, item_name, amount, currency, recurring_dedup_key, ledger_id
        FROM cashflow_logs
-       WHERE user_id = ? AND year_month = ? AND source = '自動入帳' AND deleted_at IS NULL`
+       WHERE user_id = ? AND year_month = ? AND source = '自動入帳'${opts.keepDeletedEntries ? '' : ' AND deleted_at IS NULL'}`
     )
     .bind(uid, yearMonth)
     .all<{
@@ -170,7 +178,10 @@ export async function runMonthlyRecurringD1(
       item.item_name &&
       item.type &&
       item.amount > 0 &&
-      shouldPostRecurringItem(item.cycle, item.billing_spec, year, month)
+      shouldPostRecurringItem(item.cycle, item.billing_spec, year, month) &&
+      (!opts.itemsCreatedBeforeYmd ||
+        getTaiwanDateParts(new Date(String((item as { created_at?: string }).created_at || '1970-01-01T00:00:00.000Z'))).ymd <
+          opts.itemsCreatedBeforeYmd)
   );
   const legacyCovered = new Set<string>();
   const legacyKeyOf = (item: (typeof dueItems)[number]) =>
@@ -333,7 +344,7 @@ export async function runMonthEndSnapshotD1(
 
   for (const item of full.assetItems) {
     if (!isAssetIncludedInNetWorth(item, full.ledgers)) continue;
-    const twdValue = computeAssetEffectiveTwdValue(
+    let twdValue = computeAssetEffectiveTwdValue(
       item,
       full.settings.usdTwdRate,
       full.cashflowLogs,
@@ -341,6 +352,23 @@ export async function runMonthEndSnapshotD1(
       full.stockTransactions,
       parts.ymd
     );
+    if (item.isLinkedSavings && item.balanceAnchorDate && item.balanceAnchorDate > parts.ymd) {
+      // v1.8.13 review: the savings anchor was reset AFTER the snapshot date (e.g. a missed snapshot caught up
+      // later). The anchor amount already includes the entries between the snapshot date and the anchor — back
+      // them out so the snapshot shows the balance as of its own date.
+      const rate = full.settings.usdTwdRate;
+      const logs = exported.cashflowLogs;
+      const adjs = exported.savingsAdjustments || [];
+      const afterSnapshot = computeSavingsAccountSummary(
+        { ...item, quantityOrAmount: 0, balanceAnchorDate: parts.ymd, balanceAnchorAt: '9999-12-31T23:59:59.999Z' },
+        logs,
+        adjs,
+        rate
+      ).currentBalanceTwd;
+      const afterAnchor = computeSavingsAccountSummary({ ...item, quantityOrAmount: 0 }, logs, adjs, rate)
+        .currentBalanceTwd;
+      twdValue = computeAssetTwdValue(item, rate) - (afterSnapshot - afterAnchor);
+    }
     if (twdValue === 0) continue;
     if (item.majorType === '資產') {
       totalAssets += twdValue;
@@ -472,6 +500,8 @@ export async function runMonthEndSnapshotAllUsersD1(
 
 /** H6: D1 queries kept free at the end of a scheduled invocation (bookkeeping writes). */
 const SCHEDULED_D1_RESERVE = 4;
+/** H6: D1 queries one month-end snapshot uses (baseline + delta read + existing check + write + run mark). */
+const SNAPSHOT_QUERIES_PER_USER = 5;
 
 async function markAutomationRun(
   db: D1Database,
@@ -545,8 +575,21 @@ export async function runScheduledAutomation(
   const currentPeriod = today.yearMonth;
   const lastPeriod = previousYearMonth(currentPeriod);
 
+  // v1.8.13 review: on the month-end run, keep enough D1 budget for every user's snapshot (it needs today's closes,
+  // so it runs after the quotes, but the quotes must not use up the budget)
+  const monthEndRun = cron !== '0 0 1 * *' && cron !== '0 22 * * *' && isTaiwanMonthEnd(now);
+  let snapshotReserve = 0;
+  if (monthEndRun) {
+    const n = await db
+      .prepare('SELECT COUNT(*) AS n FROM users WHERE is_active = 1')
+      .first<{ n: number }>()
+      .catch(() => null);
+    // + the housekeeping step and the per-user stop margin used by the snapshot loop
+    snapshotReserve = Number(n?.n ?? 0) * SNAPSHOT_QUERIES_PER_USER + 6;
+  }
+
   await step('catch-up', async () => {
-    if (shouldStop(3)) return 'skipped: budget';
+    if (shouldStop(3 + snapshotReserve)) return 'skipped: budget';
     const users = await db
       .prepare('SELECT id, created_at FROM users WHERE is_active = 1 ORDER BY id')
       .all<{ id: string; created_at: string }>();
@@ -560,7 +603,7 @@ export async function runScheduledAutomation(
       const joined = getTaiwanDateParts(new Date(u.created_at || now.toISOString()));
       // last month's snapshot (only for accounts that existed during that month)
       if (joined.yearMonth <= lastPeriod && !done.has(`${u.id}|snapshot|${lastPeriod}`)) {
-        if (shouldStop(4)) break;
+        if (shouldStop(4 + snapshotReserve)) break;
         try {
           await runMonthEndSnapshotD1(db, u.id, lastDayOfPreviousMonth(currentPeriod));
           await markAutomationRun(db, u.id, 'snapshot', lastPeriod, 'done', 'catch-up');
@@ -572,9 +615,14 @@ export async function runScheduledAutomation(
       }
       // this month's recurring posting (only for accounts that existed before the month started)
       if (joined.yearMonth < currentPeriod && !done.has(`${u.id}|recurring|${currentPeriod}`)) {
-        if (shouldStop(8)) break;
+        if (shouldStop(8 + snapshotReserve)) break;
         try {
-          const res = await runMonthlyRecurringD1(db, u.id, today.year, today.month, { shouldStop: () => shouldStop(2) });
+          const res = await runMonthlyRecurringD1(db, u.id, today.year, today.month, {
+            shouldStop: () => shouldStop(2 + snapshotReserve),
+            // on the 1st this is the regular posting; later it only catches up what the 1st would have posted
+            ...(today.day > 1 ? { itemsCreatedBeforeYmd: `${currentPeriod}-01` } : {}),
+            keepDeletedEntries: true,
+          });
           await markAutomationRun(
             db,
             u.id,
@@ -607,17 +655,17 @@ export async function runScheduledAutomation(
     const res = await refreshMarketData(db, fetchBudget.fetch, undefined, {
       marketScope: isDaily ? 'tw' : 'us',
       fetchBudget,
-      shouldStop: () => shouldStop(2),
+      shouldStop: () => shouldStop(2 + snapshotReserve),
     });
     return `updated ${res.updatedTickers.length}, failed ${res.failedTickers.length}, deferred ${res.deferredCount ?? 0}`;
   });
 
-  if (isDaily && isTaiwanMonthEnd(now)) {
+  if (monthEndRun) {
     await step('month-end-snapshot', async () => {
       const users = await db.prepare('SELECT id FROM users WHERE is_active = 1 ORDER BY id').all<{ id: string }>();
       let n = 0;
       for (const u of users.results || []) {
-        if (shouldStop(4)) break; // the next run's catch-up takes the remaining users
+        if (shouldStop(SNAPSHOT_QUERIES_PER_USER - 1)) break; // the next run's catch-up takes the remaining users
         try {
           await runMonthEndSnapshotD1(db, u.id, now);
           await markAutomationRun(db, u.id, 'snapshot', currentPeriod, 'done', 'month-end');

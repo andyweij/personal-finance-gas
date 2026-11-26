@@ -464,3 +464,115 @@ describe('v1.8.13 import endpoints (M13)', () => {
     expect(rows.results.every((x) => x.ledger_id === 'default')).toBe(true);
   });
 });
+
+/* ============================== v1.8.13 independent-review follow-ups ============================== */
+
+describe('v1.8.13 review follow-ups', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+  const yahooOk = (price: number) =>
+    new Response(
+      JSON.stringify({ chart: { result: [{ meta: { regularMarketPrice: price, previousClose: price }, timestamp: [1], indicators: { quote: [{ close: [price] }] } }] } }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    );
+
+  it('permanently failing tickers do not starve the others: every attempt rotates to the back of the queue', async () => {
+    const { refreshMarketData, createBudgetedFetch } = await import('../worker/market');
+    const db = createTestD1();
+    await seedUser(db, 'u1');
+    const muts = [
+      ...Array.from({ length: 10 }, (_, i) => ({ mutationId: `bad${i}`, entity: 'asset', op: 'upsert', recordId: `bad${i}`, clientTimestamp: 'x', baseVersion: null, payload: stockAsset(String(9100 + i)) })),
+      { mutationId: 'good', entity: 'asset', op: 'upsert', recordId: 'good', clientTimestamp: 'x', baseVersion: null, payload: stockAsset('2330') },
+    ];
+    await processSyncRequest(db, 'u1', { sinceSeq: 0, clientEpoch: 1, mutations: muts as never });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let goodFetches = 0;
+    const fetchImpl = async (url: string) => {
+      if (String(url).includes('2330') && String(url).includes('yahoo')) {
+        goodFetches += 1;
+        return yahooOk(1000);
+      }
+      return new Response('{}', { status: 503 });
+    };
+    for (let run = 0; run < 5; run++) {
+      const budget = createBudgetedFetch(fetchImpl as never, 50);
+      await refreshMarketData(db, budget.fetch, undefined, { marketScope: 'tw', fetchBudget: budget });
+    }
+    expect(goodFetches).toBeGreaterThan(0);
+    const good = await db.prepare("SELECT unit_price FROM asset_items WHERE id = 'good'").first<{ unit_price: number }>();
+    expect(Number(good?.unit_price)).toBe(1000);
+  });
+
+  it('import rejects ids / timestamps that are not strings (400, never stored as JSON text)', async () => {
+    const { importFullSnapshot } = await import('../worker/sync');
+    const db = createTestD1();
+    for (const bad of [{ id: { a: 1 } }, { id: true }, { createdAt: [1, 2] }, { id: 42 }]) {
+      await expect(
+        importFullSnapshot(db, 'u1', { cashflowLogs: [{ ...cf('x'), ...bad } as never] }, 'merge')
+      ).rejects.toThrow(/格式錯誤/);
+    }
+    await expect(
+      importFullSnapshot(db, 'u1', { assetItems: [{ ...stockAsset('2330'), id: 'a1', priceUpdatedAt: { x: 1 } } as never] }, 'merge')
+    ).rejects.toThrow(/格式錯誤/);
+  });
+
+  it('catch-up later in the month only posts items that existed when the month began, and never resurrects a deleted entry', async () => {
+    const db = createTestD1();
+    await seedUser(db, 'u1');
+    await processSyncRequest(db, 'u1', {
+      sinceSeq: 0,
+      clientEpoch: 1,
+      mutations: [
+        { mutationId: 'r-old', entity: 'recurring', op: 'upsert', recordId: 'rc-old', clientTimestamp: 'x', baseVersion: null, payload: recurringPayload('房租', 1000) },
+        { mutationId: 'r-new', entity: 'recurring', op: 'upsert', recordId: 'rc-new', clientTimestamp: 'x', baseVersion: null, payload: recurringPayload('新訂閱', 99) },
+      ] as never,
+    });
+    await db.prepare("UPDATE recurring_items SET created_at = '2026-11-15T00:00:00.000Z' WHERE id = 'rc-old'").run();
+    await db.prepare("UPDATE recurring_items SET created_at = '2026-12-10T00:00:00.000Z' WHERE id = 'rc-new'").run();
+    // the user already posted & then deleted this month's 房租 entry by hand
+    await db
+      .prepare(
+        `INSERT INTO cashflow_logs (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
+         VALUES ('u1', 'gone', '2026-12-01', '2026-12', '固定支出', '居住', '房租', 1000, 'TWD', 1, 1000, '自動入帳', '', 'rec:rc-old:2026-12', 'default', 'x', 'x', '2026-12-05T00:00:00.000Z', 2, 1)`
+      )
+      .run();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 503 })));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await worker.scheduled(scheduledAt('0 22 * * *', '2026-12-12T22:00:00.000Z'), { DB: db } as WorkerEnv);
+    expect(await autoRows(db, 'u1', '2026-12')).toEqual([]);
+  });
+
+  it('month-end: the quote step leaves enough D1 budget for every user\'s snapshot', async () => {
+    const inner = createTestD1();
+    for (let u = 0; u < 3; u++) await seedUser(inner, `u${u}`);
+    const muts = Array.from({ length: 45 }, (_, i) => ({ mutationId: `q${i}`, entity: 'asset', op: 'upsert', recordId: `q${i}`, clientTimestamp: 'x', baseVersion: null, payload: stockAsset(String(2000 + i)) }));
+    for (let i = 0; i < muts.length; i += 15) await processSyncRequest(inner, 'u0', { sinceSeq: 0, clientEpoch: 1, mutations: muts.slice(i, i + 15) as never });
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => (String(url).includes('yahoo') ? yahooOk(50) : new Response('{}', { status: 503 }))));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const counting = createCountingD1(inner);
+    // 2026-11-30 23:00 Taipei = month end
+    await worker.scheduled(scheduledAt('0 15 * * *', '2026-11-30T15:00:00.000Z'), { DB: counting.db } as WorkerEnv);
+    expect(counting.count()).toBeLessThanOrEqual(50);
+    const snaps = await inner.prepare("SELECT COUNT(*) AS n FROM networth_history WHERE year_month = '2026-11'").first<{ n: number }>();
+    expect(Number(snaps?.n)).toBe(3);
+  });
+
+  it('a snapshot taken after the savings anchor was reset backs out the flows between the snapshot date and the anchor', async () => {
+    const { runMonthEndSnapshotD1 } = await import('../worker/automation');
+    const db = createTestD1();
+    await seedUser(db, 'u1');
+    await processSyncRequest(db, 'u1', {
+      sinceSeq: 0,
+      clientEpoch: 1,
+      mutations: [
+        // anchor reset on 12-03 to 700 (after a 300 expense on 12-02)
+        { mutationId: 'a', entity: 'asset', op: 'upsert', recordId: 'acc', clientTimestamp: 'x', baseVersion: null, payload: { updateMode: '手動快照', majorType: '資產', subCategory: '活存', liquidity: '高流動', itemName: '活存', quantityOrAmount: 700, currency: 'TWD', unitPrice: 1, isLinkedSavings: true, balanceAnchorDate: '2026-12-03', balanceAnchorAt: '2026-12-03T01:00:00.000Z' } },
+        { mutationId: 'c', entity: 'cashflow', op: 'upsert', recordId: 'dec2', clientTimestamp: 'x', baseVersion: null, payload: { date: '2026-12-02', type: '日常花費', category: '餐飲', itemName: '支出', amount: 300, currency: 'TWD', linkedAccountId: 'acc' } },
+      ] as never,
+    });
+    const res = await runMonthEndSnapshotD1(db, 'u1', new Date('2026-11-30T15:00:00.000Z'));
+    expect(res.totalAssets).toBe(1000); // 700 + the 300 spent after the snapshot date
+  });
+});

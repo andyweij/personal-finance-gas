@@ -150,6 +150,7 @@ erDiagram
 | **識別與歸屬** | `user_id`, `id` | `TEXT` | `PK` | 租戶與資產 UUID |
 | | `ledger_id` | `TEXT` | `'default'` | 所屬帳本 ID（`0011`） |
 | | `exclude_from_net_worth` | `INTEGER` | `0` | `1`＝單筆排除不計入個人總資產（`0011`） |
+| | `quote_checked_at` | `TEXT` | `NULL` | 最後一次嘗試抓取報價的時間（不論成功與否；`0016`，v1.8.13）。排程依此排序，最久未嘗試者優先，避免下市或錯誤代號長期占用對外請求額度；僅供伺服器使用，不同步、不遞增 `change_seq` |
 | | `sort_order` | `INTEGER` | `0` | 手動拖曳排序順序（`0008`） |
 | **基本分類與估值** | `update_mode` | `TEXT` | `'手動快照'` | `手動快照` / `自動更新` |
 | | `major_type` | `TEXT` | `'資產'` | `資產` / `負債` |

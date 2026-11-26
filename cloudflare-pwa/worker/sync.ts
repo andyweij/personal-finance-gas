@@ -3004,6 +3004,16 @@ export async function exportFullSnapshot(
   };
 }
 
+/**
+ * v1.8.13 review: ids and timestamps of imported records must be text (or absent) — an object / array / number
+ * would otherwise be stored as its JSON text, and `true` ids would collide.
+ */
+function importText(v: unknown, field: string): string | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (typeof v !== 'string') throw new Error(`匯入資料格式錯誤：${field} 必須是文字。`);
+  return v;
+}
+
 /** M13: rows per `INSERT … SELECT … FROM json_each(?)` statement in an import batch */
 export const IMPORT_CHUNK_ROWS = 200;
 
@@ -3060,9 +3070,9 @@ export async function importFullSnapshot(
   for (const lg of data.ledgers || []) {
     if (!lg || lg.deletedAt) continue;
     validatedLedgers.push({
-      id: normalizeLedgerId(lg.id),
+      id: normalizeLedgerId(importText(lg.id, 'id')),
       v: validateLedgerInput(lg),
-      createdAt: lg.createdAt || nowIso,
+      createdAt: importText(lg.createdAt, 'createdAt') || nowIso,
     });
   }
 
@@ -3073,9 +3083,9 @@ export async function importFullSnapshot(
   }> = [];
   for (const log of data.cashflowLogs || []) {
     validatedLogs.push({
-      id: log.id || crypto.randomUUID(),
+      id: importText(log.id, 'id') || crypto.randomUUID(),
       v: validateCashFlowInput(log, fxForImport),
-      createdAt: log.createdAt || nowIso,
+      createdAt: importText(log.createdAt, 'createdAt') || nowIso,
     });
   }
 
@@ -3086,9 +3096,9 @@ export async function importFullSnapshot(
   }> = [];
   for (const r of data.recurringItems || []) {
     validatedRecurring.push({
-      id: r.id || crypto.randomUUID(),
+      id: importText(r.id, 'id') || crypto.randomUUID(),
       v: validateRecurringInput(r),
-      createdAt: r.createdAt || nowIso,
+      createdAt: importText(r.createdAt, 'createdAt') || nowIso,
     });
   }
 
@@ -3099,9 +3109,9 @@ export async function importFullSnapshot(
   }> = [];
   for (const s of data.sinkingItems || []) {
     validatedSinking.push({
-      id: s.id || crypto.randomUUID(),
+      id: importText(s.id, 'id') || crypto.randomUUID(),
       v: validateSinkingInput(s),
-      createdAt: s.createdAt || nowIso,
+      createdAt: importText(s.createdAt, 'createdAt') || nowIso,
     });
   }
 
@@ -3113,10 +3123,10 @@ export async function importFullSnapshot(
   }> = [];
   for (const a of data.assetItems || []) {
     validatedAssets.push({
-      id: a.id || crypto.randomUUID(),
+      id: importText(a.id, 'id') || crypto.randomUUID(),
       v: validateAssetInput(a),
-      priceUpdatedAt: a.priceUpdatedAt || null,
-      createdAt: a.createdAt || nowIso,
+      priceUpdatedAt: importText(a.priceUpdatedAt, 'priceUpdatedAt') || null,
+      createdAt: importText(a.createdAt, 'createdAt') || nowIso,
     });
   }
 
@@ -3129,10 +3139,10 @@ export async function importFullSnapshot(
   for (const adj of data.savingsAdjustments || []) {
     const v = validateSavingsAdjustmentInput(adj, fxForImport);
     validatedAdjs.push({
-      id: adj.id || crypto.randomUUID(),
+      id: importText(adj.id, 'id') || crypto.randomUUID(),
       v,
       twdAmount: adj.twdAmount !== undefined ? Math.round(adj.twdAmount) : v.twdAmount,
-      createdAt: adj.createdAt || nowIso,
+      createdAt: importText(adj.createdAt, 'createdAt') || nowIso,
     });
   }
 
@@ -3143,9 +3153,9 @@ export async function importFullSnapshot(
   }> = [];
   for (const tx of data.stockTransactions || []) {
     validatedStockTxs.push({
-      id: tx.id || crypto.randomUUID(),
+      id: importText(tx.id, 'id') || crypto.randomUUID(),
       v: validateStockTransactionInput(tx),
-      createdAt: tx.createdAt || nowIso,
+      createdAt: importText(tx.createdAt, 'createdAt') || nowIso,
     });
   }
 
@@ -3160,7 +3170,7 @@ export async function importFullSnapshot(
   for (const u of data.rentUtilityRecords || []) {
     validatedUtilityRecords.push({
       v: validateUtilityRecordInput(u),
-      createdAt: u.createdAt || nowIso,
+      createdAt: importText(u.createdAt, 'createdAt') || nowIso,
     });
   }
 
