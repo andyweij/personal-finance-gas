@@ -2,13 +2,14 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.1';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.2';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
-export const DB_SCHEMA_VERSION = '0012';
-export const SW_CACHE_VERSION = 'finance-pwa-v21';
+export const DB_SCHEMA_VERSION = '0013';
+export const SW_CACHE_VERSION = 'finance-pwa-v22';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.8.2：同步引擎正確性全面升級（同步中編輯／刪除自動 rebase 不再自衝突或死而復生、單調遞增 change_seq 游標與伺服器統一 updated_at、還原覆蓋 data_epoch 跨裝置自動重載、行情更新遞增版號與自動／手動匯率切換、X-Expected-User 409 防跨帳號寫入與 BroadcastChannel 跨分頁同步、逾時控制／分批同步／指數退避／Web Locks，以及 IndexedDB 先落庫再更新狀態）',
   'v1.8.1：安全性與同步核心強化（Passkey 登入 challenge 原子綁定與速率限制、防覆寫他人憑證、D1 樂觀鎖條件寫入與批次原子交易、匯入前全量驗證、未知同步類型白名單拒絕，以及客戶端顯示並清理遭伺服器拒絕的同步異動）',
   'v1.8.0：新增「帳戶互轉（活存 ↔ 活存 / 定存・現金）」功能（支援跨幣別換匯自訂成交金額、跨帳本轉帳、選填轉帳手續費自動記支出不重複扣款，以及活存互轉配對一鍵雙向撤銷）',
   'v1.7.1：新增全域可拖曳「懸浮隨手計算機」（不中斷既有表單與編輯彈窗，支援四則運算／括號／百分比、近期計算紀錄，以及一鍵帶入剛剛輸入的金額或股數欄位並自動重算）',

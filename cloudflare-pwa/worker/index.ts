@@ -471,9 +471,39 @@ export function createApp() {
   });
 
   // Core Offline-First Bidirectional Sync Endpoint (strictly scoped to authUser.id)
+  const MAX_SYNC_BODY_BYTES = 2 * 1024 * 1024; // 2 MB
+  const MAX_SYNC_MUTATIONS = 200;
+
   app.post('/api/sync', requireAuth, async (c) => {
     const user = c.get('authUser');
-    const body = (await c.req.json().catch(() => ({ mutations: [] }))) as SyncRequest;
+    const expectedUser = (c.req.header('x-expected-user') || '').trim();
+    if (expectedUser && expectedUser !== user.id) {
+      return c.json(
+        {
+          error: '目前瀏覽器登入帳號已變更，已停止同步以避免跨帳號寫入。請重新整理或切換帳號。',
+          code: 'ACCOUNT_MISMATCH',
+          expectedUserId: expectedUser,
+          actualUserId: user.id,
+        },
+        409
+      );
+    }
+
+    const rawText = await c.req.text();
+    if (rawText.length > MAX_SYNC_BODY_BYTES) {
+      return c.json({ error: '單次同步請求體積過大，請分批同步。' }, 413);
+    }
+    let body: SyncRequest = { mutations: [] };
+    try {
+      body = (rawText ? JSON.parse(rawText) : { mutations: [] }) as SyncRequest;
+    } catch {
+      return c.json({ error: '同步請求格式錯誤（無效 JSON）。' }, 400);
+    }
+
+    if (Array.isArray(body.mutations) && body.mutations.length > MAX_SYNC_MUTATIONS) {
+      return c.json({ error: `單次同步上限為 ${MAX_SYNC_MUTATIONS} 筆異動，請分批同步。` }, 400);
+    }
+
     const res = await processSyncRequest(c.env.DB, user.id, body);
     return c.json(res);
   });
@@ -494,7 +524,7 @@ export function createApp() {
 
   app.post('/api/market/refresh', requireAuth, async (c) => {
     const user = c.get('authUser');
-    const result = await refreshMarketData(c.env.DB, fetch, user.id);
+    const result = await refreshMarketData(c.env.DB, fetch, user.id, { forceFx: true });
     return c.json({ ok: true, ...result });
   });
 
@@ -550,15 +580,28 @@ export function createApp() {
         networth: '淨資產歷史快照 (NetWorth_History)',
       };
 
+      const currSeqExpr = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)';
+      const bumpSeqForCsv = async () => {
+        await c.env.DB.batch([
+          c.env.DB
+            .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+            .bind(user.id, nowIso),
+          c.env.DB
+            .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
+            .bind(nowIso, user.id),
+        ]);
+      };
+
       if (kind === 'cashflow') {
         const settings = await ensureAppSettings(c.env.DB, user.id);
         const rows = parseCashFlowCsv(csvText, settings.usdTwdRate);
+        if (rows.length > 0) await bumpSeqForCsv();
         for (const v of rows) {
           await c.env.DB
             .prepare(
               `INSERT INTO cashflow_logs
-                (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+                (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, created_at, updated_at, deleted_at, version, change_seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
             )
             .bind(
               user.id,
@@ -575,7 +618,8 @@ export function createApp() {
               v.source,
               v.note,
               nowIso,
-              nowIso
+              nowIso,
+              user.id
             )
             .run();
         }
@@ -584,12 +628,13 @@ export function createApp() {
 
       if (kind === 'recurring') {
         const rows = parseRecurringCsv(csvText);
+        if (rows.length > 0) await bumpSeqForCsv();
         for (const v of rows) {
           await c.env.DB
             .prepare(
               `INSERT INTO recurring_items
-                (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+                (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, created_at, updated_at, deleted_at, version, change_seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
             )
             .bind(
               user.id,
@@ -604,7 +649,8 @@ export function createApp() {
               v.status,
               v.note,
               nowIso,
-              nowIso
+              nowIso,
+              user.id
             )
             .run();
         }
@@ -613,12 +659,13 @@ export function createApp() {
 
       if (kind === 'sinking') {
         const rows = parseSinkingFundCsv(csvText);
+        if (rows.length > 0) await bumpSeqForCsv();
         for (const v of rows) {
           await c.env.DB
             .prepare(
               `INSERT INTO sinking_fund_items
-                (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+                (user_id, id, item_name, category, total_amount, months, due_note, status, note, created_at, updated_at, deleted_at, version, change_seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
             )
             .bind(
               user.id,
@@ -631,7 +678,8 @@ export function createApp() {
               v.status,
               v.note,
               nowIso,
-              nowIso
+              nowIso,
+              user.id
             )
             .run();
         }
@@ -640,12 +688,13 @@ export function createApp() {
 
       if (kind === 'asset') {
         const rows = parseAssetsCsv(csvText);
+        if (rows.length > 0) await bumpSeqForCsv();
         for (const v of rows) {
           await c.env.DB
             .prepare(
               `INSERT INTO asset_items
-                (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+                (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at, deleted_at, version, change_seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${currSeqExpr})`
             )
             .bind(
               user.id,
@@ -661,7 +710,8 @@ export function createApp() {
               v.unitPrice,
               v.note,
               nowIso,
-              nowIso
+              nowIso,
+              user.id
             )
             .run();
         }
@@ -669,12 +719,13 @@ export function createApp() {
       }
 
       const rows = parseNetWorthHistoryCsv(csvText);
+      if (rows.length > 0) await bumpSeqForCsv();
       for (const h of rows) {
         await c.env.DB
           .prepare(
             `INSERT OR REPLACE INTO networth_history
-              (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${currSeqExpr})`
           )
           .bind(
             user.id,
@@ -690,7 +741,8 @@ export function createApp() {
             h.monthlyConsumption,
             h.savingsRate,
             h.note,
-            nowIso
+            nowIso,
+            user.id
           )
           .run();
       }

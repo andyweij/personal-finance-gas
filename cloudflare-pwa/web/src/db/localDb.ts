@@ -40,6 +40,7 @@ export function createEmptySnapshot(): FinanceSnapshot {
       monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
       emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
       usdTwdRate: DEFAULT_USD_TWD_RATE,
+      autoFxEnabled: true,
       fxUpdatedAt: null,
       pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
       customStockCategories: [],
@@ -60,6 +61,8 @@ export function createEmptySnapshot(): FinanceSnapshot {
 
 export interface LocalMeta {
   lastSyncedAt: string | null;
+  syncCursor?: number | null;
+  dataEpoch?: number | null;
   pinEnabled: boolean;
   pinSalt: string | null;
   pinHash: string | null;
@@ -255,9 +258,14 @@ export class LocalFinanceDB {
 
   /**
    * 單一 IndexedDB 交易同時更新本機 Snapshot 並加入 Outbox，並自動整併同一筆紀錄的離線多次修改
-   * （保留最初的伺服器 baseVersion；新建未同步後立即刪除則互相抵銷）
+   * （保留最初的伺服器 baseVersion；已送出等待回應的 in-flight mutation 不會被合併或抵銷；
+   * 僅在新建尚未送出時，新建後立即刪除才會互相抵銷）
    */
-  async commitLocalMutation(snapshot: FinanceSnapshot, mutations: SyncMutation[]): Promise<void> {
+  async commitLocalMutation(
+    snapshot: FinanceSnapshot,
+    mutations: SyncMutation[],
+    inFlightIds?: ReadonlySet<string>
+  ): Promise<void> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
@@ -268,8 +276,14 @@ export class LocalFinanceDB {
       getAllReq.onsuccess = () => {
         const existingList = (getAllReq.result as Array<SyncMutation & { _seq?: number }>) || [];
         const byKey = new Map<string, SyncMutation & { _seq?: number }>();
+        const inFlightKeys = new Set<string>();
         for (const item of existingList) {
-          byKey.set(`${item.entity}:${item.recordId}`, item);
+          const k = `${item.entity}:${item.recordId}`;
+          if (inFlightIds && inFlightIds.has(item.mutationId)) {
+            inFlightKeys.add(k);
+          } else {
+            byKey.set(k, item);
+          }
         }
 
         for (const mut of mutations) {
@@ -278,8 +292,8 @@ export class LocalFinanceDB {
           if (prev) {
             outboxStore.delete(prev.mutationId);
             const prevIsNewUnsynced = prev.op === 'upsert' && (prev.baseVersion === null || prev.baseVersion === 0);
-            if (prevIsNewUnsynced && mut.op === 'delete') {
-              // Brand-new offline record deleted before ever syncing -> cancel out completely
+            if (prevIsNewUnsynced && mut.op === 'delete' && !inFlightKeys.has(key)) {
+              // Brand-new offline record deleted before ever being sent -> cancel out completely
               byKey.delete(key);
               continue;
             }
@@ -311,7 +325,8 @@ export class LocalFinanceDB {
     snapshot: FinanceSnapshot,
     meta: LocalMeta,
     conflicts?: SyncConflict[],
-    rejections?: SyncRejection[]
+    rejections?: SyncRejection[],
+    rebasedMutations?: Array<{ oldMutationId: string; replacement: SyncMutation }>
   ): Promise<void> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
@@ -319,6 +334,13 @@ export class LocalFinanceDB {
       const outboxStore = tx.objectStore(STORE_OUTBOX);
       for (const id of ackedIds) {
         outboxStore.delete(id);
+      }
+      if (rebasedMutations && rebasedMutations.length > 0) {
+        for (const item of rebasedMutations) {
+          outboxStore.delete(item.oldMutationId);
+          this.outboxSeq += 1;
+          outboxStore.put({ ...item.replacement, _seq: this.outboxSeq });
+        }
       }
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');

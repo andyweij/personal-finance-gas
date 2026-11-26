@@ -142,3 +142,12 @@ ALTER TABLE rent_utility_settings ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
 - 新增 `migrations/0006_optimistic_versioning.sql`（部署前需跑 `npm run db:migrate:remote`）。
 - Service Worker 快取版本升至 `finance-pwa-v9`。
 - 不修改根目錄任何 GAS 檔案。
+
+---
+
+## 8. 演進補遺（v1.8.1～v1.8.2 同步正確性與安全性強化）
+
+1. **原子條件式樂觀鎖與冪等批次（v1.8.1）**：所有寫入改為 `UPDATE ... WHERE user_id = ? AND <pk> = ? AND version = ?` 與 `INSERT ... ON CONFLICT DO NOTHING`，並與 `sync_idempotency`（搭配 `WHERE changes() > 0`）合併於單一 `db.batch()` 原子執行；未知 `entity`/`op` 白名單拒絕並於前端 `kv['rejections']` 呈現。
+2. **In-Flight Rebase 與先存後改（v1.8.2）**：`LocalFinanceDB.commitLocalMutation` 排除同步中（in-flight）異動避免合併／誤抵銷，回應後針對所有實體自動 rebase 最新 `version`；所有 CRUD 改為先持久化 IndexedDB 成功後才更新記憶體快照。
+3. **單調遞增 `change_seq` 與 `data_epoch`（`0013_sync_cursor_epoch_and_auto_fx.sql`）**：新增 `user_sync_state` 維護每使用者遞增 `change_seq`（增量同步以 `sinceSeq` 查 `change_seq > sinceSeq AND change_seq <= maxSeq`，向下相容舊 `since`）與 `data_epoch`（`replace` 覆蓋匯入自動遞增，強制其他裝置完整重載）；`updated_at` 一律寫入伺服器時間，舊版無 `baseVersion` 客戶端由 `sync_lww_timestamps` 維持 LWW 相容。
+4. **跨帳號防護與傳輸強健性（v1.8.2）**：同步請求帶 `X-Expected-User`（帳號不符回 `409` 立即停止同步）並透過 `BroadcastChannel` 跨分頁同步帳號切換；支援 `AbortController`（20 秒逾時）、指數退避＋隨機抖動、單批 50 筆分批同步（伺服器上限 200 筆 / 2 MB）與 `navigator.locks` 跨分頁互斥；市價與匯率更新同步遞增 `version` 與 `change_seq`，並支援 `auto_fx_enabled` 讓手動匯率不被排程覆蓋。

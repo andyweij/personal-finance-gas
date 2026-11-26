@@ -4,6 +4,7 @@ export interface AppSettings {
   monthlyDailyBudget: number;
   emergencyTargetMonths: number;
   usdTwdRate: number;
+  autoFxEnabled?: boolean;
   fxUpdatedAt?: string | null;
   pnlColorScheme?: PnlColorScheme;
   customStockCategories?: string[];
@@ -379,6 +380,8 @@ export interface SyncRejection {
 
 export interface SyncRequest {
   since?: string | null;
+  sinceSeq?: number | null;
+  clientEpoch?: number | null;
   mutations: SyncMutation[];
 }
 
@@ -399,6 +402,9 @@ export interface SyncDelta {
 export interface SyncResponse {
   ok: boolean;
   serverTime: string;
+  syncCursor?: number;
+  dataEpoch?: number;
+  fullResyncRequired?: boolean;
   ackedMutationIds: string[];
   rejected: Array<{ mutationId: string; reason: string }>;
   conflicts?: SyncConflict[];

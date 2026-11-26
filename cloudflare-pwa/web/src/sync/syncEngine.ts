@@ -71,12 +71,26 @@ export interface SyncStatus {
   lastError?: string;
 }
 
+export interface SyncResult {
+  ok: boolean;
+  authRequired?: boolean;
+  accountMismatch?: boolean;
+  error?: string;
+}
+
 export interface SyncEngineOptions {
   fetchImpl?: typeof fetch;
   isOnline?: () => boolean;
+  expectedUserId?: string;
+  requestTimeoutMs?: number;
+  retryBaseDelayMs?: number;
+  maxBatchSize?: number;
+  requestLock?: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
   onStatusChange?: (status: SyncStatus) => void;
   onSnapshotChange?: (snapshot: FinanceSnapshot) => void;
   onAuthRequired?: () => void;
+  onAccountMismatch?: (info: { error: string; expectedUserId?: string; actualUserId?: string }) => void;
+  onError?: (message: string) => void;
 }
 
 function isIncomingPreferred(
@@ -140,6 +154,8 @@ export class SyncEngine {
   private snapshot: FinanceSnapshot = createEmptySnapshot();
   private meta: LocalMeta = {
     lastSyncedAt: null,
+    syncCursor: null,
+    dataEpoch: null,
     pinEnabled: false,
     pinSalt: null,
     pinHash: null,
@@ -153,11 +169,19 @@ export class SyncEngine {
     rejectedCount: 0,
     lastSyncedAt: null,
   };
-  private syncingPromise: Promise<{ ok: boolean; authRequired?: boolean; error?: string }> | null =
-    null;
+  private syncingPromise: Promise<SyncResult> | null = null;
+  private readonly inFlightMutationIds = new Set<string>();
+  private expectedUserId: string | undefined;
+  private accountMismatchHalted = false;
+  private consecutiveFailures = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly fetchImpl: typeof fetch;
   private readonly isOnline: () => boolean;
+  private readonly requestTimeoutMs: number;
+  private readonly retryBaseDelayMs: number;
+  private readonly maxBatchSize: number;
+  private readonly requestLockImpl: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
 
   constructor(
     private readonly db: LocalFinanceDB,
@@ -167,6 +191,36 @@ export class SyncEngine {
     this.isOnline =
       opts.isOnline ||
       (() => (typeof navigator !== 'undefined' ? navigator.onLine !== false : true));
+    this.expectedUserId = opts.expectedUserId;
+    this.requestTimeoutMs = Math.max(20, opts.requestTimeoutMs ?? 20_000);
+    this.retryBaseDelayMs = Math.max(50, opts.retryBaseDelayMs ?? 2_000);
+    this.maxBatchSize = Math.max(1, Math.min(200, opts.maxBatchSize ?? 50));
+    this.requestLockImpl =
+      opts.requestLock ||
+      (async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
+        const navLocks =
+          typeof navigator !== 'undefined'
+            ? (navigator as unknown as {
+                locks?: { request?: <R>(lockName: string, cb: () => Promise<R>) => Promise<R> };
+              }).locks
+            : undefined;
+        if (navLocks && typeof navLocks.request === 'function') {
+          return navLocks.request(name, fn);
+        }
+        return fn();
+      });
+  }
+
+  setExpectedUserId(userId?: string): void {
+    this.expectedUserId = userId;
+    this.accountMismatchHalted = false;
+  }
+
+  destroy(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
   }
 
   async init(): Promise<void> {
@@ -200,15 +254,17 @@ export class SyncEngine {
   }
 
   async dismissRejection(mutationId: string): Promise<void> {
-    this.rejections = this.rejections.filter((r) => r.mutationId !== mutationId);
-    await this.db.saveRejections(this.rejections);
+    const nextRejections = this.rejections.filter((r) => r.mutationId !== mutationId);
+    await this.db.saveRejections(nextRejections);
+    this.rejections = nextRejections;
     const outbox = await this.db.getOutbox();
     this.updateStatus(this.computeStatus(outbox.length));
   }
 
   async clearRejections(): Promise<void> {
-    this.rejections = [];
-    await this.db.saveRejections(this.rejections);
+    const nextRejections: SyncRejection[] = [];
+    await this.db.saveRejections(nextRejections);
+    this.rejections = nextRejections;
     const outbox = await this.db.getOutbox();
     this.updateStatus(this.computeStatus(outbox.length));
   }
@@ -235,20 +291,22 @@ export class SyncEngine {
   }
 
   async updateLocalPinCache(pinEnabled: boolean, pinSalt: string | null, pinHash: string | null): Promise<void> {
-    this.meta = { ...this.meta, pinEnabled, pinSalt, pinHash };
-    await this.db.saveMeta(this.meta);
+    const nextMeta: LocalMeta = { ...this.meta, pinEnabled, pinSalt, pinHash };
+    await this.db.saveMeta(nextMeta);
+    this.meta = nextMeta;
   }
 
   async updateLocalBiometricCache(
     biometricLockEnabled: boolean,
     passkeys?: LocalMeta['passkeys']
   ): Promise<void> {
-    this.meta = {
+    const nextMeta: LocalMeta = {
       ...this.meta,
       biometricLockEnabled,
       ...(passkeys !== undefined ? { passkeys } : {}),
     };
-    await this.db.saveMeta(this.meta);
+    await this.db.saveMeta(nextMeta);
+    this.meta = nextMeta;
   }
 
   private updateStatus(next: SyncStatus): void {
@@ -293,12 +351,12 @@ export class SyncEngine {
       ...(existing?.version !== undefined ? { version: existing.version } : {}),
     };
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       ledgers: mergeById(currentLedgers, [ledger]).sort(compareBySortOrder),
     };
 
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'ledger',
@@ -418,7 +476,7 @@ export class SyncEngine {
       baseVersion: existing.version ?? null,
     });
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       ledgers: currentLedgers.filter((l) => l.id !== lid),
       cashflowLogs: nextLogs,
@@ -426,7 +484,7 @@ export class SyncEngine {
       recurringItems: nextRecurring,
     };
 
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return { migratedCount: totalLinked };
   }
 
@@ -487,13 +545,13 @@ export class SyncEngine {
       });
     }
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       cashflowLogs: this.sortCashFlows([record, ...this.snapshot.cashflowLogs]),
       recurringItems: nextRecurring,
     };
 
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return record;
   }
 
@@ -507,11 +565,11 @@ export class SyncEngine {
   async deleteCashFlow(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
     const existing = this.snapshot.cashflowLogs.find((l) => l.id === id);
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       cashflowLogs: this.snapshot.cashflowLogs.filter((l) => l.id !== id),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'cashflow',
@@ -532,16 +590,17 @@ export class SyncEngine {
     }
     const nowIso = new Date().toISOString();
     const baseVersion = this.snapshot.settings.version;
-    this.snapshot = {
-      ...this.snapshot,
-      settings: {
-        ...this.snapshot.settings,
-        monthlyDailyBudget: budget,
-        emergencyTargetMonths: months,
-        updatedAt: nowIso,
-      },
+    const nextSettings: AppSettings = {
+      ...this.snapshot.settings,
+      monthlyDailyBudget: budget,
+      emergencyTargetMonths: months,
+      updatedAt: nowIso,
     };
-    await this.commitAndMaybeSync([
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      settings: nextSettings,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'settings',
@@ -549,7 +608,37 @@ export class SyncEngine {
         recordId: '1',
         clientTimestamp: nowIso,
         ...(baseVersion !== undefined ? { baseVersion } : {}),
-        payload: { ...this.snapshot.settings },
+        payload: { ...nextSettings },
+      },
+    ]);
+  }
+
+  async saveFxSettings(usdTwdRate: number, autoFxEnabled: boolean): Promise<void> {
+    const rate = Number(usdTwdRate);
+    if (!Number.isFinite(rate) || rate <= 10 || rate >= 100) {
+      throw new Error('請輸入有效的 USD/TWD 匯率（介於 10～100）。');
+    }
+    const nowIso = new Date().toISOString();
+    const baseVersion = this.snapshot.settings.version;
+    const nextSettings: AppSettings = {
+      ...this.snapshot.settings,
+      usdTwdRate: Math.round(rate * 1000) / 1000,
+      autoFxEnabled: Boolean(autoFxEnabled),
+      updatedAt: nowIso,
+    };
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      settings: nextSettings,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'settings',
+        op: 'upsert',
+        recordId: '1',
+        clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
+        payload: { ...nextSettings },
       },
     ]);
   }
@@ -558,15 +647,16 @@ export class SyncEngine {
     const normalized = normalizePnlColorScheme(scheme);
     const nowIso = new Date().toISOString();
     const baseVersion = this.snapshot.settings.version;
-    this.snapshot = {
-      ...this.snapshot,
-      settings: {
-        ...this.snapshot.settings,
-        pnlColorScheme: normalized,
-        updatedAt: nowIso,
-      },
+    const nextSettings: AppSettings = {
+      ...this.snapshot.settings,
+      pnlColorScheme: normalized,
+      updatedAt: nowIso,
     };
-    await this.commitAndMaybeSync([
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      settings: nextSettings,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'settings',
@@ -574,7 +664,7 @@ export class SyncEngine {
         recordId: '1',
         clientTimestamp: nowIso,
         ...(baseVersion !== undefined ? { baseVersion } : {}),
-        payload: { ...this.snapshot.settings },
+        payload: { ...nextSettings },
       },
     ]);
     return normalized;
@@ -584,15 +674,16 @@ export class SyncEngine {
     const normalized = normalizeCustomStockCategories(categories);
     const nowIso = new Date().toISOString();
     const baseVersion = this.snapshot.settings.version;
-    this.snapshot = {
-      ...this.snapshot,
-      settings: {
-        ...this.snapshot.settings,
-        customStockCategories: normalized,
-        updatedAt: nowIso,
-      },
+    const nextSettings: AppSettings = {
+      ...this.snapshot.settings,
+      customStockCategories: normalized,
+      updatedAt: nowIso,
     };
-    await this.commitAndMaybeSync([
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      settings: nextSettings,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'settings',
@@ -600,7 +691,7 @@ export class SyncEngine {
         recordId: '1',
         clientTimestamp: nowIso,
         ...(baseVersion !== undefined ? { baseVersion } : {}),
-        payload: { ...this.snapshot.settings },
+        payload: { ...nextSettings },
       },
     ]);
     return normalized;
@@ -626,11 +717,11 @@ export class SyncEngine {
       deletedAt: null,
       ...(existing?.version !== undefined ? { version: existing.version } : {}),
     };
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       recurringItems: mergeById(this.snapshot.recurringItems, [item]).sort(compareBySortOrder),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'recurring',
@@ -666,22 +757,22 @@ export class SyncEngine {
         baseVersion: item.version ?? null,
         payload: { ...item },
       }));
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       recurringItems: stampedItems,
     };
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return mutations.length;
   }
 
   async deleteRecurring(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
     const existing = this.snapshot.recurringItems.find((r) => r.id === id);
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       recurringItems: this.snapshot.recurringItems.filter((r) => r.id !== id),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'recurring',
@@ -713,11 +804,11 @@ export class SyncEngine {
       deletedAt: null,
       ...(existing?.version !== undefined ? { version: existing.version } : {}),
     };
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       sinkingItems: mergeById(this.snapshot.sinkingItems, [item]).sort(compareBySortOrder),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'sinking',
@@ -753,22 +844,22 @@ export class SyncEngine {
         baseVersion: item.version ?? null,
         payload: { ...item },
       }));
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       sinkingItems: stampedItems,
     };
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return mutations.length;
   }
 
   async deleteSinking(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
     const existing = this.snapshot.sinkingItems.find((s) => s.id === id);
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       sinkingItems: this.snapshot.sinkingItems.filter((s) => s.id !== id),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'sinking',
@@ -853,12 +944,12 @@ export class SyncEngine {
         ? { ...a, isDefaultSavings: false, updatedAt: nowIso }
         : a
     );
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       assetItems: mergeById(updatedAssets, [item]).sort(compareBySortOrder),
     };
 
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'asset',
@@ -885,11 +976,11 @@ export class SyncEngine {
       stockCategory: normalized,
       updatedAt: nowIso,
     };
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       assetItems: mergeById(this.snapshot.assetItems, [updated]).sort(compareBySortOrder),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'asset',
@@ -925,11 +1016,11 @@ export class SyncEngine {
         baseVersion: item.version ?? null,
         payload: { ...item },
       }));
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       assetItems: stampedItems,
     };
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return mutations.length;
   }
 
@@ -994,13 +1085,13 @@ export class SyncEngine {
       updatedAt: nowIso,
       deletedAt: null,
     };
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       savingsAdjustments: [adj, ...this.snapshot.savingsAdjustments].sort(
         (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
       ),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'savings_adjustment',
@@ -1029,7 +1120,7 @@ export class SyncEngine {
     const deleteIds = new Set(targets.map((t) => t.id));
     if (deleteIds.size === 0) deleteIds.add(id);
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       savingsAdjustments: this.snapshot.savingsAdjustments.filter((a) => !deleteIds.has(a.id)),
     };
@@ -1044,7 +1135,7 @@ export class SyncEngine {
         baseVersion: t.version ?? null,
       })
     );
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return { deletedCount: mutations.length };
   }
 
@@ -1233,7 +1324,7 @@ export class SyncEngine {
       });
     }
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       assetItems:
         updatedAssets.length > 0
@@ -1250,7 +1341,7 @@ export class SyncEngine {
         : this.snapshot.cashflowLogs,
     };
 
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return {
       transferGroupId,
       fromAdjustment,
@@ -1353,7 +1444,7 @@ export class SyncEngine {
       payload: { ...tx },
     });
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       cashflowLogs: createdCashflow
         ? this.sortCashFlows([createdCashflow, ...this.snapshot.cashflowLogs])
@@ -1363,7 +1454,7 @@ export class SyncEngine {
       ),
     };
 
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return { tx, cashflow: createdCashflow };
   }
 
@@ -1395,22 +1486,22 @@ export class SyncEngine {
       });
     }
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       cashflowLogs: nextLogs,
       stockTransactions: (this.snapshot.stockTransactions || []).filter((t) => t.id !== id),
     };
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
   }
 
   async deleteAsset(id: string): Promise<void> {
     const nowIso = new Date().toISOString();
     const existing = this.snapshot.assetItems.find((a) => a.id === id);
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       assetItems: this.snapshot.assetItems.filter((a) => a.id !== id),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'asset',
@@ -1479,11 +1570,11 @@ export class SyncEngine {
       payload: { ...record },
     });
 
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       rentUtilityRecords: mergeUtilityRecords(this.snapshot.rentUtilityRecords, updates),
     };
-    await this.commitAndMaybeSync(mutations);
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
     return record;
   }
 
@@ -1494,11 +1585,11 @@ export class SyncEngine {
       throw new Error('無法刪除起始表底或不存在的期別。');
     }
     const nowIso = new Date().toISOString();
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       rentUtilityRecords: this.snapshot.rentUtilityRecords.filter((r) => r.period !== clean),
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'utility_record',
@@ -1519,11 +1610,11 @@ export class SyncEngine {
       updatedAt: nowIso,
       ...(baseVersion !== undefined ? { version: baseVersion } : {}),
     };
-    this.snapshot = {
+    const nextSnapshot: FinanceSnapshot = {
       ...this.snapshot,
       rentUtilityRents: nextRents,
     };
-    await this.commitAndMaybeSync([
+    await this.commitAndMaybeSync(nextSnapshot, [
       {
         mutationId: crypto.randomUUID(),
         entity: 'utility_rents',
@@ -1537,8 +1628,18 @@ export class SyncEngine {
     return nextRents;
   }
 
-  private async commitAndMaybeSync(mutations: SyncMutation[]): Promise<void> {
-    await this.db.commitLocalMutation(this.snapshot, mutations);
+  private async commitAndMaybeSync(
+    nextSnapshot: FinanceSnapshot,
+    mutations: SyncMutation[]
+  ): Promise<void> {
+    try {
+      await this.db.commitLocalMutation(nextSnapshot, mutations, this.inFlightMutationIds);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '本機儲存失敗，變更未寫入';
+      this.opts.onError?.(msg);
+      throw err;
+    }
+    this.snapshot = nextSnapshot;
     const outbox = await this.db.getOutbox();
     this.emitSnapshot();
     this.updateStatus(this.computeStatus(outbox.length));
@@ -1547,75 +1648,124 @@ export class SyncEngine {
   /* ==================== Conflict Resolution ==================== */
 
   private applyRecordToSnapshot(
+    baseSnapshot: FinanceSnapshot,
     entity: SyncConflict['entity'],
     recordId: string,
     record: Record<string, unknown> | null,
     isDelete: boolean
-  ): void {
+  ): FinanceSnapshot {
     if (entity === 'settings') {
-      if (record) this.snapshot = { ...this.snapshot, settings: record as unknown as AppSettings };
-      return;
+      if (record) return { ...baseSnapshot, settings: record as unknown as AppSettings };
+      return baseSnapshot;
     }
     if (entity === 'ledger') {
-      const current = ensureActiveLedgers(this.snapshot.ledgers);
+      const current = ensureActiveLedgers(baseSnapshot.ledgers);
       const filtered = current.filter((l) => l.id !== recordId);
       const next =
         !isDelete && record && !record.deletedAt
           ? [...filtered, record as unknown as Ledger]
           : filtered;
-      this.snapshot = { ...this.snapshot, ledgers: ensureActiveLedgers(next) };
-      return;
+      return { ...baseSnapshot, ledgers: ensureActiveLedgers(next) };
     }
     if (entity === 'utility_rents') {
-      if (record) this.snapshot = { ...this.snapshot, rentUtilityRents: record as unknown as RentUtilityRents };
-      return;
+      if (record) return { ...baseSnapshot, rentUtilityRents: record as unknown as RentUtilityRents };
+      return baseSnapshot;
     }
     if (entity === 'cashflow') {
-      const filtered = this.snapshot.cashflowLogs.filter((l) => l.id !== recordId);
+      const filtered = baseSnapshot.cashflowLogs.filter((l) => l.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [record as unknown as CashFlowLog, ...filtered] : filtered;
-      this.snapshot = { ...this.snapshot, cashflowLogs: this.sortCashFlows(next) };
-      return;
+      return { ...baseSnapshot, cashflowLogs: this.sortCashFlows(next) };
     }
     if (entity === 'recurring') {
-      const filtered = this.snapshot.recurringItems.filter((r) => r.id !== recordId);
+      const filtered = baseSnapshot.recurringItems.filter((r) => r.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as RecurringItem] : filtered;
-      this.snapshot = { ...this.snapshot, recurringItems: next.sort(compareBySortOrder) };
-      return;
+      return { ...baseSnapshot, recurringItems: next.sort(compareBySortOrder) };
     }
     if (entity === 'sinking') {
-      const filtered = this.snapshot.sinkingItems.filter((s) => s.id !== recordId);
+      const filtered = baseSnapshot.sinkingItems.filter((s) => s.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as SinkingFundItem] : filtered;
-      this.snapshot = { ...this.snapshot, sinkingItems: next.sort(compareBySortOrder) };
-      return;
+      return { ...baseSnapshot, sinkingItems: next.sort(compareBySortOrder) };
     }
     if (entity === 'asset') {
-      const filtered = this.snapshot.assetItems.filter((a) => a.id !== recordId);
+      const filtered = baseSnapshot.assetItems.filter((a) => a.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as AssetItem] : filtered;
-      this.snapshot = { ...this.snapshot, assetItems: next.sort(compareBySortOrder) };
-      return;
+      return { ...baseSnapshot, assetItems: next.sort(compareBySortOrder) };
     }
     if (entity === 'savings_adjustment') {
-      const filtered = this.snapshot.savingsAdjustments.filter((a) => a.id !== recordId);
+      const filtered = baseSnapshot.savingsAdjustments.filter((a) => a.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [record as unknown as SavingsAdjustment, ...filtered] : filtered;
-      this.snapshot = {
-        ...this.snapshot,
+      return {
+        ...baseSnapshot,
         savingsAdjustments: next.sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
       };
-      return;
     }
     if (entity === 'stock_tx') {
-      const filtered = (this.snapshot.stockTransactions || []).filter((t) => t.id !== recordId);
+      const filtered = (baseSnapshot.stockTransactions || []).filter((t) => t.id !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [record as unknown as StockTransaction, ...filtered] : filtered;
-      this.snapshot = {
-        ...this.snapshot,
+      return {
+        ...baseSnapshot,
         stockTransactions: next.sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
       };
-      return;
     }
     if (entity === 'utility_record') {
-      const filtered = this.snapshot.rentUtilityRecords.filter((r) => r.period !== recordId);
+      const filtered = baseSnapshot.rentUtilityRecords.filter((r) => r.period !== recordId);
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as RentUtilityRecord] : filtered;
-      this.snapshot = { ...this.snapshot, rentUtilityRecords: sortUtilityRecords(next) };
+      return { ...baseSnapshot, rentUtilityRecords: sortUtilityRecords(next) };
+    }
+    return baseSnapshot;
+  }
+
+  private findRecordInDelta(
+    delta: SyncDelta,
+    entity: SyncMutation['entity'],
+    recordId: string
+  ): { record: Record<string, unknown>; version?: number } | null {
+    switch (entity) {
+      case 'settings':
+        return delta.settings
+          ? { record: delta.settings as unknown as Record<string, unknown>, version: delta.settings.version }
+          : null;
+      case 'utility_rents':
+        return delta.rentUtilityRents
+          ? {
+              record: delta.rentUtilityRents as unknown as Record<string, unknown>,
+              version: delta.rentUtilityRents.version,
+            }
+          : null;
+      case 'ledger': {
+        const found = (delta.ledgers || []).find((l) => l.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'cashflow': {
+        const found = (delta.cashflowLogs || []).find((l) => l.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'recurring': {
+        const found = (delta.recurringItems || []).find((r) => r.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'sinking': {
+        const found = (delta.sinkingItems || []).find((s) => s.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'asset': {
+        const found = (delta.assetItems || []).find((a) => a.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'savings_adjustment': {
+        const found = (delta.savingsAdjustments || []).find((a) => a.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'stock_tx': {
+        const found = (delta.stockTransactions || []).find((t) => t.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'utility_record': {
+        const found = (delta.rentUtilityRecords || []).find((u) => u.period === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      default:
+        return null;
     }
   }
 
@@ -1623,34 +1773,36 @@ export class SyncEngine {
     const conflict = this.conflicts.find((c) => c.mutationId === mutationId);
     if (!conflict) return;
 
-    this.conflicts = this.conflicts.filter((c) => c.mutationId !== mutationId);
-    this.applyRecordToSnapshot(
+    const nextConflicts = this.conflicts.filter((c) => c.mutationId !== mutationId);
+    const nextSnapshot = this.applyRecordToSnapshot(
+      this.snapshot,
       conflict.entity,
       conflict.recordId,
       conflict.serverRecord,
       !conflict.serverRecord || Boolean(conflict.serverRecord.deletedAt)
     );
-    await this.db.saveSnapshot(this.snapshot);
-    await this.db.saveConflicts(this.conflicts);
+    await this.db.saveSnapshot(nextSnapshot);
+    await this.db.saveConflicts(nextConflicts);
+    this.snapshot = nextSnapshot;
+    this.conflicts = nextConflicts;
     const outbox = await this.db.getOutbox();
     this.emitSnapshot();
     this.updateStatus(this.computeStatus(outbox.length));
   }
 
-  async resolveConflictKeepLocal(
-    mutationId: string
-  ): Promise<{ ok: boolean; authRequired?: boolean; error?: string }> {
+  async resolveConflictKeepLocal(mutationId: string): Promise<SyncResult> {
     const conflict = this.conflicts.find((c) => c.mutationId === mutationId);
     if (!conflict) return { ok: true };
 
     const nowIso = new Date().toISOString();
-    this.conflicts = this.conflicts.filter((c) => c.mutationId !== mutationId);
+    const nextConflicts = this.conflicts.filter((c) => c.mutationId !== mutationId);
 
     const payloadWithVersion = conflict.clientPayload
       ? { ...conflict.clientPayload, updatedAt: nowIso, version: conflict.serverVersion }
       : undefined;
 
-    this.applyRecordToSnapshot(
+    const nextSnapshot = this.applyRecordToSnapshot(
+      this.snapshot,
       conflict.entity,
       conflict.recordId,
       payloadWithVersion || null,
@@ -1667,8 +1819,9 @@ export class SyncEngine {
       ...(payloadWithVersion ? { payload: payloadWithVersion } : {}),
     };
 
-    await this.db.saveConflicts(this.conflicts);
-    await this.commitAndMaybeSync([retryMutation]);
+    await this.db.saveConflicts(nextConflicts);
+    this.conflicts = nextConflicts;
+    await this.commitAndMaybeSync(nextSnapshot, [retryMutation]);
 
     if (this.isOnline()) {
       return this.syncNow();
@@ -1678,165 +1831,356 @@ export class SyncEngine {
 
   /* ==================== Bidirectional Sync ==================== */
 
-  async syncNow(forceFullPull = false): Promise<{ ok: boolean; authRequired?: boolean; error?: string }> {
+  private clearScheduledRetry(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  private scheduleRetry(overrideDelayMs?: number): void {
+    if (this.accountMismatchHalted) return;
+    this.clearScheduledRetry();
+    let delayMs: number;
+    if (overrideDelayMs !== undefined) {
+      delayMs = overrideDelayMs;
+    } else {
+      const exp = Math.min(60_000, this.retryBaseDelayMs * Math.pow(2, Math.max(0, this.consecutiveFailures - 1)));
+      const jitter = 0.75 + Math.random() * 0.5;
+      delayMs = Math.round(exp * jitter);
+    }
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.isOnline() && !this.accountMismatchHalted) {
+        void this.syncNow();
+      }
+    }, delayMs);
+  }
+
+  async syncNow(forceFullPull = false): Promise<SyncResult> {
+    if (this.accountMismatchHalted) {
+      return {
+        ok: false,
+        accountMismatch: true,
+        error: '目前瀏覽器登入帳號已變更，已停止同步以避免跨帳號寫入。請重新整理或切換帳號。',
+      };
+    }
     if (this.syncingPromise) return this.syncingPromise;
 
-    this.syncingPromise = this.performSync(forceFullPull).finally(() => {
+    this.clearScheduledRetry();
+    this.syncingPromise = this.requestLockImpl(`personal-finance-sync:${this.db.getDbName()}`, () =>
+      this.performSync(forceFullPull)
+    ).finally(() => {
       this.syncingPromise = null;
     });
     return this.syncingPromise;
   }
 
-  private async performSync(
-    forceFullPull: boolean
-  ): Promise<{ ok: boolean; authRequired?: boolean; error?: string }> {
-    const outbox = await this.db.getOutbox();
+  private async performSync(forceFullPull: boolean): Promise<SyncResult> {
+    // Re-read fresh state from IndexedDB after acquiring the cross-tab lock
+    this.snapshot = await this.db.getSnapshot();
+    this.meta = await this.db.getMeta();
+    this.conflicts = await this.db.getConflicts();
+    this.rejections = await this.db.getRejections();
 
+    let outbox = await this.db.getOutbox();
     if (!this.isOnline()) {
       this.updateStatus(this.computeStatus(outbox.length));
       return { ok: false, error: '目前處於離線模式' };
     }
 
-    this.updateStatus({
-      state: 'syncing',
-      pendingCount: outbox.length,
-      conflictCount: this.conflicts.length,
-      lastSyncedAt: this.meta.lastSyncedAt,
-    });
+    let fullPullPass = forceFullPull;
+    const maxPasses = 20;
 
-    try {
-      const res = await this.fetchImpl('/api/sync', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          since: forceFullPull ? null : this.meta.lastSyncedAt,
-          mutations: outbox,
-        }),
+    for (let pass = 0; pass < maxPasses; pass++) {
+      outbox = await this.db.getOutbox();
+      const batch = outbox.slice(0, this.maxBatchSize);
+      const hadMoreBatches = outbox.length > batch.length;
+
+      this.updateStatus({
+        state: 'syncing',
+        pendingCount: outbox.length,
+        conflictCount: this.conflicts.length,
+        rejectedCount: this.rejections.length,
+        lastSyncedAt: this.meta.lastSyncedAt,
       });
 
-      if (res.status === 401) {
-        this.updateStatus({
-          state: 'auth_required',
-          pendingCount: outbox.length,
-          conflictCount: this.conflicts.length,
-          lastSyncedAt: this.meta.lastSyncedAt,
-          lastError: '登入逾時，請重新驗證以同步待上傳資料',
+      for (const m of batch) {
+        this.inFlightMutationIds.add(m.mutationId);
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+
+      try {
+        const headers: Record<string, string> = { 'content-type': 'application/json' };
+        if (this.expectedUserId) {
+          headers['x-expected-user'] = this.expectedUserId;
+        }
+
+        const res = await this.fetchImpl('/api/sync', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({
+            since: fullPullPass ? null : this.meta.lastSyncedAt,
+            sinceSeq: fullPullPass ? null : (this.meta.syncCursor ?? null),
+            clientEpoch: fullPullPass ? null : (this.meta.dataEpoch ?? null),
+            mutations: batch,
+          }),
         });
-        this.opts.onAuthRequired?.();
-        return { ok: false, authRequired: true };
-      }
 
-      if (!res.ok) {
-        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errBody.error || `同步失敗 (${res.status})`);
-      }
-
-      const data = (await res.json()) as SyncResponse;
-      const incomingConflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
-      if (incomingConflicts.length > 0) {
-        const byKey = new Map<string, SyncConflict>();
-        for (const c of this.conflicts) {
-          byKey.set(`${c.entity}:${c.recordId}`, c);
-        }
-        for (const c of incomingConflicts) {
-          byKey.set(`${c.entity}:${c.recordId}`, c);
-        }
-        this.conflicts = Array.from(byKey.values());
-      }
-
-      const incomingRejected = Array.isArray(data.rejected) ? data.rejected : [];
-      const outboxById = new Map(outbox.map((m) => [m.mutationId, m]));
-      const rejectedCreatesToRollback: Array<{ entity: string; recordId: string }> = [];
-      if (incomingRejected.length > 0) {
-        const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
-        const rejectedAt = data.serverTime || new Date().toISOString();
-        for (const r of incomingRejected) {
-          const orig = outboxById.get(r.mutationId);
-          byMutId.set(r.mutationId, {
-            mutationId: r.mutationId,
-            entity: orig?.entity || 'unknown',
-            op: orig?.op || 'upsert',
-            recordId: orig?.recordId || r.mutationId,
-            reason: r.reason || '伺服器拒絕此筆異動',
-            clientPayload: orig?.payload,
-            rejectedAt,
+        if (res.status === 401) {
+          this.updateStatus({
+            state: 'auth_required',
+            pendingCount: outbox.length,
+            conflictCount: this.conflicts.length,
+            rejectedCount: this.rejections.length,
+            lastSyncedAt: this.meta.lastSyncedAt,
+            lastError: '登入逾時，請重新驗證以同步待上傳資料',
           });
-          if (orig && orig.op === 'upsert' && (orig.baseVersion === null || orig.baseVersion === 0)) {
-            rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
+          this.opts.onAuthRequired?.();
+          return { ok: false, authRequired: true };
+        }
+
+        if (res.status === 409) {
+          const errBody = (await res.json().catch(() => ({}))) as {
+            error?: string;
+            expectedUserId?: string;
+            actualUserId?: string;
+          };
+          const msg =
+            errBody.error ||
+            '目前瀏覽器登入帳號已變更，已停止同步以避免跨帳號寫入。請重新整理或切換帳號。';
+          this.accountMismatchHalted = true;
+          this.clearScheduledRetry();
+          this.updateStatus({
+            state: 'auth_required',
+            pendingCount: outbox.length,
+            conflictCount: this.conflicts.length,
+            rejectedCount: this.rejections.length,
+            lastSyncedAt: this.meta.lastSyncedAt,
+            lastError: msg,
+          });
+          this.opts.onAccountMismatch?.({
+            error: msg,
+            expectedUserId: errBody.expectedUserId,
+            actualUserId: errBody.actualUserId,
+          });
+          return { ok: false, accountMismatch: true, error: msg };
+        }
+
+        if (!res.ok) {
+          const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+          const statusErr = new Error(errBody.error || `同步失敗 (${res.status})`) as Error & {
+            httpStatus?: number;
+          };
+          statusErr.httpStatus = res.status;
+          throw statusErr;
+        }
+
+        const data = (await res.json()) as SyncResponse;
+        this.consecutiveFailures = 0;
+
+        const incomingConflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+        let nextConflicts = this.conflicts;
+        if (incomingConflicts.length > 0) {
+          const byKey = new Map<string, SyncConflict>();
+          for (const c of this.conflicts) {
+            byKey.set(`${c.entity}:${c.recordId}`, c);
+          }
+          for (const c of incomingConflicts) {
+            byKey.set(`${c.entity}:${c.recordId}`, c);
+          }
+          nextConflicts = Array.from(byKey.values());
+        }
+
+        const incomingRejected = Array.isArray(data.rejected) ? data.rejected : [];
+        const batchById = new Map(batch.map((m) => [m.mutationId, m]));
+        const rejectedCreatesToRollback: Array<{ entity: string; recordId: string }> = [];
+        let nextRejections = this.rejections;
+        if (incomingRejected.length > 0) {
+          const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
+          const rejectedAt = data.serverTime || new Date().toISOString();
+          for (const r of incomingRejected) {
+            const orig = batchById.get(r.mutationId);
+            byMutId.set(r.mutationId, {
+              mutationId: r.mutationId,
+              entity: orig?.entity || 'unknown',
+              op: orig?.op || 'upsert',
+              recordId: orig?.recordId || r.mutationId,
+              reason: r.reason || '伺服器拒絕此筆異動',
+              clientPayload: orig?.payload,
+              rejectedAt,
+            });
+            if (orig && orig.op === 'upsert' && (orig.baseVersion === null || orig.baseVersion === 0)) {
+              rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
+            }
+          }
+          nextRejections = Array.from(byMutId.values());
+        }
+
+        const epochChanged =
+          typeof this.meta.dataEpoch === 'number' &&
+          typeof data.dataEpoch === 'number' &&
+          this.meta.dataEpoch !== data.dataEpoch;
+        const applyAsFull = fullPullPass || Boolean(data.fullResyncRequired) || epochChanged;
+
+        let merged = this.mergeDelta(this.snapshot, data.delta, applyAsFull);
+        for (const rb of rejectedCreatesToRollback) {
+          merged = this.removeRecordFromSnapshot(merged, rb.entity, rb.recordId);
+        }
+
+        const nextMeta: LocalMeta = {
+          ...this.meta,
+          lastSyncedAt: data.serverTime,
+          ...(typeof data.syncCursor === 'number' ? { syncCursor: data.syncCursor } : {}),
+          ...(typeof data.dataEpoch === 'number' ? { dataEpoch: data.dataEpoch } : {}),
+        };
+
+        const outboxIdsToClear = [
+          ...(data.ackedMutationIds || []),
+          ...incomingConflicts.map((c) => c.mutationId),
+          ...incomingRejected.map((r) => r.mutationId),
+        ];
+        const clearedSet = new Set(outboxIdsToClear);
+        const batchIdSet = new Set(batch.map((m) => m.mutationId));
+
+        // Re-apply and rebase ALL pending outbox mutations that were not cleared
+        // (especially edits/deletes made while this sync batch was in-flight!)
+        const currentOutbox = await this.db.getOutbox();
+        const rebasedMutations: Array<{ oldMutationId: string; replacement: SyncMutation }> = [];
+
+        for (const pendingMut of currentOutbox) {
+          if (clearedSet.has(pendingMut.mutationId)) continue;
+          if (batchIdSet.has(pendingMut.mutationId)) continue;
+
+          const serverHit = this.findRecordInDelta(data.delta, pendingMut.entity, pendingMut.recordId);
+
+          if (pendingMut.entity === 'settings' && pendingMut.payload) {
+            const p = pendingMut.payload as Partial<AppSettings>;
+            const rebasedSettings: AppSettings = {
+              ...merged.settings,
+              ...(p.monthlyDailyBudget !== undefined ? { monthlyDailyBudget: p.monthlyDailyBudget } : {}),
+              ...(p.emergencyTargetMonths !== undefined ? { emergencyTargetMonths: p.emergencyTargetMonths } : {}),
+              ...(p.usdTwdRate !== undefined ? { usdTwdRate: p.usdTwdRate } : {}),
+              ...(p.autoFxEnabled !== undefined ? { autoFxEnabled: p.autoFxEnabled } : {}),
+              ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
+              ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
+            };
+            merged = { ...merged, settings: rebasedSettings };
+            if (serverHit && serverHit.version !== undefined) {
+              rebasedMutations.push({
+                oldMutationId: pendingMut.mutationId,
+                replacement: {
+                  ...pendingMut,
+                  mutationId: crypto.randomUUID(),
+                  baseVersion: serverHit.version,
+                  payload: { ...rebasedSettings },
+                },
+              });
+            }
+            continue;
+          }
+
+          if (pendingMut.op === 'delete') {
+            merged = this.removeRecordFromSnapshot(merged, pendingMut.entity, pendingMut.recordId);
+            if (serverHit && serverHit.version !== undefined) {
+              rebasedMutations.push({
+                oldMutationId: pendingMut.mutationId,
+                replacement: {
+                  ...pendingMut,
+                  mutationId: crypto.randomUUID(),
+                  baseVersion: serverHit.version,
+                },
+              });
+            }
+          } else if (pendingMut.op === 'upsert' && pendingMut.payload) {
+            const nextVersion = serverHit?.version;
+            const overlaidPayload: Record<string, unknown> = {
+              ...pendingMut.payload,
+              ...(nextVersion !== undefined ? { version: nextVersion } : {}),
+            };
+            merged = this.applyRecordToSnapshot(
+              merged,
+              pendingMut.entity,
+              pendingMut.recordId,
+              overlaidPayload,
+              false
+            );
+            if (nextVersion !== undefined) {
+              rebasedMutations.push({
+                oldMutationId: pendingMut.mutationId,
+                replacement: {
+                  ...pendingMut,
+                  mutationId: crypto.randomUUID(),
+                  baseVersion: nextVersion,
+                  payload: overlaidPayload,
+                },
+              });
+            }
           }
         }
-        this.rejections = Array.from(byMutId.values());
-      }
 
-      let merged = this.mergeDelta(this.snapshot, data.delta, forceFullPull);
-      for (const rb of rejectedCreatesToRollback) {
-        merged = this.removeRecordFromSnapshot(merged, rb.entity, rb.recordId);
-      }
-
-      this.meta = {
-        ...this.meta,
-        lastSyncedAt: data.serverTime,
-      };
-
-      const outboxIdsToClear = [
-        ...(data.ackedMutationIds || []),
-        ...incomingConflicts.map((c) => c.mutationId),
-        ...incomingRejected.map((r) => r.mutationId),
-      ];
-      const clearedSet = new Set(outboxIdsToClear);
-      const currentOutbox = await this.db.getOutbox();
-      const pendingSettingsMut = currentOutbox.find(
-        (m) => m.entity === 'settings' && !clearedSet.has(m.mutationId)
-      );
-
-      if (pendingSettingsMut && pendingSettingsMut.payload && data.delta.settings) {
-        // User changed settings again while an earlier sync was in flight:
-        // preserve local pending settings fields and rebase baseVersion to server's latest version
-        const p = pendingSettingsMut.payload as Partial<AppSettings>;
-        const rebasedSettings: AppSettings = {
-          ...merged.settings,
-          ...(p.monthlyDailyBudget !== undefined ? { monthlyDailyBudget: p.monthlyDailyBudget } : {}),
-          ...(p.emergencyTargetMonths !== undefined ? { emergencyTargetMonths: p.emergencyTargetMonths } : {}),
-          ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
-          ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
-        };
-        this.snapshot = { ...merged, settings: rebasedSettings };
-        await this.db.acknowledgeOutboxAndSave(
-          [...outboxIdsToClear, pendingSettingsMut.mutationId],
-          this.snapshot,
-          this.meta,
-          this.conflicts,
-          this.rejections
-        );
-        await this.db.commitLocalMutation(this.snapshot, [
-          {
-            ...pendingSettingsMut,
-            mutationId: crypto.randomUUID(),
-            baseVersion: data.delta.settings.version,
-            payload: { ...rebasedSettings },
-          },
-        ]);
-      } else {
-        this.snapshot = merged;
         await this.db.acknowledgeOutboxAndSave(
           outboxIdsToClear,
-          this.snapshot,
-          this.meta,
-          this.conflicts,
-          this.rejections
+          merged,
+          nextMeta,
+          nextConflicts,
+          nextRejections,
+          rebasedMutations
         );
-      }
 
-      const remainingOutbox = await this.db.getOutbox();
-      this.emitSnapshot();
-      this.updateStatus(this.computeStatus(remainingOutbox.length));
-      return { ok: true };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '網路同步失敗';
-      this.updateStatus(this.computeStatus(outbox.length, msg));
-      return { ok: false, error: msg };
+        this.snapshot = merged;
+        this.meta = nextMeta;
+        this.conflicts = nextConflicts;
+        this.rejections = nextRejections;
+
+        const remainingOutbox = await this.db.getOutbox();
+        this.emitSnapshot();
+        this.updateStatus(this.computeStatus(remainingOutbox.length));
+
+        const madeForwardProgress = outboxIdsToClear.length > 0;
+        fullPullPass = false;
+
+        if (hadMoreBatches && remainingOutbox.length > 0 && madeForwardProgress) {
+          continue;
+        }
+        if (remainingOutbox.length > 0 && madeForwardProgress) {
+          // New edits/deletes arrived while this request was in-flight; schedule an automatic follow-up sync
+          this.scheduleRetry(250);
+        }
+        return { ok: true };
+      } catch (err) {
+        const isAbort = err instanceof DOMException && err.name === 'AbortError';
+        const httpStatus = (err as { httpStatus?: number })?.httpStatus;
+        const msg = isAbort
+          ? `同步逾時（超過 ${Math.round(this.requestTimeoutMs / 1000)} 秒），稍後將自動重試`
+          : err instanceof Error
+            ? err.message
+            : '網路同步失敗';
+        const latestOutbox = await this.db.getOutbox();
+        this.updateStatus(this.computeStatus(latestOutbox.length, msg));
+
+        // Exponential backoff + jitter on 5xx or network/timeout failures when outbox still has pending mutations
+        const isTransient = !httpStatus || httpStatus >= 500 || isAbort;
+        if (isTransient && latestOutbox.length > 0 && this.isOnline()) {
+          this.consecutiveFailures += 1;
+          this.scheduleRetry();
+        }
+        return { ok: false, error: msg };
+      } finally {
+        clearTimeout(timeoutId);
+        for (const m of batch) {
+          this.inFlightMutationIds.delete(m.mutationId);
+        }
+      }
     }
+
+    const finalOutbox = await this.db.getOutbox();
+    this.updateStatus(this.computeStatus(finalOutbox.length));
+    return { ok: true };
   }
 
   private removeRecordFromSnapshot(

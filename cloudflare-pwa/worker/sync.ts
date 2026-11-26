@@ -54,6 +54,29 @@ export function assertUserId(userId: string): string {
   return cleaned;
 }
 
+export async function ensureUserSyncState(
+  db: D1Database,
+  userId: string
+): Promise<{ changeSeq: number; dataEpoch: number }> {
+  const uid = assertUserId(userId);
+  const nowIso = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at)
+       VALUES (?, 0, 1, ?)`
+    )
+    .bind(uid, nowIso)
+    .run();
+  const row = await db
+    .prepare('SELECT change_seq, data_epoch FROM user_sync_state WHERE user_id = ?')
+    .bind(uid)
+    .first<{ change_seq: number; data_epoch: number }>();
+  return {
+    changeSeq: Number(row?.change_seq ?? 0),
+    dataEpoch: Number(row?.data_epoch ?? 1),
+  };
+}
+
 export async function ensureAppSettings(db: D1Database, userId: string): Promise<AppSettings> {
   const uid = assertUserId(userId);
   const row = await db
@@ -63,6 +86,7 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       monthly_daily_budget: number;
       emergency_target_months: number;
       usd_twd_rate: number;
+      auto_fx_enabled?: number | null;
       fx_updated_at: string | null;
       pnl_color_scheme?: string | null;
       custom_stock_categories?: string | null;
@@ -75,6 +99,7 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       monthlyDailyBudget: row.monthly_daily_budget,
       emergencyTargetMonths: row.emergency_target_months,
       usdTwdRate: row.usd_twd_rate,
+      autoFxEnabled: row.auto_fx_enabled !== undefined && row.auto_fx_enabled !== null ? Number(row.auto_fx_enabled) !== 0 : true,
       fxUpdatedAt: row.fx_updated_at,
       pnlColorScheme: normalizePnlColorScheme(row.pnl_color_scheme),
       customStockCategories: normalizeCustomStockCategories(row.custom_stock_categories),
@@ -86,8 +111,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
   const nowIso = new Date().toISOString();
   await db
     .prepare(
-      `INSERT OR IGNORE INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, pnl_color_scheme, custom_stock_categories, updated_at, version)
-       VALUES (?, ?, ?, ?, ?, '[]', ?, 1)`
+      `INSERT OR IGNORE INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, auto_fx_enabled, pnl_color_scheme, custom_stock_categories, updated_at, version)
+       VALUES (?, ?, ?, ?, 1, ?, '[]', ?, 1)`
     )
     .bind(
       uid,
@@ -103,6 +128,7 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
     monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
     emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
     usdTwdRate: DEFAULT_USD_TWD_RATE,
+    autoFxEnabled: true,
     fxUpdatedAt: null,
     pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
     customStockCategories: [],
@@ -383,18 +409,27 @@ class VersionConflictError extends Error {
   }
 }
 
+const NEXT_SEQ_SQL = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1';
+const CURR_SEQ_SQL = 'COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)';
+
 function checkVersionOrThrow(
   mutation: SyncMutation,
   existingRow: Record<string, unknown> | null,
   existingMapped: Record<string, unknown> | null,
-  serverTime: string
-): { shouldApply: boolean; nextVersion: number; writeTs: string } {
+  serverTime: string,
+  legacyCompareTs?: string | null
+): { shouldApply: boolean; nextVersion: number; writeTs: string; legacyClientTs?: string } {
   const clientTs = mutation.clientTimestamp || serverTime;
-  const hasExplicitBase = mutation.baseVersion !== undefined;
-  const writeTs = hasExplicitBase ? serverTime : clientTs;
+  // Always persist serverTime as updated_at to eliminate clock-skew issues
+  const writeTs = serverTime;
 
   if (!existingRow) {
-    return { shouldApply: true, nextVersion: 1, writeTs };
+    return {
+      shouldApply: true,
+      nextVersion: 1,
+      writeTs,
+      ...(mutation.baseVersion === undefined ? { legacyClientTs: clientTs } : {}),
+    };
   }
 
   const serverVersion = Number(existingRow.version ?? 1);
@@ -435,11 +470,12 @@ function checkVersionOrThrow(
     return { shouldApply: true, nextVersion: serverVersion + 1, writeTs };
   }
 
-  // Legacy client without baseVersion -> LWW fallback
-  if (!isNewerOrEqual(clientTs, existingUpdatedAt)) {
+  // Legacy client without baseVersion -> LWW fallback using stored legacy client timestamp if present
+  const compareTs = legacyCompareTs ?? existingUpdatedAt;
+  if (!isNewerOrEqual(clientTs, compareTs)) {
     return { shouldApply: false, nextVersion: serverVersion, writeTs };
   }
-  return { shouldApply: true, nextVersion: serverVersion + 1, writeTs };
+  return { shouldApply: true, nextVersion: serverVersion + 1, writeTs, legacyClientTs: clientTs };
 }
 
 const ALLOWED_SYNC_ENTITIES = new Set<string>([
@@ -476,7 +512,8 @@ async function commitAtomicMutation(
   serverTime: string,
   primaryWriteStmt: D1PreparedStatement,
   postStatements: D1PreparedStatement[],
-  refetchCurrent: () => Promise<{ row: Record<string, unknown> | null; mapped: Record<string, unknown> | null }>
+  refetchCurrent: () => Promise<{ row: Record<string, unknown> | null; mapped: Record<string, unknown> | null }>,
+  legacyClientTs?: string
 ): Promise<void> {
   const idempStmt = db
     .prepare(
@@ -484,7 +521,25 @@ async function commitAtomicMutation(
     )
     .bind(uid, mutation.mutationId, serverTime);
 
-  const batchStmts = [primaryWriteStmt, idempStmt, ...postStatements];
+  const bumpSeqStmt = db
+    .prepare(
+      'UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0'
+    )
+    .bind(serverTime, uid);
+
+  const extraStmts: D1PreparedStatement[] = [];
+  if (legacyClientTs) {
+    extraStmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO sync_lww_timestamps (user_id, entity, record_id, client_ts)
+           SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?)`
+        )
+        .bind(uid, mutation.entity, mutation.recordId, legacyClientTs, uid, mutation.mutationId)
+    );
+  }
+
+  const batchStmts = [primaryWriteStmt, idempStmt, bumpSeqStmt, ...extraStmts, ...postStatements];
   try {
     const results = await db.batch(batchStmts);
     const changed = Number(results[0]?.meta?.changes ?? 0);
@@ -522,6 +577,14 @@ async function applySingleMutation(
   serverTime: string
 ): Promise<void> {
   const uid = assertUserId(userId);
+  let legacyCompareTs: string | null = null;
+  if (mutation.baseVersion === undefined) {
+    const lwwRow = await db
+      .prepare('SELECT client_ts FROM sync_lww_timestamps WHERE user_id = ? AND entity = ? AND record_id = ?')
+      .bind(uid, mutation.entity, mutation.recordId)
+      .first<{ client_ts: string }>();
+    legacyCompareTs = lwwRow?.client_ts ?? null;
+  }
 
   if (mutation.entity === 'settings') {
     if (mutation.op !== 'upsert') {
@@ -537,7 +600,8 @@ async function applySingleMutation(
       mutation,
       existingRow,
       existing as unknown as Record<string, unknown>,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -548,6 +612,12 @@ async function applySingleMutation(
     const months = Math.min(60, Math.max(1, Math.round(toSafeNumber(p.emergencyTargetMonths, existing.emergencyTargetMonths))));
     const fx = toSafeNumber(p.usdTwdRate, existing.usdTwdRate);
     const validFx = fx > 10 && fx < 100 ? fx : existing.usdTwdRate;
+    const autoFxEnabled =
+      p.autoFxEnabled !== undefined
+        ? Boolean(p.autoFxEnabled)
+        : existing.autoFxEnabled !== undefined
+          ? existing.autoFxEnabled
+          : true;
     const pnlScheme =
       p.pnlColorScheme !== undefined
         ? normalizePnlColorScheme(p.pnlColorScheme)
@@ -559,17 +629,19 @@ async function applySingleMutation(
     const writeStmt = db
       .prepare(
         `UPDATE app_settings
-         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = ?
+         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
          WHERE user_id = ? AND version = ?`
       )
       .bind(
         budget,
         months,
         validFx,
+        autoFxEnabled ? 1 : 0,
         pnlScheme,
         JSON.stringify(customStockCats),
         check.writeTs,
         check.nextVersion,
+        uid,
         uid,
         expectedVersion
       );
@@ -583,7 +655,7 @@ async function applySingleMutation(
         row,
         mapped: mapped as unknown as Record<string, unknown>,
       };
-    });
+    }, check.legacyClientTs);
     return;
   }
 
@@ -597,7 +669,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapLedgerRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -641,10 +714,10 @@ async function applySingleMutation(
       const expectedVersion = Number(existing.version ?? 1);
       const delStmt = db
         .prepare(
-          'UPDATE ledgers SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+          `UPDATE ledgers SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, expectedVersion);
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchLedger);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, expectedVersion);
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchLedger, check.legacyClientTs);
       return;
     }
 
@@ -678,7 +751,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE ledgers
-             SET name = ?, include_in_net_worth = ?, monthly_daily_budget = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET name = ?, include_in_net_worth = ?, monthly_daily_budget = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -690,14 +763,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO ledgers
-              (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -710,10 +784,11 @@ async function applySingleMutation(
             v.sortOrder,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchLedger);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchLedger, check.legacyClientTs);
     return;
   }
 
@@ -726,7 +801,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapCashFlowRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -748,10 +824,10 @@ async function applySingleMutation(
       }
       const delStmt = db
         .prepare(
-          'UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+          `UPDATE cashflow_logs SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchCashflow);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchCashflow, check.legacyClientTs);
       return;
     }
 
@@ -780,7 +856,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE cashflow_logs
-             SET date = ?, year_month = ?, type = ?, category = ?, item_name = ?, amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, source = ?, note = ?, linked_account_id = ?, ledger_id = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET date = ?, year_month = ?, type = ?, category = ?, item_name = ?, amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, source = ?, note = ?, linked_account_id = ?, ledger_id = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -800,14 +876,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO cashflow_logs
-              (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -828,10 +905,11 @@ async function applySingleMutation(
             v.ledgerId,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchCashflow);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchCashflow, check.legacyClientTs);
     return;
   }
 
@@ -844,7 +922,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapRecurringRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -866,10 +945,10 @@ async function applySingleMutation(
       }
       const delStmt = db
         .prepare(
-          'UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+          `UPDATE recurring_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchRecurring);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchRecurring, check.legacyClientTs);
       return;
     }
 
@@ -901,7 +980,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE recurring_items
-             SET item_name = ?, category = ?, type = ?, amount = ?, currency = ?, cycle = ?, billing_spec = ?, status = ?, note = ?, linked_account_id = ?, ledger_id = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET item_name = ?, category = ?, type = ?, amount = ?, currency = ?, cycle = ?, billing_spec = ?, status = ?, note = ?, linked_account_id = ?, ledger_id = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -920,14 +999,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO recurring_items
-              (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -947,10 +1027,11 @@ async function applySingleMutation(
             v.sortOrder,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchRecurring);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchRecurring, check.legacyClientTs);
     return;
   }
 
@@ -963,7 +1044,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapSinkingRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -985,10 +1067,10 @@ async function applySingleMutation(
       }
       const delStmt = db
         .prepare(
-          'UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+          `UPDATE sinking_fund_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchSinking);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchSinking, check.legacyClientTs);
       return;
     }
 
@@ -1013,7 +1095,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE sinking_fund_items
-             SET item_name = ?, category = ?, total_amount = ?, months = ?, due_note = ?, status = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET item_name = ?, category = ?, total_amount = ?, months = ?, due_note = ?, status = ?, note = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -1028,14 +1110,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO sinking_fund_items
-              (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1051,10 +1134,11 @@ async function applySingleMutation(
             v.sortOrder,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchSinking);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchSinking, check.legacyClientTs);
     return;
   }
 
@@ -1067,7 +1151,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapAssetRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -1089,10 +1174,10 @@ async function applySingleMutation(
       }
       const delStmt = db
         .prepare(
-          'UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+          `UPDATE asset_items SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAsset);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAsset, check.legacyClientTs);
       return;
     }
 
@@ -1170,11 +1255,11 @@ async function applySingleMutation(
         db
           .prepare(
             `UPDATE asset_items
-             SET is_default_savings = 0, updated_at = ?, version = version + 1
+             SET is_default_savings = 0, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
              WHERE user_id = ? AND ledger_id = ? AND is_default_savings = 1 AND id != ?
                AND EXISTS (SELECT 1 FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?)`
           )
-          .bind(check.writeTs, uid, v.ledgerId, mutation.recordId, uid, mutation.mutationId)
+          .bind(check.writeTs, uid, uid, v.ledgerId, mutation.recordId, uid, mutation.mutationId)
       );
     }
 
@@ -1182,7 +1267,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE asset_items
-             SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -1214,14 +1299,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO asset_items
-              (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1254,10 +1340,11 @@ async function applySingleMutation(
             v.sortOrder,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, postStatements, refetchAsset);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, postStatements, refetchAsset, check.legacyClientTs);
     return;
   }
 
@@ -1270,7 +1357,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapSavingsAdjustmentRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -1295,10 +1383,10 @@ async function applySingleMutation(
       }
       const delStmt = db
         .prepare(
-          'UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+          `UPDATE savings_adjustments SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAdj);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchAdj, check.legacyClientTs);
       return;
     }
 
@@ -1320,7 +1408,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE savings_adjustments
-             SET account_id = ?, date = ?, amount = ?, twd_amount = ?, note = ?, transfer_group_id = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET account_id = ?, date = ?, amount = ?, twd_amount = ?, note = ?, transfer_group_id = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -1333,14 +1421,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO savings_adjustments
-              (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1354,10 +1443,11 @@ async function applySingleMutation(
             v.transferGroupId,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchAdj);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchAdj, check.legacyClientTs);
     return;
   }
 
@@ -1370,7 +1460,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapStockTransactionRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -1395,10 +1486,10 @@ async function applySingleMutation(
       }
       const delStmt = db
         .prepare(
-          'UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND id = ? AND version = ?'
+          `UPDATE stock_transactions SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchStockTx);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchStockTx, check.legacyClientTs);
       return;
     }
 
@@ -1418,7 +1509,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE stock_transactions
-             SET asset_id = ?, date = ?, tx_type = ?, shares = ?, total_amount = ?, fee = ?, linked_cashflow_id = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET asset_id = ?, date = ?, tx_type = ?, shares = ?, total_amount = ?, fee = ?, linked_cashflow_id = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -1433,14 +1524,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             mutation.recordId,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO stock_transactions
-              (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, id) DO NOTHING`
           )
           .bind(
@@ -1456,10 +1548,11 @@ async function applySingleMutation(
             v.note,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchStockTx);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchStockTx, check.legacyClientTs);
     return;
   }
 
@@ -1476,7 +1569,8 @@ async function applySingleMutation(
       mutation,
       existingRow,
       existing as unknown as Record<string, unknown>,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -1487,10 +1581,10 @@ async function applySingleMutation(
     const writeStmt = db
       .prepare(
         `UPDATE rent_utility_settings
-         SET rent_6f = ?, rent_a = ?, rent_b = ?, rent_c = ?, updated_at = ?, version = ?
+         SET rent_6f = ?, rent_a = ?, rent_b = ?, rent_c = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
          WHERE user_id = ? AND version = ?`
       )
-      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, check.writeTs, check.nextVersion, uid, expectedVersion);
+      .bind(v.rent6F, v.rentA, v.rentB, v.rentC, check.writeTs, check.nextVersion, uid, uid, expectedVersion);
 
     await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], async () => {
       const row = await db
@@ -1502,7 +1596,7 @@ async function applySingleMutation(
         row,
         mapped: mapped as unknown as Record<string, unknown>,
       };
-    });
+    }, check.legacyClientTs);
     return;
   }
 
@@ -1515,7 +1609,8 @@ async function applySingleMutation(
       mutation,
       existing,
       existing ? (mapUtilityRecordRow(existing) as unknown as Record<string, unknown>) : null,
-      serverTime
+      serverTime,
+      legacyCompareTs
     );
     if (!check.shouldApply) {
       await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime);
@@ -1543,10 +1638,10 @@ async function applySingleMutation(
       }
       const delStmt = db
         .prepare(
-          'UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ? WHERE user_id = ? AND period = ? AND version = ?'
+          `UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND period = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, mutation.recordId, Number(existing.version ?? 1));
-      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchUtil);
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+      await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchUtil, check.legacyClientTs);
       return;
     }
 
@@ -1569,7 +1664,7 @@ async function applySingleMutation(
       ? db
           .prepare(
             `UPDATE rent_utility_records
-             SET is_baseline = ?, cur_total = ?, cur_6f = ?, total_elec = ?, total_water = ?, f6_people = ?, f5_people = ?, cur_a = ?, cur_b = ?, cur_c = ?, updated_at = ?, deleted_at = NULL, version = ?
+             SET is_baseline = ?, cur_total = ?, cur_6f = ?, total_elec = ?, total_water = ?, f6_people = ?, f5_people = ?, cur_a = ?, cur_b = ?, cur_c = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND period = ? AND version = ?`
           )
           .bind(
@@ -1586,14 +1681,15 @@ async function applySingleMutation(
             check.writeTs,
             check.nextVersion,
             uid,
+            uid,
             v.period,
             Number(existing.version ?? 1)
           )
       : db
           .prepare(
             `INSERT INTO rent_utility_records
-              (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+              (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version, change_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL})
              ON CONFLICT(user_id, period) DO NOTHING`
           )
           .bind(
@@ -1611,10 +1707,11 @@ async function applySingleMutation(
             v.curC,
             String(p.createdAt || check.writeTs),
             check.writeTs,
-            check.nextVersion
+            check.nextVersion,
+            uid
           );
 
-    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchUtil);
+    await commitAtomicMutation(db, uid, mutation, serverTime, writeStmt, [], refetchUtil, check.legacyClientTs);
     return;
   }
 
@@ -1624,7 +1721,9 @@ async function applySingleMutation(
 export async function querySyncDelta(
   db: D1Database,
   userId: string,
-  since?: string | null
+  since?: string | null,
+  sinceSeq?: number | null,
+  maxSeq?: number
 ): Promise<SyncDelta> {
   const uid = assertUserId(userId);
   const [settings, utilityRents] = await Promise.all([
@@ -1632,6 +1731,84 @@ export async function querySyncDelta(
     ensureRentUtilitySettings(db, uid),
     ensureDefaultLedger(db, uid),
   ]);
+
+  if (typeof sinceSeq === 'number' && Number.isFinite(sinceSeq) && typeof maxSeq === 'number') {
+    const [settingsSeqRow, utilityRentsSeqRow, ledgers, logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] =
+      await Promise.all([
+        db.prepare('SELECT change_seq FROM app_settings WHERE user_id = ?').bind(uid).first<{ change_seq?: number }>(),
+        db
+          .prepare('SELECT change_seq FROM rent_utility_settings WHERE user_id = ?')
+          .bind(uid)
+          .first<{ change_seq?: number }>(),
+        db
+          .prepare(
+            'SELECT * FROM ledgers WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY sort_order ASC, created_at ASC'
+          )
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare('SELECT * FROM cashflow_logs WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY date DESC')
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare(
+            'SELECT * FROM recurring_items WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY sort_order ASC, created_at ASC'
+          )
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare(
+            'SELECT * FROM sinking_fund_items WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY sort_order ASC, created_at ASC'
+          )
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare(
+            'SELECT * FROM asset_items WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY sort_order ASC, created_at ASC'
+          )
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare(
+            'SELECT * FROM savings_adjustments WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY date DESC'
+          )
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare(
+            'SELECT * FROM stock_transactions WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY date DESC'
+          )
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare(
+            'SELECT * FROM networth_history WHERE user_id = ? AND change_seq > ? AND change_seq <= ? ORDER BY year_month DESC'
+          )
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+        db
+          .prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND change_seq > ? AND change_seq <= ?')
+          .bind(uid, sinceSeq, maxSeq)
+          .all(),
+      ]);
+
+    const settingsSeq = Number(settingsSeqRow?.change_seq ?? 0);
+    const utilityRentsSeq = Number(utilityRentsSeqRow?.change_seq ?? 0);
+
+    return {
+      settings: settingsSeq > sinceSeq && settingsSeq <= maxSeq ? settings : null,
+      ledgers: ledgers.results.map(mapLedgerRow),
+      cashflowLogs: logs.results.map(mapCashFlowRow),
+      recurringItems: rec.results.map(mapRecurringRow),
+      sinkingItems: sink.results.map(mapSinkingRow),
+      assetItems: assets.results.map(mapAssetRow),
+      savingsAdjustments: adjs.results.map(mapSavingsAdjustmentRow),
+      stockTransactions: stockTxs.results.map(mapStockTransactionRow),
+      netWorthHistory: hist.results.map(mapNetWorthRow),
+      rentUtilityRecords: utilRecs.results.map(mapUtilityRecordRow),
+      rentUtilityRents: utilityRentsSeq > sinceSeq && utilityRentsSeq <= maxSeq ? utilityRents : null,
+    };
+  }
 
   if (since) {
     const [ledgers, logs, rec, sink, assets, adjs, stockTxs, hist, utilRecs] = await Promise.all([
@@ -1695,12 +1872,43 @@ export async function processSyncRequest(
 ): Promise<SyncResponse> {
   const uid = assertUserId(userId);
   const serverTime = new Date().toISOString();
-  const settings = await ensureAppSettings(db, uid);
-  await ensureDefaultLedger(db, uid);
+  const [settings, syncStateBefore] = await Promise.all([
+    ensureAppSettings(db, uid),
+    ensureUserSyncState(db, uid),
+    ensureDefaultLedger(db, uid),
+  ]);
   const mutations = Array.isArray(req.mutations) ? req.mutations : [];
   const ackedMutationIds: string[] = [];
   const rejected: Array<{ mutationId: string; reason: string }> = [];
   const conflicts: SyncConflict[] = [];
+
+  const epochMismatch =
+    typeof req.clientEpoch === 'number' &&
+    Number.isFinite(req.clientEpoch) &&
+    req.clientEpoch !== syncStateBefore.dataEpoch;
+
+  if (epochMismatch) {
+    for (const mut of mutations) {
+      if (mut?.mutationId) {
+        rejected.push({
+          mutationId: mut.mutationId,
+          reason: '伺服器資料已透過備份還原重設，請於完整重載後確認是否重新套用',
+        });
+      }
+    }
+    const fullDelta = await querySyncDelta(db, uid, null);
+    return {
+      ok: true,
+      serverTime,
+      syncCursor: syncStateBefore.changeSeq,
+      dataEpoch: syncStateBefore.dataEpoch,
+      fullResyncRequired: true,
+      ackedMutationIds,
+      rejected,
+      conflicts,
+      delta: fullDelta,
+    };
+  }
 
   for (const mut of mutations) {
     if (!mut || !mut.mutationId || !mut.entity || !mut.recordId) {
@@ -1740,10 +1948,18 @@ export async function processSyncRequest(
     }
   }
 
-  const delta = await querySyncDelta(db, uid, req.since);
+  const syncStateAfter = await ensureUserSyncState(db, uid);
+  const useSeqCursor = typeof req.sinceSeq === 'number' && Number.isFinite(req.sinceSeq);
+  const delta = useSeqCursor
+    ? await querySyncDelta(db, uid, null, req.sinceSeq, syncStateAfter.changeSeq)
+    : await querySyncDelta(db, uid, req.since);
+
   return {
     ok: true,
     serverTime,
+    syncCursor: syncStateAfter.changeSeq,
+    dataEpoch: syncStateAfter.dataEpoch,
+    fullResyncRequired: false,
     ackedMutationIds,
     rejected,
     conflicts,
@@ -1899,11 +2115,19 @@ export async function importFullSnapshot(
     });
   }
 
+  await ensureUserSyncState(db, uid);
+
   // 2. Assemble ALL DELETE + INSERT statements into a single atomic D1 batch
   const stmts: D1PreparedStatement[] = [];
 
   if (mode === 'replace') {
     stmts.push(
+      db
+        .prepare(
+          'UPDATE user_sync_state SET change_seq = change_seq + 1, data_epoch = data_epoch + 1, updated_at = ? WHERE user_id = ?'
+        )
+        .bind(nowIso, uid),
+      db.prepare('DELETE FROM sync_lww_timestamps WHERE user_id = ?').bind(uid),
       db.prepare('DELETE FROM ledgers WHERE user_id = ?').bind(uid),
       db.prepare('DELETE FROM cashflow_logs WHERE user_id = ?').bind(uid),
       db.prepare('DELETE FROM recurring_items WHERE user_id = ?').bind(uid),
@@ -1916,6 +2140,12 @@ export async function importFullSnapshot(
     if (validatedUtilityRecords.length > 0) {
       stmts.push(db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid));
     }
+  } else {
+    stmts.push(
+      db
+        .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
+        .bind(nowIso, uid)
+    );
   }
 
   // Always ensure default primary ledger exists inside the batch
@@ -1923,8 +2153,8 @@ export async function importFullSnapshot(
     db
       .prepare(
         `INSERT OR IGNORE INTO ledgers
-          (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, 1, NULL, ?, 1, ?, ?, NULL, 1)`
+          (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+         VALUES (?, ?, ?, 1, NULL, ?, 1, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
       )
       .bind(
         uid,
@@ -1932,7 +2162,8 @@ export async function importFullSnapshot(
         DEFAULT_LEDGER_NAME,
         '預設個人帳本（納入總資產與淨值統計）',
         nowIso,
-        nowIso
+        nowIso,
+        uid
       )
   );
 
@@ -1941,8 +2172,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO ledgers
-            (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, id, name, include_in_net_worth, monthly_daily_budget, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -1953,7 +2184,8 @@ export async function importFullSnapshot(
           v.note,
           v.sortOrder,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -1962,20 +2194,28 @@ export async function importFullSnapshot(
     const customStockCategories = normalizeCustomStockCategories(
       data.settings.customStockCategories ?? currentSettings.customStockCategories
     );
+    const autoFxEnabled =
+      data.settings.autoFxEnabled !== undefined
+        ? Boolean(data.settings.autoFxEnabled)
+        : currentSettings.autoFxEnabled !== undefined
+          ? currentSettings.autoFxEnabled
+          : true;
     stmts.push(
       db
         .prepare(
           `UPDATE app_settings
-           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = 1
+           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = 1, change_seq = ${CURR_SEQ_SQL}
            WHERE user_id = ?`
         )
         .bind(
           Math.max(0, Math.round(toSafeNumber(data.settings.monthlyDailyBudget, currentSettings.monthlyDailyBudget))),
           Math.min(60, Math.max(1, Math.round(toSafeNumber(data.settings.emergencyTargetMonths, currentSettings.emergencyTargetMonths)))),
           fxForImport,
+          autoFxEnabled ? 1 : 0,
           normalizePnlColorScheme(data.settings.pnlColorScheme ?? currentSettings.pnlColorScheme),
           JSON.stringify(customStockCategories),
           nowIso,
+          uid,
           uid
         )
     );
@@ -1986,8 +2226,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO cashflow_logs
-            (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2006,7 +2246,8 @@ export async function importFullSnapshot(
           v.linkedAccountId,
           v.ledgerId,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2016,8 +2257,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO recurring_items
-            (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2035,7 +2276,8 @@ export async function importFullSnapshot(
           v.ledgerId,
           v.sortOrder,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2045,8 +2287,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO sinking_fund_items
-            (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, id, item_name, category, total_amount, months, due_note, status, note, sort_order, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2060,7 +2302,8 @@ export async function importFullSnapshot(
           v.note,
           v.sortOrder,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2070,8 +2313,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO asset_items
-            (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2103,7 +2346,8 @@ export async function importFullSnapshot(
           v.ledgerId,
           v.excludeFromNetWorth ? 1 : 0,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2113,8 +2357,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO savings_adjustments
-            (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2126,7 +2370,8 @@ export async function importFullSnapshot(
           v.note,
           v.transferGroupId,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2136,8 +2381,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO stock_transactions
-            (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, id, asset_id, date, tx_type, shares, total_amount, fee, linked_cashflow_id, note, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2151,7 +2396,8 @@ export async function importFullSnapshot(
           v.linkedCashflowId,
           v.note,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2161,8 +2407,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO networth_history
-            (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2178,7 +2424,8 @@ export async function importFullSnapshot(
           Math.round(h.monthlyConsumption),
           h.savingsRate,
           h.note || '',
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2187,8 +2434,8 @@ export async function importFullSnapshot(
     stmts.push(
       db
         .prepare(
-          `INSERT OR REPLACE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, 1)`
+          `INSERT OR REPLACE INTO rent_utility_settings (user_id, rent_6f, rent_a, rent_b, rent_c, updated_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2196,7 +2443,8 @@ export async function importFullSnapshot(
           validatedUtilityRents.rentA,
           validatedUtilityRents.rentB,
           validatedUtilityRents.rentC,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }
@@ -2206,8 +2454,8 @@ export async function importFullSnapshot(
       db
         .prepare(
           `INSERT OR REPLACE INTO rent_utility_records
-            (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+            (user_id, period, is_baseline, cur_total, cur_6f, total_elec, total_water, f6_people, f5_people, cur_a, cur_b, cur_c, created_at, updated_at, deleted_at, version, change_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ${CURR_SEQ_SQL})`
         )
         .bind(
           uid,
@@ -2223,7 +2471,8 @@ export async function importFullSnapshot(
           v.curB,
           v.curC,
           createdAt,
-          nowIso
+          nowIso,
+          uid
         )
     );
   }

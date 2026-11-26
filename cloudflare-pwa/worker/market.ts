@@ -483,7 +483,8 @@ export async function fetchTaiwanStockPrice(
 export async function refreshMarketData(
   db: D1Database,
   fetchImpl: FetchLike = fetch,
-  targetUserId?: string
+  targetUserId?: string,
+  opts?: { forceFx?: boolean }
 ): Promise<{
   usdTwdRate: number;
   fxUpdated: boolean;
@@ -493,31 +494,53 @@ export async function refreshMarketData(
 }> {
   const nowIso = new Date().toISOString();
   let usdTwdRate = 32.5;
+  let targetAutoFx = true;
 
   if (targetUserId) {
     const settings = await ensureAppSettings(db, targetUserId);
     usdTwdRate = settings.usdTwdRate;
+    targetAutoFx = settings.autoFxEnabled !== false;
   }
 
   let fxUpdated = false;
-  const liveFx = await fetchUsdTwdRate(fetchImpl);
+  const shouldFetchFx = targetUserId ? targetAutoFx || Boolean(opts?.forceFx) : true;
+  const liveFx = shouldFetchFx ? await fetchUsdTwdRate(fetchImpl) : null;
   if (liveFx !== null) {
     usdTwdRate = liveFx;
     fxUpdated = true;
+    const fxUserIds: string[] = [];
     if (targetUserId) {
-      await db
-        .prepare('UPDATE app_settings SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ? WHERE user_id = ?')
-        .bind(usdTwdRate, nowIso, nowIso, targetUserId)
-        .run();
+      fxUserIds.push(targetUserId);
     } else {
-      await db
+      const eligible = await db
         .prepare(
-          `UPDATE app_settings
-           SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ?
-           WHERE user_id IN (SELECT id FROM users WHERE is_active = 1)`
+          `SELECT a.user_id FROM app_settings a
+           INNER JOIN users u ON u.id = a.user_id
+           WHERE u.is_active = 1 AND COALESCE(a.auto_fx_enabled, 1) = 1`
         )
-        .bind(usdTwdRate, nowIso, nowIso)
-        .run();
+        .all<{ user_id: string }>();
+      for (const r of eligible.results) {
+        fxUserIds.push(r.user_id);
+      }
+    }
+
+    for (const uid of fxUserIds) {
+      await db.batch([
+        db
+          .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+          .bind(uid, nowIso),
+        db
+          .prepare(
+            `UPDATE app_settings
+             SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ?, version = version + 1,
+                 change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
+             WHERE user_id = ?`
+          )
+          .bind(usdTwdRate, nowIso, nowIso, uid, uid),
+        db
+          .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+          .bind(nowIso, uid),
+      ]);
     }
   }
 
@@ -559,14 +582,23 @@ export async function refreshMarketData(
     }
 
     if (quote !== null) {
-      await db
-        .prepare(
-          `UPDATE asset_items
-           SET unit_price = ?, previous_close = COALESCE(?, previous_close), price_updated_at = ?, updated_at = ?
-           WHERE user_id = ? AND id = ?`
-        )
-        .bind(quote.price, quote.previousClose, nowIso, nowIso, item.user_id, item.id)
-        .run();
+      await db.batch([
+        db
+          .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+          .bind(item.user_id, nowIso),
+        db
+          .prepare(
+            `UPDATE asset_items
+             SET unit_price = ?, previous_close = COALESCE(?, previous_close), price_updated_at = ?, updated_at = ?,
+                 version = version + 1,
+                 change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
+             WHERE user_id = ? AND id = ?`
+          )
+          .bind(quote.price, quote.previousClose, nowIso, nowIso, item.user_id, item.user_id, item.id),
+        db
+          .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+          .bind(nowIso, item.user_id),
+      ]);
       updatedTickers.push({
         id: item.id,
         ticker: item.ticker,

@@ -6,7 +6,7 @@ import { normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
 import { fetchAuthStatus, getRememberedAccount, saveRememberedAccount } from './auth/authClient';
-import { closeModal, el, fmtMoney, isDesktopDevice, setLoading, showToast } from './ui/helpers';
+import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast } from './ui/helpers';
 import {
   getTodayYmd,
   renderLogCategories,
@@ -191,15 +191,33 @@ async function bootstrap(): Promise<void> {
 
   let syncDebounce: number | undefined;
   let activeDb = new LocalFinanceDB(LocalFinanceDB.dbNameForUser(remembered?.id));
+  const accountChannel =
+    typeof BroadcastChannel !== 'undefined'
+      ? new BroadcastChannel('personal-finance-account-sync')
+      : null;
 
-  const createSyncEngineForDb = (db: LocalFinanceDB): SyncEngine =>
+  const createSyncEngineForDb = (db: LocalFinanceDB, expectedUserId?: string): SyncEngine =>
     new SyncEngine(db, {
+      expectedUserId,
       onStatusChange: (status) => renderSyncPill(status),
       onSnapshotChange: () => ctx.renderAll(),
+      onError: (msg) => showToast(`本機資料儲存失敗：${msg}`, 'error'),
       onAuthRequired: () => {
         ctx.state.authenticated = false;
         openAuthScreen(ctx, 'login', '登入憑證已過期，重新登入後將自動上傳待同步帳目', () => {
           void ctx.engine.syncNow();
+        });
+      },
+      onAccountMismatch: (info) => {
+        ctx.state.authenticated = false;
+        showToast(info.error, 'error');
+        openAuthScreen(ctx, 'login', info.error, () => {
+          void fetchAuthStatus().then(async (auth) => {
+            if (auth.authenticated && auth.user) {
+              await ctx.switchAccountDb(auth.user);
+              void ctx.engine.syncNow(true);
+            }
+          });
         });
       },
     });
@@ -224,7 +242,10 @@ async function bootstrap(): Promise<void> {
       if (snap.settings.pnlColorScheme) {
         applyPnlSchemeDom(snap.settings.pnlColorScheme);
       }
-      el('fxTopPill').textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}`;
+      const autoFx = snap.settings.autoFxEnabled !== false;
+      const fxEl = el('fxTopPill');
+      fxEl.textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}${autoFx ? '' : ' · 手動'}`;
+      fxEl.title = autoFx ? '自動更新美元匯率（點擊調整）' : '手動固定美元匯率（點擊調整）';
       renderLogTab(ctx);
       renderOverviewTab(ctx);
       renderAssetsTab(ctx);
@@ -262,14 +283,16 @@ async function bootstrap(): Promise<void> {
       }
     },
     switchAccountDb: async (user) => {
+      const prevUserId = ctx.state.currentUser?.id || remembered?.id || null;
       ctx.state.currentUser = user;
       cancelReorder(ctx, true);
       saveRememberedAccount(user);
       const nextDbName = LocalFinanceDB.dbNameForUser(user.id);
       if (activeDb.getDbName() !== nextDbName) {
+        ctx.engine?.destroy();
         activeDb.close();
         activeDb = new LocalFinanceDB(nextDbName);
-        const nextEngine = createSyncEngineForDb(activeDb);
+        const nextEngine = createSyncEngineForDb(activeDb, user.id);
         ctx.engine = nextEngine;
         await nextEngine.init();
         const nextMeta = nextEngine.getMeta();
@@ -286,13 +309,43 @@ async function bootstrap(): Promise<void> {
         state.recurringLedgerScope = 'all';
         state.flippedStockIds = [];
         state.logLinkedAccountTouched = false;
+      } else {
+        ctx.engine?.setExpectedUserId(user.id);
+      }
+      if (prevUserId && prevUserId !== user.id) {
+        accountChannel?.postMessage({ type: 'account_changed', userId: user.id });
       }
       ctx.applyUtilityTabVisibility();
       ctx.renderAll();
     },
   };
 
-  ctx.engine = createSyncEngineForDb(activeDb);
+  ctx.engine = createSyncEngineForDb(activeDb, remembered?.id);
+
+  if (accountChannel) {
+    accountChannel.onmessage = (evt: MessageEvent) => {
+      const msg = evt.data as { type?: string; userId?: string } | null;
+      if (!msg || msg.type !== 'account_changed') return;
+      const currentId = ctx.state.currentUser?.id || remembered?.id;
+      if (msg.userId && msg.userId !== currentId) {
+        ctx.engine.destroy();
+        showToast('其他分頁已切換登入帳號，正在同步切換對應帳本…');
+        void fetchAuthStatus()
+          .then(async (auth) => {
+            if (auth.authenticated && auth.user) {
+              await ctx.switchAccountDb(auth.user);
+              void ctx.engine.syncNow(true);
+            } else {
+              ctx.state.authenticated = false;
+              openAuthScreen(ctx, 'login', '其他分頁已切換或登出帳號，請重新登入', () => {
+                void ctx.engine.syncNow(true);
+              });
+            }
+          })
+          .catch(() => {});
+      }
+    };
+  }
 
   // 1. 0ms 立即從該帳號專屬的本機 IndexedDB 載入畫面（離線也能秒開）
   await ctx.engine.init();
@@ -452,6 +505,43 @@ function bindEvents(ctx: UiContext): void {
     if (res.ok) showToast('已重新同步最新雲端帳本', 'success');
     else if (!res.authRequired) showToast(res.error || '同步失敗', 'error');
   });
+
+  const fxPillEl = document.getElementById('fxTopPill');
+  if (fxPillEl) {
+    fxPillEl.style.cursor = 'pointer';
+    fxPillEl.addEventListener('click', () => {
+      const s = ctx.engine.getSnapshot().settings;
+      const autoFx = s.autoFxEnabled !== false;
+      const body = openModal('USD / TWD 匯率設定');
+      body.innerHTML = `<div class="form-stack">
+          <div class="field-group">
+            <label for="fxModalRateInput">目前匯率（1 USD = ? TWD）</label>
+            <input id="fxModalRateInput" type="number" step="0.01" min="10.01" max="99.99" value="${Number(s.usdTwdRate || 32.5).toFixed(2)}" />
+          </div>
+          <label class="checkbox-row" style="display:flex;align-items:center;gap:8px;font-size:14px;">
+            <input id="fxModalAutoToggle" type="checkbox" ${autoFx ? 'checked' : ''} />
+            <span>允許系統每日排程自動更新匯率（關閉後將保留您的手動匯率，不被排程覆蓋）</span>
+          </label>
+          <div style="display:flex;gap:10px;margin-top:8px;">
+            <button type="button" class="btn-secondary" id="fxModalCancelBtn" style="flex:1;">取消</button>
+            <button type="button" class="btn-primary" id="fxModalSaveBtn" style="flex:1;">儲存匯率設定</button>
+          </div>
+        </div>`;
+      el('fxModalCancelBtn').addEventListener('click', () => closeModal());
+      el('fxModalSaveBtn').addEventListener('click', async () => {
+        try {
+          const rate = Number(el<HTMLInputElement>('fxModalRateInput').value);
+          const auto = el<HTMLInputElement>('fxModalAutoToggle').checked;
+          await ctx.engine.saveFxSettings(rate, auto);
+          closeModal();
+          showToast(auto ? `已更新匯率 ${rate}（自動同步開啟）` : `已固定手動匯率 ${rate}`, 'success');
+          ctx.scheduleSync();
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : '匯率格式不正確', 'error');
+        }
+      });
+    });
+  }
 
   el('maskBtn').addEventListener('click', () => {
     ctx.state.masked = !ctx.state.masked;

@@ -250,16 +250,16 @@ flowchart LR
   SE --> KV["IndexedDB Store: kv\n- snapshot (完整 FinanceSnapshot)\n- meta (lastSyncedAt / PIN / Passkey)\n- conflicts (SyncConflict[])\n- rejections (SyncRejection[])"]
   SE --> OB["IndexedDB Store: outbox\nkeyPath: mutationId\nindex: clientTimestamp\n(自動整併同筆離線修改)"]
   OB -- "POST /api/sync\n(帶 baseVersion + mutationId)" --> W["Cloudflare Worker\nworker/sync.ts"]
-  W -- "條件式樂觀鎖 & batch 原子寫入" --> D1["Cloudflare D1 (20 張表)"]
+  W -- "條件式樂觀鎖 & batch 原子寫入" --> D1["Cloudflare D1 (22 張表)"]
   D1 -- "serverTime + delta + conflicts + rejected" --> SE
 ```
 
-- **單一 Transaction 原子寫入**：`commitLocalMutation()` 在同一筆 IndexedDB 交易內同步更新 `kv['snapshot']` 與 `outbox`，並將同一筆紀錄的多次離線編輯自動整併（保留最初伺服器 `baseVersion`；若離線新建後又刪除則自動抵銷）。
-- **衝突與拒絕保護**：伺服器以條件式 `UPDATE ... WHERE user_id = ? AND id = ? AND version = ?`（新建採 `INSERT ... ON CONFLICT DO NOTHING`）與 `sync_idempotency` 合併於同一 `db.batch()` 原子執行；版本不符回傳衝突詳情存入 `kv['conflicts']`，遭伺服器驗證或白名單拒絕的異動則移出 `outbox`、回滾未落庫的新建紀錄並存入 `kv['rejections']` 顯示於同步異常彈窗。
+- **單一 Transaction 原子寫入與先存後改**：`commitLocalMutation()` 先於同一筆 IndexedDB 交易內原子持久化 `kv['snapshot']` 與 `outbox` 後才更新記憶體狀態；自動整併同一筆紀錄的離線編輯時會排除已送出等待回應的 in-flight 異動，並於 ack 後針對所有實體自動 rebase 最新 `version`。
+- **衝突、拒絕、游標與 Epoch 保護**：伺服器以條件式 `UPDATE ... WHERE user_id = ? AND id = ? AND version = ?`（新建採 `INSERT ... ON CONFLICT DO NOTHING`）、`sync_idempotency` 與單調遞增 `user_sync_state.change_seq` 合併於同一 `db.batch()` 原子執行；`updated_at` 一律寫入伺服器時間（舊版無 `baseVersion` 客戶端改以 `sync_lww_timestamps` 維持 LWW 相容）；`replace` 覆蓋匯入會遞增 `data_epoch` 通知其他裝置完整重載；並支援 `X-Expected-User`（409 防跨帳號寫入）、`BroadcastChannel` 跨分頁帳號切換、Web Locks、分批同步（單批上限 50／伺服器上限 200）與逾時退避重試。
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0012`）
+## 5. Migration 演進總覽（`0001` → `0013`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -275,3 +275,4 @@ flowchart LR
 | `0010` | `0010_watchlist_and_prev_close.sql` | `asset_items` 新增 `is_watchlist`（觀察清單）與 `previous_close`（昨收價） |
 | `0011` | `0011_multi_ledger.sql` | 新增 `ledgers` 表並種子 `default` 主帳本；`cashflow_logs`、`asset_items`、`recurring_items` 全面加入 `ledger_id`，`asset_items` 加入 `exclude_from_net_worth` |
 | `0012` | `0012_transfer_group.sql` | `savings_adjustments` 新增 `transfer_group_id` 欄位與局部索引，支援帳戶互轉雙向成對撤銷 |
+| `0013` | `0013_sync_cursor_epoch_and_auto_fx.sql` | 新增 `user_sync_state`（單調 `change_seq` 與 `data_epoch`）與 `sync_lww_timestamps`；11 張可同步表加入 `change_seq` 與複合索引；`app_settings` 加入 `auto_fx_enabled`（排程自動匯率開關） |

@@ -109,11 +109,18 @@ export async function runMonthlyRecurringD1(
     else if (item.cycle === '一次性') cycleTag = '[一次性排程] ';
     const finalNote = `${cycleTag}${item.note || ''}`.trim();
 
+    const ensureSyncStmt = db
+      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+      .bind(uid, nowIso);
+    const bumpSyncStmt = db
+      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
+      .bind(nowIso, uid);
+
     const insertStmt = db
       .prepare(
         `INSERT INTO cashflow_logs
-          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, NULL, 1, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0))`
       )
       .bind(
         uid,
@@ -132,7 +139,8 @@ export async function runMonthlyRecurringD1(
         item.linked_account_id || null,
         ledgerId,
         nowIso,
-        nowIso
+        nowIso,
+        uid
       );
 
     if (item.cycle === '一次性') {
@@ -140,13 +148,15 @@ export async function runMonthlyRecurringD1(
       const updatedNote = item.note ? `${item.note} ${suffix}` : suffix;
       const deactivateStmt = db
         .prepare(
-          `UPDATE recurring_items SET status = '停用', note = ?, updated_at = ?, version = version + 1 WHERE user_id = ? AND id = ?`
+          `UPDATE recurring_items SET status = '停用', note = ?, updated_at = ?, version = version + 1,
+              change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
+           WHERE user_id = ? AND id = ?`
         )
-        .bind(updatedNote, nowIso, uid, item.id);
-      await db.batch([insertStmt, deactivateStmt]);
+        .bind(updatedNote, nowIso, uid, uid, item.id);
+      await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt, deactivateStmt]);
       deactivatedOneTimeCount++;
     } else {
-      await insertStmt.run();
+      await db.batch([ensureSyncStmt, bumpSyncStmt, insertStmt]);
     }
 
     existingKeys.add(dedupKey);
@@ -246,29 +256,37 @@ export async function runMonthEndSnapshotD1(
     .first();
   const updated = Boolean(existing);
 
-  await db
-    .prepare(
-      `INSERT OR REPLACE INTO networth_history
-        (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      uid,
-      yearMonth,
-      parts.ymd,
-      Math.round(totalAssets),
-      Math.round(totalLiabilities),
-      netWorth,
-      Math.round(highLiquidityAssets),
-      Math.round(investmentAssets),
-      Math.round(insuranceAssets),
-      Math.round(monthlyIncome),
-      totalConsumption,
-      savingsRate,
-      `自動快照 @ ${parts.ymd}`,
-      nowIso
-    )
-    .run();
+  await db.batch([
+    db
+      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+      .bind(uid, nowIso),
+    db
+      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
+      .bind(nowIso, uid),
+    db
+      .prepare(
+        `INSERT OR REPLACE INTO networth_history
+          (user_id, year_month, snapshot_date, total_assets, total_liabilities, net_worth, high_liquidity_assets, investment_assets, insurance_assets, monthly_income, monthly_consumption, savings_rate, note, updated_at, change_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0))`
+      )
+      .bind(
+        uid,
+        yearMonth,
+        parts.ymd,
+        Math.round(totalAssets),
+        Math.round(totalLiabilities),
+        netWorth,
+        Math.round(highLiquidityAssets),
+        Math.round(investmentAssets),
+        Math.round(insuranceAssets),
+        Math.round(monthlyIncome),
+        totalConsumption,
+        savingsRate,
+        `自動快照 @ ${parts.ymd}`,
+        nowIso,
+        uid
+      ),
+  ]);
 
   return {
     yearMonth,
