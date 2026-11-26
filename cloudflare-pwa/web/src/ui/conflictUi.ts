@@ -357,9 +357,24 @@ export function openConflictsModal(ctx: UiContext): void {
       ).trim();
       title.textContent = itemTitle ? `${entityLabel} · ${itemTitle}` : `${entityLabel} (${r.recordId})`;
       const badge = document.createElement('span');
-      badge.className = 'badge red';
+      badge.className =
+        r.resolutionStatus === 'pending_resync' || r.resolutionStatus === 'quarantined'
+          ? 'badge warn'
+          : 'badge red';
       badge.style.marginRight = '0';
-      badge.textContent = r.isNewRecord ? '新建遭拒（已回滾）' : '異動遭拒（已還原）';
+      const statusLabel =
+        r.resolutionStatus === 'rolled_back'
+          ? '新建遭拒（已回滾）'
+          : r.resolutionStatus === 'restored'
+            ? '異動遭拒（已還原）'
+            : r.resolutionStatus === 'pending_resync'
+              ? '異動遭拒（待重整雲端）'
+              : r.resolutionStatus === 'quarantined'
+                ? '反覆失敗（已移出佇列）'
+                : r.isNewRecord
+                  ? '新建遭拒（已回滾）'
+                  : '異動遭拒（待重整雲端）';
+      badge.textContent = statusLabel;
       head.appendChild(title);
       head.appendChild(badge);
       card.appendChild(head);
@@ -394,7 +409,11 @@ export function openConflictsModal(ctx: UiContext): void {
       dismissBtn.textContent = '清除此通知';
       dismissBtn.addEventListener('click', async () => {
         await ctx.engine.dismissRejection(r.mutationId);
-        if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+        if (
+          ctx.engine.getConflicts().length > 0 ||
+          ctx.engine.getRejections().length > 0 ||
+          ctx.engine.getFrozenOutbox().length > 0
+        ) {
           openConflictsModal(ctx);
         } else {
           closeModal();
@@ -417,7 +436,11 @@ export function openConflictsModal(ctx: UiContext): void {
         }
         await ctx.engine.dismissRejection(r.mutationId);
         showToast('已從雲端重整最新帳本', 'success');
-        if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
+        if (
+          ctx.engine.getConflicts().length > 0 ||
+          ctx.engine.getRejections().length > 0 ||
+          ctx.engine.getFrozenOutbox().length > 0
+        ) {
           openConflictsModal(ctx);
         } else {
           closeModal();
@@ -433,27 +456,31 @@ export function openConflictsModal(ctx: UiContext): void {
     body.appendChild(rejList);
   }
 
+  // C7: Always provide a manual sync trigger even when pendingCount === 0 (e.g. while conflict/rejection cards are open)
   const pendingCount = ctx.engine.getStatus().pendingCount;
-  if (pendingCount > 0) {
-    const syncPendingBtn = document.createElement('button');
-    syncPendingBtn.type = 'button';
-    syncPendingBtn.className = 'btn btn-outline btn-sm';
-    syncPendingBtn.style.cssText = 'width:100%;margin-top:12px;';
-    syncPendingBtn.textContent = `立即同步其餘 ${pendingCount} 筆待上傳異動`;
-    syncPendingBtn.addEventListener('click', async () => {
-      syncPendingBtn.disabled = true;
-      const res = await ctx.engine.syncNow();
-      if (res.ok) {
-        showToast('待上傳異動已同步完成', 'success');
-      } else if (!res.authRequired) {
-        showToast(res.error || '同步失敗', 'error');
-      }
-      if (ctx.engine.getConflicts().length > 0 || ctx.engine.getRejections().length > 0) {
-        openConflictsModal(ctx);
-      } else {
-        closeModal();
-      }
-    });
-    body.appendChild(syncPendingBtn);
-  }
+  const syncPendingBtn = document.createElement('button');
+  syncPendingBtn.type = 'button';
+  syncPendingBtn.className = 'btn btn-outline btn-sm';
+  syncPendingBtn.style.cssText = 'width:100%;margin-top:12px;';
+  syncPendingBtn.textContent =
+    pendingCount > 0 ? `立即同步其餘 ${pendingCount} 筆待上傳異動` : '立即從雲端同步最新資料';
+  syncPendingBtn.addEventListener('click', async () => {
+    syncPendingBtn.disabled = true;
+    const res = await ctx.engine.syncNow();
+    if (res.ok) {
+      showToast(pendingCount > 0 ? '待上傳異動已同步完成' : '已從雲端同步最新資料', 'success');
+    } else if (!res.authRequired) {
+      showToast(res.error || '同步失敗', 'error');
+    }
+    if (
+      ctx.engine.getConflicts().length > 0 ||
+      ctx.engine.getRejections().length > 0 ||
+      ctx.engine.getFrozenOutbox().length > 0
+    ) {
+      openConflictsModal(ctx);
+    } else {
+      closeModal();
+    }
+  });
+  body.appendChild(syncPendingBtn);
 }

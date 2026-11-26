@@ -542,7 +542,7 @@ describe('Stock previousClose & Live Price Consistency Fixes (v1.8.4)', () => {
       manualPriceOverride: true,
     });
 
-    // User explicitly cleared prevClose only -> update previousClose: null with manualPriceOverride: true
+    // User explicitly cleared prevClose only -> update previousClose: null with manualPriceOverride: true (and omit unchanged unitPrice per F4)
     expect(
       resolveStockModalPriceFields({
         existing,
@@ -551,7 +551,6 @@ describe('Stock previousClose & Live Price Consistency Fixes (v1.8.4)', () => {
         hasPrevCloseInput: true,
       })
     ).toEqual({
-      unitPrice: 100,
       previousClose: null,
       manualPriceOverride: true,
     });

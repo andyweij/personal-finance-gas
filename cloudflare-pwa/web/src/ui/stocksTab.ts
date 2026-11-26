@@ -1440,6 +1440,22 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
   const subSel = form.querySelector('#wlSub') as unknown as HTMLSelectElement;
   const currSel = form.querySelector('#wlCurr') as unknown as HTMLSelectElement;
   const tickerInp = form.querySelector<HTMLInputElement>('#wlTicker')!;
+  const wlPriceInp = form.querySelector<HTMLInputElement>('#wlPrice')!;
+  const wlPrevInp = form.querySelector<HTMLInputElement>('#wlPrevClose')!;
+
+  // F6: When editing an existing watchlist item and modifying market price, clear stale previousClose immediately
+  if (existing && existing.previousClose != null && existing.previousClose > 0) {
+    const initialPrevStr = String(existing.previousClose);
+    const initialPriceStr = existing.unitPrice > 0 ? String(existing.unitPrice) : '';
+    let prevAutoCleared = false;
+    wlPriceInp.addEventListener('input', () => {
+      if (!prevAutoCleared && wlPriceInp.value.trim() !== initialPriceStr && wlPrevInp.value.trim() === initialPrevStr) {
+        wlPrevInp.value = '';
+        prevAutoCleared = true;
+      }
+    });
+  }
+
   subSel.addEventListener('change', () => {
     if (!existing) {
       currSel.value = subSel.value === '美股/ETF' ? 'USD' : 'TWD';
@@ -1485,13 +1501,17 @@ export function openWatchlistModal(ctx: UiContext, existing: AssetItem | null): 
     e.preventDefault();
     try {
       const ticker = tickerInp.value.trim().toUpperCase();
-      const rawPrice = el<HTMLInputElement>('wlPrice').value.trim();
-      const rawPrev = el<HTMLInputElement>('wlPrevClose').value.trim();
+      const rawPrice = wlPriceInp.value.trim();
+      const rawPrev = wlPrevInp.value.trim();
+      const tickerChanged = Boolean(
+        existing && (existing.ticker || '').trim().toUpperCase() !== ticker
+      );
       const priceFields = resolveStockModalPriceFields({
         existing,
         rawPrice,
         rawPrevClose: rawPrev,
         hasPrevCloseInput: true,
+        tickerChanged,
         defaultNewPrice: 0,
       });
       await ctx.engine.saveAsset({
@@ -1844,6 +1864,18 @@ export function openStockBaselineModal(
   unitBtn.addEventListener('click', () => switchCostMode('unit'));
   totalBtn.addEventListener('click', () => switchCostMode('total'));
   sharesInp.addEventListener('input', refreshPreview);
+  const stPrevInp = form.querySelector<HTMLInputElement>('#stPrevClose')!;
+  if (existing && existing.previousClose != null && existing.previousClose > 0) {
+    const initialPrevStr = String(existing.previousClose);
+    const initialPriceStr = existing.unitPrice > 0 ? String(existing.unitPrice) : '';
+    let prevAutoCleared = false;
+    priceInp.addEventListener('input', () => {
+      if (!prevAutoCleared && priceInp.value.trim() !== initialPriceStr && stPrevInp.value.trim() === initialPrevStr) {
+        stPrevInp.value = '';
+        prevAutoCleared = true;
+      }
+    });
+  }
   priceInp.addEventListener('input', refreshPreview);
   costInp.addEventListener('input', refreshPreview);
   currSel.addEventListener('change', refreshPreview);
@@ -1895,12 +1927,16 @@ export function openStockBaselineModal(
     try {
       const ticker = el<HTMLInputElement>('stTicker').value.trim().toUpperCase();
       const rawPrice = priceInp.value.trim();
-      const rawPrev = el<HTMLInputElement>('stPrevClose').value.trim();
+      const rawPrev = stPrevInp.value.trim();
+      const tickerChanged = Boolean(
+        existing && (existing.ticker || '').trim().toUpperCase() !== ticker
+      );
       const priceFields = resolveStockModalPriceFields({
         existing,
         rawPrice,
         rawPrevClose: rawPrev,
         hasPrevCloseInput: true,
+        tickerChanged,
         defaultNewPrice: marketPrice,
       });
       await ctx.engine.saveAsset({

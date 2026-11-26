@@ -23,6 +23,7 @@ import {
   hasAnyUser,
   listAdminUsers,
   listInvites,
+  PasskeyClientError,
   recordLoginFailure,
   registerWithInviteCode,
   resetPasswordWithCode,
@@ -307,8 +308,12 @@ export function createApp() {
       c.header('Set-Cookie', buildSessionCookie(token, isHttps));
       return c.json({ ok: true, user: toAuthUser(user) });
     } catch (err) {
-      await recordLoginFailure(c.env.DB, `pk:${ip}`);
-      return c.json({ error: err instanceof Error ? err.message : 'Passkey 登入失敗' }, 401);
+      if (err instanceof PasskeyClientError) {
+        await recordLoginFailure(c.env.DB, `pk:${ip}`);
+        return c.json({ error: err.message || 'Passkey 登入失敗' }, 401);
+      }
+      console.error('[auth] passkey login verify unexpected error:', err);
+      return c.json({ error: 'Passkey 登入時發生暫時性系統錯誤，請稍後重試。' }, 500);
     }
   });
 
@@ -379,10 +384,15 @@ export function createApp() {
     try {
       const user = c.get('authUser');
       const { rpID, origin } = getOriginAndRpId(c);
-      const body = (await c.req.json()) as {
-        response: RegistrationResponseJSON;
-        deviceName?: string;
-      };
+      let body: { response: RegistrationResponseJSON; deviceName?: string };
+      try {
+        body = (await c.req.json()) as {
+          response: RegistrationResponseJSON;
+          deviceName?: string;
+        };
+      } catch {
+        throw new PasskeyClientError('Passkey 請求資料格式無效。');
+      }
       const res = await finishPasskeyRegistration(
         c.env.DB,
         user,
@@ -393,7 +403,11 @@ export function createApp() {
       );
       return c.json(res);
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : 'Passkey 綁定失敗' }, 400);
+      if (err instanceof PasskeyClientError) {
+        return c.json({ error: err.message || 'Passkey 綁定失敗' }, 400);
+      }
+      console.error('[auth] passkey register verify unexpected error:', err);
+      return c.json({ error: 'Passkey 註冊時發生暫時性系統錯誤，請稍後重試。' }, 500);
     }
   });
 

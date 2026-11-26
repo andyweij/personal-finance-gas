@@ -328,12 +328,20 @@ export function resolveStockModalPriceFields(params: {
   rawPrevClose?: string;
   hasPrevCloseInput: boolean;
   defaultNewPrice?: number;
+  tickerChanged?: boolean;
 }): {
   unitPrice?: number;
   previousClose?: number | null;
   manualPriceOverride?: boolean;
 } {
-  const { existing, rawPrice, rawPrevClose = '', hasPrevCloseInput, defaultNewPrice = 0 } = params;
+  const {
+    existing,
+    rawPrice,
+    rawPrevClose = '',
+    hasPrevCloseInput,
+    defaultNewPrice = 0,
+    tickerChanged = false,
+  } = params;
   const trimmedPrice = rawPrice.trim();
   const trimmedPrev = rawPrevClose.trim();
   const parsedPrice = trimmedPrice !== '' ? Number(trimmedPrice) : null;
@@ -353,6 +361,14 @@ export function resolveStockModalPriceFields(params: {
     ? (parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null) !== existingPrev
     : false;
 
+  // F5: Ticker changed without explicit new price -> clear old ticker's price & previousClose
+  if (tickerChanged && !priceChanged) {
+    return {
+      unitPrice: 0,
+      previousClose: prevChanged && parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null,
+    };
+  }
+
   if (!priceChanged && !prevChanged) {
     // Neither price nor previousClose was edited: omit both so server-owned live quotes are untouched
     return {};
@@ -363,6 +379,14 @@ export function resolveStockModalPriceFields(params: {
     return {
       unitPrice: parsedPrice!,
       previousClose: null,
+      manualPriceOverride: true,
+    };
+  }
+
+  if (!priceChanged && prevChanged) {
+    // F4: User ONLY changed previousClose -> omit unitPrice so server's newer live price is preserved!
+    return {
+      previousClose: parsedPrev !== null && Number.isFinite(parsedPrev) ? parsedPrev : null,
       manualPriceOverride: true,
     };
   }

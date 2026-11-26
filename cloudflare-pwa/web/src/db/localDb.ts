@@ -63,6 +63,7 @@ export interface LocalMeta {
   lastSyncedAt: string | null;
   syncCursor?: number | null;
   dataEpoch?: number | null;
+  pendingFullResync?: boolean;
   pinEnabled: boolean;
   pinSalt: string | null;
   pinHash: string | null;
@@ -301,6 +302,60 @@ export class LocalFinanceDB {
     });
   }
 
+  async incrementOutboxRetryCounts(
+    mutationIds: string[],
+    lastError: string
+  ): Promise<SyncMutation[]> {
+    if (mutationIds.length === 0) return [];
+    const idSet = new Set(mutationIds);
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const updated: SyncMutation[] = [];
+      const tx = db.transaction(STORE_OUTBOX, 'readwrite');
+      const store = tx.objectStore(STORE_OUTBOX);
+      const req = store.getAll();
+      req.onsuccess = () => {
+        const list = (req.result as Array<SyncMutation & { _seq?: number }>) || [];
+        for (const item of list) {
+          if (idSet.has(item.mutationId)) {
+            const next = {
+              ...item,
+              retryCount: (item.retryCount ?? 0) + 1,
+              lastError: lastError.slice(0, 240),
+            };
+            store.put(next);
+            const { _seq: _ignored, ...clean } = next;
+            updated.push(clean);
+          }
+        }
+      };
+      tx.oncomplete = () => resolve(updated);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async quarantineOutboxMutation(
+    mutationIdsToRemove: string[],
+    snapshot: FinanceSnapshot,
+    meta: LocalMeta,
+    rejections: SyncRejection[]
+  ): Promise<void> {
+    const db = this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_KV, STORE_OUTBOX], 'readwrite');
+      const outboxStore = tx.objectStore(STORE_OUTBOX);
+      for (const id of mutationIdsToRemove) {
+        outboxStore.delete(id);
+      }
+      const kv = tx.objectStore(STORE_KV);
+      kv.put(snapshot, 'snapshot');
+      kv.put(meta, 'meta');
+      kv.put(rejections, 'rejections');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   private applyMutationsToOutboxStore(
     outboxStore: IDBObjectStore,
     existingList: Array<SyncMutation & { _seq?: number }>,
@@ -309,6 +364,7 @@ export class LocalFinanceDB {
   ): void {
     const byKey = new Map<string, SyncMutation & { _seq?: number }>();
     const lockedKeys = new Set<string>();
+    const lockedNewRecordKeys = new Set<string>();
     for (const item of existingList) {
       const k = `${item.entity}:${item.recordId}`;
       // P2-C2: Once a mutation has ever been sent (persisted sentAt) or is in-flight,
@@ -316,6 +372,14 @@ export class LocalFinanceDB {
       const isImmutable = Boolean(item.sentAt) || Boolean(inFlightIds && inFlightIds.has(item.mutationId));
       if (isImmutable) {
         lockedKeys.add(k);
+        const itemIsNew =
+          item.op === 'upsert' &&
+          (item.isNewRecord !== undefined
+            ? item.isNewRecord
+            : item.baseVersion === null || item.baseVersion === 0);
+        if (itemIsNew) {
+          lockedNewRecordKeys.add(k);
+        }
       } else {
         byKey.set(k, item);
       }
@@ -343,16 +407,25 @@ export class LocalFinanceDB {
           baseVersion: prev.baseVersion !== undefined ? prev.baseVersion : mut.baseVersion,
           ...(prev.isNewRecord !== undefined
             ? { isNewRecord: prev.isNewRecord }
-            : mut.isNewRecord !== undefined
-              ? { isNewRecord: mut.isNewRecord }
-              : {}),
+            : lockedNewRecordKeys.has(key) && mut.op === 'upsert'
+              ? { isNewRecord: true }
+              : mut.isNewRecord !== undefined
+                ? { isNewRecord: mut.isNewRecord }
+                : {}),
           _seq: this.outboxSeq,
         };
         outboxStore.put(coalesced);
         byKey.set(key, coalesced);
       } else {
         this.outboxSeq += 1;
-        const record = { ...mut, _seq: this.outboxSeq };
+        // R7: If an immutable/in-flight create exists for this key, mark dependent follow-up upsert as isNewRecord: true
+        const record: SyncMutation & { _seq: number } = {
+          ...mut,
+          ...(lockedNewRecordKeys.has(key) && mut.op === 'upsert' && mut.isNewRecord === undefined
+            ? { isNewRecord: true }
+            : {}),
+          _seq: this.outboxSeq,
+        };
         outboxStore.put(record);
         byKey.set(key, record);
       }

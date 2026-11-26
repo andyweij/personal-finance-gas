@@ -1274,9 +1274,10 @@ async function applySingleMutation(
 
     const p = mutation.payload || {};
     const isManualPriceOverride = Boolean(p.manualPriceOverride);
-    const existingTicker = existing ? String(existing.ticker || '').trim().toUpperCase() : '';
+    const isActiveExisting = Boolean(existing && !existing.deleted_at);
+    const existingTicker = isActiveExisting ? String(existing?.ticker || '').trim().toUpperCase() : '';
     const incomingTicker = String(p.ticker || '').trim().toUpperCase();
-    const tickerChanged = Boolean(existing && existingTicker !== incomingTicker);
+    const tickerChanged = Boolean(isActiveExisting && existingTicker !== incomingTicker);
 
     const v = runValidation(() =>
       validateAssetInput({
@@ -1291,13 +1292,13 @@ async function applySingleMutation(
         unitPrice:
           p.unitPrice !== undefined
             ? Number(p.unitPrice)
-            : existing?.unit_price !== undefined
+            : isActiveExisting && existing?.unit_price !== undefined
               ? Number(existing.unit_price)
               : 1,
         previousClose:
           p.previousClose !== undefined
             ? (p.previousClose as number | null)
-            : existing?.previous_close !== undefined && existing?.previous_close !== null
+            : isActiveExisting && existing?.previous_close !== undefined && existing?.previous_close !== null
               ? Number(existing.previous_close)
               : null,
         costBasis:
@@ -1347,21 +1348,47 @@ async function applySingleMutation(
       })
     );
 
-    // Server-owned live quotes: for existing auto-updated assets on the same ticker, preserve server's
-    // unit_price & previous_close unless the client explicitly marks manualPriceOverride: true.
+    // Server-owned live quotes (F4, F5, F9):
+    // - Same ticker on active auto-updated asset: preserve server unit_price & previous_close unless explicitly overridden.
+    //   When manualPriceOverride is true, only override fields actually sent in payload (e.g. editing only previousClose won't clobber unit_price).
+    // - Ticker changed on active auto-updated asset: clear stale price_updated_at and unprovided old quotes.
+    // - Resurrecting a soft-deleted asset: never retain stale deleted-row price_updated_at or prices.
     let finalUnitPrice = v.unitPrice;
     let finalPreviousClose = v.previousClose;
-    if (existing && v.updateMode === '自動更新' && !isManualPriceOverride) {
+    let clearPriceUpdatedAt = false;
+    if (isActiveExisting && v.updateMode === '自動更新') {
       if (!tickerChanged) {
-        finalUnitPrice = existing.unit_price !== undefined ? Number(existing.unit_price) : v.unitPrice;
-        finalPreviousClose =
-          existing.previous_close !== undefined && existing.previous_close !== null
-            ? Number(existing.previous_close)
-            : null;
-      } else if (p.previousClose === undefined) {
-        // Ticker changed: do not pair old ticker's previous_close with new ticker
-        finalPreviousClose = null;
+        if (!isManualPriceOverride) {
+          finalUnitPrice = existing!.unit_price !== undefined ? Number(existing!.unit_price) : v.unitPrice;
+          finalPreviousClose =
+            existing!.previous_close !== undefined && existing!.previous_close !== null
+              ? Number(existing!.previous_close)
+              : null;
+        } else {
+          finalUnitPrice =
+            p.unitPrice !== undefined
+              ? v.unitPrice
+              : existing!.unit_price !== undefined
+                ? Number(existing!.unit_price)
+                : v.unitPrice;
+          finalPreviousClose =
+            p.previousClose !== undefined
+              ? v.previousClose
+              : existing!.previous_close !== undefined && existing!.previous_close !== null
+                ? Number(existing!.previous_close)
+                : null;
+        }
+      } else {
+        clearPriceUpdatedAt = true;
+        if (p.unitPrice === undefined) {
+          finalUnitPrice = 0;
+        }
+        if (p.previousClose === undefined) {
+          finalPreviousClose = null;
+        }
       }
+    } else if (existing && !isActiveExisting && v.updateMode === '自動更新') {
+      clearPriceUpdatedAt = true;
     }
 
     const postStatements: D1PreparedStatement[] = [];
@@ -1378,11 +1405,17 @@ async function applySingleMutation(
       );
     }
 
+    const nextPriceUpdatedAt = clearPriceUpdatedAt
+      ? null
+      : existing?.price_updated_at !== undefined && existing?.price_updated_at !== null
+        ? String(existing.price_updated_at)
+        : null;
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE asset_items
-             SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
+             SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, price_updated_at = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ?`
           )
           .bind(
@@ -1396,6 +1429,7 @@ async function applySingleMutation(
             v.currency,
             finalUnitPrice,
             finalPreviousClose,
+            nextPriceUpdatedAt,
             v.costBasis,
             v.note,
             v.isLinkedSavings ? 1 : 0,
@@ -1519,7 +1553,14 @@ async function applySingleMutation(
         defaultFxRate
       )
     );
-    const twdAmount = p.twdAmount !== undefined ? Math.round(Number(p.twdAmount)) : v.twdAmount;
+    let twdAmount = v.twdAmount;
+    if (p.twdAmount !== undefined) {
+      const parsedTwd = Number(p.twdAmount);
+      if (!Number.isFinite(parsedTwd)) {
+        throw new RejectError('台幣金額格式無效。');
+      }
+      twdAmount = Math.round(parsedTwd);
+    }
 
     const writeStmt = existing
       ? db
@@ -1722,17 +1763,18 @@ async function applySingleMutation(
   }
 
   if (mutation.entity === 'utility_record') {
+    const normalizedPeriod = mutation.recordId.trim();
     if (mutation.op !== 'delete') {
       const pEarly = mutation.payload || {};
       const payloadPeriodEarly =
         pEarly.period !== undefined && pEarly.period !== null ? String(pEarly.period).trim() : '';
-      if (payloadPeriodEarly && payloadPeriodEarly !== mutation.recordId) {
-        throw new RejectError(`水電期別鍵值不一致（${mutation.recordId} vs ${payloadPeriodEarly}）。`);
+      if (payloadPeriodEarly && payloadPeriodEarly !== normalizedPeriod) {
+        throw new RejectError(`水電期別鍵值不一致（${normalizedPeriod} vs ${payloadPeriodEarly}）。`);
       }
     }
     const existing = await db
       .prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND period = ?')
-      .bind(uid, mutation.recordId)
+      .bind(uid, normalizedPeriod)
       .first<Record<string, unknown>>();
     const check = checkVersionOrThrow(
       mutation,
@@ -1749,7 +1791,7 @@ async function applySingleMutation(
     const refetchUtil = async () => {
       const row = await db
         .prepare('SELECT * FROM rent_utility_records WHERE user_id = ? AND period = ?')
-        .bind(uid, mutation.recordId)
+        .bind(uid, normalizedPeriod)
         .first<Record<string, unknown>>();
       return {
         row,
@@ -1769,7 +1811,7 @@ async function applySingleMutation(
         .prepare(
           `UPDATE rent_utility_records SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND period = ? AND version = ?`
         )
-        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, mutation.recordId, Number(existing.version ?? 1));
+        .bind(check.writeTs, check.writeTs, check.nextVersion, uid, uid, normalizedPeriod, Number(existing.version ?? 1));
       await commitAtomicMutation(db, uid, mutation, serverTime, delStmt, [], refetchUtil, check.legacyClientTs);
       return;
     }
@@ -1777,7 +1819,7 @@ async function applySingleMutation(
     const p = mutation.payload || {};
     const v = runValidation(() =>
       validateUtilityRecordInput({
-        period: mutation.recordId,
+        period: normalizedPeriod,
         isBaseline: Boolean(p.isBaseline),
         curTotal: Number(p.curTotal),
         cur6F: Number(p.cur6F),
@@ -1813,7 +1855,7 @@ async function applySingleMutation(
             check.nextVersion,
             uid,
             uid,
-            mutation.recordId,
+            v.period,
             Number(existing.version ?? 1)
           )
       : db
@@ -1825,7 +1867,7 @@ async function applySingleMutation(
           )
           .bind(
             uid,
-            mutation.recordId,
+            v.period,
             v.isBaseline ? 1 : 0,
             v.curTotal,
             v.cur6F,
@@ -2038,8 +2080,27 @@ export async function processSyncRequest(
   }
 
   for (const mut of mutations) {
-    if (!mut || !mut.mutationId || !mut.entity || !mut.recordId) {
-      rejected.push({ mutationId: mut?.mutationId || 'unknown', reason: 'Invalid mutation format' });
+    const rawId =
+      mut && typeof mut === 'object' && typeof mut.mutationId === 'string' && mut.mutationId.trim()
+        ? mut.mutationId
+        : 'unknown';
+    const hasValidEnvelope =
+      Boolean(mut && typeof mut === 'object') &&
+      typeof mut.mutationId === 'string' &&
+      mut.mutationId.trim().length > 0 &&
+      typeof mut.entity === 'string' &&
+      typeof mut.recordId === 'string' &&
+      mut.recordId.trim().length > 0 &&
+      typeof mut.op === 'string' &&
+      (mut.baseVersion === undefined ||
+        mut.baseVersion === null ||
+        (typeof mut.baseVersion === 'number' && Number.isInteger(mut.baseVersion))) &&
+      (mut.payload === undefined ||
+        mut.payload === null ||
+        (typeof mut.payload === 'object' && !Array.isArray(mut.payload)));
+
+    if (!hasValidEnvelope) {
+      rejected.push({ mutationId: rawId, reason: 'Invalid mutation format' });
       continue;
     }
     if (!ALLOWED_SYNC_ENTITIES.has(String(mut.entity)) || !ALLOWED_SYNC_OPS.has(String(mut.op))) {
@@ -2065,16 +2126,42 @@ export async function processSyncRequest(
       ackedMutationIds.push(mut.mutationId);
     } catch (err) {
       if (err instanceof VersionConflictError) {
-        conflicts.push(err.conflict);
+        // R1: Concurrent duplicate mutationId race — Request A may have committed between our initial
+        // sync_idempotency check and our table SELECT, causing checkVersionOrThrow to throw before
+        // commitAtomicMutation ran. Re-check sync_idempotency before declaring a false conflict!
+        const appliedByRace = await db
+          .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
+          .bind(uid, mut.mutationId)
+          .first();
+        if (appliedByRace) {
+          ackedMutationIds.push(mut.mutationId);
+        } else {
+          conflicts.push(err.conflict);
+        }
       } else if (err instanceof RejectError) {
         rejected.push({
           mutationId: mut.mutationId,
           reason: err.message || '資料驗證失敗，伺服器拒絕此筆異動',
         });
       } else {
-        // S2: Transient / infrastructure error (e.g. D1 overload/timeout) must NOT be treated as permanent rejection
-        console.error('[sync] transient mutation failure:', mut.entity, mut.recordId, err);
-        throw err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        // R2: Deterministic SQLite/D1 schema/type constraint errors are permanent payload failures,
+        // NOT transient infrastructure failures — reject with a sanitized message (never leak SQL text).
+        if (
+          /SQLITE_CONSTRAINT|NOT NULL constraint|CHECK constraint|FOREIGN KEY constraint|D1_TYPE_ERROR/i.test(
+            errMsg
+          )
+        ) {
+          console.warn('[sync] deterministic constraint rejected:', mut.entity, mut.recordId, errMsg);
+          rejected.push({
+            mutationId: mut.mutationId,
+            reason: '資料格式或欄位約束不符合規範，伺服器拒絕此筆異動',
+          });
+        } else {
+          // S2: Transient / infrastructure error (e.g. D1 overload/timeout) must NOT be treated as permanent rejection
+          console.error('[sync] transient mutation failure:', mut.entity, mut.recordId, err);
+          throw err;
+        }
       }
     }
   }

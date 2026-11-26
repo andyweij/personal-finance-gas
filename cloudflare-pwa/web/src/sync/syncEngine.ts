@@ -87,6 +87,7 @@ export interface SyncEngineOptions {
   requestTimeoutMs?: number;
   retryBaseDelayMs?: number;
   maxBatchSize?: number;
+  maxPoisonRetries?: number;
   requestLock?: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
   onStatusChange?: (status: SyncStatus) => void;
   onSnapshotChange?: (snapshot: FinanceSnapshot) => void;
@@ -251,6 +252,7 @@ export class SyncEngine {
   private readonly requestTimeoutMs: number;
   private readonly retryBaseDelayMs: number;
   private readonly maxBatchSize: number;
+  private readonly maxPoisonRetries: number;
   private readonly requestLockImpl: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
 
   constructor(
@@ -265,6 +267,7 @@ export class SyncEngine {
     this.requestTimeoutMs = Math.max(20, opts.requestTimeoutMs ?? 20_000);
     this.retryBaseDelayMs = Math.max(50, opts.retryBaseDelayMs ?? 2_000);
     this.maxBatchSize = Math.max(1, Math.min(200, opts.maxBatchSize ?? 50));
+    this.maxPoisonRetries = Math.max(2, Math.min(20, opts.maxPoisonRetries ?? 5));
     this.requestLockImpl =
       opts.requestLock ||
       (async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
@@ -705,6 +708,7 @@ export class SyncEngine {
             recordId: updated.id,
             clientTimestamp: nowIso,
             baseVersion: l.version ?? null,
+            isNewRecord: false,
             payload: { ...updated },
           });
           return updated;
@@ -727,6 +731,7 @@ export class SyncEngine {
             recordId: updated.id,
             clientTimestamp: nowIso,
             baseVersion: a.version ?? null,
+            isNewRecord: false,
             payload: { ...updated },
           });
           return updated;
@@ -744,6 +749,7 @@ export class SyncEngine {
             recordId: updated.id,
             clientTimestamp: nowIso,
             baseVersion: r.version ?? null,
+            isNewRecord: false,
             payload: { ...updated },
           });
           return updated;
@@ -759,6 +765,7 @@ export class SyncEngine {
       recordId: lid,
       clientTimestamp: nowIso,
       baseVersion: existing.version ?? null,
+      isNewRecord: false,
     });
 
     const nextSnapshot: FinanceSnapshot = {
@@ -1200,16 +1207,27 @@ export class SyncEngine {
           ? existing.sortOrder ?? 0
           : this.nextSortOrderFor(this.snapshot.assetItems);
 
+    const tickerChanged = Boolean(
+      existing && (existing.ticker || '').trim().toUpperCase() !== v.ticker.trim().toUpperCase()
+    );
     const resolvedUnitPrice =
-      payload.unitPrice !== undefined ? v.unitPrice : existing?.unitPrice ?? (v.isWatchlist ? 0 : 1);
+      payload.unitPrice !== undefined
+        ? v.unitPrice
+        : tickerChanged && v.updateMode === '自動更新'
+          ? 0
+          : existing?.unitPrice ?? (v.isWatchlist ? 0 : 1);
     const priceChangedLocally =
       Boolean(existing) && payload.unitPrice !== undefined && resolvedUnitPrice !== existing!.unitPrice;
     const resolvedPreviousClose =
       payload.previousClose !== undefined
         ? v.previousClose
-        : priceChangedLocally
+        : tickerChanged && v.updateMode === '自動更新'
           ? null
-          : existing?.previousClose ?? null;
+          : priceChangedLocally
+            ? null
+            : existing?.previousClose ?? null;
+    const resolvedPriceUpdatedAt =
+      tickerChanged && v.updateMode === '自動更新' ? null : (existing?.priceUpdatedAt ?? null);
 
     const item: AssetItem = {
       id,
@@ -1230,7 +1248,7 @@ export class SyncEngine {
         payload.excludeFromNetWorth !== undefined
           ? v.excludeFromNetWorth
           : existing?.excludeFromNetWorth ?? false,
-      priceUpdatedAt: existing?.priceUpdatedAt ?? null,
+      priceUpdatedAt: resolvedPriceUpdatedAt,
       balanceAnchorDate,
       balanceAnchorAt,
       isDefaultSavings,
@@ -1255,11 +1273,13 @@ export class SyncEngine {
     };
 
     const mutationPayload: Record<string, unknown> = { ...item };
-    if (existing && v.updateMode === '自動更新' && !payload.manualPriceOverride) {
+    if (existing && v.updateMode === '自動更新' && !tickerChanged) {
+      // F4: Even when manualPriceOverride is true (e.g. editing ONLY previousClose),
+      // omit unitPrice when caller did not explicitly provide it so server live quote is never clobbered.
       if (payload.unitPrice === undefined) {
         delete mutationPayload.unitPrice;
       }
-      if (payload.previousClose === undefined) {
+      if (payload.previousClose === undefined && !priceChangedLocally) {
         delete mutationPayload.previousClose;
       }
     }
@@ -1420,6 +1440,7 @@ export class SyncEngine {
         recordId: id,
         clientTimestamp: nowIso,
         baseVersion: null,
+        isNewRecord: true,
         payload: { ...adj, currency },
       },
     ]);
@@ -1454,6 +1475,7 @@ export class SyncEngine {
         recordId: t.id,
         clientTimestamp: nowIso,
         baseVersion: t.version ?? null,
+        isNewRecord: false,
       })
     );
     await this.commitAndMaybeSync(nextSnapshot, mutations);
@@ -1538,6 +1560,7 @@ export class SyncEngine {
         recordId: adjId,
         clientTimestamp: nowIso,
         baseVersion: null,
+        isNewRecord: true,
         payload: { ...fromAdjustment, currency: fromAcc.currency },
       });
     } else {
@@ -1555,6 +1578,7 @@ export class SyncEngine {
         recordId: updatedFrom.id,
         clientTimestamp: nowIso,
         baseVersion: fromAcc.version ?? null,
+        isNewRecord: false,
         payload: { ...updatedFrom },
       });
     }
@@ -1588,6 +1612,7 @@ export class SyncEngine {
         recordId: adjId,
         clientTimestamp: nowIso,
         baseVersion: null,
+        isNewRecord: true,
         payload: { ...toAdjustment, currency: toAcc.currency },
       });
     } else {
@@ -1605,6 +1630,7 @@ export class SyncEngine {
         recordId: updatedTo.id,
         clientTimestamp: nowIso,
         baseVersion: toAcc.version ?? null,
+        isNewRecord: false,
         payload: { ...updatedTo },
       });
     }
@@ -1641,6 +1667,7 @@ export class SyncEngine {
         recordId: cfId,
         clientTimestamp: nowIso,
         baseVersion: null,
+        isNewRecord: true,
         payload: { ...feeCashflow },
       });
     }
@@ -1742,6 +1769,7 @@ export class SyncEngine {
         recordId: cfId,
         clientTimestamp: nowIso,
         baseVersion: null,
+        isNewRecord: true,
         payload: { ...createdCashflow },
       });
     }
@@ -1762,6 +1790,7 @@ export class SyncEngine {
       recordId: txId,
       clientTimestamp: nowIso,
       baseVersion: null,
+      isNewRecord: true,
       payload: { ...tx },
     });
 
@@ -2023,9 +2052,17 @@ export class SyncEngine {
       return { ...baseSnapshot, sinkingItems: next.sort(compareBySortOrder) };
     }
     if (entity === 'asset') {
+      const existing = baseSnapshot.assetItems.find((a) => a.id === recordId);
       const filtered = baseSnapshot.assetItems.filter((a) => a.id !== recordId);
-      const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as AssetItem] : filtered;
-      return { ...baseSnapshot, assetItems: next.sort(compareBySortOrder) };
+      if (!isDelete && record && !record.deletedAt) {
+        const definedRecord: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(record)) {
+          if (v !== undefined) definedRecord[k] = v;
+        }
+        const mergedAsset = (existing ? { ...existing, ...definedRecord } : definedRecord) as unknown as AssetItem;
+        return { ...baseSnapshot, assetItems: [...filtered, mergedAsset].sort(compareBySortOrder) };
+      }
+      return { ...baseSnapshot, assetItems: filtered.sort(compareBySortOrder) };
     }
     if (entity === 'savings_adjustment') {
       const filtered = baseSnapshot.savingsAdjustments.filter((a) => a.id !== recordId);
@@ -2138,15 +2175,39 @@ export class SyncEngine {
       const nowIso = new Date().toISOString();
       const nextConflicts = this.conflicts.filter((c) => c.mutationId !== mutationId);
 
-      const payloadWithVersion = conflict.clientPayload
+      const payloadWithVersion: Record<string, unknown> | undefined = conflict.clientPayload
         ? { ...conflict.clientPayload, updatedAt: nowIso, version: conflict.serverVersion }
         : undefined;
+
+      // F1: Preserve server's latest live quote fields in the local snapshot when clientPayload
+      // omitted unitPrice/previousClose/priceUpdatedAt, while keeping retryMutation minimal for server upload.
+      let snapshotPayload: Record<string, unknown> | null = payloadWithVersion || null;
+      if (
+        conflict.entity === 'asset' &&
+        conflict.op !== 'delete' &&
+        payloadWithVersion &&
+        conflict.serverRecord
+      ) {
+        const srv = conflict.serverRecord;
+        snapshotPayload = {
+          ...payloadWithVersion,
+          ...(payloadWithVersion.unitPrice === undefined && srv.unitPrice !== undefined
+            ? { unitPrice: srv.unitPrice }
+            : {}),
+          ...(payloadWithVersion.previousClose === undefined && srv.previousClose !== undefined
+            ? { previousClose: srv.previousClose }
+            : {}),
+          ...(payloadWithVersion.priceUpdatedAt === undefined && srv.priceUpdatedAt !== undefined
+            ? { priceUpdatedAt: srv.priceUpdatedAt }
+            : {}),
+        };
+      }
 
       const nextSnapshot = this.applyRecordToSnapshot(
         this.snapshot,
         conflict.entity,
         conflict.recordId,
-        payloadWithVersion || null,
+        snapshotPayload,
         conflict.op === 'delete'
       );
 
@@ -2267,6 +2328,115 @@ export class SyncEngine {
     return undefined;
   }
 
+  private overlayPendingOutboxOnSnapshot(
+    baseSnapshot: FinanceSnapshot,
+    pendingList: SyncMutation[]
+  ): FinanceSnapshot {
+    let merged = baseSnapshot;
+    for (const pendingMut of pendingList) {
+      if (pendingMut.entity === 'settings' && pendingMut.payload) {
+        const p = pendingMut.payload as Partial<AppSettings>;
+        merged = {
+          ...merged,
+          settings: {
+            ...merged.settings,
+            ...(p.monthlyDailyBudget !== undefined ? { monthlyDailyBudget: p.monthlyDailyBudget } : {}),
+            ...(p.emergencyTargetMonths !== undefined ? { emergencyTargetMonths: p.emergencyTargetMonths } : {}),
+            ...(p.usdTwdRate !== undefined ? { usdTwdRate: p.usdTwdRate } : {}),
+            ...(p.autoFxEnabled !== undefined ? { autoFxEnabled: p.autoFxEnabled } : {}),
+            ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
+            ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
+          },
+        };
+      } else if (pendingMut.op === 'delete') {
+        merged = this.removeRecordFromSnapshot(merged, pendingMut.entity, pendingMut.recordId);
+      } else if (pendingMut.op === 'upsert' && pendingMut.payload) {
+        merged = this.applyRecordToSnapshot(
+          merged,
+          pendingMut.entity,
+          pendingMut.recordId,
+          pendingMut.payload,
+          false
+        );
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * R2: Best-effort read-only pull when an outbox batch fails with 5xx/400/413,
+   * ensuring server-side changes still download instead of being head-of-line blocked.
+   */
+  private async tryReadOnlyPull(
+    reqSince: string | null,
+    reqSinceSeq: number | null,
+    reqClientEpoch: number | null
+  ): Promise<void> {
+    if (!this.isOnline()) return;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), Math.min(this.requestTimeoutMs, 15_000));
+    try {
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (this.expectedUserId) {
+        headers['x-expected-user'] = this.expectedUserId;
+      }
+      const res = await this.fetchImpl('/api/sync', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
+        signal: controller.signal,
+        body: JSON.stringify({
+          since: reqSince,
+          sinceSeq: reqSinceSeq,
+          clientEpoch: reqClientEpoch,
+          mutations: [],
+        }),
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as SyncResponse;
+      await this.runSerialized(async () => {
+        const currentOutbox = await this.db.getOutbox();
+        const nextMeta: LocalMeta = {
+          ...this.meta,
+          lastSyncedAt: data.serverTime,
+          ...(typeof data.syncCursor === 'number' ? { syncCursor: data.syncCursor } : {}),
+          ...(typeof data.dataEpoch === 'number' ? { dataEpoch: data.dataEpoch } : {}),
+        };
+        const epochChanged =
+          typeof this.meta.dataEpoch === 'number' &&
+          typeof data.dataEpoch === 'number' &&
+          this.meta.dataEpoch !== data.dataEpoch;
+        if ((Boolean(data.epochMismatch) || epochChanged) && currentOutbox.length > 0) {
+          const restoredSnap = this.mergeDelta(this.snapshot, data.delta, true);
+          const mergedFrozen = await this.db.freezeOutboxAndApplySnapshot(
+            restoredSnap,
+            nextMeta,
+            this.conflicts,
+            this.rejections
+          );
+          this.snapshot = restoredSnap;
+          this.meta = nextMeta;
+          this.frozenOutbox = mergedFrozen;
+          this.emitSnapshot();
+          this.broadcastDbChanged();
+          return;
+        }
+        const applyAsFull = Boolean(data.fullResyncRequired) || epochChanged;
+        const baseMerged = this.mergeDelta(this.snapshot, data.delta, applyAsFull);
+        const overlaid = this.overlayPendingOutboxOnSnapshot(baseMerged, currentOutbox);
+        await this.db.acknowledgeOutboxAndSave([], overlaid, nextMeta);
+        this.snapshot = overlaid;
+        this.meta = nextMeta;
+        this.emitSnapshot();
+        this.broadcastDbChanged();
+      });
+    } catch {
+      // Best-effort read-only pull; ignore secondary errors
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
   private async performSync(forceFullPull: boolean): Promise<SyncResult> {
     // Re-read fresh state from IndexedDB after acquiring the cross-tab lock
     let initialOutboxCount = 0;
@@ -2284,7 +2454,8 @@ export class SyncEngine {
       return { ok: false, error: '目前處於離線模式' };
     }
 
-    let fullPullPass = forceFullPull;
+    // R3: Honor persisted pendingFullResync even across page reload when outbox is empty
+    let fullPullPass = forceFullPull || (Boolean(this.meta.pendingFullResync) && initialOutboxCount === 0);
     const maxPasses = 20;
 
     for (let pass = 0; pass < maxPasses; pass++) {
@@ -2297,7 +2468,9 @@ export class SyncEngine {
 
       await this.runSerialized(async () => {
         outbox = await this.db.getOutbox();
-        batch = outbox.slice(0, this.maxBatchSize);
+        // R2: Shrink batch size to 1 after any failure so a single poison-pill mutation is isolated
+        const effectiveBatchSize = this.consecutiveFailures >= 1 ? 1 : this.maxBatchSize;
+        batch = outbox.slice(0, effectiveBatchSize);
         hadMoreBatches = outbox.length > batch.length;
         // P2-C2: Persist sentAt & attempts to IndexedDB BEFORE sending HTTP request so timeout/reload never coalesces sent mutations
         if (batch.length > 0) {
@@ -2472,6 +2645,7 @@ export class SyncEngine {
           // freeze the ENTIRE outbox instead of discarding 50 items or blindly applying remaining batches.
           const unackedOutbox = currentOutbox.filter((m) => !clearedSet.has(m.mutationId));
           if (isEpochMismatch && unackedOutbox.length > 0) {
+            nextMeta.pendingFullResync = false;
             const restoredSnap = this.mergeDelta(this.snapshot, data.delta, true);
             const mergedFrozen = await this.db.freezeOutboxAndApplySnapshot(
               restoredSnap,
@@ -2496,11 +2670,7 @@ export class SyncEngine {
             return;
           }
 
-          const pendingKeysAfterClear = new Set(
-            currentOutbox
-              .filter((m) => !clearedSet.has(m.mutationId) && !batchIdSet.has(m.mutationId))
-              .map((m) => `${m.entity}:${m.recordId}`)
-          );
+          const applyAsFull = fullPullPass || Boolean(data.fullResyncRequired) || epochChanged;
 
           const rejectedCreatesToRollback: Array<{ entity: string; recordId: string }> = [];
           let needsFullResyncAfterRejection = false;
@@ -2515,31 +2685,69 @@ export class SyncEngine {
                   ? orig.isNewRecord
                   : orig.op === 'upsert' && (orig.baseVersion === null || orig.baseVersion === 0)
                 : false;
-              byMutId.set(r.mutationId, {
-                mutationId: r.mutationId,
-                entity: orig?.entity || 'unknown',
-                op: orig?.op || 'upsert',
-                recordId: orig?.recordId || r.mutationId,
-                isNewRecord: isCreate,
-                reason: r.reason || '伺服器拒絕此筆異動',
-                clientPayload: orig?.payload,
-                rejectedAt,
-              });
-              if (orig) {
+
+              let preservedPayload = orig?.payload;
+
+              if (orig && isCreate) {
+                // R7: Clear any dependent pending edits for this failed create so the record cannot resurrect
                 const key = `${orig.entity}:${orig.recordId}`;
-                if (isCreate) {
-                  if (!pendingKeysAfterClear.has(key)) {
-                    rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
+                const dependentPending = currentOutbox.filter(
+                  (m) =>
+                    !clearedSet.has(m.mutationId) &&
+                    !batchIdSet.has(m.mutationId) &&
+                    `${m.entity}:${m.recordId}` === key
+                );
+                for (const dep of dependentPending) {
+                  outboxIdsToClear.push(dep.mutationId);
+                  clearedSet.add(dep.mutationId);
+                  if (dep.op === 'upsert' && dep.payload) {
+                    preservedPayload = dep.payload;
                   }
-                } else if (!pendingKeysAfterClear.has(key)) {
+                }
+                rejectedCreatesToRollback.push({ entity: orig.entity, recordId: orig.recordId });
+                byMutId.set(r.mutationId, {
+                  mutationId: r.mutationId,
+                  entity: orig.entity,
+                  op: orig.op,
+                  recordId: orig.recordId,
+                  isNewRecord: true,
+                  resolutionStatus: 'rolled_back',
+                  reason: r.reason || '伺服器拒絕此筆異動',
+                  clientPayload: preservedPayload,
+                  rejectedAt,
+                });
+              } else {
+                // R3 & R6: Always mark pendingFullResync when a non-create edit/delete is rejected
+                // (even if another pending edit exists for that key) unless this pass already fetched a full snapshot
+                if (!applyAsFull) {
                   needsFullResyncAfterRejection = true;
                 }
+                byMutId.set(r.mutationId, {
+                  mutationId: r.mutationId,
+                  entity: orig?.entity || 'unknown',
+                  op: orig?.op || 'upsert',
+                  recordId: orig?.recordId || r.mutationId,
+                  isNewRecord: false,
+                  resolutionStatus: applyAsFull ? 'restored' : 'pending_resync',
+                  reason: r.reason || '伺服器拒絕此筆異動',
+                  clientPayload: preservedPayload,
+                  rejectedAt,
+                });
               }
             }
             nextRejections = Array.from(byMutId.values());
           }
 
-          const applyAsFull = fullPullPass || Boolean(data.fullResyncRequired) || epochChanged;
+          if (needsFullResyncAfterRejection && !applyAsFull) {
+            nextMeta.pendingFullResync = true;
+          } else if (applyAsFull) {
+            nextMeta.pendingFullResync = false;
+            if (nextRejections.some((r) => r.resolutionStatus === 'pending_resync')) {
+              nextRejections = nextRejections.map((r) =>
+                r.resolutionStatus === 'pending_resync' ? { ...r, resolutionStatus: 'restored' } : r
+              );
+            }
+          }
 
           let merged = this.mergeDelta(this.snapshot, data.delta, applyAsFull);
           for (const rb of rejectedCreatesToRollback) {
@@ -2672,7 +2880,17 @@ export class SyncEngine {
           return { ok: true, epochMismatch: true };
         }
 
-        if (passOutcome.needsFullResyncAfterRejection && !passOutcome.applyAsFull) {
+        // R6: Drain remaining outbox batches first, then perform ONE consolidated full pull if pendingFullResync is set
+        if (hadMoreBatches && passOutcome.remainingOutboxCount > 0 && passOutcome.madeForwardProgress) {
+          fullPullPass = false;
+          continue;
+        }
+
+        if (
+          this.meta.pendingFullResync &&
+          !passOutcome.applyAsFull &&
+          (passOutcome.remainingOutboxCount === 0 || passOutcome.needsFullResyncAfterRejection)
+        ) {
           fullPullPass = true;
           continue;
         }
@@ -2689,9 +2907,6 @@ export class SyncEngine {
           return { ok: false, error: msg };
         }
 
-        if (hadMoreBatches && passOutcome.remainingOutboxCount > 0 && passOutcome.madeForwardProgress) {
-          continue;
-        }
         if (passOutcome.remainingOutboxCount > 0 && passOutcome.madeForwardProgress) {
           this.scheduleRetry(250);
         }
@@ -2704,12 +2919,95 @@ export class SyncEngine {
           : err instanceof Error
             ? err.message
             : '網路同步失敗';
+
+        const isServerOrPayloadFailure =
+          httpStatus !== undefined && (httpStatus >= 500 || httpStatus === 400 || httpStatus === 413);
+
+        if (isServerOrPayloadFailure && batch.length > 0) {
+          const updatedBatch = await this.db.incrementOutboxRetryCounts(
+            batch.map((m) => m.mutationId),
+            msg
+          );
+          const singleFailed = batch.length === 1 ? updatedBatch[0] || batch[0] : null;
+          if (singleFailed && (singleFailed.retryCount ?? 0) >= this.maxPoisonRetries) {
+            // R2: Poison-pill mutation hit retry ceiling — quarantine it so remaining mutations & pulls proceed!
+            let remainingAfterQuarantine = 0;
+            await this.runSerialized(async () => {
+              const currentOutbox = await this.db.getOutbox();
+              const isCreate =
+                singleFailed.isNewRecord !== undefined
+                  ? singleFailed.isNewRecord
+                  : singleFailed.op === 'upsert' &&
+                    (singleFailed.baseVersion === null || singleFailed.baseVersion === 0);
+              const idsToRemove = [singleFailed.mutationId];
+              let preservedPayload = singleFailed.payload;
+              if (isCreate) {
+                const key = `${singleFailed.entity}:${singleFailed.recordId}`;
+                for (const m of currentOutbox) {
+                  if (m.mutationId !== singleFailed.mutationId && `${m.entity}:${m.recordId}` === key) {
+                    idsToRemove.push(m.mutationId);
+                    if (m.op === 'upsert' && m.payload) {
+                      preservedPayload = m.payload;
+                    }
+                  }
+                }
+              }
+              const nextSnap = isCreate
+                ? this.removeRecordFromSnapshot(this.snapshot, singleFailed.entity, singleFailed.recordId)
+                : this.snapshot;
+              const nextMeta: LocalMeta = {
+                ...this.meta,
+                ...(!isCreate ? { pendingFullResync: true } : {}),
+              };
+              const byMutId = new Map<string, SyncRejection>(this.rejections.map((r) => [r.mutationId, r]));
+              byMutId.set(singleFailed.mutationId, {
+                mutationId: singleFailed.mutationId,
+                entity: singleFailed.entity,
+                op: singleFailed.op,
+                recordId: singleFailed.recordId,
+                isNewRecord: isCreate,
+                resolutionStatus: 'quarantined',
+                reason: `多次同步失敗已自動移出待上傳佇列：${msg}`,
+                clientPayload: preservedPayload,
+                rejectedAt: new Date().toISOString(),
+              });
+              const nextRejections = Array.from(byMutId.values());
+              await this.db.quarantineOutboxMutation(idsToRemove, nextSnap, nextMeta, nextRejections);
+              this.snapshot = nextSnap;
+              this.meta = nextMeta;
+              this.rejections = nextRejections;
+              remainingAfterQuarantine = (await this.db.getOutbox()).length;
+              this.emitSnapshot();
+              this.broadcastDbChanged();
+              this.updateStatus(this.computeStatus(remainingAfterQuarantine));
+            });
+
+            this.consecutiveFailures = 0;
+            if (remainingAfterQuarantine > 0) {
+              fullPullPass = false;
+              continue;
+            }
+            if (this.meta.pendingFullResync) {
+              fullPullPass = true;
+              continue;
+            }
+            return { ok: true };
+          }
+
+          // R2: Even while the outbox batch failed, run a silent read-only pull so server delta still downloads!
+          await this.tryReadOnlyPull(reqSince, reqSinceSeq, reqClientEpoch);
+        }
+
         const latestOutbox = await this.db.getOutbox();
         this.updateStatus(this.computeStatus(latestOutbox.length, msg));
 
-        // Exponential backoff + jitter on 5xx, 429, or network/timeout failures when outbox still has pending mutations
+        // Exponential backoff + jitter on 5xx, 429, or network/timeout failures when outbox OR pendingFullResync needs retry
         const isTransient = !httpStatus || httpStatus >= 500 || httpStatus === 429 || isAbort;
-        if (isTransient && latestOutbox.length > 0 && this.isOnline()) {
+        if (
+          (isTransient || (isServerOrPayloadFailure && batch.length > 0)) &&
+          (latestOutbox.length > 0 || Boolean(this.meta.pendingFullResync)) &&
+          this.isOnline()
+        ) {
           this.consecutiveFailures += 1;
           this.scheduleRetry();
         }
@@ -2722,10 +3020,10 @@ export class SyncEngine {
       }
     }
 
-    // P2-C8: If maxPasses (20) reached with remaining outbox items, schedule continuation retry
+    // P2-C8: If maxPasses (20) reached with remaining outbox items or pendingFullResync, schedule continuation retry
     const finalOutbox = await this.db.getOutbox();
     this.updateStatus(this.computeStatus(finalOutbox.length));
-    if (finalOutbox.length > 0 && this.isOnline()) {
+    if ((finalOutbox.length > 0 || Boolean(this.meta.pendingFullResync)) && this.isOnline()) {
       this.scheduleRetry(500);
     }
     return { ok: true };

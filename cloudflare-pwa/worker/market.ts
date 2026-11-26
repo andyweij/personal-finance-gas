@@ -442,16 +442,62 @@ async function fetchTwseMisQuote(
     });
     if (!res.ok) return null;
     const json = (await res.json()) as {
-      msgArray?: Array<{ z?: string; y?: string; b?: string; a?: string; o?: string }>;
+      msgArray?: Array<{
+        z?: string;
+        y?: string;
+        b?: string;
+        a?: string;
+        o?: string;
+        t?: string;
+        v?: string;
+        ip?: string;
+      }>;
     };
     const entries = json?.msgArray || [];
     for (const entry of entries) {
+      // F2: Skip delayed open/close auction snapshots (ip='4' 暫緩收盤, ip='5' 暫緩開盤) -> fall back to Yahoo
+      const ipStr = typeof entry?.ip === 'string' ? entry.ip.trim() : '';
+      if (ipStr === '4' || ipStr === '5') {
+        continue;
+      }
+
+      // F2: Skip pre-market trial matching before 09:00:00 (speculative bid/ask) -> fall back to Yahoo
+      const tStr = typeof entry?.t === 'string' ? entry.t.trim() : '';
+      const hasValidTime = /^\d{2}:\d{2}:\d{2}$/.test(tStr);
+      if (hasValidTime && tStr < '09:00:00') {
+        continue;
+      }
+
       const yNum = Number(entry?.y);
       const validY = Number.isFinite(yNum) && yNum > 0 ? roundStockPrice(yNum) : null;
 
       // 1. Latest trade price z
       const zNum = entry?.z && entry.z !== '-' ? Number(entry.z) : NaN;
-      let price: number | null = Number.isFinite(zNum) && zNum > 0 ? roundStockPrice(zNum) : null;
+      const validZ = Number.isFinite(zNum) && zNum > 0 ? roundStockPrice(zNum) : null;
+
+      // Opening price o
+      const oNum = entry?.o && entry.o !== '-' ? Number(entry.o) : NaN;
+      const validO = Number.isFinite(oNum) && oNum > 0 ? roundStockPrice(oNum) : null;
+
+      // F3: Check cumulative daily volume v when neither z nor o traded today
+      const rawV = entry?.v !== undefined && entry.v !== null ? String(entry.v).trim() : undefined;
+      const isZeroVolume =
+        rawV !== undefined &&
+        (rawV === '-' || rawV === '' || (Number.isFinite(Number(rawV)) && Number(rawV) === 0));
+
+      if (validZ === null && isZeroVolume && validO === null) {
+        // Confirmed post-close zero-volume trading day: flat close at previousClose y (0% change)
+        if (hasValidTime && tStr >= '13:30:00' && validY !== null) {
+          return {
+            price: validY,
+            previousClose: validY,
+          };
+        }
+        // Intraday with zero trades so far: do not fabricate a price from resting quotes -> let Yahoo take over
+        continue;
+      }
+
+      let price: number | null = validZ;
 
       // 2. When z === '-' (e.g., 5s snapshot without trade or closing call auction), try best bid/ask (b / a)
       if (price === null) {
@@ -465,11 +511,8 @@ async function fetchTwseMisQuote(
       }
 
       // 3. Fallback to opening price o
-      if (price === null) {
-        const oNum = entry?.o && entry.o !== '-' ? Number(entry.o) : NaN;
-        if (Number.isFinite(oNum) && oNum > 0) {
-          price = roundStockPrice(oNum);
-        }
+      if (price === null && validO !== null) {
+        price = validO;
       }
 
       // 4. Never fall back to previousClose y as live price — return null so Yahoo Finance takes over

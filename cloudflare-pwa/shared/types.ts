@@ -377,6 +377,7 @@ export interface SyncRejection {
   op: SyncOp | string;
   recordId: string;
   isNewRecord?: boolean;
+  resolutionStatus?: 'rolled_back' | 'restored' | 'pending_resync' | 'quarantined';
   reason: string;
   clientPayload?: Record<string, unknown>;
   rejectedAt: string;

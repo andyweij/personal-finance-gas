@@ -839,6 +839,13 @@ async function consumeChallengeByValue(
   return row ? row.challenge : null;
 }
 
+export class PasskeyClientError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PasskeyClientError';
+  }
+}
+
 export async function insertPasskeyCredentialOrThrow(
   db: D1Database,
   params: {
@@ -870,7 +877,7 @@ export async function insertPasskeyCredentialOrThrow(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (/UNIQUE|PRIMARY KEY/i.test(msg)) {
-      throw new Error('此 Passkey 憑證已被綁定，無法覆蓋既有憑證。');
+      throw new PasskeyClientError('此 Passkey 憑證已被綁定，無法覆蓋既有憑證。');
     }
     throw err;
   }
@@ -917,21 +924,26 @@ export async function finishPasskeyRegistration(
 ) {
   const clientChallenge = extractChallengeFromClientDataJSON(response?.response?.clientDataJSON);
   if (!clientChallenge) {
-    throw new Error('Passkey 驗證資料格式無效。');
+    throw new PasskeyClientError('Passkey 驗證資料格式無效。');
   }
   const expectedChallenge = await consumeChallengeByValue(db, clientChallenge, 'register', user.id);
-  if (!expectedChallenge) throw new Error('Passkey 驗證已過期，請重試。');
+  if (!expectedChallenge) throw new PasskeyClientError('Passkey 驗證已過期，請重試。');
 
-  const verification = await verifyRegistrationResponse({
-    response,
-    expectedChallenge,
-    expectedOrigin: origin,
-    expectedRPID: rpID,
-    requireUserVerification: true,
-  });
+  let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
+  try {
+    verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      requireUserVerification: true,
+    });
+  } catch (err) {
+    throw new PasskeyClientError(err instanceof Error ? err.message : 'Passkey 註冊驗證失敗。');
+  }
 
   if (!verification.verified || !verification.registrationInfo) {
-    throw new Error('Passkey 註冊驗證失敗。');
+    throw new PasskeyClientError('Passkey 註冊驗證失敗。');
   }
 
   const { credential } = verification.registrationInfo;
@@ -960,7 +972,7 @@ export async function createPasskeyAuthenticationOptions(
   // Always use Discoverable Credential flow (never return allowCredentials by username to prevent credential enumeration)
   const anyPk = await db.prepare('SELECT credential_id FROM auth_passkeys LIMIT 1').first<{ credential_id: string }>();
   if (!anyPk) {
-    throw new Error('尚未綁定任何 Passkey。');
+    throw new PasskeyClientError('尚未綁定任何 Passkey。');
   }
 
   const options = await generateAuthenticationOptions({
@@ -979,10 +991,10 @@ export async function finishPasskeyAuthentication(
 ): Promise<{ verified: true; user: UserRow }> {
   const clientChallenge = extractChallengeFromClientDataJSON(response?.response?.clientDataJSON);
   if (!clientChallenge) {
-    throw new Error('Passkey 驗證資料格式無效。');
+    throw new PasskeyClientError('Passkey 驗證資料格式無效。');
   }
   const expectedChallenge = await consumeChallengeByValue(db, clientChallenge, 'authenticate', null);
-  if (!expectedChallenge) throw new Error('Passkey 驗證已過期，請重試。');
+  if (!expectedChallenge) throw new PasskeyClientError('Passkey 驗證已過期，請重試。');
 
   const passkey = await db
     .prepare('SELECT * FROM auth_passkeys WHERE credential_id = ?')
@@ -990,30 +1002,35 @@ export async function finishPasskeyAuthentication(
     .first<PasskeyRow>();
 
   if (!passkey) {
-    throw new Error('找不到對應的 Passkey 憑證。');
+    throw new PasskeyClientError('找不到對應的 Passkey 憑證。');
   }
 
   const user = await getUserById(db, passkey.user_id);
   if (!user || user.is_active !== 1) {
-    throw new Error('此帳號已停用或不存在。');
+    throw new PasskeyClientError('此帳號已停用或不存在。');
   }
 
-  const verification = await verifyAuthenticationResponse({
-    response,
-    expectedChallenge,
-    expectedOrigin: origin,
-    expectedRPID: rpID,
-    requireUserVerification: true,
-    credential: {
-      id: passkey.credential_id,
-      publicKey: isoBase64URL.toBuffer(passkey.public_key),
-      counter: passkey.counter,
-      transports: JSON.parse(passkey.transports || '[]') as AuthenticatorTransportFuture[],
-    },
-  });
+  let verification: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
+  try {
+    verification = await verifyAuthenticationResponse({
+      response,
+      expectedChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      requireUserVerification: true,
+      credential: {
+        id: passkey.credential_id,
+        publicKey: isoBase64URL.toBuffer(passkey.public_key),
+        counter: passkey.counter,
+        transports: JSON.parse(passkey.transports || '[]') as AuthenticatorTransportFuture[],
+      },
+    });
+  } catch (err) {
+    throw new PasskeyClientError(err instanceof Error ? err.message : 'Passkey 驗證失敗。');
+  }
 
   if (!verification.verified) {
-    throw new Error('Passkey 驗證失敗。');
+    throw new PasskeyClientError('Passkey 驗證失敗。');
   }
 
   const nowIso = new Date().toISOString();

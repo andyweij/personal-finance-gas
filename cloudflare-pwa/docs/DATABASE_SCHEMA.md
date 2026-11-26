@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.5 / D1 Schema `0013`）
+# 資料庫 Schema 設計架構（v1.8.6 / D1 Schema `0013`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（21 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
 > **最新 Migration**：[`0013_sync_cursor_epoch_and_auto_fx.sql`](../migrations/0013_sync_cursor_epoch_and_auto_fx.sql)  
-> **對應版本**：`APP_VERSION = 1.8.5` / `DB_SCHEMA_VERSION = 0013` / `SW_CACHE_VERSION = finance-pwa-v25`
+> **對應版本**：`APP_VERSION = 1.8.6` / `DB_SCHEMA_VERSION = 0013` / `SW_CACHE_VERSION = finance-pwa-v26`
 
 ---
 
@@ -276,3 +276,10 @@ flowchart LR
 | `0011` | `0011_multi_ledger.sql` | 新增 `ledgers` 表並種子 `default` 主帳本；`cashflow_logs`、`asset_items`、`recurring_items` 全面加入 `ledger_id`，`asset_items` 加入 `exclude_from_net_worth` |
 | `0012` | `0012_transfer_group.sql` | `savings_adjustments` 新增 `transfer_group_id` 欄位與局部索引，支援帳戶互轉雙向成對撤銷 |
 | `0013` | `0013_sync_cursor_epoch_and_auto_fx.sql` | 新增 `user_sync_state`（單調 `change_seq` 與 `data_epoch`）與 `sync_lww_timestamps`；11 張可同步表加入 `change_seq` 與複合索引；`app_settings` 加入 `auto_fx_enabled`（排程自動匯率開關） |
+
+---
+
+## 6. 部署後維運備註（v1.8.4+ 歷史股價／昨收校正）
+
+- **一次性行情校正（F10）**：從 `v1.8.3` 或更早版本升級至 `v1.8.4+`／`v1.8.6` 部署完成後，雲端 D1 內既有 `asset_items` 可能仍殘留舊版排程或 Yahoo `range=5d` 寫入的歷史 `unit_price` / `previous_close` 汙染值。請於部署後至前端「持股」或「設定」頁點擊一次「更新股價匯率」（呼叫 `POST /api/market/refresh`），或等待下一次台股／美股排程執行，即可自動以新版報價邏輯覆寫修正所有自動更新標的。
+
