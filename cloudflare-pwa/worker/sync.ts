@@ -268,6 +268,7 @@ function mapSavingsAdjustmentRow(r: Record<string, unknown>): SavingsAdjustment 
     amount: Number(r.amount),
     twdAmount: Number(r.twd_amount),
     note: String(r.note || ''),
+    transferGroupId: r.transfer_group_id ? String(r.transfer_group_id) : null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -1054,6 +1055,7 @@ async function applySingleMutation(
         amount: Number(p.amount),
         currency: p.currency ? String(p.currency) : 'TWD',
         note: String(p.note || ''),
+        transferGroupId: p.transferGroupId ? String(p.transferGroupId) : null,
       },
       defaultFxRate
     );
@@ -1062,14 +1064,15 @@ async function applySingleMutation(
     await db
       .prepare(
         `INSERT INTO savings_adjustments
-          (user_id, id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+          (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET
            account_id = excluded.account_id,
            date = excluded.date,
            amount = excluded.amount,
            twd_amount = excluded.twd_amount,
            note = excluded.note,
+           transfer_group_id = excluded.transfer_group_id,
            updated_at = excluded.updated_at,
            deleted_at = NULL,
            version = excluded.version`
@@ -1082,6 +1085,7 @@ async function applySingleMutation(
         v.amount,
         twdAmount,
         v.note,
+        v.transferGroupId,
         String(p.createdAt || check.writeTs),
         check.writeTs,
         check.nextVersion
@@ -1632,8 +1636,8 @@ export async function importFullSnapshot(
     await db
       .prepare(
         `INSERT OR REPLACE INTO savings_adjustments
-          (user_id, id, account_id, date, amount, twd_amount, note, created_at, updated_at, deleted_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
+          (user_id, id, account_id, date, amount, twd_amount, note, transfer_group_id, created_at, updated_at, deleted_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`
       )
       .bind(
         uid,
@@ -1643,6 +1647,7 @@ export async function importFullSnapshot(
         v.amount,
         adj.twdAmount !== undefined ? Math.round(adj.twdAmount) : v.twdAmount,
         v.note,
+        v.transferGroupId,
         adj.createdAt || nowIso,
         nowIso
       )

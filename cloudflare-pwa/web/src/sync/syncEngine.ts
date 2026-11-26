@@ -3,6 +3,7 @@ import {
   compareBySortOrder,
   ensureActiveLedgers,
   getEffectiveLedgerId,
+  isTransferableAccount,
 } from '../../../shared/calculations';
 import {
   CASHFLOW_TYPES,
@@ -39,6 +40,7 @@ import {
   normalizeLedgerId,
   normalizePnlColorScheme,
   normalizeStockCategory,
+  validateAccountTransferInput,
   validateAssetInput,
   validateCashFlowInput,
   validateLedgerInput,
@@ -46,6 +48,7 @@ import {
   validateSavingsAdjustmentInput,
   validateSinkingInput,
   validateStockTransactionInput,
+  type AccountTransferInputPayload,
   type AssetInputPayload,
   type CashFlowInputPayload,
   type LedgerInputPayload,
@@ -986,23 +989,252 @@ export class SyncEngine {
     return adj;
   }
 
-  async deleteSavingsAdjustment(id: string): Promise<void> {
+  async deleteSavingsAdjustment(id: string, deletePairedTransfer = false): Promise<{ deletedCount: number }> {
     const nowIso = new Date().toISOString();
     const existing = this.snapshot.savingsAdjustments.find((a) => a.id === id);
+    const targets: SavingsAdjustment[] = existing ? [existing] : [];
+
+    if (deletePairedTransfer && existing?.transferGroupId) {
+      const siblings = this.snapshot.savingsAdjustments.filter(
+        (a) => !a.deletedAt && a.id !== existing.id && a.transferGroupId === existing.transferGroupId
+      );
+      targets.push(...siblings);
+    }
+
+    const deleteIds = new Set(targets.map((t) => t.id));
+    if (deleteIds.size === 0) deleteIds.add(id);
+
     this.snapshot = {
       ...this.snapshot,
-      savingsAdjustments: this.snapshot.savingsAdjustments.filter((a) => a.id !== id),
+      savingsAdjustments: this.snapshot.savingsAdjustments.filter((a) => !deleteIds.has(a.id)),
     };
-    await this.commitAndMaybeSync([
-      {
+
+    const mutations: SyncMutation[] = (targets.length > 0 ? targets : [{ id, version: undefined }]).map(
+      (t) => ({
         mutationId: crypto.randomUUID(),
         entity: 'savings_adjustment',
         op: 'delete',
-        recordId: id,
+        recordId: t.id,
         clientTimestamp: nowIso,
-        baseVersion: existing?.version ?? null,
-      },
-    ]);
+        baseVersion: t.version ?? null,
+      })
+    );
+    await this.commitAndMaybeSync(mutations);
+    return { deletedCount: mutations.length };
+  }
+
+  async transferBetweenAccounts(payload: AccountTransferInputPayload): Promise<{
+    transferGroupId: string;
+    fromAdjustment: SavingsAdjustment | null;
+    toAdjustment: SavingsAdjustment | null;
+    feeCashflow: CashFlowLog | null;
+    fromAmount: number;
+    toAmount: number;
+    fee: number;
+  }> {
+    const v = validateAccountTransferInput(payload);
+    const fromAcc = this.snapshot.assetItems.find((a) => a.id === v.fromAccountId && !a.deletedAt);
+    const toAcc = this.snapshot.assetItems.find((a) => a.id === v.toAccountId && !a.deletedAt);
+    if (!fromAcc || !toAcc) {
+      throw new Error('找不到指定的轉出或轉入帳戶。');
+    }
+    if (!isTransferableAccount(fromAcc) || !isTransferableAccount(toAcc)) {
+      throw new Error('僅支援活存與定存／現金等帳戶間轉帳（股票請使用持股頁買賣功能）。');
+    }
+
+    const rate = this.snapshot.settings.usdTwdRate || 32.5;
+    let toAmount: number;
+    if (fromAcc.currency === toAcc.currency) {
+      toAmount = v.amount;
+    } else if (v.targetAmount !== null) {
+      toAmount = v.targetAmount;
+    } else if (fromAcc.currency === 'TWD' && toAcc.currency === 'USD') {
+      toAmount = Math.round((v.amount / rate) * 100) / 100;
+    } else {
+      toAmount = Math.round(v.amount * rate);
+    }
+
+    if (!fromAcc.isLinkedSavings) {
+      const nextFromQty = Math.round((fromAcc.quantityOrAmount - v.amount - v.fee) * 100) / 100;
+      if (nextFromQty < 0) {
+        throw new Error(
+          `轉出金額與手續費合計超過「${fromAcc.itemName}」目前餘額（${fromAcc.quantityOrAmount.toLocaleString('zh-TW')} ${fromAcc.currency}）。`
+        );
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const transferGroupId = crypto.randomUUID();
+    const mutations: SyncMutation[] = [];
+    const newAdjustments: SavingsAdjustment[] = [];
+    const updatedAssets: AssetItem[] = [];
+    let fromAdjustment: SavingsAdjustment | null = null;
+    let toAdjustment: SavingsAdjustment | null = null;
+    let feeCashflow: CashFlowLog | null = null;
+
+    // 1. Deduct from source account (A)
+    if (fromAcc.isLinkedSavings) {
+      const adjId = crypto.randomUUID();
+      const validatedAdj = validateSavingsAdjustmentInput(
+        {
+          accountId: fromAcc.id,
+          date: v.date,
+          amount: -v.amount,
+          currency: fromAcc.currency,
+          note: `轉帳至 ${toAcc.itemName}${v.note ? ' · ' + v.note : ''}`,
+          transferGroupId,
+        },
+        rate
+      );
+      fromAdjustment = {
+        id: adjId,
+        ...validatedAdj,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      newAdjustments.push(fromAdjustment);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'savings_adjustment',
+        op: 'upsert',
+        recordId: adjId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        payload: { ...fromAdjustment, currency: fromAcc.currency },
+      });
+    } else {
+      const nextFromQty = Math.round((fromAcc.quantityOrAmount - v.amount - v.fee) * 100) / 100;
+      const updatedFrom: AssetItem = {
+        ...fromAcc,
+        quantityOrAmount: nextFromQty,
+        updatedAt: nowIso,
+      };
+      updatedAssets.push(updatedFrom);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'asset',
+        op: 'upsert',
+        recordId: updatedFrom.id,
+        clientTimestamp: nowIso,
+        baseVersion: fromAcc.version ?? null,
+        payload: { ...updatedFrom },
+      });
+    }
+
+    // 2. Credit to target account (B)
+    if (toAcc.isLinkedSavings) {
+      const adjId = crypto.randomUUID();
+      const validatedAdj = validateSavingsAdjustmentInput(
+        {
+          accountId: toAcc.id,
+          date: v.date,
+          amount: toAmount,
+          currency: toAcc.currency,
+          note: `轉帳自 ${fromAcc.itemName}${v.note ? ' · ' + v.note : ''}`,
+          transferGroupId,
+        },
+        rate
+      );
+      toAdjustment = {
+        id: adjId,
+        ...validatedAdj,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      newAdjustments.push(toAdjustment);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'savings_adjustment',
+        op: 'upsert',
+        recordId: adjId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        payload: { ...toAdjustment, currency: toAcc.currency },
+      });
+    } else {
+      const nextToQty = Math.round((toAcc.quantityOrAmount + toAmount) * 100) / 100;
+      const updatedTo: AssetItem = {
+        ...toAcc,
+        quantityOrAmount: nextToQty,
+        updatedAt: nowIso,
+      };
+      updatedAssets.push(updatedTo);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'asset',
+        op: 'upsert',
+        recordId: updatedTo.id,
+        clientTimestamp: nowIso,
+        baseVersion: toAcc.version ?? null,
+        payload: { ...updatedTo },
+      });
+    }
+
+    // 3. Optional transfer fee (recorded in source account's ledger; linked to source savings if applicable)
+    if (v.fee > 0) {
+      const cfId = crypto.randomUUID();
+      const validatedCf = validateCashFlowInput(
+        {
+          date: v.date,
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: '其他',
+          itemName: `轉帳手續費 (${fromAcc.itemName} → ${toAcc.itemName})`,
+          amount: v.fee,
+          currency: fromAcc.currency,
+          source: '手機記帳',
+          note: v.note ? `[轉帳手續費] ${v.note}` : '[轉帳手續費]',
+          linkedAccountId: fromAcc.isLinkedSavings ? fromAcc.id : null,
+          ledgerId: getEffectiveLedgerId(fromAcc),
+        },
+        rate
+      );
+      feeCashflow = {
+        id: cfId,
+        ...validatedCf,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'cashflow',
+        op: 'upsert',
+        recordId: cfId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        payload: { ...feeCashflow },
+      });
+    }
+
+    this.snapshot = {
+      ...this.snapshot,
+      assetItems:
+        updatedAssets.length > 0
+          ? mergeById(this.snapshot.assetItems, updatedAssets).sort(compareBySortOrder)
+          : this.snapshot.assetItems,
+      savingsAdjustments:
+        newAdjustments.length > 0
+          ? [...newAdjustments, ...this.snapshot.savingsAdjustments].sort(
+              (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+            )
+          : this.snapshot.savingsAdjustments,
+      cashflowLogs: feeCashflow
+        ? this.sortCashFlows([feeCashflow, ...this.snapshot.cashflowLogs])
+        : this.snapshot.cashflowLogs,
+    };
+
+    await this.commitAndMaybeSync(mutations);
+    return {
+      transferGroupId,
+      fromAdjustment,
+      toAdjustment,
+      feeCashflow,
+      fromAmount: v.amount,
+      toAmount,
+      fee: v.fee,
+    };
   }
 
   async addStockTransaction(

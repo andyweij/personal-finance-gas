@@ -22,7 +22,13 @@ import {
   openSinkingModal,
   renderConfigTab,
 } from './ui/configTab';
-import { getAssetSectionIds, openAssetModal, openSavingsAccountModal, renderAssetsTab } from './ui/assetsTab';
+import {
+  getAssetSectionIds,
+  openAccountTransferModal,
+  openAssetModal,
+  openSavingsAccountModal,
+  renderAssetsTab,
+} from './ui/assetsTab';
 import {
   getOrderedStockIds,
   getOrderedWatchlistIds,
@@ -767,6 +773,7 @@ function bindEvents(ctx: UiContext): void {
 
   el('addSavingsBtn').addEventListener('click', () => openSavingsAccountModal(ctx, null));
   el('addAssetBtn').addEventListener('click', () => openAssetModal(ctx, null));
+  el('transferAccountBtn').addEventListener('click', () => openAccountTransferModal(ctx));
   el('refreshMarketBtn').addEventListener('click', () => void refreshMarketAction());
   el('reorderSavingsBtn').addEventListener('click', () => {
     startReorder(ctx, 'assets_savings', getAssetSectionIds(ctx, 'assets_savings'));

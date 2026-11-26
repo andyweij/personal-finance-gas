@@ -466,6 +466,14 @@ export function computeSavingsAccountSummary(
   };
 }
 
+export function isTransferableAccount(item: AssetItem): boolean {
+  if (item.deletedAt || item.isWatchlist) return false;
+  if (item.majorType !== '資產') return false;
+  if (item.isLinkedSavings) return true;
+  if (isStockAsset(item)) return false;
+  return !String(item.ticker || '').trim() && Number(item.unitPrice) === 1;
+}
+
 export function computeAllSavingsSummary(
   assets: AssetItem[],
   logs: CashFlowLog[],

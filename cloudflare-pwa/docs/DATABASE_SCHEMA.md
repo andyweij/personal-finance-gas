@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.7.0 / D1 Schema `0011`）
+# 資料庫 Schema 設計架構（v1.8.0 / D1 Schema `0012`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（20 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0011_multi_ledger.sql`](../migrations/0011_multi_ledger.sql)  
-> **對應版本**：`APP_VERSION = 1.7.0` / `DB_SCHEMA_VERSION = 0011` / `SW_CACHE_VERSION = finance-pwa-v18`
+> **最新 Migration**：[`0012_transfer_group.sql`](../migrations/0012_transfer_group.sql)  
+> **對應版本**：`APP_VERSION = 1.8.0` / `DB_SCHEMA_VERSION = 0012` / `SW_CACHE_VERSION = finance-pwa-v20`
 
 ---
 
@@ -180,9 +180,9 @@ erDiagram
 
 #### 5. `savings_adjustments`（活存本金存轉調整紀錄）
 - **主鍵**：`PRIMARY KEY (user_id, id)`
-- **索引**：`idx_savings_adj_user_account (user_id, account_id)`、`idx_savings_adj_user_updated (user_id, updated_at)`
-- **欄位**：`user_id`, `id`, `account_id`（對應 `asset_items.id`）, `date`, `amount`（正＝存入／負＝轉出）, `twd_amount`, `note`, `created_at`, `updated_at`, `deleted_at`, `version`。
-- **用途**：記錄銀行間轉帳或本金移轉，更新活存即時餘額而不扭曲損益與儲蓄率。
+- **索引**：`idx_savings_adj_user_account (user_id, account_id)`、`idx_savings_adj_user_updated (user_id, updated_at)`、`idx_savings_adj_user_transfer (user_id, transfer_group_id) WHERE transfer_group_id IS NOT NULL`（`0012`）
+- **欄位**：`user_id`, `id`, `account_id`（對應 `asset_items.id`）, `date`, `amount`（正＝存入／負＝轉出）, `twd_amount`, `note`, `transfer_group_id`（配對互轉識別碼，`0012`）, `created_at`, `updated_at`, `deleted_at`, `version`。
+- **用途**：記錄銀行間轉帳或本金移轉，更新活存即時餘額而不扭曲損益與儲蓄率；成對帳戶互轉透過 `transfer_group_id` 關聯以支援雙向一鍵撤銷。
 
 ---
 
@@ -259,7 +259,7 @@ flowchart LR
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0011`）
+## 5. Migration 演進總覽（`0001` → `0012`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -274,3 +274,4 @@ flowchart LR
 | `0009` | `0009_stock_categories.sql` | 新增 `stock_category` 與 `custom_stock_categories` 持股自訂分類 |
 | `0010` | `0010_watchlist_and_prev_close.sql` | `asset_items` 新增 `is_watchlist`（觀察清單）與 `previous_close`（昨收價） |
 | `0011` | `0011_multi_ledger.sql` | 新增 `ledgers` 表並種子 `default` 主帳本；`cashflow_logs`、`asset_items`、`recurring_items` 全面加入 `ledger_id`，`asset_items` 加入 `exclude_from_net_worth` |
+| `0012` | `0012_transfer_group.sql` | `savings_adjustments` 新增 `transfer_group_id` 欄位與局部索引，支援帳戶互轉雙向成對撤銷 |

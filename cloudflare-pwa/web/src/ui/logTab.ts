@@ -7,7 +7,7 @@ import {
   isCashFlowIncome,
 } from '../../../shared/calculations';
 import type { CashFlowLog } from '../../../shared/types';
-import { openSavingsAccountModal } from './assetsTab';
+import { openAccountTransferModal, openSavingsAccountModal } from './assetsTab';
 import { el, fmtMoney, fmtNum, showToast, TRASH_SVG } from './helpers';
 import { renderLedgerSwitcherBar, resolveActiveLedger } from './ledgerUi';
 import type { UiContext } from './state';
@@ -199,16 +199,27 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
         row.appendChild(val);
         bodyEl.appendChild(row);
       }
+      const actionRow = document.createElement('div');
+      actionRow.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:4px';
+      const transferBtn = document.createElement('button');
+      transferBtn.type = 'button';
+      transferBtn.className = 'btn btn-tinted btn-sm';
+      transferBtn.textContent = '⇄ 帳戶互轉';
+      transferBtn.addEventListener('click', () => {
+        const presetId = ctx.state.logLinkedAccountId || savings.defaultAccountId || savings.accounts[0]?.account.id;
+        openAccountTransferModal(ctx, presetId);
+      });
       const manageBtn = document.createElement('button');
       manageBtn.type = 'button';
       manageBtn.className = 'btn btn-outline btn-sm';
-      manageBtn.style.marginTop = '2px';
-      manageBtn.textContent = '前往資產頁管理活存 / 存入款項';
+      manageBtn.textContent = '管理活存 / 存入';
       manageBtn.addEventListener('click', () => {
         ctx.state.assetsLedgerScope = activeLedger.includeInNetWorth ? 'net_worth' : activeLedger.id;
         ctx.navigateToTab('assets');
       });
-      bodyEl.appendChild(manageBtn);
+      actionRow.appendChild(transferBtn);
+      actionRow.appendChild(manageBtn);
+      bodyEl.appendChild(actionRow);
     }
   }
 

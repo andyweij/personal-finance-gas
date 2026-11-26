@@ -250,6 +250,7 @@ export interface SavingsAdjustment {
   amount: number; // positive = deposit, negative = withdrawal/transfer out
   twdAmount: number;
   note: string;
+  transferGroupId?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;

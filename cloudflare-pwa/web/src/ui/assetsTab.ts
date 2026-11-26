@@ -11,6 +11,7 @@ import {
   filterAssetsByLedgerScope,
   getEffectiveLedgerId,
   isStockAsset,
+  isTransferableAccount,
   solveImpliedLoanAnnualRate,
 } from '../../../shared/calculations';
 import type { AssetItem } from '../../../shared/types';
@@ -595,6 +596,14 @@ export function renderAssetsTab(ctx: UiContext): void {
       });
 
       right.appendChild(amt);
+      if (isTransferableAccount(item)) {
+        const trBtn = document.createElement('button');
+        trBtn.type = 'button';
+        trBtn.className = 'btn btn-tinted btn-sm';
+        trBtn.textContent = '轉帳';
+        trBtn.addEventListener('click', () => openAccountTransferModal(ctx, item.id));
+        right.appendChild(trBtn);
+      }
       right.appendChild(editBtn);
       row.appendChild(main);
       row.appendChild(right);
@@ -919,7 +928,7 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
 
   let mode: 'deposit' | 'withdraw' = 'deposit';
   const seg = document.createElement('div');
-  seg.className = 'seg-bar';
+  seg.className = 'seg-bar cols-3';
   seg.style.marginBottom = '12px';
   const depBtn = document.createElement('button');
   depBtn.type = 'button';
@@ -929,8 +938,14 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
   wdBtn.type = 'button';
   wdBtn.className = 'seg-btn';
   wdBtn.textContent = '- 轉出 / 提領';
+  const trBtn = document.createElement('button');
+  trBtn.type = 'button';
+  trBtn.className = 'seg-btn';
+  trBtn.textContent = '⇄ 帳戶互轉';
+  trBtn.addEventListener('click', () => openAccountTransferModal(ctx, freshAccount.id));
   seg.appendChild(depBtn);
   seg.appendChild(wdBtn);
+  seg.appendChild(trBtn);
   body.appendChild(seg);
 
   const form = document.createElement('form');
@@ -1025,7 +1040,13 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
       sub.className = 'muted tnum';
       const beforeAnchor =
         freshAccount.balanceAnchorDate && adj.date < freshAccount.balanceAnchorDate ? ' · 基準日前(不計入)' : '';
-      sub.textContent = `${adj.date}${beforeAnchor}`;
+      const pairedSibling = adj.transferGroupId
+        ? (snap.savingsAdjustments || []).find(
+            (s) => !s.deletedAt && s.id !== adj.id && s.transferGroupId === adj.transferGroupId
+          )
+        : undefined;
+      const pairedTag = pairedSibling ? ' · ⇄ 配對互轉' : '';
+      sub.textContent = `${adj.date}${beforeAnchor}${pairedTag}`;
       info.appendChild(title);
       info.appendChild(sub);
 
@@ -1044,9 +1065,23 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
       delBtn.title = '刪除此筆紀錄';
       delBtn.innerHTML = TRASH_SVG;
       delBtn.addEventListener('click', async () => {
-        if (!confirm(`確定刪除此筆 ${adj.date} 的存轉紀錄？`)) return;
-        await ctx.engine.deleteSavingsAdjustment(adj.id);
-        showToast('已刪除存轉紀錄並重算餘額', 'success');
+        if (pairedSibling) {
+          const siblingAcc = snap.assetItems.find((a) => !a.deletedAt && a.id === pairedSibling.accountId);
+          const siblingName = siblingAcc?.itemName || '對方帳戶';
+          if (
+            !confirm(
+              `確定刪除此筆 ${adj.date} 的帳戶互轉紀錄？\n\n對方帳戶「${siblingName}」的對應轉帳紀錄也會一併撤銷（若當時有記轉帳手續費流水帳，可另至流水帳刪除）。`
+            )
+          ) {
+            return;
+          }
+          await ctx.engine.deleteSavingsAdjustment(adj.id, true);
+          showToast(`已同步撤銷「${freshAccount.itemName}」與「${siblingName}」的配對轉帳`, 'success');
+        } else {
+          if (!confirm(`確定刪除此筆 ${adj.date} 的存轉紀錄？`)) return;
+          await ctx.engine.deleteSavingsAdjustment(adj.id, false);
+          showToast('已刪除存轉紀錄並重算餘額', 'success');
+        }
         ctx.scheduleSync();
         openSavingsAdjustmentModal(ctx, freshAccount);
       });
@@ -1059,6 +1094,314 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
     }
   }
   body.appendChild(listWrap);
+}
+
+export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: string): void {
+  const snap = ctx.engine.getSnapshot();
+  const rate = snap.settings.usdTwdRate || 32.5;
+  const ledgers = getActiveLedgers(ctx);
+  const ledgerNameMap = new Map(ledgers.map((l) => [l.id, l.name]));
+  const showLedgerTag = ledgers.length > 1;
+
+  const accounts = snap.assetItems
+    .filter((a) => isTransferableAccount(a))
+    .slice()
+    .sort(compareBySortOrder);
+
+  const body = openModal('帳戶互轉（活存 / 定存）');
+
+  if (accounts.length < 2) {
+    const empty = document.createElement('div');
+    empty.className = 'stock-live-preview';
+    empty.textContent =
+      '需要至少 2 個活存或定存／現金帳戶才能進行帳戶互轉。請先於資產頁新增活存帳戶或定存／現金資產。';
+    body.appendChild(empty);
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'btn btn-outline btn-block';
+    closeBtn.textContent = '關閉';
+    closeBtn.addEventListener('click', closeModal);
+    body.appendChild(closeBtn);
+    return;
+  }
+
+  const getAccountCurrentRawBalance = (acc: AssetItem): number => {
+    if (acc.isLinkedSavings) {
+      const s = computeSavingsAccountSummary(
+        acc,
+        snap.cashflowLogs,
+        snap.savingsAdjustments || [],
+        rate
+      );
+      return acc.currency === 'USD'
+        ? Math.round((s.currentBalanceTwd / rate) * 100) / 100
+        : s.currentBalanceTwd;
+    }
+    return acc.quantityOrAmount;
+  };
+
+  const getAccountCurrentTwd = (acc: AssetItem): number => {
+    if (acc.isLinkedSavings) {
+      return computeSavingsAccountSummary(
+        acc,
+        snap.cashflowLogs,
+        snap.savingsAdjustments || [],
+        rate
+      ).currentBalanceTwd;
+    }
+    return computeAssetEffectiveTwdValue(acc, rate, snap.cashflowLogs, snap.savingsAdjustments || []);
+  };
+
+  const formatAccountOptionLabel = (acc: AssetItem): string => {
+    const lgPrefix = showLedgerTag ? `[${ledgerNameMap.get(getEffectiveLedgerId(acc)) || '主帳本'}] ` : '';
+    const kind = acc.isLinkedSavings ? '活存' : acc.subCategory;
+    const balStr = fmtRaw(getAccountCurrentRawBalance(acc), acc.currency, ctx.state.masked);
+    return `${lgPrefix}${acc.itemName}（${kind} · ${balStr}）`;
+  };
+
+  const buildGroupedAccountSelect = (id: string, label: string, selectedId: string): HTMLDivElement => {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const lbl = document.createElement('label');
+    lbl.className = 'section-label';
+    lbl.htmlFor = id;
+    lbl.textContent = label;
+    const sel = document.createElement('select');
+    sel.id = id;
+
+    const savingsList = accounts.filter((a) => a.isLinkedSavings);
+    const otherList = accounts.filter((a) => !a.isLinkedSavings);
+
+    if (savingsList.length > 0) {
+      const grp = document.createElement('optgroup');
+      grp.label = '連動活存帳戶';
+      for (const acc of savingsList) {
+        const opt = document.createElement('option');
+        opt.value = acc.id;
+        opt.textContent = formatAccountOptionLabel(acc);
+        if (acc.id === selectedId) opt.selected = true;
+        grp.appendChild(opt);
+      }
+      sel.appendChild(grp);
+    }
+
+    if (otherList.length > 0) {
+      const grp = document.createElement('optgroup');
+      grp.label = '定存 / 現金與其他帳戶';
+      for (const acc of otherList) {
+        const opt = document.createElement('option');
+        opt.value = acc.id;
+        opt.textContent = formatAccountOptionLabel(acc);
+        if (acc.id === selectedId) opt.selected = true;
+        grp.appendChild(opt);
+      }
+      sel.appendChild(grp);
+    }
+
+    wrap.appendChild(lbl);
+    wrap.appendChild(sel);
+    return wrap;
+  };
+
+  const defaultFrom =
+    accounts.find((a) => a.id === presetFromAccountId) ||
+    accounts.find((a) => a.isLinkedSavings && a.isDefaultSavings) ||
+    accounts[0];
+  const defaultTo = accounts.find((a) => a.id !== defaultFrom.id) || accounts[1];
+
+  const intro = document.createElement('div');
+  intro.className = 'stock-live-preview';
+  intro.textContent =
+    '本金互轉會同步扣減轉出帳戶並增加轉入帳戶餘額，不計入當月收支與儲蓄率；若有填寫轉帳手續費，僅手續費會記為一筆支出。';
+  body.appendChild(intro);
+
+  const form = document.createElement('form');
+  form.appendChild(buildGroupedAccountSelect('trFromAcc', '轉出帳戶（從 A 扣款）', defaultFrom.id));
+
+  const swapRow = document.createElement('div');
+  swapRow.style.cssText = 'display:flex;justify-content:center;margin:-4px 0 8px';
+  const swapBtn = document.createElement('button');
+  swapBtn.type = 'button';
+  swapBtn.className = 'btn btn-outline btn-sm';
+  swapBtn.textContent = '⇅ 互換轉出 / 轉入帳戶';
+  swapRow.appendChild(swapBtn);
+  form.appendChild(swapRow);
+
+  form.appendChild(buildGroupedAccountSelect('trToAcc', '轉入帳戶（入帳到 B）', defaultTo.id));
+
+  const r1 = document.createElement('div');
+  r1.className = 'row-2';
+  r1.appendChild(makeInputField(`轉出金額 (${defaultFrom.currency})`, 'trAmt', 'number', '', '例如：50000', true));
+  r1.appendChild(makeInputField('日期', 'trDate', 'date', todayYmdLocal(), '', true));
+  form.appendChild(r1);
+
+  // Cross-currency target amount container (shown only when from.currency !== to.currency)
+  const fxWrap = document.createElement('div');
+  fxWrap.id = 'trFxWrap';
+  fxWrap.style.display = 'none';
+  fxWrap.appendChild(
+    makeInputField('實際入帳金額（可依網銀實際成交調整）', 'trTargetAmt', 'number', '', '')
+  );
+  form.appendChild(fxWrap);
+
+  const r2 = document.createElement('div');
+  r2.className = 'row-2';
+  r2.appendChild(
+    makeInputField(`轉帳手續費（選填，${defaultFrom.currency}）`, 'trFee', 'number', '', '0')
+  );
+  r2.appendChild(makeInputField('備註（選填）', 'trNote', 'text', '', '如：轉存定存、銀行互轉'));
+  form.appendChild(r2);
+
+  const previewBox = document.createElement('div');
+  previewBox.id = 'trPreviewBox';
+  previewBox.className = 'stock-live-preview tnum';
+  previewBox.style.cssText = 'display:flex;flex-direction:column;gap:4px;line-height:1.55';
+  form.appendChild(previewBox);
+
+  const btns = document.createElement('div');
+  btns.style.cssText = 'display:grid;grid-template-columns:1fr 2fr;gap:8px;margin-top:4px';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'btn btn-outline';
+  cancelBtn.textContent = '取消';
+  cancelBtn.addEventListener('click', closeModal);
+  const submitBtn = document.createElement('button');
+  submitBtn.type = 'submit';
+  submitBtn.className = 'btn btn-primary';
+  submitBtn.textContent = '確認轉帳';
+  btns.appendChild(cancelBtn);
+  btns.appendChild(submitBtn);
+  form.appendChild(btns);
+
+  body.appendChild(form);
+
+  const fromSel = el<HTMLSelectElement>('trFromAcc');
+  const toSel = el<HTMLSelectElement>('trToAcc');
+  const amtInp = el<HTMLInputElement>('trAmt');
+  const targetAmtInp = el<HTMLInputElement>('trTargetAmt');
+  const feeInp = el<HTMLInputElement>('trFee');
+  let targetAmtTouched = false;
+
+  const findAcc = (id: string) => accounts.find((a) => a.id === id);
+
+  const updatePreview = (autoFillTarget = false) => {
+    const fromAcc = findAcc(fromSel.value);
+    const toAcc = findAcc(toSel.value);
+    if (!fromAcc || !toAcc) return;
+
+    const amtLbl = document.querySelector<HTMLLabelElement>('label[for="trAmt"]');
+    if (amtLbl) amtLbl.textContent = `轉出金額 (${fromAcc.currency})`;
+    const feeLbl = document.querySelector<HTMLLabelElement>('label[for="trFee"]');
+    if (feeLbl) feeLbl.textContent = `轉帳手續費（選填，${fromAcc.currency}）`;
+
+    const crossCurr = fromAcc.currency !== toAcc.currency;
+    fxWrap.style.display = crossCurr ? 'block' : 'none';
+    const targetLbl = document.querySelector<HTMLLabelElement>('label[for="trTargetAmt"]');
+    if (targetLbl) targetLbl.textContent = `實際入帳金額 (${toAcc.currency}，依匯率 ${rate} 估算，可修改)`;
+
+    const rawAmt = parseFloat(amtInp.value);
+    const hasAmt = !Number.isNaN(rawAmt) && rawAmt > 0;
+    const rawFee = parseFloat(feeInp.value);
+    const fee = !Number.isNaN(rawFee) && rawFee > 0 ? rawFee : 0;
+
+    if (crossCurr && (autoFillTarget || !targetAmtTouched)) {
+      if (hasAmt) {
+        const est =
+          fromAcc.currency === 'TWD'
+            ? Math.round((rawAmt / rate) * 100) / 100
+            : Math.round(rawAmt * rate);
+        targetAmtInp.value = String(est);
+      } else {
+        targetAmtInp.value = '';
+      }
+    }
+
+    const rawTarget = parseFloat(targetAmtInp.value);
+    const toAmt = crossCurr ? (!Number.isNaN(rawTarget) && rawTarget > 0 ? rawTarget : 0) : hasAmt ? rawAmt : 0;
+
+    const fromBefore = getAccountCurrentRawBalance(fromAcc);
+    const toBefore = getAccountCurrentRawBalance(toAcc);
+    const fromAfter = hasAmt ? Math.round((fromBefore - rawAmt - fee) * 100) / 100 : fromBefore;
+    const toAfter = toAmt > 0 ? Math.round((toBefore + toAmt) * 100) / 100 : toBefore;
+
+    if (fromAcc.id === toAcc.id) {
+      previewBox.innerHTML = '<span style="color:var(--neg);font-weight:600">⚠ 轉出與轉入帳戶相同，請選擇不同的目標帳戶。</span>';
+      return;
+    }
+
+    const fromLine = `<div>轉出 <strong>${fromAcc.itemName}</strong>：${fmtRaw(fromBefore, fromAcc.currency, ctx.state.masked)} → <strong style="color:${fromAfter < 0 ? 'var(--neg)' : 'var(--text)'}">${fmtRaw(fromAfter, fromAcc.currency, ctx.state.masked)}</strong></div>`;
+    const toLine = `<div>轉入 <strong>${toAcc.itemName}</strong>：${fmtRaw(toBefore, toAcc.currency, ctx.state.masked)} → <strong style="color:var(--pos)">${fmtRaw(toAfter, toAcc.currency, ctx.state.masked)}</strong></div>`;
+    const feeLine =
+      fee > 0
+        ? `<div style="color:var(--text-secondary)">含轉帳手續費 ${fmtRaw(fee, fromAcc.currency, ctx.state.masked)}（同步記為流水帳支出）</div>`
+        : '';
+    const crossLedgerHint =
+      getEffectiveLedgerId(fromAcc) !== getEffectiveLedgerId(toAcc)
+        ? `<div style="color:var(--warning)">跨帳本轉帳：${ledgerNameMap.get(getEffectiveLedgerId(fromAcc)) || '主帳本'} → ${ledgerNameMap.get(getEffectiveLedgerId(toAcc)) || '主帳本'}</div>`
+        : '';
+    const twdHint =
+      !hasAmt
+        ? `<div style="color:var(--text-muted)">目前合計參考：${fmtMoney(getAccountCurrentTwd(fromAcc), ctx.state.masked)} / ${fmtMoney(getAccountCurrentTwd(toAcc), ctx.state.masked)}</div>`
+        : '';
+
+    previewBox.innerHTML = fromLine + toLine + feeLine + crossLedgerHint + twdHint;
+  };
+
+  swapBtn.addEventListener('click', () => {
+    const prevFrom = fromSel.value;
+    fromSel.value = toSel.value;
+    toSel.value = prevFrom;
+    targetAmtTouched = false;
+    updatePreview(true);
+  });
+
+  fromSel.addEventListener('change', () => {
+    if (fromSel.value === toSel.value) {
+      const alt = accounts.find((a) => a.id !== fromSel.value);
+      if (alt) toSel.value = alt.id;
+    }
+    targetAmtTouched = false;
+    updatePreview(true);
+  });
+  toSel.addEventListener('change', () => {
+    targetAmtTouched = false;
+    updatePreview(true);
+  });
+  amtInp.addEventListener('input', () => updatePreview(false));
+  feeInp.addEventListener('input', () => updatePreview(false));
+  targetAmtInp.addEventListener('input', () => {
+    targetAmtTouched = true;
+    updatePreview(false);
+  });
+
+  updatePreview(true);
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fromAcc = findAcc(fromSel.value);
+    const toAcc = findAcc(toSel.value);
+    if (!fromAcc || !toAcc) return;
+    try {
+      const res = await ctx.engine.transferBetweenAccounts({
+        fromAccountId: fromAcc.id,
+        toAccountId: toAcc.id,
+        date: el<HTMLInputElement>('trDate').value,
+        amount: amtInp.value,
+        targetAmount: fromAcc.currency !== toAcc.currency ? targetAmtInp.value : null,
+        fee: feeInp.value,
+        note: el<HTMLInputElement>('trNote').value.trim(),
+      });
+      closeModal();
+      const feeText = res.fee > 0 ? `（含手續費 ${fmtRaw(res.fee, fromAcc.currency, ctx.state.masked)}）` : '';
+      showToast(
+        `已轉帳：${fromAcc.itemName} → ${toAcc.itemName} ${fmtRaw(res.fromAmount, fromAcc.currency, ctx.state.masked)}${feeText}`,
+        'success'
+      );
+      ctx.scheduleSync();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '轉帳失敗', 'error');
+    }
+  });
 }
 
 export function openReconcileModal(ctx: UiContext, account: AssetItem): void {

@@ -477,6 +477,7 @@ export interface SavingsAdjustmentInputPayload {
   amount: number | string;
   currency?: string;
   note?: string;
+  transferGroupId?: string | null;
 }
 
 export function validateSavingsAdjustmentInput(
@@ -494,12 +495,75 @@ export function validateSavingsAdjustmentInput(
   const rate = currency === 'USD' ? usdTwdRate : 1;
   const twdAmount = Math.round(amount * rate);
   const note = String(payload.note || '').trim().slice(0, 200);
+  const transferGroupId = payload.transferGroupId ? String(payload.transferGroupId).trim().slice(0, 80) : null;
 
   return {
     accountId,
     date: String(payload.date).trim(),
     amount,
     twdAmount,
+    note,
+    transferGroupId,
+  };
+}
+
+export interface AccountTransferInputPayload {
+  fromAccountId: string;
+  toAccountId: string;
+  date: string;
+  amount: number | string;
+  targetAmount?: number | string | null;
+  fee?: number | string | null;
+  note?: string;
+}
+
+export function validateAccountTransferInput(payload: AccountTransferInputPayload) {
+  const fromAccountId = String(payload.fromAccountId || '').trim();
+  const toAccountId = String(payload.toAccountId || '').trim();
+  if (!fromAccountId || !toAccountId) {
+    throw new Error('請選擇轉出帳戶與轉入帳戶。');
+  }
+  if (fromAccountId === toAccountId) {
+    throw new Error('轉出帳戶與轉入帳戶不可相同。');
+  }
+  const date = String(payload.date || '').trim();
+  parseLocalDate(date);
+
+  const amount = Number(payload.amount);
+  if (Number.isNaN(amount) || !Number.isFinite(amount) || amount <= 0) {
+    throw new Error('轉帳金額須大於 0。');
+  }
+
+  let targetAmount: number | null = null;
+  if (
+    payload.targetAmount !== undefined &&
+    payload.targetAmount !== null &&
+    String(payload.targetAmount).trim() !== ''
+  ) {
+    const parsedTarget = Number(payload.targetAmount);
+    if (Number.isNaN(parsedTarget) || !Number.isFinite(parsedTarget) || parsedTarget <= 0) {
+      throw new Error('實際入帳金額須大於 0。');
+    }
+    targetAmount = Math.round(parsedTarget * 100) / 100;
+  }
+
+  let fee = 0;
+  if (payload.fee !== undefined && payload.fee !== null && String(payload.fee).trim() !== '') {
+    const parsedFee = Number(payload.fee);
+    if (Number.isNaN(parsedFee) || !Number.isFinite(parsedFee) || parsedFee < 0) {
+      throw new Error('轉帳手續費需大於等於 0。');
+    }
+    fee = Math.round(parsedFee * 100) / 100;
+  }
+
+  const note = String(payload.note || '').trim().slice(0, 150);
+  return {
+    fromAccountId,
+    toAccountId,
+    date,
+    amount: Math.round(amount * 100) / 100,
+    targetAmount,
+    fee,
     note,
   };
 }
