@@ -621,10 +621,16 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
   const r0 = document.createElement('div');
   r0.className = 'row-2';
   r0.appendChild(
-    makeInputField('股票名稱', 'stName', 'text', existing?.itemName || '', '例如：0050、台積電', true)
+    makeInputField('股票名稱', 'stName', 'text', existing?.itemName || '', '例如：0050、台積電、VOO', true)
   );
   r0.appendChild(
-    makeInputField('股票代碼（自動更新行情）', 'stTicker', 'text', existing?.ticker || '', '如 TPE:0050 或 2330')
+    makeInputField(
+      '股票代碼（自動更新行情）',
+      'stTicker',
+      'text',
+      existing?.ticker || '',
+      existing?.subCategory === '美股/ETF' ? '如 VOO、NVDA、AAPL、BRK.B' : '台股如 0050；美股如 VOO / NVDA'
+    )
   );
   form.appendChild(r0);
 
@@ -836,6 +842,45 @@ export function openStockBaselineModal(ctx: UiContext, existing: AssetItem | nul
     }
     refreshPreview();
   };
+
+  const subSel = form.querySelector('#stSub') as unknown as HTMLSelectElement;
+  const tickerInp = form.querySelector<HTMLInputElement>('#stTicker')!;
+  const syncMarketPlaceholder = () => {
+    const isUs = subSel.value === '美股/ETF';
+    tickerInp.placeholder = isUs ? '如 VOO、NVDA、AAPL、BRK.B' : '台股如 0050、2330、00679B';
+  };
+  subSel.addEventListener('change', () => {
+    syncMarketPlaceholder();
+    if (!existing) {
+      currSel.value = subSel.value === '美股/ETF' ? 'USD' : 'TWD';
+      refreshPreview();
+    }
+  });
+  tickerInp.addEventListener('input', () => {
+    if (existing) return;
+    const raw = tickerInp.value.trim().toUpperCase();
+    if (!raw) return;
+    const looksUs =
+      /^(?:US|NASDAQ|NYSE|NYSEARCA|ARCA|AMEX|BATS|CBOE):/.test(raw) ||
+      /\.US$/.test(raw) ||
+      (/^[A-Z]{1,5}(?:[.\-][A-Z]{1,2})?$/.test(raw) && !raw.startsWith('TPE'));
+    const looksTw =
+      /^(?:TPE|TWSE|TPEX|OTC|TWO|TW):/.test(raw) ||
+      /\.(?:TW|TWO)$/.test(raw) ||
+      /^\d{4,6}[A-Z]?$/.test(raw);
+    if (looksUs && subSel.value !== '美股/ETF') {
+      subSel.value = '美股/ETF';
+      currSel.value = 'USD';
+      syncMarketPlaceholder();
+      refreshPreview();
+    } else if (looksTw && subSel.value !== '台股') {
+      subSel.value = '台股';
+      currSel.value = 'TWD';
+      syncMarketPlaceholder();
+      refreshPreview();
+    }
+  });
+  syncMarketPlaceholder();
 
   unitBtn.addEventListener('click', () => switchCostMode('unit'));
   totalBtn.addEventListener('click', () => switchCostMode('total'));

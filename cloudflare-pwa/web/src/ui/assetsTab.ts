@@ -1138,7 +1138,15 @@ export function openAssetModal(ctx: UiContext, existing: AssetItem | null): void
 
   const r4 = document.createElement('div');
   r4.className = 'row-2';
-  r4.appendChild(makeInputField('股票代碼（選填，如 TPE:0050）', 'asTicker', 'text', existing?.ticker || '', 'TPE:0050'));
+  r4.appendChild(
+    makeInputField(
+      '股票代碼（台股如 0050；美股如 VOO / NVDA）',
+      'asTicker',
+      'text',
+      existing?.ticker || '',
+      'TPE:0050 或 VOO'
+    )
+  );
   r4.appendChild(makeInputField('目前單價（非股票填 1）', 'asPrice', 'number', existing?.unitPrice ?? 1, '1', true));
   form.appendChild(r4);
 

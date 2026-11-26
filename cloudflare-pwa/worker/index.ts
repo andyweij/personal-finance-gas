@@ -720,7 +720,13 @@ export default {
       return;
     }
 
-    // Daily 23:00 Asia/Taipei (15:00 UTC): refresh prices & FX for all active users, snapshot on month-end
+    if (controller.cron === '0 22 * * *') {
+      // Daily 06:00 Asia/Taipei (22:00 UTC): refresh US & TW closing prices and FX after US market close
+      await refreshMarketData(env.DB);
+      return;
+    }
+
+    // Daily 23:00 Asia/Taipei (15:00 UTC): refresh TW/US prices & FX for all active users, snapshot on month-end
     await refreshMarketData(env.DB);
     if (isTaiwanMonthEnd(now)) {
       await runMonthEndSnapshotAllUsersD1(env.DB, now);

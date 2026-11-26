@@ -154,7 +154,11 @@ export function buildStockChartItems(
             ? Math.max(0, pos.costBasisTwd)
             : 0
           : Math.max(0, pos.marketValueTwd);
-      const ticker = pos.asset.ticker ? pos.asset.ticker.replace(/^TPE:/i, '') : '';
+      const ticker = pos.asset.ticker
+        ? pos.asset.ticker
+            .replace(/^(?:TPE|TWSE|TPEX|OTC|TWO|TW|US|NASDAQ|NYSE|NYSEARCA|ARCA|AMEX|BATS|CBOE):/i, '')
+            .replace(/\.(?:TW|TWO|US)$/i, '')
+        : '';
       return {
         id: pos.asset.id,
         label: pos.asset.itemName,

@@ -702,11 +702,21 @@ function bindEvents(ctx: UiContext): void {
       const json = (await res.json()) as {
         usdTwdRate?: number;
         updatedTickers?: unknown[];
+        failedTickers?: string[];
         error?: string;
       };
       if (!res.ok) throw new Error(json.error || '行情更新失敗');
       await ctx.engine.syncNow();
-      showToast(`匯率 ${json.usdTwdRate}｜已更新 ${json.updatedTickers?.length || 0} 檔股價`, 'success');
+      const updatedCount = json.updatedTickers?.length || 0;
+      const failed = Array.isArray(json.failedTickers) ? json.failedTickers : [];
+      if (failed.length > 0) {
+        showToast(
+          `匯率 ${json.usdTwdRate}｜已更新 ${updatedCount} 檔（未取得：${failed.join('、')}）`,
+          updatedCount > 0 ? 'success' : 'error'
+        );
+      } else {
+        showToast(`匯率 ${json.usdTwdRate}｜已更新 ${updatedCount} 檔台美股價`, 'success');
+      }
     } catch (err) {
       showToast(err instanceof Error ? err.message : '行情更新需要網路連線', 'error');
     } finally {

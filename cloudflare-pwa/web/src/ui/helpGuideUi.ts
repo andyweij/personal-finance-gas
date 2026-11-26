@@ -76,6 +76,10 @@ const HELP_SECTIONS: HelpSection[] = [
         lead: '持股分類與多樣化圖表',
         text: '可為每檔持股標記「個股 / ETF / 特別股」或自訂分類（如債券 ETF、高股息），並切換甜甜圈、圓餅圖、長條圖、面積圖檢視「市值佔比 / 持股分類 / 成本佔比 / 台美市場」。',
       },
+      {
+        lead: '台股與美股自動行情同步',
+        text: '填入股票代碼即可自動更新收盤價：台股支援 2330 / 0050 / 00679B / TPE:0050（含上市與上櫃債券 ETF）；美股支援 VOO / NVDA / AAPL / BRK.B / NASDAQ:TSLA（Yahoo Finance ＋ Stooq 雙備援，免費免 API Key）。',
+      },
     ],
   },
   {

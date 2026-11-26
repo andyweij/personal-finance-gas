@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../worker/index';
 import { runMonthlyRecurringD1, runMonthEndSnapshotD1 } from '../worker/automation';
-import { refreshMarketData, normalizeTaiwanTicker } from '../worker/market';
+import { normalizeMarketTicker, normalizeTaiwanTicker, refreshMarketData } from '../worker/market';
 import { createTestD1 } from './helpers/mockD1';
 import { CASHFLOW_TYPES } from '../shared/constants';
 import type { WorkerEnv } from '../worker/types';
@@ -434,6 +434,121 @@ describe('Cloudflare Worker API + D1 Integration', () => {
     expect(failRes.usdTwdRate).toBe(32.65);
     const assetRow = await db.prepare('SELECT unit_price FROM asset_items WHERE user_id = ? AND id = ?').bind('owner', 'a1').first<{ unit_price: number }>();
     expect(assetRow?.unit_price).toBe(198.5);
+  });
+
+  it('normalizes and syncs US stocks/ETFs (Yahoo query1/query2 + Stooq fallback) alongside TW OTC stocks with dedup', async () => {
+    expect(normalizeMarketTicker('VOO')).toMatchObject({
+      market: 'US',
+      code: 'VOO',
+      yahooSymbol: 'VOO',
+      stooqSymbol: 'voo.us',
+    });
+    expect(normalizeMarketTicker('NASDAQ:AAPL')).toMatchObject({
+      market: 'US',
+      code: 'AAPL',
+      yahooSymbol: 'AAPL',
+      stooqSymbol: 'aapl.us',
+    });
+    expect(normalizeMarketTicker('NYSE:BRK.B')).toMatchObject({
+      market: 'US',
+      code: 'BRK.B',
+      yahooSymbol: 'BRK-B',
+      stooqSymbol: 'brk-b.us',
+    });
+    expect(normalizeMarketTicker('TPEX:00679B')).toMatchObject({
+      market: 'TW',
+      code: '00679B',
+      yahooSymbol: '00679B.TWO',
+      twseExchange: 'otc',
+    });
+
+    const nowIso = '2026-11-25T00:00:00.000Z';
+    await db
+      .prepare(
+        `INSERT INTO app_settings (user_id, monthly_daily_budget, emergency_target_months, usd_twd_rate, updated_at)
+         VALUES ('owner', 45000, 6, 32.2, ?)`
+      )
+      .bind(nowIso)
+      .run();
+
+    const rows = [
+      ['us1', '美股/ETF', 'VOO ETF', 'VOO', 'USD', 500],
+      ['us2', '美股/ETF', 'VOO 複委託', 'NYSEARCA:VOO', 'USD', 500], // should dedup with us1
+      ['us3', '美股/ETF', '輝達', 'NASDAQ:NVDA', 'USD', 120], // Yahoo query1 fails -> query2 succeeds
+      ['us4', '美股/ETF', '波克夏 B', 'NYSE:BRK.B', 'USD', 420], // Yahoo fails -> Stooq CSV fallback succeeds
+      ['tw-otc', '台股', '元大美債20年', '00679B', 'TWD', 29.5], // MIS fails, .TW fails -> .TWO succeeds
+    ] as const;
+
+    for (const [id, sub, name, ticker, curr, price] of rows) {
+      await db
+        .prepare(
+          `INSERT INTO asset_items (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, note, created_at, updated_at)
+           VALUES ('owner', ?, '自動更新', '資產', ?, '高流動', ?, ?, 10, ?, ?, '', ?, ?)`
+        )
+        .bind(id, sub, name, ticker, curr, price, nowIso, nowIso)
+        .run();
+    }
+
+    let vooLookups = 0;
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('open.er-api.com')) {
+        return new Response(JSON.stringify({ rates: { TWD: 32.8 } }), { status: 200 });
+      }
+      // VOO via Yahoo query1
+      if (url.includes('query1.finance.yahoo.com') && url.includes('/chart/VOO?')) {
+        vooLookups += 1;
+        return new Response(
+          JSON.stringify({ chart: { result: [{ meta: { regularMarketPrice: 545.25 } }] } }),
+          { status: 200 }
+        );
+      }
+      // NVDA: query1 rate-limited (429), query2 succeeds
+      if (url.includes('query1.finance.yahoo.com') && url.includes('/chart/NVDA?')) {
+        return new Response('rate limited', { status: 429 });
+      }
+      if (url.includes('query2.finance.yahoo.com') && url.includes('/chart/NVDA?')) {
+        return new Response(
+          JSON.stringify({ chart: { result: [{ meta: { regularMarketPrice: 142.8 } }] } }),
+          { status: 200 }
+        );
+      }
+      // BRK-B: both Yahoo hosts fail, Stooq CSV succeeds
+      if (url.includes('finance.yahoo.com') && url.includes('/chart/BRK-B?')) {
+        return new Response('unavailable', { status: 503 });
+      }
+      if (url.includes('stooq.com') && url.includes('s=brk-b.us')) {
+        return new Response(
+          'Symbol,Date,Time,Open,High,Low,Close,Volume\nBRK-B.US,2026-11-24,22:00:00,455.1,461.2,454.0,460.15,3210000\n',
+          { status: 200 }
+        );
+      }
+      // TW OTC 00679B: TWSE MIS fails, .TW fails, .TWO succeeds
+      if (url.includes('mis.twse.com.tw')) {
+        return new Response('down', { status: 503 });
+      }
+      if (url.includes('/chart/00679B.TW?')) {
+        return new Response('not found', { status: 404 });
+      }
+      if (url.includes('query1.finance.yahoo.com') && url.includes('/chart/00679B.TWO?')) {
+        return new Response(
+          JSON.stringify({ chart: { result: [{ meta: { regularMarketPrice: 30.45 } }] } }),
+          { status: 200 }
+        );
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const res = await refreshMarketData(db, fetchMock, 'owner');
+    expect(res.usdTwdRate).toBe(32.8);
+    expect(res.failedTickers).toEqual([]);
+    expect(vooLookups).toBe(1); // VOO & NYSEARCA:VOO deduplicated!
+    expect(res.updatedTickers).toEqual([
+      { id: 'us1', ticker: 'VOO', price: 545.25 },
+      { id: 'us2', ticker: 'NYSEARCA:VOO', price: 545.25 },
+      { id: 'us3', ticker: 'NASDAQ:NVDA', price: 142.8 },
+      { id: 'us4', ticker: 'NYSE:BRK.B', price: 460.15 },
+      { id: 'tw-otc', ticker: '00679B', price: 30.45 },
+    ]);
   });
 
   it('exports and imports JSON backup via authenticated endpoints', async () => {
