@@ -9,6 +9,7 @@ import {
   getEffectiveLedgerId,
   isCashFlowIncome,
 } from '../../../shared/calculations';
+import { computeAllCreditCardsSummary } from '../../../shared/creditCard';
 import { exportCashFlowCsv } from '../../../shared/csv';
 import {
   collectAvailableCategories,
@@ -117,7 +118,17 @@ export function updateSavingsPreview(ctx: UiContext): void {
     activeLedger.id
   );
   const selected = savings.accounts.find((a) => a.account.id === ctx.state.logLinkedAccountId);
-  if (!selected) {
+  const ccSummary = computeAllCreditCardsSummary(
+    snap.assetItems,
+    snap.cashflowLogs,
+    snap.savingsAdjustments || [],
+    snap.installmentPlans || [],
+    snap.settings,
+    activeLedger.id
+  );
+  const selectedCard = ccSummary.cards.find((c) => c.card.id === ctx.state.logLinkedAccountId);
+
+  if (!selected && !selectedCard) {
     preview.style.display = 'none';
     preview.innerHTML = '';
     return;
@@ -125,6 +136,59 @@ export function updateSavingsPreview(ctx: UiContext): void {
 
   const rawAmt = parseFloat(el<HTMLInputElement>('amountInput').value);
   const dateVal = el<HTMLInputElement>('dateInput').value || getTodayYmd();
+
+  if (selectedCard) {
+    const beforeAnchor = Boolean(
+      selectedCard.card.balanceAnchorDate && dateVal < selectedCard.card.balanceAnchorDate
+    );
+    preview.style.display = 'flex';
+    preview.innerHTML = '';
+
+    if (Number.isNaN(rawAmt) || rawAmt <= 0) {
+      const left = document.createElement('span');
+      left.textContent = `💳 ${selectedCard.card.itemName} 目前未繳`;
+      const right = document.createElement('strong');
+      right.className = selectedCard.currentBalanceTwd > 0 ? 'delta-neg' : 'delta-pos';
+      right.textContent = fmtMoney(selectedCard.currentBalanceTwd, ctx.state.masked);
+      preview.appendChild(left);
+      preview.appendChild(right);
+      return;
+    }
+
+    if (beforeAnchor) {
+      const warn = document.createElement('span');
+      warn.className = 'delta-warn';
+      warn.textContent = `日期早於 ${selectedCard.card.itemName} 基準日 (${selectedCard.card.balanceAnchorDate})，寫入後不影響目前未繳`;
+      preview.appendChild(warn);
+      return;
+    }
+
+    const twdDeltaAbs = Math.round(rawAmt * resolveFxRate(ctx.state.logCurrency, snap.settings));
+    const isInc = isCashFlowIncome(ctx.state.logType);
+    const signedLiabilityDelta = isInc ? -twdDeltaAbs : twdDeltaAbs;
+    const afterUnpaid = selectedCard.currentBalanceTwd + signedLiabilityDelta;
+
+    const left = document.createElement('span');
+    left.textContent = `💳 ${selectedCard.card.itemName} 未繳：${fmtMoney(selectedCard.currentBalanceTwd, ctx.state.masked)} → `;
+    const afterStrong = document.createElement('strong');
+    afterStrong.className = afterUnpaid > 0 ? 'delta-neg' : 'delta-pos';
+    afterStrong.textContent = fmtMoney(afterUnpaid, ctx.state.masked);
+    left.appendChild(afterStrong);
+
+    const deltaSpan = document.createElement('span');
+    deltaSpan.className = isInc ? 'delta-pos' : 'delta-neg';
+    deltaSpan.textContent = ctx.state.masked
+      ? isInc
+        ? '退款 -•••'
+        : '刷卡 +•••'
+      : `${isInc ? '退款 -' : '刷卡 +'}${fmtNum(twdDeltaAbs)}`;
+
+    preview.appendChild(left);
+    preview.appendChild(deltaSpan);
+    return;
+  }
+
+  if (!selected) return;
   const beforeAnchor = Boolean(
     selected.account.balanceAnchorDate && dateVal < selected.account.balanceAnchorDate
   );
@@ -186,12 +250,25 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
     activeLedger.id
   );
 
-  // Keep selected linked savings account in sync with available accounts in this ledger
+  const ccSummary = computeAllCreditCardsSummary(
+    snap.assetItems,
+    snap.cashflowLogs,
+    snap.savingsAdjustments || [],
+    snap.installmentPlans || [],
+    snap.settings,
+    activeLedger.id
+  );
+
+  // Keep selected linked savings / credit card account in sync with available accounts in this ledger
+  const validLinkedIds = new Set<string>([
+    ...savings.accounts.map((a) => a.account.id),
+    ...ccSummary.cards.map((c) => c.card.id),
+  ]);
   if (!ctx.state.logLinkedAccountTouched) {
     ctx.state.logLinkedAccountId = savings.defaultAccountId;
   } else if (
     ctx.state.logLinkedAccountId &&
-    !savings.accounts.some((a) => a.account.id === ctx.state.logLinkedAccountId)
+    !validLinkedIds.has(ctx.state.logLinkedAccountId)
   ) {
     ctx.state.logLinkedAccountId = savings.defaultAccountId;
     ctx.state.logLinkedAccountTouched = false;
@@ -272,10 +349,10 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
     }
   }
 
-  // 2. Quick Entry linked savings account chips
+  // 2. Quick Entry linked savings & credit card chips
   const chipsBox = el('logSavingsChips');
   chipsBox.innerHTML = '';
-  if (!savings.accounts.length) {
+  if (!savings.accounts.length && !ccSummary.cards.length) {
     const setupBtn = document.createElement('button');
     setupBtn.type = 'button';
     setupBtn.className = 'chip-btn sm';
@@ -294,6 +371,18 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
       chip.textContent = `${s.account.isDefaultSavings ? '★ ' : ''}${s.account.itemName}`;
       chip.addEventListener('click', () => {
         ctx.state.logLinkedAccountId = s.account.id;
+        ctx.state.logLinkedAccountTouched = true;
+        renderSavingsStripAndChips(ctx);
+      });
+      chipsBox.appendChild(chip);
+    }
+    for (const c of ccSummary.cards) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chip-btn sm' + (ctx.state.logLinkedAccountId === c.card.id ? ' active' : '');
+      chip.textContent = `💳 ${c.card.itemName}`;
+      chip.addEventListener('click', () => {
+        ctx.state.logLinkedAccountId = c.card.id;
         ctx.state.logLinkedAccountTouched = true;
         renderSavingsStripAndChips(ctx);
       });

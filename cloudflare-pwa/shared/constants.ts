@@ -64,6 +64,7 @@ export const ASSET_SUB_CATEGORIES: string[] = [
   '保單(保價金)',
   '房貸餘額',
   '車貸餘額',
+  '信用卡',
   '其他資產',
   '其他負債',
 ];
@@ -78,6 +79,7 @@ export const STOCK_TX_TYPES = {
 
 export const FINANCIAL_GOAL_TYPES = ['net_worth', 'fire', 'ledger_bucket', 'asset_bucket', 'manual'] as const;
 export const SPLIT_RECEIVABLE_STATUSES = ['open', 'partial', 'settled', 'written_off'] as const;
+export const INSTALLMENT_PLAN_STATUSES = ['active', 'completed', 'cancelled'] as const;
 
 export const ALL_STOCK_TX_TYPES: string[] = [
   STOCK_TX_TYPES.BUY,

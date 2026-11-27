@@ -19,6 +19,12 @@ import {
   resolveRecurringEntryDate,
   shouldPostRecurringItem,
 } from '../shared/recurring';
+import {
+  buildInstallmentDedupKey,
+  computeInstallmentScheduleAmounts,
+  getInstallmentEntryDate,
+  monthsBetweenYm,
+} from '../shared/creditCard';
 import { assertUserId, ensureAppSettings, exportFullSnapshot } from './sync';
 
 /**
@@ -514,7 +520,7 @@ const SNAPSHOT_QUERIES_PER_USER = 5;
 async function markAutomationRun(
   db: D1Database,
   uid: string,
-  kind: 'recurring' | 'snapshot',
+  kind: 'recurring' | 'snapshot' | 'installments',
   period: string,
   status: 'done' | 'partial' | 'failed',
   detail: string
@@ -536,6 +542,225 @@ async function markAutomationRun(
 function lastDayOfPreviousMonth(yearMonth: string): Date {
   const [y, m] = yearMonth.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, 1) - 12 * 60 * 60 * 1000);
+}
+
+/**
+ * Phase 7 (v1.15.0): Idempotent monthly auto-posting for active installment plans.
+ * Posts due installments for `targetYear`/`targetMonth`, prevents duplicate entries via
+ * (installment_plan_id, installment_seq) + recurring_dedup_key, and automatically marks
+ * plans as `completed` once their final installment is posted.
+ */
+export async function runMonthlyInstallmentsD1(
+  db: D1Database,
+  userId: string,
+  targetYear?: number,
+  targetMonth?: number,
+  opts: {
+    shouldStop?: () => boolean;
+    keepDeletedEntries?: boolean;
+  } = {}
+): Promise<{
+  yearMonth: string;
+  insertedCount: number;
+  skippedCount: number;
+  completedCount: number;
+  complete: boolean;
+}> {
+  const uid = assertUserId(userId);
+  const period = validateRecurringPeriod(targetYear, targetMonth);
+  if (!period.ok) throw new Error(period.error);
+  const nowParts = getTaiwanDateParts(new Date());
+  const year = targetYear || nowParts.year;
+  const month = targetMonth || nowParts.month;
+  const yearMonth = `${year}-${String(month).padStart(2, '0')}`;
+  const nowIso = new Date().toISOString();
+
+  let planRows: D1Result<{
+    id: string;
+    ledger_id: string;
+    card_account_id: string | null;
+    item_name: string;
+    category: string;
+    total_amount: number;
+    total_installments: number;
+    posted_installments: number;
+    start_ym: string;
+    post_day: number;
+    currency: string;
+    note: string;
+  }>;
+  try {
+    planRows = await db
+      .prepare(`SELECT * FROM installment_plans WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL`)
+      .bind(uid)
+      .all();
+  } catch (err) {
+    if (/no such table:\s*installment_plans/i.test(err instanceof Error ? err.message : String(err))) {
+      return { yearMonth, insertedCount: 0, skippedCount: 0, completedCount: 0, complete: true };
+    }
+    throw err;
+  }
+
+  const activePlans = planRows.results || [];
+  if (!activePlans.length) {
+    return { yearMonth, insertedCount: 0, skippedCount: 0, completedCount: 0, complete: true };
+  }
+
+  const settings = await ensureAppSettings(db, uid);
+  await db
+    .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+    .bind(uid, nowIso)
+    .run();
+  const epochRow = await db
+    .prepare('SELECT data_epoch FROM user_sync_state WHERE user_id = ?')
+    .bind(uid)
+    .first<{ data_epoch: number }>();
+  const expectedEpoch = Number(epochRow?.data_epoch ?? 1);
+  const epochGuard = '(SELECT data_epoch FROM user_sync_state WHERE user_id = ?) = ?';
+
+  const existingLogsRes = await db
+    .prepare(
+      `SELECT installment_plan_id, installment_seq, recurring_dedup_key
+       FROM cashflow_logs
+       WHERE user_id = ? AND (installment_plan_id IS NOT NULL OR recurring_dedup_key LIKE 'inst:%')${opts.keepDeletedEntries ? '' : ' AND deleted_at IS NULL'}`
+    )
+    .bind(uid)
+    .all<{
+      installment_plan_id: string | null;
+      installment_seq: number | null;
+      recurring_dedup_key: string | null;
+    }>();
+
+  const existingKeys = new Set<string>();
+  for (const r of existingLogsRes.results || []) {
+    if (r.installment_plan_id && r.installment_seq) {
+      existingKeys.add(buildInstallmentDedupKey(r.installment_plan_id, Number(r.installment_seq)));
+    }
+    if (r.recurring_dedup_key && r.recurring_dedup_key.startsWith('inst:')) {
+      existingKeys.add(r.recurring_dedup_key);
+    }
+  }
+
+  let insertedCount = 0;
+  let skippedCount = 0;
+  let completedCount = 0;
+  let complete = true;
+
+  for (const plan of activePlans) {
+    if (opts.shouldStop?.()) {
+      complete = false;
+      break;
+    }
+    const diff = monthsBetweenYm(plan.start_ym, yearMonth);
+    const seq = diff + 1;
+    if (seq < 1 || seq > plan.total_installments) {
+      continue;
+    }
+    const dedupKey = buildInstallmentDedupKey(plan.id, seq);
+    if (existingKeys.has(dedupKey) || seq <= Number(plan.posted_installments || 0)) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const schedule = computeInstallmentScheduleAmounts(
+      Number(plan.total_amount),
+      Number(plan.total_installments),
+      String(plan.currency || 'TWD')
+    );
+    const amount = schedule[seq - 1] ?? 0;
+    if (amount <= 0) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const entryDate = getInstallmentEntryDate(plan.start_ym, seq, Number(plan.post_day || 1));
+    const fxRate = resolveFxRate(String(plan.currency || 'TWD'), settings);
+    const twdAmount = Math.round(amount * fxRate);
+    const itemName = `${plan.item_name} (${seq}/${plan.total_installments}期)`.slice(0, 80);
+    const finalNote = `[分期 ${seq}/${plan.total_installments}]${plan.note ? ' ' + plan.note : ''}`.slice(0, 200);
+    const ledgerId = String(plan.ledger_id || 'default').trim() || 'default';
+    const nextPosted = Math.max(Number(plan.posted_installments || 0), seq);
+    const nextStatus = nextPosted >= Number(plan.total_installments) ? 'completed' : 'active';
+
+    const ensureSyncStmt = db
+      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+      .bind(uid, nowIso);
+    const bumpSyncStmt = db
+      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
+      .bind(nowIso, uid);
+    const insertCfStmt = db
+      .prepare(
+        `INSERT INTO cashflow_logs
+          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, installment_plan_id, installment_seq, created_at, updated_at, deleted_at, version, change_seq)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
+         WHERE ${epochGuard}
+         ON CONFLICT DO NOTHING`
+      )
+      .bind(
+        uid,
+        crypto.randomUUID(),
+        entryDate,
+        yearMonth,
+        CASHFLOW_TYPES.DAILY_EXPENSE,
+        String(plan.category || '其他'),
+        itemName,
+        amount,
+        String(plan.currency || 'TWD'),
+        fxRate,
+        twdAmount,
+        finalNote,
+        dedupKey,
+        plan.card_account_id || null,
+        ledgerId,
+        plan.id,
+        seq,
+        nowIso,
+        nowIso,
+        uid,
+        uid,
+        expectedEpoch
+      );
+    const updatePlanStmt = db
+      .prepare(
+        `UPDATE installment_plans
+         SET posted_installments = MAX(posted_installments, ?), status = ?, updated_at = ?, version = version + 1, change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
+         WHERE user_id = ? AND id = ? AND deleted_at IS NULL AND ${epochGuard}
+           AND EXISTS (SELECT 1 FROM cashflow_logs WHERE user_id = ? AND installment_plan_id = ? AND installment_seq = ?)`
+      )
+      .bind(
+        nextPosted,
+        nextStatus,
+        nowIso,
+        uid,
+        uid,
+        plan.id,
+        uid,
+        expectedEpoch,
+        uid,
+        plan.id,
+        seq
+      );
+
+    const results = await db.batch([ensureSyncStmt, bumpSyncStmt, insertCfStmt, updatePlanStmt]);
+    const inserted = Number(results[2]?.meta?.changes ?? 0);
+    if (inserted > 0) {
+      insertedCount += 1;
+      existingKeys.add(dedupKey);
+      if (nextStatus === 'completed') completedCount += 1;
+    } else {
+      const epochNow = await db
+        .prepare('SELECT data_epoch FROM user_sync_state WHERE user_id = ?')
+        .bind(uid)
+        .first<{ data_epoch: number }>();
+      if (Number(epochNow?.data_epoch ?? 1) !== expectedEpoch) {
+        complete = false;
+        break;
+      }
+      skippedCount += 1;
+    }
+  }
+
+  return { yearMonth, insertedCount, skippedCount, completedCount, complete };
 }
 
 export interface ScheduledAutomationSummary {
@@ -606,6 +831,15 @@ export async function runScheduledAutomation(
       .bind(currentPeriod, lastPeriod)
       .all<{ user_id: string; kind: string; period: string }>();
     const done = new Set((doneRows.results || []).map((r) => `${r.user_id}|${r.kind}|${r.period}`));
+    const activeInstUsers = new Set<string>();
+    try {
+      const instUserRows = await db
+        .prepare("SELECT DISTINCT user_id FROM installment_plans WHERE status = 'active' AND deleted_at IS NULL")
+        .all<{ user_id: string }>();
+      for (const r of instUserRows.results || []) activeInstUsers.add(String(r.user_id));
+    } catch {
+      // Pre-0024 database without installment_plans table
+    }
     const notes: string[] = [];
     for (const u of users.results || []) {
       const joined = getTaiwanDateParts(new Date(u.created_at || now.toISOString()));
@@ -644,6 +878,31 @@ export async function runScheduledAutomation(
         } catch (err) {
           console.error('[cron] recurring posting failed:', u.id, currentPeriod, err);
           await markAutomationRun(db, u.id, 'recurring', currentPeriod, 'failed', String(err)).catch(() => {});
+        }
+      }
+      // this month's installment auto-posting (only when user actually has active installment plans)
+      if (activeInstUsers.has(u.id) && !done.has(`${u.id}|installments|${currentPeriod}`)) {
+        if (shouldStop(6 + snapshotReserve)) break;
+        try {
+          const iRes = await runMonthlyInstallmentsD1(db, u.id, today.year, today.month, {
+            shouldStop: () => shouldStop(2 + snapshotReserve),
+            keepDeletedEntries: true,
+          });
+          await markAutomationRun(
+            db,
+            u.id,
+            'installments',
+            currentPeriod,
+            iRes.complete ? 'done' : 'partial',
+            `inserted ${iRes.insertedCount}, skipped ${iRes.skippedCount}`
+          );
+          if (iRes.insertedCount > 0 || !iRes.complete) {
+            notes.push(`installments ${currentPeriod} ${u.id}: +${iRes.insertedCount}${iRes.complete ? '' : ' (partial)'}`);
+          }
+          if (!iRes.complete) break;
+        } catch (err) {
+          console.error('[cron] installments posting failed:', u.id, currentPeriod, err);
+          await markAutomationRun(db, u.id, 'installments', currentPeriod, 'failed', String(err)).catch(() => {});
         }
       }
     }

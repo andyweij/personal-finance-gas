@@ -19,6 +19,8 @@ import type {
   FinancialGoal,
   FinancialGoalType,
   FinanceSnapshot,
+  InstallmentPlan,
+  InstallmentPlanStatus,
   Ledger,
   NetWorthHistory,
   RecurringItem,
@@ -56,6 +58,7 @@ import {
   validateAssetInput,
   validateCashFlowInput,
   validateFinancialGoalInput,
+  validateInstallmentPlanInput,
   validateLedgerInput,
   validateRecurringInput,
   validateSavingsAdjustmentInput,
@@ -315,6 +318,9 @@ function mapCashFlowRow(r: Record<string, unknown>): CashFlowLog {
     recurringDedupKey: r.recurring_dedup_key ? String(r.recurring_dedup_key) : null,
     linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
     ledgerId: normalizeLedgerId(r.ledger_id),
+    installmentPlanId: r.installment_plan_id ? String(r.installment_plan_id) : null,
+    installmentSeq:
+      r.installment_seq !== null && r.installment_seq !== undefined ? Number(r.installment_seq) : null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -416,6 +422,28 @@ function mapSplitReceivableRow(r: Record<string, unknown>): SplitReceivable {
   };
 }
 
+function mapInstallmentPlanRow(r: Record<string, unknown>): InstallmentPlan {
+  return {
+    id: String(r.id),
+    ledgerId: normalizeLedgerId(r.ledger_id),
+    cardAccountId: r.card_account_id ? String(r.card_account_id) : null,
+    itemName: String(r.item_name),
+    category: String(r.category || '其他'),
+    totalAmount: Number(r.total_amount),
+    totalInstallments: Number(r.total_installments),
+    postedInstallments: Number(r.posted_installments ?? 0),
+    startYm: String(r.start_ym),
+    postDay: Number(r.post_day ?? 1),
+    currency: String(r.currency || 'TWD'),
+    status: String(r.status || 'active') as InstallmentPlanStatus,
+    note: String(r.note || ''),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+    version: Number(r.version ?? 1),
+  };
+}
+
 function mapAssetRow(r: Record<string, unknown>): AssetItem {
   return {
     id: String(r.id),
@@ -446,6 +474,15 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
         : null,
     loanBillingDay:
       r.loan_billing_day !== null && r.loan_billing_day !== undefined ? Number(r.loan_billing_day) : null,
+    isCreditCard: Number(r.is_credit_card || 0) === 1,
+    creditBillingDay:
+      r.credit_billing_day !== null && r.credit_billing_day !== undefined
+        ? Number(r.credit_billing_day)
+        : null,
+    creditDueDay:
+      r.credit_due_day !== null && r.credit_due_day !== undefined ? Number(r.credit_due_day) : null,
+    creditLimit:
+      r.credit_limit !== null && r.credit_limit !== undefined ? Number(r.credit_limit) : null,
     stockCategory: String(r.stock_category || ''),
     isWatchlist: Number(r.is_watchlist || 0) === 1,
     ledgerId: normalizeLedgerId(r.ledger_id),
@@ -730,6 +767,24 @@ async function hasRecurringPostDayColumn(db: D1Database): Promise<boolean> {
 const RECURRING_POST_DAY_MIGRATION_ERROR =
   '伺服器資料庫尚未完成升級（缺少「入帳日」欄位），請先執行資料庫遷移後再重試。';
 
+async function hasAssetCreditCardColumns(db: D1Database): Promise<boolean> {
+  try {
+    await db.prepare('SELECT is_credit_card FROM asset_items LIMIT 0').all();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function hasCashflowInstallmentColumns(db: D1Database): Promise<boolean> {
+  try {
+    await db.prepare('SELECT installment_plan_id FROM cashflow_logs LIMIT 0').all();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function readExistingRow(
   db: D1Database,
   uid: string,
@@ -760,6 +815,7 @@ const ENTITY_ROW_TABLE: Record<string, { table: string; keyColumn: 'id' | 'perio
   stock_tx: { table: 'stock_transactions', keyColumn: 'id' },
   financial_goal: { table: 'financial_goals', keyColumn: 'id' },
   split_receivable: { table: 'split_receivables', keyColumn: 'id' },
+  installment_plan: { table: 'installment_plans', keyColumn: 'id' },
 };
 
 function runValidation<T>(fn: () => T): T {
@@ -862,6 +918,7 @@ const ALLOWED_SYNC_ENTITIES = new Set<string>([
   'utility_rents',
   'financial_goal',
   'split_receivable',
+  'installment_plan',
 ]);
 
 const ALLOWED_SYNC_OPS = new Set<string>(['upsert', 'delete']);
@@ -1509,6 +1566,18 @@ async function applySingleMutation(
             p.ledgerId !== undefined
               ? normalizeLedgerId(p.ledgerId)
               : normalizeLedgerId(existing?.ledger_id),
+          installmentPlanId:
+            p.installmentPlanId !== undefined
+              ? (p.installmentPlanId as string | null)
+              : existing?.installment_plan_id
+                ? String(existing.installment_plan_id)
+                : null,
+          installmentSeq:
+            p.installmentSeq !== undefined
+              ? (p.installmentSeq as number | null)
+              : existing?.installment_seq !== undefined && existing?.installment_seq !== null
+                ? Number(existing.installment_seq)
+                : null,
         },
         defaultFxRate
       )
@@ -1517,15 +1586,30 @@ async function applySingleMutation(
     // M3: only references changed by this write are checked; the guard is part of the write statement
     const changedRefs = collectChangedRefs(existing, [
       { kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' },
-      { kind: 'asset', value: v.linkedAccountId, column: 'linked_account_id', label: '連動的活存帳戶' },
+      { kind: 'asset', value: v.linkedAccountId, column: 'linked_account_id', label: '連動的活存或信用卡帳戶' },
     ]);
     const refGuard = refGuardSql(db, uid, changedRefs);
+
+    const hasInstCols = existing
+      ? 'installment_plan_id' in existing
+      : v.installmentPlanId === null && v.installmentSeq === null
+        ? false
+        : await hasCashflowInstallmentColumns(db);
+    if (!hasInstCols && (v.installmentPlanId !== null || v.installmentSeq !== null)) {
+      throw new RejectError(
+        '伺服器資料庫尚未完成升級（缺少流水帳分期關聯欄位），請先執行 0024 資料庫遷移後再重試。'
+      );
+    }
+    const instSetSql = hasInstCols ? ', installment_plan_id = ?, installment_seq = ?' : '';
+    const instBinds = hasInstCols ? [v.installmentPlanId, v.installmentSeq] : [];
+    const instInsCols = hasInstCols ? ', installment_plan_id, installment_seq' : '';
+    const instInsVals = hasInstCols ? ', ?, ?' : '';
 
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE cashflow_logs
-             SET date = ?, year_month = ?, type = ?, category = ?, item_name = ?, amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, source = ?, note = ?, linked_account_id = ?, ledger_id = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
+             SET date = ?, year_month = ?, type = ?, category = ?, item_name = ?, amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, source = ?, note = ?, linked_account_id = ?, ledger_id = ?${instSetSql}, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
@@ -1542,6 +1626,7 @@ async function applySingleMutation(
             v.note,
             v.linkedAccountId,
             v.ledgerId,
+            ...instBinds,
             check.writeTs,
             check.nextVersion,
             uid,
@@ -1555,8 +1640,8 @@ async function applySingleMutation(
       : db
           .prepare(
             `INSERT INTO cashflow_logs
-              (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+              (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id${instInsCols}, created_at, updated_at, deleted_at, version, change_seq)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${instInsVals}, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
              WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
@@ -1576,6 +1661,7 @@ async function applySingleMutation(
             v.note,
             v.linkedAccountId,
             v.ledgerId,
+            ...instBinds,
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
@@ -2277,6 +2363,180 @@ async function applySingleMutation(
     return;
   }
 
+  if (mutation.entity === 'installment_plan') {
+    let existing: Record<string, unknown> | null = null;
+    try {
+      existing = await readExistingRow(db, uid, 'installment_plans', 'id', mutation.recordId);
+    } catch (err) {
+      if (/no such table:\s*installment_plans/i.test(err instanceof Error ? err.message : String(err))) {
+        throw new RejectError(
+          '伺服器資料庫尚未完成升級（缺少分期付款資料表），請先執行 0024 資料庫遷移後再重試。'
+        );
+      }
+      throw err;
+    }
+    const check = checkVersionOrThrow(
+      mutation,
+      existing,
+      existing ? (mapInstallmentPlanRow(existing) as unknown as Record<string, unknown>) : null,
+      serverTime,
+      legacyCompareTs
+    );
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+      return;
+    }
+
+    const refetchInst = async () => {
+      const row = await db
+        .prepare('SELECT * FROM installment_plans WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return {
+        row,
+        mapped: row ? (mapInstallmentPlanRow(row) as unknown as Record<string, unknown>) : null,
+      };
+    };
+
+    if (mutation.op === 'delete') {
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          `UPDATE installment_plans SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+        )
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(
+        db,
+        uid,
+        mutation,
+        serverTime,
+        expectedEpoch,
+        delStmt,
+        [],
+        refetchInst,
+        check.legacyClientTs
+      );
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = runValidation(() =>
+      validateInstallmentPlanInput({
+        ledgerId:
+          p.ledgerId !== undefined
+            ? normalizeLedgerId(p.ledgerId)
+            : normalizeLedgerId(existing?.ledger_id),
+        cardAccountId:
+          p.cardAccountId !== undefined ? (p.cardAccountId as string | null) : null,
+        itemName: String(p.itemName || ''),
+        category: String(p.category || '其他'),
+        totalAmount: Number(p.totalAmount),
+        totalInstallments: Number(p.totalInstallments),
+        postedInstallments: p.postedInstallments !== undefined ? Number(p.postedInstallments) : 0,
+        startYm: String(p.startYm || ''),
+        postDay: p.postDay !== undefined && p.postDay !== null ? Number(p.postDay) : 1,
+        currency: String(p.currency || 'TWD'),
+        status: p.status !== undefined ? String(p.status) : undefined,
+        note: String(p.note || ''),
+      })
+    );
+
+    const refs = collectChangedRefs(existing, [
+      { kind: 'ledger', column: 'ledger_id', value: v.ledgerId, label: '帳本' },
+      { kind: 'asset', column: 'card_account_id', value: v.cardAccountId, label: '綁定信用卡' },
+    ]);
+    const guard = refGuardSql(db, uid, refs);
+
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE installment_plans
+             SET ledger_id = ?, card_account_id = ?, item_name = ?, category = ?, total_amount = ?, total_installments = ?, posted_installments = ?, start_ym = ?, post_day = ?, currency = ?, status = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${guard.sql}`
+          )
+          .bind(
+            v.ledgerId,
+            v.cardAccountId,
+            v.itemName,
+            v.category,
+            v.totalAmount,
+            v.totalInstallments,
+            v.postedInstallments,
+            v.startYm,
+            v.postDay,
+            v.currency,
+            v.status,
+            v.note,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch,
+            ...guard.binds
+          )
+      : db
+          .prepare(
+            `INSERT INTO installment_plans
+              (user_id, id, ledger_id, card_account_id, item_name, category, total_amount, total_installments, posted_installments, start_ym, post_day, currency, status, note, created_at, updated_at, deleted_at, version, change_seq)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${guard.sql}
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.ledgerId,
+            v.cardAccountId,
+            v.itemName,
+            v.category,
+            v.totalAmount,
+            v.totalInstallments,
+            v.postedInstallments,
+            v.startYm,
+            v.postDay,
+            v.currency,
+            v.status,
+            v.note,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            uid,
+            expectedEpoch,
+            ...guard.binds
+          );
+
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      [],
+      refetchInst,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, refs)
+    );
+    return;
+  }
+
   if (mutation.entity === 'asset') {
     const existing = await readExistingRow(db, uid, 'asset_items', 'id', mutation.recordId);
     const check = checkVersionOrThrow(
@@ -2379,6 +2639,28 @@ async function applySingleMutation(
             : null,
         loanBillingDay:
           p.loanBillingDay !== undefined && p.loanBillingDay !== null ? Number(p.loanBillingDay) : null,
+        isCreditCard:
+          p.isCreditCard !== undefined
+            ? Boolean(p.isCreditCard)
+            : Number(existing?.is_credit_card || 0) === 1,
+        creditBillingDay:
+          p.creditBillingDay !== undefined
+            ? (p.creditBillingDay as number | null)
+            : existing?.credit_billing_day !== undefined && existing?.credit_billing_day !== null
+              ? Number(existing.credit_billing_day)
+              : null,
+        creditDueDay:
+          p.creditDueDay !== undefined
+            ? (p.creditDueDay as number | null)
+            : existing?.credit_due_day !== undefined && existing?.credit_due_day !== null
+              ? Number(existing.credit_due_day)
+              : null,
+        creditLimit:
+          p.creditLimit !== undefined
+            ? (p.creditLimit as number | null)
+            : existing?.credit_limit !== undefined && existing?.credit_limit !== null
+              ? Number(existing.credit_limit)
+              : null,
         stockCategory:
           p.stockCategory !== undefined
             ? normalizeStockCategory(p.stockCategory)
@@ -2473,11 +2755,32 @@ async function applySingleMutation(
     const changedRefs = collectChangedRefs(existing, [{ kind: 'ledger', value: v.ledgerId, column: 'ledger_id', label: '指定的帳本' }]);
     const refGuard = refGuardSql(db, uid, changedRefs);
 
+    const hasCcCols = existing
+      ? 'is_credit_card' in existing
+      : !v.isCreditCard
+        ? false
+        : await hasAssetCreditCardColumns(db);
+    if (!hasCcCols && v.isCreditCard) {
+      throw new RejectError(
+        '伺服器資料庫尚未完成升級（缺少信用卡欄位），請先執行 0024 資料庫遷移後再重試。'
+      );
+    }
+    const ccSetSql = hasCcCols
+      ? ', is_credit_card = ?, credit_billing_day = ?, credit_due_day = ?, credit_limit = ?'
+      : '';
+    const ccBinds = hasCcCols
+      ? [v.isCreditCard ? 1 : 0, v.creditBillingDay, v.creditDueDay, v.creditLimit]
+      : [];
+    const ccInsCols = hasCcCols
+      ? ', is_credit_card, credit_billing_day, credit_due_day, credit_limit'
+      : '';
+    const ccInsVals = hasCcCols ? ', ?, ?, ?, ?' : '';
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE asset_items
-             SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, price_updated_at = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
+             SET update_mode = ?, major_type = ?, sub_category = ?, liquidity = ?, item_name = ?, ticker = ?, quantity_or_amount = ?, currency = ?, unit_price = ?, previous_close = ?, price_updated_at = ?, cost_basis = ?, note = ?, is_linked_savings = ?, balance_anchor_date = ?, balance_anchor_at = ?, is_default_savings = ?, is_amortizing_loan = ?, loan_annual_rate = ?, loan_monthly_payment = ?, loan_billing_day = ?, stock_category = ?, is_watchlist = ?, ledger_id = ?, exclude_from_net_worth = ?, sort_order = ?${ccSetSql}, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
@@ -2507,6 +2810,7 @@ async function applySingleMutation(
             v.ledgerId,
             v.excludeFromNetWorth ? 1 : 0,
             v.sortOrder,
+            ...ccBinds,
             check.writeTs,
             check.nextVersion,
             uid,
@@ -2520,8 +2824,8 @@ async function applySingleMutation(
       : db
           .prepare(
             `INSERT INTO asset_items
-              (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+              (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, sort_order${ccInsCols}, created_at, updated_at, deleted_at, version, change_seq)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${ccInsVals}, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
              WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
@@ -2553,6 +2857,7 @@ async function applySingleMutation(
             v.ledgerId,
             v.excludeFromNetWorth ? 1 : 0,
             v.sortOrder,
+            ...ccBinds,
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
@@ -3116,6 +3421,7 @@ async function readDeltaWithState(
   ];
   const goalTable = { table: 'financial_goals', order: 'sort_order ASC, created_at ASC', liveOnlyWhenFull: true };
   const splitTable = { table: 'split_receivables', order: 'date DESC, created_at DESC', liveOnlyWhenFull: true };
+  const instTable = { table: 'installment_plans', order: 'start_ym DESC, created_at DESC', liveOnlyWhenFull: true };
   const upper =
     mode.kind === 'seq' && typeof mode.maxSeq === 'number'
       ? { sql: '?', binds: [mode.maxSeq] as unknown[] }
@@ -3142,22 +3448,37 @@ async function readDeltaWithState(
   const coreStmts = coreTables.map(buildEntityStmt);
   let includeGoals = true;
   let includeSplits = true;
+  let includeInstallments = true;
   let results: D1Result<unknown>[];
   try {
-    results = await db.batch([...headerStmts, ...coreStmts, buildEntityStmt(goalTable), buildEntityStmt(splitTable)]);
+    results = await db.batch([
+      ...headerStmts,
+      ...coreStmts,
+      buildEntityStmt(goalTable),
+      buildEntityStmt(splitTable),
+      buildEntityStmt(instTable),
+    ]);
   } catch (err) {
-    if (!/no such table:\s*(financial_goals|split_receivables)/i.test(err instanceof Error ? err.message : String(err))) {
+    if (
+      !/no such table:\s*(financial_goals|split_receivables|installment_plans)/i.test(
+        err instanceof Error ? err.message : String(err)
+      )
+    ) {
       throw err;
     }
     const existingOpt = await db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables')")
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables', 'installment_plans')"
+      )
       .all<{ name: string }>();
     const optNames = new Set((existingOpt.results || []).map((r) => r.name));
     includeGoals = optNames.has('financial_goals');
     includeSplits = optNames.has('split_receivables');
+    includeInstallments = optNames.has('installment_plans');
     const fallbackBatch: D1PreparedStatement[] = [...headerStmts, ...coreStmts];
     if (includeGoals) fallbackBatch.push(buildEntityStmt(goalTable));
     if (includeSplits) fallbackBatch.push(buildEntityStmt(splitTable));
+    if (includeInstallments) fallbackBatch.push(buildEntityStmt(instTable));
     results = await db.batch(fallbackBatch);
   }
   const rowsOf = (i: number) => (results[i]?.results || []) as Record<string, unknown>[];
@@ -3182,6 +3503,7 @@ async function readDeltaWithState(
   let nextIdx = base + 9;
   const goalsRows = includeGoals ? rowsOf(nextIdx++) : [];
   const splitsRows = includeSplits ? rowsOf(nextIdx++) : [];
+  const instRows = includeInstallments ? rowsOf(nextIdx++) : [];
   const delta: SyncDelta = {
     settings: includeSettings ? settings : null,
     ledgers: rowsOf(base).map(mapLedgerRow),
@@ -3196,6 +3518,7 @@ async function readDeltaWithState(
     rentUtilityRents: includeRents ? rents : null,
     financialGoals: goalsRows.map(mapFinancialGoalRow),
     splitReceivables: splitsRows.map(mapSplitReceivableRow),
+    installmentPlans: instRows.map(mapInstallmentPlanRow),
   };
   return { delta, changeSeq, dataEpoch };
 }
@@ -3420,14 +3743,22 @@ export async function processSyncRequest(
       try {
         results = await db.batch(stmts);
       } catch (err) {
-        if (!/no such table:\s*(financial_goals|split_receivables)/i.test(err instanceof Error ? err.message : String(err))) {
+        if (
+          !/no such table:\s*(financial_goals|split_receivables|installment_plans)/i.test(
+            err instanceof Error ? err.message : String(err)
+          )
+        ) {
           throw err;
         }
         // Pre-migration DB: drop optional post-0020 tables from prefetch so applySingleMutation rejects them cleanly
         const fallbackStmts = stmts.slice(0, idemStatements);
         prefetchedRowKeys = [];
         rowKeys.forEach((key, idx) => {
-          if (!key.startsWith('financial_goals:') && !key.startsWith('split_receivables:')) {
+          if (
+            !key.startsWith('financial_goals:') &&
+            !key.startsWith('split_receivables:') &&
+            !key.startsWith('installment_plans:')
+          ) {
             prefetchedRowKeys.push(key);
             fallbackStmts.push(stmts[idemStatements + idx]);
           }
@@ -3636,6 +3967,7 @@ export async function exportFullSnapshot(
     rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db, uid)),
     financialGoals: delta.financialGoals || [],
     splitReceivables: delta.splitReceivables || [],
+    installmentPlans: delta.installmentPlans || [],
   };
 }
 
@@ -3891,12 +4223,29 @@ export async function importFullSnapshot(
     });
   }
 
+  const validatedInstallments: Array<{
+    id: string;
+    v: ReturnType<typeof validateInstallmentPlanInput>;
+    createdAt: string;
+  }> = [];
+  for (const ip of data.installmentPlans || []) {
+    if (!ip || ip.deletedAt) continue;
+    validatedInstallments.push({
+      id: importText(ip.id, 'id') || crypto.randomUUID(),
+      v: validateInstallmentPlanInput(ip),
+      createdAt: importText(ip.createdAt, 'createdAt') || nowIso,
+    });
+  }
+
   const optTablesRes = await db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables')")
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables', 'installment_plans')"
+    )
     .all<{ name: string }>();
   const optTables = new Set((optTablesRes.results || []).map((r) => r.name));
   const hasGoalsTable = optTables.has('financial_goals');
   const hasSplitsTable = optTables.has('split_receivables');
+  const hasInstallmentsTable = optTables.has('installment_plans');
   if (!hasGoalsTable && validatedGoals.length > 0) {
     throw new Error(
       '伺服器資料庫尚未完成升級（缺少財務目標資料表），請先執行資料庫遷移後再匯入備份。'
@@ -3905,6 +4254,11 @@ export async function importFullSnapshot(
   if (!hasSplitsTable && validatedSplits.length > 0) {
     throw new Error(
       '伺服器資料庫尚未完成升級（缺少代墊／拆帳資料表），請先執行 0023 資料庫遷移後再匯入備份。'
+    );
+  }
+  if (!hasInstallmentsTable && validatedInstallments.length > 0) {
+    throw new Error(
+      '伺服器資料庫尚未完成升級（缺少分期付款資料表），請先執行 0024 資料庫遷移後再匯入備份。'
     );
   }
 
@@ -3935,6 +4289,9 @@ export async function importFullSnapshot(
     }
     if (hasSplitsTable) {
       stmts.push(db.prepare('DELETE FROM split_receivables WHERE user_id = ?').bind(uid));
+    }
+    if (hasInstallmentsTable) {
+      stmts.push(db.prepare('DELETE FROM installment_plans WHERE user_id = ?').bind(uid));
     }
     if (validatedUtilityRecords.length > 0) {
       stmts.push(db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid));
@@ -4132,21 +4489,35 @@ export async function importFullSnapshot(
   };
   const tailLive = `NULL, 1, ${CURR_SEQ_SQL}`;
 
+  const hasCcColsImport = hasInstallmentsTable || (await hasAssetCreditCardColumns(db));
+  if (!hasCcColsImport && validatedAssets.some((a) => a.v.isCreditCard)) {
+    throw new Error(
+      '伺服器資料庫尚未完成升級（缺少信用卡欄位），請先執行 0024 資料庫遷移後再匯入備份。'
+    );
+  }
+  const hasCfInstColsImport = hasInstallmentsTable || (await hasCashflowInstallmentColumns(db));
+  if (!hasCfInstColsImport && validatedLogs.some((l) => l.v.installmentPlanId !== null || l.v.installmentSeq !== null)) {
+    throw new Error(
+      '伺服器資料庫尚未完成升級（缺少流水帳分期關聯欄位），請先執行 0024 資料庫遷移後再匯入備份。'
+    );
+  }
+
   const logsRange = chunked(
     `INSERT INTO cashflow_logs
-      (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at, deleted_at, version, change_seq)`,
-    16,
+      (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, linked_account_id, ledger_id, created_at, updated_at${hasCfInstColsImport ? ', installment_plan_id, installment_seq' : ''}, deleted_at, version, change_seq)`,
+    hasCfInstColsImport ? 18 : 16,
     tailLive,
     `ON CONFLICT(user_id, id) DO UPDATE SET
        date = excluded.date, year_month = excluded.year_month, type = excluded.type, category = excluded.category,
        item_name = excluded.item_name, amount = excluded.amount, currency = excluded.currency, fx_rate = excluded.fx_rate,
        twd_amount = excluded.twd_amount, source = excluded.source, note = excluded.note,
-       linked_account_id = excluded.linked_account_id, ledger_id = excluded.ledger_id, updated_at = excluded.updated_at,
+       linked_account_id = excluded.linked_account_id, ledger_id = excluded.ledger_id, updated_at = excluded.updated_at,${hasCfInstColsImport ? ' installment_plan_id = excluded.installment_plan_id, installment_seq = excluded.installment_seq,' : ''}
        version = cashflow_logs.version + 1, change_seq = excluded.change_seq
      WHERE cashflow_logs.deleted_at IS NULL`,
     validatedLogs.map(({ id, v, createdAt }) => [
       id, v.date, v.yearMonth, v.type, v.category, v.itemName, v.amount, v.currency, v.fxRate, v.twdAmount,
       v.source, v.note, v.linkedAccountId, v.ledgerId, createdAt, nowIso,
+      ...(hasCfInstColsImport ? [v.installmentPlanId, v.installmentSeq] : []),
     ])
   );
 
@@ -4192,8 +4563,8 @@ export async function importFullSnapshot(
 
   const assetsRange = chunked(
     `INSERT INTO asset_items
-      (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at, deleted_at, version, change_seq)`,
-    29,
+      (user_id, id, update_mode, major_type, sub_category, liquidity, item_name, ticker, quantity_or_amount, currency, unit_price, previous_close, cost_basis, price_updated_at, note, is_linked_savings, balance_anchor_date, balance_anchor_at, is_default_savings, is_amortizing_loan, loan_annual_rate, loan_monthly_payment, loan_billing_day, sort_order, stock_category, is_watchlist, ledger_id, exclude_from_net_worth, created_at, updated_at${hasCcColsImport ? ', is_credit_card, credit_billing_day, credit_due_day, credit_limit' : ''}, deleted_at, version, change_seq)`,
+    hasCcColsImport ? 33 : 29,
     tailLive,
     `ON CONFLICT(user_id, id) DO UPDATE SET
        update_mode = excluded.update_mode, major_type = excluded.major_type, sub_category = excluded.sub_category,
@@ -4206,7 +4577,7 @@ export async function importFullSnapshot(
        loan_annual_rate = excluded.loan_annual_rate, loan_monthly_payment = excluded.loan_monthly_payment,
        loan_billing_day = excluded.loan_billing_day, sort_order = excluded.sort_order,
        stock_category = excluded.stock_category, is_watchlist = excluded.is_watchlist, ledger_id = excluded.ledger_id,
-       exclude_from_net_worth = excluded.exclude_from_net_worth, updated_at = excluded.updated_at,
+       exclude_from_net_worth = excluded.exclude_from_net_worth, updated_at = excluded.updated_at,${hasCcColsImport ? ' is_credit_card = excluded.is_credit_card, credit_billing_day = excluded.credit_billing_day, credit_due_day = excluded.credit_due_day, credit_limit = excluded.credit_limit,' : ''}
        version = asset_items.version + 1, change_seq = excluded.change_seq
      WHERE asset_items.deleted_at IS NULL`,
     validatedAssets.map(({ id, v, priceUpdatedAt, createdAt }) => [
@@ -4215,6 +4586,7 @@ export async function importFullSnapshot(
       v.balanceAnchorDate, v.balanceAnchorAt, v.isDefaultSavings ? 1 : 0, v.isAmortizingLoan ? 1 : 0,
       v.loanAnnualRate, v.loanMonthlyPayment, v.loanBillingDay, v.sortOrder, v.stockCategory, v.isWatchlist ? 1 : 0,
       v.ledgerId, v.excludeFromNetWorth ? 1 : 0, createdAt, nowIso,
+      ...(hasCcColsImport ? [v.isCreditCard ? 1 : 0, v.creditBillingDay, v.creditDueDay, v.creditLimit] : []),
     ])
   );
 
@@ -4374,6 +4746,40 @@ export async function importFullSnapshot(
         v.sourceCashflowId,
         v.sourceAccountId,
         v.sourceAdjustmentId,
+        v.note,
+        createdAt,
+        nowIso,
+      ])
+    );
+  }
+
+  if (hasInstallmentsTable && validatedInstallments.length > 0) {
+    chunked(
+      `INSERT INTO installment_plans
+        (user_id, id, ledger_id, card_account_id, item_name, category, total_amount, total_installments, posted_installments, start_ym, post_day, currency, status, note, created_at, updated_at, deleted_at, version, change_seq)`,
+      15,
+      tailLive,
+      `ON CONFLICT(user_id, id) DO UPDATE SET
+         ledger_id = excluded.ledger_id, card_account_id = excluded.card_account_id, item_name = excluded.item_name,
+         category = excluded.category, total_amount = excluded.total_amount,
+         total_installments = excluded.total_installments, posted_installments = excluded.posted_installments,
+         start_ym = excluded.start_ym, post_day = excluded.post_day, currency = excluded.currency,
+         status = excluded.status, note = excluded.note, updated_at = excluded.updated_at,
+         version = installment_plans.version + 1, change_seq = excluded.change_seq
+       WHERE installment_plans.deleted_at IS NULL`,
+      validatedInstallments.map(({ id, v, createdAt }) => [
+        id,
+        v.ledgerId,
+        v.cardAccountId,
+        v.itemName,
+        v.category,
+        v.totalAmount,
+        v.totalInstallments,
+        v.postedInstallments,
+        v.startYm,
+        v.postDay,
+        v.currency,
+        v.status,
         v.note,
         createdAt,
         nowIso,

@@ -34,6 +34,7 @@ import {
 import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { renderNetWorthChartCard } from './networthChart';
 import { renderReorderList } from './reorderHelper';
+import { renderCreditCardsAndInstallmentsCard } from './creditCardUi';
 import { renderSplitReceivablesCard } from './splitsUi';
 import type { UiContext } from './state';
 
@@ -61,11 +62,11 @@ export function getAssetSectionIds(
   }
   if (section === 'assets_auto') {
     return active
-      .filter((a) => !a.isLinkedSavings && !(a.majorType === '負債' && a.isAmortizingLoan) && a.updateMode === '自動更新')
+      .filter((a) => !a.isLinkedSavings && !a.isCreditCard && !(a.majorType === '負債' && a.isAmortizingLoan) && a.updateMode === '自動更新')
       .map((a) => a.id);
   }
   return active
-    .filter((a) => !a.isLinkedSavings && ((a.majorType === '負債' && a.isAmortizingLoan) || a.updateMode !== '自動更新'))
+    .filter((a) => !a.isLinkedSavings && !a.isCreditCard && ((a.majorType === '負債' && a.isAmortizingLoan) || a.updateMode !== '自動更新'))
     .map((a) => a.id);
 }
 
@@ -345,7 +346,7 @@ export function renderAssetsTab(ctx: UiContext): void {
   const autoItems: AssetItem[] = [];
   const manualItems: AssetItem[] = [];
   for (const item of activeAssets) {
-    if (item.isLinkedSavings) continue;
+    if (item.isLinkedSavings || item.isCreditCard) continue;
     if (item.majorType === '負債' && item.isAmortizingLoan) {
       manualItems.push(item);
     } else if (item.updateMode === '自動更新') {
@@ -727,6 +728,11 @@ export function renderAssetsTab(ctx: UiContext): void {
     } else {
       indepSec.style.display = 'none';
     }
+  }
+
+  const ccCard = document.getElementById('assetsCreditCardsCard');
+  if (ccCard) {
+    renderCreditCardsAndInstallmentsCard(ctx, ccCard);
   }
 
   const splitsCard = document.getElementById('assetsSplitsCard');

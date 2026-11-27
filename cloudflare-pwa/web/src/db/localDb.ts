@@ -63,6 +63,7 @@ export function createEmptySnapshot(): FinanceSnapshot {
     rentUtilityRents: { ...DEFAULT_UTILITY_RENTS },
     financialGoals: [],
     splitReceivables: [],
+    installmentPlans: [],
   };
 }
 
@@ -253,6 +254,7 @@ export class LocalFinanceDB {
           rentUtilityRents: raw.rentUtilityRents || empty.rentUtilityRents,
           financialGoals: Array.isArray(raw.financialGoals) ? raw.financialGoals : [],
           splitReceivables: Array.isArray(raw.splitReceivables) ? raw.splitReceivables : [],
+          installmentPlans: Array.isArray(raw.installmentPlans) ? raw.installmentPlans : [],
         });
       };
       req.onerror = () => reject(req.error);

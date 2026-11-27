@@ -17,7 +17,7 @@ export function mutationReferenceKeys(m: unknown): string[] {
   if (linkedLedgerId && linkedLedgerId !== 'default' && mut.entity !== 'ledger') {
     keys.push(`ledger:${linkedLedgerId}`);
   }
-  for (const field of ['linkedAccountId', 'accountId', 'assetId', 'sourceAccountId']) {
+  for (const field of ['linkedAccountId', 'accountId', 'assetId', 'sourceAccountId', 'cardAccountId']) {
     const v = typeof p[field] === 'string' ? (p[field] as string).trim() : '';
     if (v && !(mut.entity === 'asset' && v === mut.recordId)) keys.push(`asset:${v}`);
   }

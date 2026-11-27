@@ -11,6 +11,7 @@ import {
   DEFAULT_STOCK_CATEGORIES,
   DEFAULT_USD_TWD_RATE,
   FINANCIAL_GOAL_TYPES,
+  INSTALLMENT_PLAN_STATUSES,
   LIQUIDITY_LEVELS,
   PNL_COLOR_SCHEMES,
   QUICK_ENTRY_TYPES,
@@ -24,6 +25,7 @@ import {
 import type {
   CustomCategoriesMap,
   FinancialGoalType,
+  InstallmentPlanStatus,
   PnlColorScheme,
   QuickEntryTemplate,
   RebalanceTargetKind,
@@ -413,6 +415,8 @@ export interface CashFlowInputPayload {
   makeRecurring?: boolean;
   linkedAccountId?: string | null;
   ledgerId?: string;
+  installmentPlanId?: string | null;
+  installmentSeq?: number | null;
 }
 
 export interface ValidatedCashFlowInput {
@@ -429,6 +433,8 @@ export interface ValidatedCashFlowInput {
   note: string;
   linkedAccountId: string | null;
   ledgerId: string;
+  installmentPlanId: string | null;
+  installmentSeq: number | null;
 }
 
 export function normalizeEnabledCurrencies(value: unknown): string[] {
@@ -510,6 +516,17 @@ export function validateCashFlowInput(
   const note = String(payload.note || '').trim().slice(0, 200);
   const linkedAccountId = payload.linkedAccountId ? String(payload.linkedAccountId).trim() : null;
   const ledgerId = normalizeLedgerId(payload.ledgerId);
+  const rawPlanId = (payload as { installmentPlanId?: string | null }).installmentPlanId;
+  const installmentPlanId = rawPlanId ? String(rawPlanId).trim().slice(0, 80) : null;
+  const rawSeq = (payload as { installmentSeq?: number | string | null }).installmentSeq;
+  let installmentSeq: number | null = null;
+  if (rawSeq !== undefined && rawSeq !== null && String(rawSeq).trim() !== '') {
+    const s = Number(rawSeq);
+    if (!Number.isInteger(s) || s < 1 || s > 120) {
+      throw new Error('分期期數序號需為 1～120 的整數。');
+    }
+    installmentSeq = s;
+  }
 
   if (!ALL_CASHFLOW_TYPES.includes(type)) {
     throw new Error(`不支援的收支類型：${type}`);
@@ -540,6 +557,8 @@ export function validateCashFlowInput(
     note,
     linkedAccountId,
     ledgerId,
+    installmentPlanId,
+    installmentSeq,
   };
 }
 
@@ -657,6 +676,10 @@ export interface AssetInputPayload {
   loanAnnualRate?: number | string | null;
   loanMonthlyPayment?: number | string | null;
   loanBillingDay?: number | string | null;
+  isCreditCard?: boolean;
+  creditBillingDay?: number | string | null;
+  creditDueDay?: number | string | null;
+  creditLimit?: number | string | null;
   stockCategory?: string;
   isWatchlist?: boolean;
   ledgerId?: string;
@@ -755,20 +778,35 @@ export function resolveStockModalPriceFields(params: {
 
 export function validateAssetInput(payload: AssetInputPayload) {
   const isWatchlist = Boolean(payload.isWatchlist);
-  const isLinkedSavings = !isWatchlist && Boolean(payload.isLinkedSavings);
-  const ticker = isLinkedSavings ? '' : String(payload.ticker || '').trim().toUpperCase().slice(0, 30);
-  const updateMode = isLinkedSavings
-    ? '手動快照'
-    : isWatchlist
-      ? ticker
-        ? '自動更新'
-        : '手動快照'
-      : String(payload.updateMode || '手動快照').trim();
-  const majorType = isLinkedSavings || isWatchlist ? '資產' : String(payload.majorType || '資產').trim();
-  const subCategory = isLinkedSavings
-    ? '活存'
-    : String(payload.subCategory || (isWatchlist ? '台股' : '其他資產')).trim().slice(0, 40);
-  const rawLiquidity = isLinkedSavings || isWatchlist ? '高流動' : String(payload.liquidity || '中流動').trim();
+  const isCreditCard = !isWatchlist && Boolean(payload.isCreditCard);
+  const isLinkedSavings = !isWatchlist && !isCreditCard && Boolean(payload.isLinkedSavings);
+  const ticker =
+    isLinkedSavings || isCreditCard
+      ? ''
+      : String(payload.ticker || '').trim().toUpperCase().slice(0, 30);
+  const updateMode =
+    isLinkedSavings || isCreditCard
+      ? '手動快照'
+      : isWatchlist
+        ? ticker
+          ? '自動更新'
+          : '手動快照'
+        : String(payload.updateMode || '手動快照').trim();
+  const majorType = isCreditCard
+    ? '負債'
+    : isLinkedSavings || isWatchlist
+      ? '資產'
+      : String(payload.majorType || '資產').trim();
+  const subCategory = isCreditCard
+    ? '信用卡'
+    : isLinkedSavings
+      ? '活存'
+      : String(payload.subCategory || (isWatchlist ? '台股' : '其他資產')).trim().slice(0, 40);
+  const rawLiquidity = isCreditCard
+    ? '負債'
+    : isLinkedSavings || isWatchlist
+      ? '高流動'
+      : String(payload.liquidity || '中流動').trim();
   const liquidity =
     majorType === '負債'
       ? '負債'
@@ -778,13 +816,14 @@ export function validateAssetInput(payload: AssetInputPayload) {
   const itemName = String(payload.itemName || '').trim().slice(0, 80);
   const quantityOrAmount = isWatchlist ? 0 : Number(payload.quantityOrAmount);
   const currency = String(payload.currency || 'TWD').trim().toUpperCase();
-  const unitPrice = isLinkedSavings
-    ? 1
-    : payload.unitPrice !== undefined && payload.unitPrice !== ''
-      ? Number(payload.unitPrice)
-      : isWatchlist
-        ? 0
-        : 1;
+  const unitPrice =
+    isLinkedSavings || isCreditCard
+      ? 1
+      : payload.unitPrice !== undefined && payload.unitPrice !== ''
+        ? Number(payload.unitPrice)
+        : isWatchlist
+          ? 0
+          : 1;
   let previousClose: number | null = null;
   if (
     !isLinkedSavings &&
@@ -829,7 +868,44 @@ export function validateAssetInput(payload: AssetInputPayload) {
   const excludeFromNetWorth = isWatchlist ? false : Boolean(payload.excludeFromNetWorth);
   const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
 
-  const isAmortizingLoan = !isLinkedSavings && !isWatchlist && majorType === '負債' && Boolean(payload.isAmortizingLoan);
+  const isAmortizingLoan =
+    !isLinkedSavings && !isCreditCard && !isWatchlist && majorType === '負債' && Boolean(payload.isAmortizingLoan);
+  let creditBillingDay: number | null = null;
+  let creditDueDay: number | null = null;
+  let creditLimit: number | null = null;
+  if (isCreditCard) {
+    const bDay =
+      payload.creditBillingDay !== undefined &&
+      payload.creditBillingDay !== null &&
+      String(payload.creditBillingDay).trim() !== ''
+        ? Number(payload.creditBillingDay)
+        : 15;
+    if (!Number.isInteger(bDay) || bDay < 1 || bDay > 31) {
+      throw new Error('信用卡結帳日需為 1～31 的整數。');
+    }
+    const dDay =
+      payload.creditDueDay !== undefined &&
+      payload.creditDueDay !== null &&
+      String(payload.creditDueDay).trim() !== ''
+        ? Number(payload.creditDueDay)
+        : 1;
+    if (!Number.isInteger(dDay) || dDay < 1 || dDay > 31) {
+      throw new Error('信用卡繳款截止日需為 1～31 的整數。');
+    }
+    creditBillingDay = bDay;
+    creditDueDay = dDay;
+    if (
+      payload.creditLimit !== undefined &&
+      payload.creditLimit !== null &&
+      String(payload.creditLimit).trim() !== ''
+    ) {
+      const lim = Number(payload.creditLimit);
+      if (Number.isNaN(lim) || !Number.isFinite(lim) || lim <= 0) {
+        throw new Error('信用額度須大於 0（留空表示不設定）。');
+      }
+      creditLimit = roundTo(lim, 2);
+    }
+  }
   let loanAnnualRate: number | null = null;
   let loanMonthlyPayment: number | null = null;
   let loanBillingDay: number | null = null;
@@ -902,6 +978,10 @@ export function validateAssetInput(payload: AssetInputPayload) {
     loanAnnualRate,
     loanMonthlyPayment,
     loanBillingDay,
+    isCreditCard,
+    creditBillingDay,
+    creditDueDay,
+    creditLimit,
     stockCategory,
     isWatchlist,
     ledgerId,
@@ -1329,6 +1409,99 @@ export function validateSplitReceivableInput(
     sourceCashflowId,
     sourceAccountId,
     sourceAdjustmentId,
+    note,
+  };
+}
+
+export interface InstallmentPlanInputPayload {
+  ledgerId?: string;
+  cardAccountId?: string | null;
+  itemName: string;
+  category?: string;
+  totalAmount: number | string;
+  totalInstallments: number | string;
+  postedInstallments?: number | string;
+  startYm: string; // YYYY-MM
+  postDay?: number | string | null;
+  currency?: string;
+  status?: InstallmentPlanStatus | string;
+  note?: string;
+}
+
+export function validateInstallmentPlanInput(payload: InstallmentPlanInputPayload) {
+  const itemName = String(payload.itemName || '').trim().slice(0, 80);
+  if (!itemName) throw new Error('請輸入分期項目名稱。');
+
+  const category = String(payload.category || '').trim().slice(0, 40) || '其他';
+  const currency = String(payload.currency || 'TWD').trim().toUpperCase();
+  if (!CURRENCIES.includes(currency)) {
+    throw new Error(`不支援的幣別：${currency}`);
+  }
+
+  const rawTotal = Number(payload.totalAmount);
+  if (Number.isNaN(rawTotal) || !Number.isFinite(rawTotal) || rawTotal <= 0) {
+    throw new Error('分期總金額須大於 0。');
+  }
+  const totalAmount = roundTo(rawTotal, 2);
+
+  const totalInstallments = Number(payload.totalInstallments);
+  if (!Number.isInteger(totalInstallments) || totalInstallments < 2 || totalInstallments > 60) {
+    throw new Error('分期期數需為 2～60 之間的整數。');
+  }
+
+  const rawPosted =
+    payload.postedInstallments !== undefined &&
+    payload.postedInstallments !== null &&
+    String(payload.postedInstallments).trim() !== ''
+      ? Number(payload.postedInstallments)
+      : 0;
+  if (!Number.isInteger(rawPosted) || rawPosted < 0 || rawPosted > totalInstallments) {
+    throw new Error('已入帳期數需介於 0 與總期數之間。');
+  }
+
+  const startYm = String(payload.startYm || '').trim();
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(startYm)) {
+    throw new Error('首期入帳年月格式須為 YYYY-MM。');
+  }
+
+  let postDay = 1;
+  if (payload.postDay !== undefined && payload.postDay !== null && String(payload.postDay).trim() !== '') {
+    const d = Number(payload.postDay);
+    if (!Number.isInteger(d) || d < 1 || d > 31) {
+      throw new Error('每月分期入帳日需為 1～31 的整數。');
+    }
+    postDay = d;
+  }
+
+  const rawStatus = String(payload.status || '').trim();
+  if (rawStatus && !(INSTALLMENT_PLAN_STATUSES as readonly string[]).includes(rawStatus)) {
+    throw new Error(`不支援的分期狀態：${rawStatus}`);
+  }
+  let status: InstallmentPlanStatus;
+  if (rawStatus === 'cancelled') {
+    status = 'cancelled';
+  } else if (rawPosted >= totalInstallments || rawStatus === 'completed') {
+    status = 'completed';
+  } else {
+    status = 'active';
+  }
+
+  const ledgerId = normalizeLedgerId(payload.ledgerId);
+  const cardAccountId = payload.cardAccountId ? String(payload.cardAccountId).trim().slice(0, 80) : null;
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  return {
+    ledgerId,
+    cardAccountId,
+    itemName,
+    category,
+    totalAmount,
+    totalInstallments,
+    postedInstallments: status === 'completed' ? totalInstallments : rawPosted,
+    startYm,
+    postDay,
+    currency,
+    status,
     note,
   };
 }
