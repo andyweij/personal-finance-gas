@@ -26,6 +26,8 @@ import type {
   RentUtilityRents,
   SavingsAdjustment,
   SinkingFundItem,
+  SplitReceivable,
+  SplitReceivableStatus,
   StockTransaction,
   SyncConflict,
   SyncDelta,
@@ -58,6 +60,7 @@ import {
   validateRecurringInput,
   validateSavingsAdjustmentInput,
   validateSinkingInput,
+  validateSplitReceivableInput,
   validateStockTransactionInput,
 } from '../shared/validation';
 
@@ -379,6 +382,32 @@ function mapFinancialGoalRow(r: Record<string, unknown>): FinancialGoal {
       r.fire_swr_pct !== null && r.fire_swr_pct !== undefined ? Number(r.fire_swr_pct) : null,
     targetDate: r.target_date ? String(r.target_date) : null,
     sortOrder: Number(r.sort_order ?? 0),
+    note: String(r.note || ''),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+    version: Number(r.version ?? 1),
+  };
+}
+
+function mapSplitReceivableRow(r: Record<string, unknown>): SplitReceivable {
+  return {
+    id: String(r.id),
+    ledgerId: normalizeLedgerId(r.ledger_id),
+    splitGroupId: String(r.split_group_id || ''),
+    counterparty: String(r.counterparty),
+    date: String(r.date),
+    itemName: String(r.item_name),
+    category: String(r.category || '其他'),
+    amount: Number(r.amount),
+    settledAmount: Number(r.settled_amount ?? 0),
+    currency: String(r.currency || 'TWD'),
+    fxRate: Number(r.fx_rate ?? 1),
+    twdAmount: Number(r.twd_amount ?? 0),
+    status: (String(r.status || 'open') as SplitReceivableStatus),
+    sourceCashflowId: r.source_cashflow_id ? String(r.source_cashflow_id) : null,
+    sourceAccountId: r.source_account_id ? String(r.source_account_id) : null,
+    sourceAdjustmentId: r.source_adjustment_id ? String(r.source_adjustment_id) : null,
     note: String(r.note || ''),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
@@ -730,6 +759,7 @@ const ENTITY_ROW_TABLE: Record<string, { table: string; keyColumn: 'id' | 'perio
   savings_adjustment: { table: 'savings_adjustments', keyColumn: 'id' },
   stock_tx: { table: 'stock_transactions', keyColumn: 'id' },
   financial_goal: { table: 'financial_goals', keyColumn: 'id' },
+  split_receivable: { table: 'split_receivables', keyColumn: 'id' },
 };
 
 function runValidation<T>(fn: () => T): T {
@@ -831,6 +861,7 @@ const ALLOWED_SYNC_ENTITIES = new Set<string>([
   'utility_record',
   'utility_rents',
   'financial_goal',
+  'split_receivable',
 ]);
 
 const ALLOWED_SYNC_OPS = new Set<string>(['upsert', 'delete']);
@@ -2059,6 +2090,193 @@ async function applySingleMutation(
     return;
   }
 
+  if (mutation.entity === 'split_receivable') {
+    let existing: Record<string, unknown> | null = null;
+    try {
+      existing = await readExistingRow(db, uid, 'split_receivables', 'id', mutation.recordId);
+    } catch (err) {
+      if (/no such table:\s*split_receivables/i.test(err instanceof Error ? err.message : String(err))) {
+        throw new RejectError(
+          '伺服器資料庫尚未完成升級（缺少代墊／拆帳資料表），請先執行 0023 資料庫遷移後再重試。'
+        );
+      }
+      throw err;
+    }
+    const check = checkVersionOrThrow(
+      mutation,
+      existing,
+      existing ? (mapSplitReceivableRow(existing) as unknown as Record<string, unknown>) : null,
+      serverTime,
+      legacyCompareTs
+    );
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+      return;
+    }
+
+    const refetchSplit = async () => {
+      const row = await db
+        .prepare('SELECT * FROM split_receivables WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return {
+        row,
+        mapped: row ? (mapSplitReceivableRow(row) as unknown as Record<string, unknown>) : null,
+      };
+    };
+
+    if (mutation.op === 'delete') {
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          `UPDATE split_receivables SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+        )
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(
+        db,
+        uid,
+        mutation,
+        serverTime,
+        expectedEpoch,
+        delStmt,
+        [],
+        refetchSplit,
+        check.legacyClientTs
+      );
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = runValidation(() =>
+      validateSplitReceivableInput(
+        {
+          ledgerId: p.ledgerId !== undefined ? String(p.ledgerId) : undefined,
+          splitGroupId: p.splitGroupId !== undefined ? String(p.splitGroupId) : '',
+          counterparty: String(p.counterparty || ''),
+          date: String(p.date || ''),
+          itemName: String(p.itemName || ''),
+          category: String(p.category || '其他'),
+          amount: Number(p.amount),
+          settledAmount: p.settledAmount !== undefined ? Number(p.settledAmount) : 0,
+          currency: String(p.currency || 'TWD'),
+          fxRate: p.fxRate !== undefined ? Number(p.fxRate) : undefined,
+          status: p.status !== undefined ? String(p.status) : undefined,
+          sourceCashflowId:
+            p.sourceCashflowId !== undefined ? (p.sourceCashflowId as string | null) : null,
+          sourceAccountId:
+            p.sourceAccountId !== undefined ? (p.sourceAccountId as string | null) : null,
+          sourceAdjustmentId:
+            p.sourceAdjustmentId !== undefined ? (p.sourceAdjustmentId as string | null) : null,
+          note: String(p.note || ''),
+        },
+        defaultFxRate
+      )
+    );
+
+    const refs = collectChangedRefs(existing, [
+      { kind: 'ledger', column: 'ledger_id', value: v.ledgerId, label: '帳本' },
+      { kind: 'asset', column: 'source_account_id', value: v.sourceAccountId, label: '付款活存帳戶' },
+    ]);
+    const guard = refGuardSql(db, uid, refs);
+
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE split_receivables
+             SET ledger_id = ?, split_group_id = ?, counterparty = ?, date = ?, item_name = ?, category = ?, amount = ?, settled_amount = ?, currency = ?, fx_rate = ?, twd_amount = ?, status = ?, source_cashflow_id = ?, source_account_id = ?, source_adjustment_id = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${guard.sql}`
+          )
+          .bind(
+            v.ledgerId,
+            v.splitGroupId,
+            v.counterparty,
+            v.date,
+            v.itemName,
+            v.category,
+            v.amount,
+            v.settledAmount,
+            v.currency,
+            v.fxRate,
+            v.twdAmount,
+            v.status,
+            v.sourceCashflowId,
+            v.sourceAccountId,
+            v.sourceAdjustmentId,
+            v.note,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch,
+            ...guard.binds
+          )
+      : db
+          .prepare(
+            `INSERT INTO split_receivables
+              (user_id, id, ledger_id, split_group_id, counterparty, date, item_name, category, amount, settled_amount, currency, fx_rate, twd_amount, status, source_cashflow_id, source_account_id, source_adjustment_id, note, created_at, updated_at, deleted_at, version, change_seq)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${guard.sql}
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.ledgerId,
+            v.splitGroupId,
+            v.counterparty,
+            v.date,
+            v.itemName,
+            v.category,
+            v.amount,
+            v.settledAmount,
+            v.currency,
+            v.fxRate,
+            v.twdAmount,
+            v.status,
+            v.sourceCashflowId,
+            v.sourceAccountId,
+            v.sourceAdjustmentId,
+            v.note,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            uid,
+            expectedEpoch,
+            ...guard.binds
+          );
+
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      [],
+      refetchSplit,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, refs)
+    );
+    return;
+  }
+
   if (mutation.entity === 'asset') {
     const existing = await readExistingRow(db, uid, 'asset_items', 'id', mutation.recordId);
     const check = checkVersionOrThrow(
@@ -2897,6 +3115,7 @@ async function readDeltaWithState(
     { table: 'rent_utility_records', order: '', liveOnlyWhenFull: true },
   ];
   const goalTable = { table: 'financial_goals', order: 'sort_order ASC, created_at ASC', liveOnlyWhenFull: true };
+  const splitTable = { table: 'split_receivables', order: 'date DESC, created_at DESC', liveOnlyWhenFull: true };
   const upper =
     mode.kind === 'seq' && typeof mode.maxSeq === 'number'
       ? { sql: '?', binds: [mode.maxSeq] as unknown[] }
@@ -2922,15 +3141,24 @@ async function readDeltaWithState(
   ];
   const coreStmts = coreTables.map(buildEntityStmt);
   let includeGoals = true;
+  let includeSplits = true;
   let results: D1Result<unknown>[];
   try {
-    results = await db.batch([...headerStmts, ...coreStmts, buildEntityStmt(goalTable)]);
+    results = await db.batch([...headerStmts, ...coreStmts, buildEntityStmt(goalTable), buildEntityStmt(splitTable)]);
   } catch (err) {
-    if (!/no such table:\s*financial_goals/i.test(err instanceof Error ? err.message : String(err))) {
+    if (!/no such table:\s*(financial_goals|split_receivables)/i.test(err instanceof Error ? err.message : String(err))) {
       throw err;
     }
-    includeGoals = false;
-    results = await db.batch([...headerStmts, ...coreStmts]);
+    const existingOpt = await db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables')")
+      .all<{ name: string }>();
+    const optNames = new Set((existingOpt.results || []).map((r) => r.name));
+    includeGoals = optNames.has('financial_goals');
+    includeSplits = optNames.has('split_receivables');
+    const fallbackBatch: D1PreparedStatement[] = [...headerStmts, ...coreStmts];
+    if (includeGoals) fallbackBatch.push(buildEntityStmt(goalTable));
+    if (includeSplits) fallbackBatch.push(buildEntityStmt(splitTable));
+    results = await db.batch(fallbackBatch);
   }
   const rowsOf = (i: number) => (results[i]?.results || []) as Record<string, unknown>[];
   const stateRow = rowsOf(0)[0];
@@ -2951,6 +3179,9 @@ async function readDeltaWithState(
   const includeRents =
     mode.kind === 'full' ? true : mode.kind === 'since' ? Boolean(rents && rents.updatedAt > mode.since) : inSeqWindow(rentsRow);
   const base = 3;
+  let nextIdx = base + 9;
+  const goalsRows = includeGoals ? rowsOf(nextIdx++) : [];
+  const splitsRows = includeSplits ? rowsOf(nextIdx++) : [];
   const delta: SyncDelta = {
     settings: includeSettings ? settings : null,
     ledgers: rowsOf(base).map(mapLedgerRow),
@@ -2963,7 +3194,8 @@ async function readDeltaWithState(
     netWorthHistory: rowsOf(base + 7).map(mapNetWorthRow),
     rentUtilityRecords: rowsOf(base + 8).map(mapUtilityRecordRow),
     rentUtilityRents: includeRents ? rents : null,
-    financialGoals: includeGoals ? rowsOf(base + 9).map(mapFinancialGoalRow) : [],
+    financialGoals: goalsRows.map(mapFinancialGoalRow),
+    splitReceivables: splitsRows.map(mapSplitReceivableRow),
   };
   return { delta, changeSeq, dataEpoch };
 }
@@ -3188,14 +3420,14 @@ export async function processSyncRequest(
       try {
         results = await db.batch(stmts);
       } catch (err) {
-        if (!/no such table:\s*financial_goals/i.test(err instanceof Error ? err.message : String(err))) {
+        if (!/no such table:\s*(financial_goals|split_receivables)/i.test(err instanceof Error ? err.message : String(err))) {
           throw err;
         }
-        // Pre-0021 DB: drop financial_goals from prefetch so applySingleMutation rejects it cleanly
+        // Pre-migration DB: drop optional post-0020 tables from prefetch so applySingleMutation rejects them cleanly
         const fallbackStmts = stmts.slice(0, idemStatements);
         prefetchedRowKeys = [];
         rowKeys.forEach((key, idx) => {
-          if (!key.startsWith('financial_goals:')) {
+          if (!key.startsWith('financial_goals:') && !key.startsWith('split_receivables:')) {
             prefetchedRowKeys.push(key);
             fallbackStmts.push(stmts[idemStatements + idx]);
           }
@@ -3218,10 +3450,17 @@ export async function processSyncRequest(
   let processedMutations = 0;
   // H5: before starting a unit, make sure its worst case still fits the query budget (and the per-request
   // mutation cap). The first unit is always processed so every request makes progress.
-  const fitsBudget = (unitSize: number): boolean =>
-    processedMutations === 0 ||
-    (processedMutations + unitSize <= SYNC_MAX_MUTATIONS_PER_REQUEST &&
-      counter.used() + PER_MUTATION_QUERY_WORST * unitSize + SYNC_TAIL_QUERY_RESERVE <= queryBudget);
+  // Atomic groups commit all members in a single D1 batch (1 query on success; bounded diagnosis on error).
+  const fitsBudget = (unitSize: number, isAtomicGroup = false): boolean => {
+    if (processedMutations === 0) return true;
+    const worstQueries = isAtomicGroup
+      ? Math.min(PER_MUTATION_QUERY_WORST * unitSize, 4 + 3 * unitSize)
+      : PER_MUTATION_QUERY_WORST * unitSize;
+    return (
+      processedMutations + unitSize <= SYNC_MAX_MUTATIONS_PER_REQUEST &&
+      counter.used() + worstQueries + SYNC_TAIL_QUERY_RESERVE <= queryBudget
+    );
+  };
 
   const handledIdx = new Set<number>();
   for (let idx = 0; idx < mutations.length; idx++) {
@@ -3249,7 +3488,7 @@ export async function processSyncRequest(
       if (memberIdx.length > 1) {
         const members = memberIdx.map((j) => mutations[j]);
         const pendingCount = members.filter((m) => !alreadyApplied.has(m.mutationId)).length;
-        if (pendingCount > 0 && !fitsBudget(pendingCount)) break; // H5: leave the rest for the next request
+        if (pendingCount > 0 && !fitsBudget(pendingCount, true)) break; // H5: leave the rest for the next request
         for (const j of memberIdx) handledIdx.add(j);
         processedMutations += pendingCount;
         if (await processGroup(members)) break;
@@ -3396,6 +3635,7 @@ export async function exportFullSnapshot(
     rentUtilityRecords: delta.rentUtilityRecords,
     rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db, uid)),
     financialGoals: delta.financialGoals || [],
+    splitReceivables: delta.splitReceivables || [],
   };
 }
 
@@ -3435,6 +3675,7 @@ export async function importFullSnapshot(
     'netWorthHistory',
     'rentUtilityRecords',
     'financialGoals',
+    'splitReceivables',
   ] as const) {
     const list = (data as Record<string, unknown>)[field];
     if (list === undefined || list === null) continue;
@@ -3636,14 +3877,34 @@ export async function importFullSnapshot(
     });
   }
 
-  const hasGoalsTable = Boolean(
-    await db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'financial_goals'")
-      .first()
-  );
+  const validatedSplits: Array<{
+    id: string;
+    v: ReturnType<typeof validateSplitReceivableInput>;
+    createdAt: string;
+  }> = [];
+  for (const sp of data.splitReceivables || []) {
+    if (!sp || sp.deletedAt) continue;
+    validatedSplits.push({
+      id: importText(sp.id, 'id') || crypto.randomUUID(),
+      v: validateSplitReceivableInput(sp, fxForImportSource),
+      createdAt: importText(sp.createdAt, 'createdAt') || nowIso,
+    });
+  }
+
+  const optTablesRes = await db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables')")
+    .all<{ name: string }>();
+  const optTables = new Set((optTablesRes.results || []).map((r) => r.name));
+  const hasGoalsTable = optTables.has('financial_goals');
+  const hasSplitsTable = optTables.has('split_receivables');
   if (!hasGoalsTable && validatedGoals.length > 0) {
     throw new Error(
       '伺服器資料庫尚未完成升級（缺少財務目標資料表），請先執行資料庫遷移後再匯入備份。'
+    );
+  }
+  if (!hasSplitsTable && validatedSplits.length > 0) {
+    throw new Error(
+      '伺服器資料庫尚未完成升級（缺少代墊／拆帳資料表），請先執行 0023 資料庫遷移後再匯入備份。'
     );
   }
 
@@ -3671,6 +3932,9 @@ export async function importFullSnapshot(
     );
     if (hasGoalsTable) {
       stmts.push(db.prepare('DELETE FROM financial_goals WHERE user_id = ?').bind(uid));
+    }
+    if (hasSplitsTable) {
+      stmts.push(db.prepare('DELETE FROM split_receivables WHERE user_id = ?').bind(uid));
     }
     if (validatedUtilityRecords.length > 0) {
       stmts.push(db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid));
@@ -4071,6 +4335,45 @@ export async function importFullSnapshot(
         v.fireSwrPct,
         v.targetDate,
         v.sortOrder,
+        v.note,
+        createdAt,
+        nowIso,
+      ])
+    );
+  }
+
+  if (hasSplitsTable && validatedSplits.length > 0) {
+    chunked(
+      `INSERT INTO split_receivables
+        (user_id, id, ledger_id, split_group_id, counterparty, date, item_name, category, amount, settled_amount, currency, fx_rate, twd_amount, status, source_cashflow_id, source_account_id, source_adjustment_id, note, created_at, updated_at, deleted_at, version, change_seq)`,
+      19,
+      tailLive,
+      `ON CONFLICT(user_id, id) DO UPDATE SET
+         ledger_id = excluded.ledger_id, split_group_id = excluded.split_group_id, counterparty = excluded.counterparty,
+         date = excluded.date, item_name = excluded.item_name, category = excluded.category,
+         amount = excluded.amount, settled_amount = excluded.settled_amount, currency = excluded.currency,
+         fx_rate = excluded.fx_rate, twd_amount = excluded.twd_amount, status = excluded.status,
+         source_cashflow_id = excluded.source_cashflow_id, source_account_id = excluded.source_account_id,
+         source_adjustment_id = excluded.source_adjustment_id, note = excluded.note, updated_at = excluded.updated_at,
+         version = split_receivables.version + 1, change_seq = excluded.change_seq
+       WHERE split_receivables.deleted_at IS NULL`,
+      validatedSplits.map(({ id, v, createdAt }) => [
+        id,
+        v.ledgerId,
+        v.splitGroupId,
+        v.counterparty,
+        v.date,
+        v.itemName,
+        v.category,
+        v.amount,
+        v.settledAmount,
+        v.currency,
+        v.fxRate,
+        v.twdAmount,
+        v.status,
+        v.sourceCashflowId,
+        v.sourceAccountId,
+        v.sourceAdjustmentId,
         v.note,
         createdAt,
         nowIso,
