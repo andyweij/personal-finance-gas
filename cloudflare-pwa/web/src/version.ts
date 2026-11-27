@@ -2,7 +2,7 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.8.17';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.9.0';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0017';
@@ -10,6 +10,7 @@ export const DB_SCHEMA_VERSION = '0017';
 export const SW_CACHE_VERSION = 'finance-pwa';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.9.0：流水帳跨月全文搜尋與條件篩選加總（支援多詞 AND 關鍵字搜尋與 XSS 安全高亮、本月／近 3 月／今年／全部／自訂日期、交易類型複選、分類、連動活存、金額區間與多帳本範圍篩選；即時加總支出／收入／投資／淨現金流並支援一鍵匯出篩選結果 CSV，純本機 IndexedDB 0ms 查詢）',
   'v1.8.17：同步修正（離線時新增帳戶、轉帳到該帳戶、再修改該帳戶，恢復連線後轉帳不再整筆被拒；仍在使用舊版頁面的裝置，連動到尚未上傳的帳戶或帳本的紀錄不再被拒，已刪除的帳戶或帳本仍會拒絕）',
   'v1.8.16：資料表結構調整（重建 12 張使用者資料表，移除「沒有指定使用者時歸給管理員」的預設值；之後任何漏填使用者的寫入都會直接失敗，不會把資料記到管理員名下。既有資料、索引與功能都不變，使用上沒有差異）',
   'v1.8.15：細節修正（儲存時防止連點重複建立；CSV 匯出防公式注入、水電 CSV 正確跳脫；「今天」、匯出檔名與管理畫面日期一律依台北時間；不再顯示 -NT$ 0、-0.0%；iOS 下載不再拿到空檔案；視窗支援 Esc 關閉與鍵盤焦點、提示訊息可被讀屏器播報、可雙指縮放；金額改用十進位捨入，美元貸款保留小數、隱含利率可推算到 50%、賣出超過持股時拒絕並正確計算；同步遇到多分頁同時寫入會重試、批次選取與標記在同一交易、切換帳號等待進行中的操作；只重繪目前分頁、跨分頁重新載入合併處理）',

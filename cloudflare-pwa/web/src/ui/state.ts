@@ -1,6 +1,37 @@
 import type { AuthUser, CachedPasskeyDto, PnlColorScheme } from '../../../shared/types';
+import type { LedgerDatePreset } from '../../../shared/ledgerSearch';
 import type { SyncEngine } from '../sync/syncEngine';
 import type { LocalMeta } from '../db/localDb';
+
+export interface LedgerSearchUiState {
+  query: string;
+  datePreset: LedgerDatePreset;
+  dateFrom: string;
+  dateTo: string;
+  types: string[];
+  category: string;
+  linkedAccountId: string;
+  minAmount: string;
+  maxAmount: string;
+  scopeMode: 'active' | 'net_worth' | 'all';
+  filtersExpanded: boolean;
+}
+
+export function createDefaultLedgerSearchState(): LedgerSearchUiState {
+  return {
+    query: '',
+    datePreset: 'month',
+    dateFrom: '',
+    dateTo: '',
+    types: [],
+    category: '',
+    linkedAccountId: '',
+    minAmount: '',
+    maxAmount: '',
+    scopeMode: 'active',
+    filtersExpanded: false,
+  };
+}
 
 export type StockChartType = 'donut' | 'pie' | 'hbar' | 'treemap';
 export type StockChartDimension = 'value' | 'category' | 'cost' | 'market';
@@ -22,6 +53,7 @@ export interface AppUiState {
   ledgerPage: number;
   pageSize: number;
   selectedCalendarDay: string;
+  ledgerSearch: LedgerSearchUiState;
   overviewPeriod: 'monthly' | 'yearly';
   overviewExpandedGroups: string[];
   chartMetric: 'netCashFlow' | 'investment' | 'totalSavings' | 'daily' | 'income';

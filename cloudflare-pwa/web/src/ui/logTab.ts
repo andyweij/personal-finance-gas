@@ -1,5 +1,5 @@
 import { todayInTimeZone } from '../../../shared/dates';
-import { DEFAULT_LEDGER_ID, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
+import { ALL_CASHFLOW_TYPES, DEFAULT_LEDGER_ID, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
 import {
   aggregatePeriodMetrics,
   computeAllSavingsSummary,
@@ -7,11 +7,20 @@ import {
   getEffectiveLedgerId,
   isCashFlowIncome,
 } from '../../../shared/calculations';
-import type { CashFlowLog } from '../../../shared/types';
+import { exportCashFlowCsv } from '../../../shared/csv';
+import {
+  collectAvailableCategories,
+  searchCashFlowLogs,
+  splitHighlightSegments,
+  type LedgerDatePreset,
+  type LedgerSearchFilter,
+  type LedgerSearchResult,
+} from '../../../shared/ledgerSearch';
+import type { CashFlowLog, Ledger } from '../../../shared/types';
 import { openAccountTransferModal, openSavingsAccountModal } from './assetsTab';
-import { el, fmtMoney, fmtNum, showToast, TRASH_SVG, fmtPct } from './helpers';
-import { renderLedgerSwitcherBar, resolveActiveLedger } from './ledgerUi';
-import type { UiContext } from './state';
+import { downloadTextFile, el, fmtMoney, fmtNum, showToast, TRASH_SVG, fmtPct } from './helpers';
+import { getActiveLedgers, renderLedgerSwitcherBar, resolveActiveLedger } from './ledgerUi';
+import { createDefaultLedgerSearchState, type UiContext } from './state';
 
 export function getSelectedYearMonth(year: number, month: number): string {
   return `${year}-${String(month).padStart(2, '0')}`;
@@ -264,10 +273,75 @@ function renderSavingsStripAndChips(ctx: UiContext): void {
   updateSavingsPreview(ctx);
 }
 
+function appendHighlightedText(container: HTMLElement, text: string, tokens: string[]): void {
+  const segs = splitHighlightSegments(text, tokens);
+  for (const seg of segs) {
+    if (seg.match) {
+      const mark = document.createElement('mark');
+      mark.className = 'search-hit';
+      mark.textContent = seg.text;
+      container.appendChild(mark);
+    } else {
+      container.appendChild(document.createTextNode(seg.text));
+    }
+  }
+}
+
+function parseOptionalAmount(raw: string): number | null {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function buildLedgerSearchFilter(ctx: UiContext, activeLedgerId: string, ym: string): LedgerSearchFilter {
+  const s = ctx.state.ledgerSearch;
+  const ledgerScope =
+    s.scopeMode === 'all' ? 'all' : s.scopeMode === 'net_worth' ? 'net_worth' : activeLedgerId;
+  return {
+    query: s.query,
+    datePreset: s.datePreset,
+    anchorYm: ym,
+    dateFrom: s.dateFrom,
+    dateTo: s.dateTo,
+    types: s.types,
+    category: s.category,
+    linkedAccountId: s.linkedAccountId,
+    minAmount: parseOptionalAmount(s.minAmount),
+    maxAmount: parseOptionalAmount(s.maxAmount),
+    ledgerScope,
+  };
+}
+
+function countAdvancedFilters(ctx: UiContext): number {
+  const s = ctx.state.ledgerSearch;
+  let count = 0;
+  if (s.scopeMode !== 'active') count++;
+  if (s.types.length > 0) count++;
+  if (s.category) count++;
+  if (s.linkedAccountId) count++;
+  if (parseOptionalAmount(s.minAmount) !== null || parseOptionalAmount(s.maxAmount) !== null) count++;
+  if (s.datePreset === 'custom' && (s.dateFrom || s.dateTo)) count++;
+  return count;
+}
+
+function formatEffectiveRangeLabel(
+  preset: LedgerDatePreset,
+  range: { from: string | null; to: string | null },
+  swapped: boolean
+): string {
+  if (preset === 'all') return '全部期間';
+  const from = range.from || '最早';
+  const to = range.to || '最新';
+  return `${from} ～ ${to}${swapped ? '（已對調）' : ''}`;
+}
+
 function createLedgerRow(
   ctx: UiContext,
   item: CashFlowLog,
-  savingsNameById: Map<string, string>
+  savingsNameById: Map<string, string>,
+  tokens: string[] = [],
+  ledgerNameById: Map<string, string> | null = null
 ): HTMLDivElement {
   const row = document.createElement('div');
   row.className = 'list-row';
@@ -288,11 +362,16 @@ function createLedgerRow(
   main.className = 'item-main';
   const t = document.createElement('div');
   t.className = 'item-title';
-  t.textContent = item.itemName || item.category;
+  appendHighlightedText(t, item.itemName || item.category, tokens);
   const sub = document.createElement('div');
   sub.className = 'item-sub tnum';
   const accName = item.linkedAccountId ? savingsNameById.get(item.linkedAccountId) : null;
-  sub.textContent = `${item.date} · ${item.type} · ${item.category}${accName ? ` · 活存:${accName}` : ''}${item.note ? ' · ' + item.note : ''}`;
+  const ledgerTag =
+    ledgerNameById && ctx.state.ledgerSearch.scopeMode !== 'active'
+      ? ledgerNameById.get(getEffectiveLedgerId(item)) || null
+      : null;
+  const subText = `${item.date}${ledgerTag ? ` · [${ledgerTag}]` : ''} · ${item.type} · ${item.category}${accName ? ` · 活存:${accName}` : ''}${item.note ? ' · ' + item.note : ''}`;
+  appendHighlightedText(sub, subText, tokens);
   main.appendChild(t);
   main.appendChild(sub);
   leading.appendChild(dotBox);
@@ -325,9 +404,307 @@ function createLedgerRow(
   return row;
 }
 
+function renderLedgerSearchControls(
+  ctx: UiContext,
+  activeLedger: Ledger,
+  ledgers: Ledger[],
+  ym: string,
+  searchResult: LedgerSearchResult
+): void {
+  const s = ctx.state.ledgerSearch;
+  const snap = ctx.engine.getSnapshot();
+
+  const searchInput = el<HTMLInputElement>('ledgerSearchInput');
+  if (document.activeElement !== searchInput && searchInput.value !== s.query) {
+    searchInput.value = s.query;
+  }
+  el('ledgerSearchClearBtn').style.display = s.query ? 'inline-flex' : 'none';
+
+  const advCount = countAdvancedFilters(ctx);
+  const toggleBtn = el('ledgerFilterToggleBtn');
+  toggleBtn.classList.toggle('active', s.filtersExpanded || advCount > 0);
+  toggleBtn.setAttribute('aria-expanded', String(s.filtersExpanded));
+  const countBadge = el('ledgerFilterCountBadge');
+  countBadge.style.display = advCount > 0 ? 'inline-flex' : 'none';
+  countBadge.textContent = String(advCount);
+
+  el('ledgerFilterDrawer').style.display = s.filtersExpanded ? 'flex' : 'none';
+  el('ledgerCustomDateRow').style.display = s.datePreset === 'custom' ? 'grid' : 'none';
+
+  const fromInput = el<HTMLInputElement>('ledgerDateFromInput');
+  const toInput = el<HTMLInputElement>('ledgerDateToInput');
+  if (document.activeElement !== fromInput) fromInput.value = s.dateFrom;
+  if (document.activeElement !== toInput) toInput.value = s.dateTo;
+
+  const minInput = el<HTMLInputElement>('ledgerMinAmountInput');
+  const maxInput = el<HTMLInputElement>('ledgerMaxAmountInput');
+  if (document.activeElement !== minInput) minInput.value = s.minAmount;
+  if (document.activeElement !== maxInput) maxInput.value = s.maxAmount;
+
+  document.querySelectorAll<HTMLButtonElement>('#ledgerDatePresetRow .chip-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.datePreset === s.datePreset);
+  });
+
+  const scopeBlock = el('ledgerScopeFilterBlock');
+  scopeBlock.style.display = ledgers.length > 1 ? '' : 'none';
+  document.querySelectorAll<HTMLButtonElement>('#ledgerScopeModeChips .chip-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.scopeMode === s.scopeMode);
+  });
+
+  // Type chips (multi-select)
+  const typeBox = el('ledgerTypeFilterChips');
+  typeBox.innerHTML = '';
+  for (const t of ALL_CASHFLOW_TYPES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chip-btn sm' + (s.types.includes(t) ? ' active' : '');
+    btn.textContent = t;
+    btn.addEventListener('click', () => {
+      const idx = s.types.indexOf(t);
+      if (idx >= 0) s.types.splice(idx, 1);
+      else s.types.push(t);
+      ctx.state.ledgerPage = 1;
+      renderLogTab(ctx);
+    });
+    typeBox.appendChild(btn);
+  }
+
+  // Category select
+  const ledgerScope =
+    s.scopeMode === 'all' ? 'all' : s.scopeMode === 'net_worth' ? 'net_worth' : activeLedger.id;
+  const categories = collectAvailableCategories(snap.cashflowLogs, ledgerScope, ledgers);
+  if (s.category && !categories.includes(s.category)) {
+    categories.unshift(s.category);
+  }
+  const catSel = el<HTMLSelectElement>('ledgerCategoryFilterSelect');
+  catSel.innerHTML = '';
+  const allCatOpt = document.createElement('option');
+  allCatOpt.value = '';
+  allCatOpt.textContent = '全部分類';
+  catSel.appendChild(allCatOpt);
+  for (const c of categories) {
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.textContent = c;
+    catSel.appendChild(opt);
+  }
+  catSel.value = s.category;
+
+  // Linked savings account select
+  const accSel = el<HTMLSelectElement>('ledgerAccountFilterSelect');
+  accSel.innerHTML = '';
+  const allAccOpt = document.createElement('option');
+  allAccOpt.value = '';
+  allAccOpt.textContent = '全部帳戶';
+  accSel.appendChild(allAccOpt);
+  const noneAccOpt = document.createElement('option');
+  noneAccOpt.value = '__none__';
+  noneAccOpt.textContent = '未連動活存';
+  accSel.appendChild(noneAccOpt);
+  const savingsAccs = snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings);
+  for (const acc of savingsAccs) {
+    const opt = document.createElement('option');
+    opt.value = acc.id;
+    opt.textContent = acc.itemName;
+    accSel.appendChild(opt);
+  }
+  accSel.value = s.linkedAccountId;
+
+  // Summary bar (visible whenever any filter or search is active)
+  const summaryBar = el('ledgerSearchSummaryBar');
+  const { summary } = searchResult;
+  if (summary.hasActiveFilter) {
+    summaryBar.style.display = 'flex';
+    const rangeTxt =
+      s.datePreset === 'month'
+        ? ym
+        : formatEffectiveRangeLabel(s.datePreset, summary.effectiveDateRange, summary.swappedDateRange);
+    el('ledgerSummaryTitle').textContent = `符合 ${summary.count} 筆 · ${rangeTxt}`;
+
+    const grid = el('ledgerSummaryGrid');
+    grid.innerHTML = '';
+    const tiles: Array<{ label: string; value: string; cls: string }> = [
+      { label: '消費支出', value: fmtMoney(summary.totalExpense, ctx.state.masked), cls: '' },
+      { label: '總收入', value: fmtMoney(summary.totalIncome, ctx.state.masked), cls: 'pos' },
+      { label: '投資流出', value: fmtMoney(summary.totalInvestment, ctx.state.masked), cls: 'inv' },
+      {
+        label: '淨現金流',
+        value: fmtMoney(summary.netCashFlow, ctx.state.masked),
+        cls: summary.netCashFlow > 0 ? 'pos' : summary.netCashFlow < 0 ? 'neg' : '',
+      },
+    ];
+    for (const tile of tiles) {
+      const cell = document.createElement('div');
+      cell.className = 'ledger-summary-cell';
+      const lbl = document.createElement('span');
+      lbl.className = 'ledger-summary-k';
+      lbl.textContent = tile.label;
+      const val = document.createElement('strong');
+      val.className = 'ledger-summary-v' + (tile.cls ? ' ' + tile.cls : '');
+      val.textContent = tile.value;
+      cell.appendChild(lbl);
+      cell.appendChild(val);
+      grid.appendChild(cell);
+    }
+    el<HTMLButtonElement>('ledgerExportCsvBtn').disabled = summary.count === 0;
+  } else {
+    summaryBar.style.display = 'none';
+  }
+
+  // Month nav vs cross-month mode
+  const isCrossMonth = s.datePreset !== 'month';
+  el('ledgerMonthNavControls').style.display = isCrossMonth ? 'none' : 'flex';
+  const crossBadge = el('ledgerCrossMonthRangeBadge');
+  if (isCrossMonth) {
+    crossBadge.style.display = 'inline-flex';
+    crossBadge.textContent = `跨月範圍：${formatEffectiveRangeLabel(
+      s.datePreset,
+      summary.effectiveDateRange,
+      summary.swappedDateRange
+    )}`;
+  } else {
+    crossBadge.style.display = 'none';
+  }
+
+  const calBtn = document.querySelector<HTMLButtonElement>('#ledgerModeToggle [data-ledger-mode="calendar"]');
+  const listBtn = document.querySelector<HTMLButtonElement>('#ledgerModeToggle [data-ledger-mode="list"]');
+  if (calBtn) {
+    calBtn.disabled = isCrossMonth;
+    calBtn.title = isCrossMonth ? '跨月搜尋僅支援列表檢視' : '切換至單月日曆檢視';
+  }
+  const showCalendar = !isCrossMonth && ctx.state.ledgerMode === 'calendar';
+  listBtn?.classList.toggle('active', !showCalendar);
+  calBtn?.classList.toggle('active', showCalendar);
+  el('ledgerListMode').style.display = showCalendar ? 'none' : 'flex';
+  el('ledgerCalendarMode').style.display = showCalendar ? 'flex' : 'none';
+}
+
+export function bindLedgerSearchEvents(ctx: UiContext): void {
+  let searchTimer: number | undefined;
+  let amountTimer: number | undefined;
+
+  const scheduleRerender = (timerKind: 'search' | 'amount') => {
+    if (timerKind === 'search') {
+      window.clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(() => {
+        ctx.state.ledgerPage = 1;
+        renderLogTab(ctx);
+      }, 150);
+    } else {
+      window.clearTimeout(amountTimer);
+      amountTimer = window.setTimeout(() => {
+        ctx.state.ledgerPage = 1;
+        renderLogTab(ctx);
+      }, 150);
+    }
+  };
+
+  el<HTMLInputElement>('ledgerSearchInput').addEventListener('input', (e) => {
+    ctx.state.ledgerSearch.query = (e.target as HTMLInputElement).value;
+    el('ledgerSearchClearBtn').style.display = ctx.state.ledgerSearch.query ? 'inline-flex' : 'none';
+    scheduleRerender('search');
+  });
+
+  el('ledgerSearchClearBtn').addEventListener('click', () => {
+    ctx.state.ledgerSearch.query = '';
+    el<HTMLInputElement>('ledgerSearchInput').value = '';
+    ctx.state.ledgerPage = 1;
+    renderLogTab(ctx);
+    el<HTMLInputElement>('ledgerSearchInput').focus();
+  });
+
+  el('ledgerFilterToggleBtn').addEventListener('click', () => {
+    ctx.state.ledgerSearch.filtersExpanded = !ctx.state.ledgerSearch.filtersExpanded;
+    renderLogTab(ctx);
+  });
+
+  document.querySelectorAll<HTMLButtonElement>('#ledgerDatePresetRow .chip-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const preset = (btn.dataset.datePreset as LedgerDatePreset) || 'month';
+      ctx.state.ledgerSearch.datePreset = preset;
+      if (preset === 'custom') {
+        ctx.state.ledgerSearch.filtersExpanded = true;
+      }
+      ctx.state.ledgerPage = 1;
+      renderLogTab(ctx);
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>('#ledgerScopeModeChips .chip-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.scopeMode as 'active' | 'net_worth' | 'all';
+      ctx.state.ledgerSearch.scopeMode = mode || 'active';
+      ctx.state.ledgerPage = 1;
+      renderLogTab(ctx);
+    });
+  });
+
+  el<HTMLInputElement>('ledgerDateFromInput').addEventListener('change', (e) => {
+    ctx.state.ledgerSearch.dateFrom = (e.target as HTMLInputElement).value;
+    ctx.state.ledgerSearch.datePreset = 'custom';
+    ctx.state.ledgerPage = 1;
+    renderLogTab(ctx);
+  });
+
+  el<HTMLInputElement>('ledgerDateToInput').addEventListener('change', (e) => {
+    ctx.state.ledgerSearch.dateTo = (e.target as HTMLInputElement).value;
+    ctx.state.ledgerSearch.datePreset = 'custom';
+    ctx.state.ledgerPage = 1;
+    renderLogTab(ctx);
+  });
+
+  el<HTMLSelectElement>('ledgerCategoryFilterSelect').addEventListener('change', (e) => {
+    ctx.state.ledgerSearch.category = (e.target as HTMLSelectElement).value;
+    ctx.state.ledgerPage = 1;
+    renderLogTab(ctx);
+  });
+
+  el<HTMLSelectElement>('ledgerAccountFilterSelect').addEventListener('change', (e) => {
+    ctx.state.ledgerSearch.linkedAccountId = (e.target as HTMLSelectElement).value;
+    ctx.state.ledgerPage = 1;
+    renderLogTab(ctx);
+  });
+
+  el<HTMLInputElement>('ledgerMinAmountInput').addEventListener('input', (e) => {
+    ctx.state.ledgerSearch.minAmount = (e.target as HTMLInputElement).value;
+    scheduleRerender('amount');
+  });
+
+  el<HTMLInputElement>('ledgerMaxAmountInput').addEventListener('input', (e) => {
+    ctx.state.ledgerSearch.maxAmount = (e.target as HTMLInputElement).value;
+    scheduleRerender('amount');
+  });
+
+  const resetAllFilters = () => {
+    ctx.state.ledgerSearch = createDefaultLedgerSearchState();
+    ctx.state.ledgerPage = 1;
+    el<HTMLInputElement>('ledgerSearchInput').value = '';
+    renderLogTab(ctx);
+  };
+  el('ledgerResetFiltersBtn').addEventListener('click', resetAllFilters);
+  el('ledgerClearAllBtn').addEventListener('click', resetAllFilters);
+
+  el('ledgerExportCsvBtn').addEventListener('click', () => {
+    const snap = ctx.engine.getSnapshot();
+    const activeLedger = resolveActiveLedger(ctx);
+    const ledgers = getActiveLedgers(ctx);
+    const ym = getSelectedYearMonth(ctx.state.selectedYear, ctx.state.selectedMonth);
+    const filter = buildLedgerSearchFilter(ctx, activeLedger.id, ym);
+    const result = searchCashFlowLogs(snap.cashflowLogs, filter, ledgers, activeLedger.id);
+    if (!result.items.length) {
+      showToast('目前沒有可匯出的篩選紀錄');
+      return;
+    }
+    const csv = exportCashFlowCsv(result.items);
+    downloadTextFile(`cashflow-search-${getTodayYmd()}.csv`, csv, 'text/csv;charset=utf-8');
+    showToast(`已匯出 ${result.items.length} 筆篩選結果 CSV`, 'success');
+  });
+}
+
 export function renderLogTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
   const activeLedger = resolveActiveLedger(ctx);
+  const ledgers = getActiveLedgers(ctx);
   const ym = getSelectedYearMonth(ctx.state.selectedYear, ctx.state.selectedMonth);
 
   renderLedgerSwitcherBar(ctx, el('logLedgerBar'), {
@@ -370,9 +747,14 @@ export function renderLogTab(ctx: UiContext): void {
     ? snap.settings.monthlyDailyBudget
     : Number(activeLedger.monthlyDailyBudget || 0);
 
+  const searchFilter = buildLedgerSearchFilter(ctx, activeLedger.id, ym);
+  const searchResult = searchCashFlowLogs(snap.cashflowLogs, searchFilter, ledgers, activeLedger.id);
+
   el('logMonthBadge').textContent = ym;
   el('ledgerMonthLabel').textContent = ym;
-  el('ledgerCountBadge').textContent = String(monthLogs.length);
+  el('ledgerCountBadge').textContent = String(
+    searchResult.summary.hasActiveFilter ? searchResult.summary.count : monthLogs.length
+  );
 
   const progressTrack = el('budgetProgressTrack');
   if (hasBudgetLimit) {
@@ -411,18 +793,30 @@ export function renderLogTab(ctx: UiContext): void {
   }
 
   renderSavingsStripAndChips(ctx);
+  renderLedgerSearchControls(ctx, activeLedger, ledgers, ym, searchResult);
 
   const savingsNameById = new Map(
     snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
   );
-  renderLedgerList(ctx, monthLogs, savingsNameById);
-  renderLedgerCalendar(ctx, monthLogs, ym, savingsNameById);
+  const ledgerNameById = new Map(ledgers.map((l) => [l.id, l.name]));
+  renderLedgerList(
+    ctx,
+    searchResult.items,
+    savingsNameById,
+    ledgerNameById,
+    searchResult.tokens,
+    searchResult.summary.hasActiveFilter
+  );
+  renderLedgerCalendar(ctx, searchResult.items, ym, savingsNameById, searchResult.tokens, ledgerNameById);
 }
 
 function renderLedgerList(
   ctx: UiContext,
   logs: CashFlowLog[],
-  savingsNameById: Map<string, string>
+  savingsNameById: Map<string, string>,
+  ledgerNameById: Map<string, string>,
+  tokens: string[],
+  hasActiveFilter: boolean
 ): void {
   const total = logs.length;
   const totalPages = Math.max(1, Math.ceil(total / ctx.state.pageSize));
@@ -432,20 +826,21 @@ function renderLedgerList(
   const start = (ctx.state.ledgerPage - 1) * ctx.state.pageSize;
   const slice = logs.slice(start, start + ctx.state.pageSize);
 
+  const emptyMsg = hasActiveFilter ? '沒有符合篩選條件的流水帳紀錄' : '本月尚無流水帳紀錄';
   el('listRangeInfo').textContent = total
     ? `顯示第 ${start + 1}–${Math.min(total, start + ctx.state.pageSize)} 筆，共 ${total} 筆`
-    : '本月尚無流水帳紀錄';
+    : emptyMsg;
 
   const list = el('recentList');
   list.innerHTML = '';
   if (!slice.length) {
     const empty = document.createElement('div');
     empty.className = 'list-empty';
-    empty.textContent = '本月尚無流水帳紀錄';
+    empty.textContent = emptyMsg;
     list.appendChild(empty);
   } else {
     for (const item of slice) {
-      list.appendChild(createLedgerRow(ctx, item, savingsNameById));
+      list.appendChild(createLedgerRow(ctx, item, savingsNameById, tokens, ledgerNameById));
     }
   }
 
@@ -479,7 +874,7 @@ function renderLedgerList(
     btn.textContent = String(pageNum);
     btn.addEventListener('click', () => {
       ctx.state.ledgerPage = pageNum;
-      renderLedgerList(ctx, logs, savingsNameById);
+      renderLedgerList(ctx, logs, savingsNameById, ledgerNameById, tokens, hasActiveFilter);
     });
     pills.appendChild(btn);
   }
@@ -489,7 +884,9 @@ function renderLedgerCalendar(
   ctx: UiContext,
   logs: CashFlowLog[],
   ym: string,
-  savingsNameById: Map<string, string>
+  savingsNameById: Map<string, string>,
+  tokens: string[] = [],
+  ledgerNameById: Map<string, string> | null = null
 ): void {
   const year = ctx.state.selectedYear;
   const month = ctx.state.selectedMonth;
@@ -568,7 +965,7 @@ function renderLedgerCalendar(
 
     cell.addEventListener('click', () => {
       ctx.state.selectedCalendarDay = dateStr;
-      renderLedgerCalendar(ctx, logs, ym, savingsNameById);
+      renderLedgerCalendar(ctx, logs, ym, savingsNameById, tokens, ledgerNameById);
     });
     grid.appendChild(cell);
   }
@@ -588,7 +985,7 @@ function renderLedgerCalendar(
     dayList.appendChild(empty);
   } else {
     for (const item of sel.logs) {
-      dayList.appendChild(createLedgerRow(ctx, item, savingsNameById));
+      dayList.appendChild(createLedgerRow(ctx, item, savingsNameById, tokens, ledgerNameById));
     }
   }
 }

@@ -18,6 +18,7 @@ import {
 import { createCrossTabChannel } from './sync/crossTab';
 import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast, bindSubmit } from './ui/helpers';
 import {
+  bindLedgerSearchEvents,
   getTodayYmd,
   renderLogCategories,
   renderLogTab,
@@ -70,7 +71,7 @@ import type {
   StockChartType,
   UiContext,
 } from './ui/state';
-import { applyAuthMetaToState } from './ui/state';
+import { applyAuthMetaToState, createDefaultLedgerSearchState } from './ui/state';
 
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
 
@@ -304,6 +305,7 @@ async function bootstrap(): Promise<void> {
     ledgerPage: 1,
     pageSize: 10,
     selectedCalendarDay: getTodayYmd(),
+    ledgerSearch: createDefaultLedgerSearchState(),
     overviewPeriod: 'monthly',
     overviewExpandedGroups: [],
     chartMetric: 'netCashFlow',
@@ -462,6 +464,8 @@ async function bootstrap(): Promise<void> {
         state.recurringLedgerScope = 'all';
         state.flippedStockIds = [];
         state.logLinkedAccountTouched = false;
+        state.ledgerSearch = createDefaultLedgerSearchState();
+        state.ledgerPage = 1;
       } else {
         ctx.engine?.setExpectedUserId(user.id);
       }
@@ -805,12 +809,13 @@ function bindEvents(ctx: UiContext): void {
 
   document.querySelectorAll<HTMLButtonElement>('#ledgerModeToggle .mini-seg-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
+      if (btn.disabled) return;
       ctx.state.ledgerMode = btn.dataset.ledgerMode as 'list' | 'calendar';
-      document.querySelectorAll('#ledgerModeToggle .mini-seg-btn').forEach((b) => b.classList.toggle('active', b === btn));
-      el('ledgerListMode').style.display = ctx.state.ledgerMode === 'list' ? 'flex' : 'none';
-      el('ledgerCalendarMode').style.display = ctx.state.ledgerMode === 'calendar' ? 'flex' : 'none';
+      renderLogTab(ctx);
     });
   });
+
+  bindLedgerSearchEvents(ctx);
 
   const shiftMonth = (delta: number) => {
     let y = ctx.state.selectedYear;

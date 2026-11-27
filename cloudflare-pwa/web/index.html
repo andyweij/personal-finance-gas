@@ -204,8 +204,98 @@
       </form>
 
       <div id="ledgerPanel" style="display:none;flex-direction:column;gap:12px">
-        <div class="month-nav">
-          <div class="month-nav-controls">
+        <div class="card compact ledger-search-card" id="ledgerSearchCard">
+          <div class="ledger-search-row">
+            <div class="ledger-search-input-wrap">
+              <svg class="ledger-search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+              <input id="ledgerSearchInput" class="ledger-search-input" type="search" placeholder="搜尋項目、備註、分類（空白可多詞）" autocomplete="off" aria-label="搜尋流水帳" />
+              <button type="button" class="ledger-search-clear" id="ledgerSearchClearBtn" aria-label="清除關鍵字" style="display:none">✕</button>
+            </div>
+            <button type="button" class="btn btn-outline btn-sm ledger-filter-toggle" id="ledgerFilterToggleBtn" aria-expanded="false">
+              <span>篩選</span>
+              <span class="ledger-filter-count" id="ledgerFilterCountBadge" style="display:none">0</span>
+            </button>
+          </div>
+
+          <div class="quick-row ledger-preset-row" id="ledgerDatePresetRow">
+            <button type="button" class="chip-btn sm active" data-date-preset="month">本月</button>
+            <button type="button" class="chip-btn sm" data-date-preset="3m">近 3 月</button>
+            <button type="button" class="chip-btn sm" data-date-preset="year">今年</button>
+            <button type="button" class="chip-btn sm" data-date-preset="all">全部</button>
+            <button type="button" class="chip-btn sm" data-date-preset="custom">自訂日期</button>
+          </div>
+
+          <div class="ledger-filter-drawer" id="ledgerFilterDrawer" style="display:none">
+            <div class="row-2" id="ledgerCustomDateRow" style="display:none">
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="ledgerDateFromInput">起始日期</label>
+                <input id="ledgerDateFromInput" class="tnum" type="date" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="ledgerDateToInput">結束日期</label>
+                <input id="ledgerDateToInput" class="tnum" type="date" />
+              </div>
+            </div>
+
+            <div id="ledgerScopeFilterBlock">
+              <label class="section-label">帳本範圍</label>
+              <div class="chip-group" id="ledgerScopeModeChips" style="margin-bottom:0">
+                <button type="button" class="chip-btn sm active" data-scope-mode="active">目前帳本</button>
+                <button type="button" class="chip-btn sm" data-scope-mode="net_worth">納入淨值帳本</button>
+                <button type="button" class="chip-btn sm" data-scope-mode="all">全部帳本合併</button>
+              </div>
+            </div>
+
+            <div>
+              <label class="section-label">交易類型（可複選）</label>
+              <div class="chip-group" id="ledgerTypeFilterChips" style="margin-bottom:0"></div>
+            </div>
+
+            <div class="row-2">
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="ledgerCategoryFilterSelect">分類</label>
+                <select id="ledgerCategoryFilterSelect">
+                  <option value="">全部分類</option>
+                </select>
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="ledgerAccountFilterSelect">連動活存</label>
+                <select id="ledgerAccountFilterSelect">
+                  <option value="">全部帳戶</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row-2">
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="ledgerMinAmountInput">最低金額 (TWD)</label>
+                <input id="ledgerMinAmountInput" class="tnum" type="number" inputmode="numeric" min="0" placeholder="不限" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="section-label" for="ledgerMaxAmountInput">最高金額 (TWD)</label>
+                <input id="ledgerMaxAmountInput" class="tnum" type="number" inputmode="numeric" min="0" placeholder="不限" />
+              </div>
+            </div>
+
+            <div class="ledger-filter-actions">
+              <button type="button" class="btn btn-outline btn-sm" id="ledgerResetFiltersBtn">重置所有條件</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card compact ledger-search-summary" id="ledgerSearchSummaryBar" style="display:none">
+          <div class="ledger-summary-head">
+            <span class="ledger-summary-title tnum" id="ledgerSummaryTitle">符合 0 筆</span>
+            <div class="ledger-summary-actions">
+              <button type="button" class="btn btn-outline btn-sm" id="ledgerExportCsvBtn">⬇ 匯出 CSV</button>
+              <button type="button" class="btn btn-outline btn-sm" id="ledgerClearAllBtn">清除</button>
+            </div>
+          </div>
+          <div class="ledger-summary-grid tnum" id="ledgerSummaryGrid"></div>
+        </div>
+
+        <div class="month-nav" id="ledgerMonthNav">
+          <div class="month-nav-controls" id="ledgerMonthNavControls">
             <button type="button" class="icon-btn sm" id="ledgerPrevMonthBtn" title="上個月" aria-label="上個月">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
             </button>
@@ -214,6 +304,7 @@
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
             </button>
           </div>
+          <span class="ledger-range-badge tnum" id="ledgerCrossMonthRangeBadge" style="display:none"></span>
           <div class="mini-seg" id="ledgerModeToggle">
             <button type="button" class="mini-seg-btn active" data-ledger-mode="list">列表</button>
             <button type="button" class="mini-seg-btn" data-ledger-mode="calendar">日曆</button>
