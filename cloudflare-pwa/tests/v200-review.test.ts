@@ -161,3 +161,59 @@ describe('v2.0.0 review — finding 2: owner replace import of a backup without 
     expect(bob.revokedSharedLedgerIds ?? []).toContain('led_home');
   });
 });
+
+const deleteMut = (mutationId: string, entity: string, recordId: string, baseVersion: number) => ({
+  mutationId,
+  entity,
+  op: 'delete',
+  recordId,
+  baseVersion,
+  sharedLedgerId: 'led_home',
+  clientTimestamp: '2026-05-02T00:00:00.000Z',
+});
+
+describe('aa75631 re-review — R1: the SL-4 guard on EXISTING references blocks legitimate deletes', () => {
+  it.fails('a shared record linked to a since-deleted shared account can still be deleted', async () => {
+    const { db, epoch } = await setup();
+    const created = await processSyncRequest(db, 'alice', {
+      clientEpoch: epoch,
+      refsOrdered: true,
+      mutations: [cashflowMut('a_cf', 'cf_joint', 20, 'ast_joint', { sharedLedgerId: 'led_home' })] as never,
+    });
+    expect(created.rejected).toEqual([]);
+    // Deleting the account is allowed while records still point at it ...
+    const delAcct = await processSyncRequest(db, 'alice', {
+      clientEpoch: epoch,
+      refsOrdered: true,
+      mutations: [deleteMut('a_del_acct', 'asset', 'ast_joint', 1)] as never,
+    });
+    expect(delAcct.rejected).toEqual([]);
+    // ... but afterwards nobody (editor or owner) can delete the record any more: the delete re-checks the
+    // existing linked_account_id with `deleted_at IS NULL`.
+    const bobDel = await processSyncRequest(db, 'bob', {
+      refsOrdered: true,
+      mutations: [deleteMut('b_del', 'cashflow', 'cf_joint', 1)] as never,
+    });
+    expect(bobDel.rejected).toEqual([]);
+    expect(bobDel.ackedMutationIds).toEqual(['b_del']);
+  });
+
+  it.fails('the owner can delete their own pre-sharing record that is linked to a personal account', async () => {
+    const { db, epoch } = await setup({ linkPrivateBeforeSharing: true });
+    const res = await processSyncRequest(db, 'alice', {
+      clientEpoch: epoch,
+      refsOrdered: true,
+      mutations: [deleteMut('a_del_pre', 'cashflow', 'cf_pre', 1)] as never,
+    });
+    expect(res.rejected).toEqual([]);
+  });
+
+  it('control: an editor still cannot delete a shared record linked to the owner’s personal account', async () => {
+    const { db } = await setup({ linkPrivateBeforeSharing: true });
+    const res = await processSyncRequest(db, 'bob', {
+      refsOrdered: true,
+      mutations: [deleteMut('b_del_pre', 'cashflow', 'cf_pre', 1)] as never,
+    });
+    expect(res.ackedMutationIds).toEqual([]);
+  });
+});
