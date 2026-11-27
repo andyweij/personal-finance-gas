@@ -814,7 +814,7 @@ export function renderSplitReceivablesCard(ctx: UiContext, container: HTMLElemen
   addBtn.addEventListener('click', () => openCreateSplitModal(ctx));
 
   head.appendChild(titleWrap);
-  head.appendChild(addBtn);
+  if (!ctx.engine.isLedgerReadOnly(ctx.state.activeLedgerId)) head.appendChild(addBtn);
   container.appendChild(head);
 
   if (summary.items.length === 0) {
@@ -981,7 +981,7 @@ export function renderSplitReceivablesCard(ctx: UiContext, container: HTMLElemen
     delBtn.addEventListener('click', () => openDeleteSplitModal(ctx, rec));
     actions.appendChild(delBtn);
 
-    item.appendChild(actions);
+    if (!ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(rec))) item.appendChild(actions);
     list.appendChild(item);
   }
 

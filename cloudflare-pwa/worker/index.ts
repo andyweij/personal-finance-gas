@@ -100,8 +100,7 @@ function getClientIp(c: AppContext): string {
  * H2: Key for IP-based rate limits. An IPv6 client controls a whole /64, so group by that prefix — otherwise
  * every address in it gets its own counter and the limit is trivial to sidestep.
  */
-function getRateLimitIp(c: AppContext): string {
-  const ip = getClientIp(c);
+function getRateLimitIp(c: AppContext, ip = getClientIp(c)): string {
   if (!ip.includes(':')) return ip;
   const [head, tail = ''] = ip.toLowerCase().split('::');
   const headParts = head ? head.split(':') : [];
@@ -151,20 +150,21 @@ async function readBodyWithLimit(req: Request, maxBytes: number): Promise<string
  */
 async function readJsonBodyLimited(
   c: AppContext,
-  maxBytes: number
+  maxBytes: number,
+  sizeError = '匯入內容過大（上限 2 MB），請分批匯入。'
 ): Promise<{ ok: true; body: unknown } | { ok: false; response: Response }> {
   const contentLength = Number(c.req.header('content-length') || '');
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    return { ok: false, response: c.json({ error: '匯入內容過大（上限 2 MB），請分批匯入。' }, 413) };
+    return { ok: false, response: c.json({ error: sizeError }, 413) };
   }
   const raw = await readBodyWithLimit(c.req.raw, maxBytes);
   if (raw === null) {
-    return { ok: false, response: c.json({ error: '匯入內容過大（上限 2 MB），請分批匯入。' }, 413) };
+    return { ok: false, response: c.json({ error: sizeError }, 413) };
   }
   try {
     return { ok: true, body: raw ? JSON.parse(raw) : {} };
   } catch {
-    return { ok: false, response: c.json({ error: '匯入內容不是有效的 JSON。' }, 400) };
+    return { ok: false, response: c.json({ error: '請求內容不是有效的 JSON。' }, 400) };
   }
 }
 
@@ -691,7 +691,9 @@ export function createApp() {
   app.post('/api/shared-ledgers/:ledgerId/invites', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
-      const body = (await c.req.json().catch(() => ({}))) as {
+      const parsed = await readJsonBodyLimited(c, 4096, '請求內容過大（上限 4 KB）。');
+      if (!parsed.ok) return parsed.response;
+      const body = (parsed.body && typeof parsed.body === 'object' ? parsed.body : {}) as {
         role?: string;
         note?: string;
         expiresInDays?: number;
@@ -723,19 +725,21 @@ export function createApp() {
 
   app.post('/api/shared-ledgers/join', requireAuth, async (c) => {
     const user = c.get('authUser');
-    const ip = getRateLimitIp(c);
+    const ip = getRateLimitIp(c, c.req.header('cf-connecting-ip') || 'local');
     const ipKey = `shl_join:${ip}`;
     const userKey = `shl_join_u:${user.id}`;
-    const ipLimit = await checkRateLimit(c.env.DB, ipKey);
+    const dailyLimit = await checkRateLimit(c.env.DB, `shl_join_day:${ip}`, 50, 24 * 60 * 60 * 1000);
+    const ipLimit = dailyLimit.blocked ? dailyLimit : await checkRateLimit(c.env.DB, ipKey);
     const userLimit = !ipLimit.blocked ? await peekRateLimit(c.env.DB, userKey, 15) : { blocked: false };
     if (ipLimit.blocked || userLimit.blocked) {
       const retry = Math.max(ipLimit.retryAfterSec || 0, userLimit.retryAfterSec || 0) || 900;
       return c.json({ error: `嘗試次數過多，請於 ${Math.ceil(retry / 60)} 分鐘後再試。` }, 429);
     }
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { code?: string };
+      const parsed = await readJsonBodyLimited(c, 4096, '請求內容過大（上限 4 KB）。');
+      if (!parsed.ok) return parsed.response;
+      const body = (parsed.body && typeof parsed.body === 'object' ? parsed.body : {}) as { code?: string };
       const joined = await joinSharedLedgerByCode(c.env.DB, user.id, String(body.code || ''));
-      await clearRateLimit(c.env.DB, ipKey);
       await clearRateLimit(c.env.DB, userKey);
       return c.json({ ok: true, ...joined });
     } catch (err) {
@@ -747,7 +751,9 @@ export function createApp() {
   app.patch('/api/shared-ledgers/:ledgerId/members/:memberUserId', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
-      const body = (await c.req.json().catch(() => ({}))) as { role?: string };
+      const parsed = await readJsonBodyLimited(c, 4096, '請求內容過大（上限 4 KB）。');
+      if (!parsed.ok) return parsed.response;
+      const body = (parsed.body && typeof parsed.body === 'object' ? parsed.body : {}) as { role?: string };
       await updateSharedLedgerMemberRole(
         c.env.DB,
         user.id,
@@ -779,7 +785,9 @@ export function createApp() {
   app.patch('/api/shared-ledgers/:ledgerId/preferences', requireAuth, async (c) => {
     try {
       const user = c.get('authUser');
-      const body = (await c.req.json().catch(() => ({}))) as { includeInNetWorth?: boolean };
+      const parsed = await readJsonBodyLimited(c, 4096, '請求內容過大（上限 4 KB）。');
+      if (!parsed.ok) return parsed.response;
+      const body = (parsed.body && typeof parsed.body === 'object' ? parsed.body : {}) as { includeInNetWorth?: boolean };
       if (typeof body.includeInNetWorth !== 'boolean') {
         return c.json({ error: 'includeInNetWorth 必須為布林值。' }, 400);
       }

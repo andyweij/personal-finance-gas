@@ -332,7 +332,7 @@ export function renderAssetsTab(ctx: UiContext): void {
       actions.appendChild(editBtn);
 
       row.appendChild(top);
-      row.appendChild(actions);
+      if (!ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(s.account))) row.appendChild(actions);
       savList.appendChild(row);
     }
   }
@@ -446,7 +446,7 @@ export function renderAssetsTab(ctx: UiContext): void {
       });
 
       right.appendChild(amt);
-      right.appendChild(editBtn);
+      if (isStock || !ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(item))) right.appendChild(editBtn);
       row.appendChild(main);
       row.appendChild(right);
       autoList.appendChild(row);
@@ -544,9 +544,11 @@ export function renderAssetsTab(ctx: UiContext): void {
         editBtn.textContent = '編輯';
         editBtn.addEventListener('click', () => openAssetModal(ctx, item));
 
-        actions.appendChild(recBtn);
+        if (!ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(item))) {
+          actions.appendChild(recBtn);
+          actions.appendChild(editBtn);
+        }
         actions.appendChild(schBtn);
-        actions.appendChild(editBtn);
 
         row.appendChild(top);
         row.appendChild(actions);
@@ -602,7 +604,7 @@ export function renderAssetsTab(ctx: UiContext): void {
       });
 
       right.appendChild(amt);
-      if (isTransferableAccount(item)) {
+      if (isTransferableAccount(item) && !ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(item))) {
         const trBtn = document.createElement('button');
         trBtn.type = 'button';
         trBtn.className = 'btn btn-tinted btn-sm';
@@ -610,7 +612,7 @@ export function renderAssetsTab(ctx: UiContext): void {
         trBtn.addEventListener('click', () => openAccountTransferModal(ctx, item.id));
         right.appendChild(trBtn);
       }
-      right.appendChild(editBtn);
+      if (isStock || !ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(item))) right.appendChild(editBtn);
       row.appendChild(main);
       row.appendChild(right);
       manualList.appendChild(row);
@@ -1126,7 +1128,7 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
   const showLedgerTag = ledgers.length > 1;
 
   const accounts = snap.assetItems
-    .filter((a) => isTransferableAccount(a))
+    .filter((a) => isTransferableAccount(a) && !ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(a)))
     .slice()
     .sort(compareBySortOrder);
 
@@ -1674,7 +1676,7 @@ export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
   closeBtn.className = 'btn btn-outline';
   closeBtn.textContent = '關閉';
   closeBtn.addEventListener('click', closeModal);
-  footer.appendChild(recBtn);
+  if (!ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(item))) footer.appendChild(recBtn);
   footer.appendChild(closeBtn);
   body.appendChild(footer);
 }

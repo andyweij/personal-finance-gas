@@ -2799,7 +2799,7 @@ export class SyncEngine {
     let skippedCount = 0;
 
     for (const plan of currentPlans) {
-      if (plan.deletedAt || plan.status !== 'active') continue;
+      if (plan.deletedAt || plan.status !== 'active' || this.isLedgerReadOnly(getEffectiveLedgerId(plan))) continue;
       // v1.15.0 review finding 2: every installment due up to `cleanYm` that is not posted yet (not only that month's)
       const dueSeq = monthsBetweenYm(plan.startYm, cleanYm) + 1;
       if (dueSeq < 1 || dueSeq > plan.totalInstallments) continue;
@@ -3148,16 +3148,20 @@ export class SyncEngine {
   }
 
   async reorderAssets(orderedSubsetIds: string[]): Promise<number> {
+    const readOnlyAssets = new Map(this.snapshot.assetItems
+      .filter((asset) => this.isLedgerReadOnly(getEffectiveLedgerId(asset)))
+      .map((asset) => [asset.id, asset]));
     const { nextItems, changedItems } = applySubsetReorder(
       this.snapshot.assetItems,
-      orderedSubsetIds
+      orderedSubsetIds.filter((id) => !readOnlyAssets.has(id))
     );
-    if (!changedItems.length) return 0;
+    const changedIdSet = new Set(changedItems.filter((item) => !readOnlyAssets.has(item.id)).map((item) => item.id));
+    if (!changedIdSet.size) return 0;
     const nowIso = new Date().toISOString();
-    const changedIdSet = new Set(changedItems.map((i) => i.id));
-    const stampedItems = nextItems.map((item) =>
-      changedIdSet.has(item.id) ? { ...item, updatedAt: nowIso } : item
-    );
+    const stampedItems = nextItems.map((item) => {
+      if (changedIdSet.has(item.id)) return { ...item, updatedAt: nowIso };
+      return readOnlyAssets.get(item.id) || item;
+    });
     const mutations: SyncMutation[] = stampedItems
       .filter((item) => changedIdSet.has(item.id))
       .map((item) => ({
@@ -4010,6 +4014,54 @@ export class SyncEngine {
     await this.syncNow(false);
   }
 
+  getBackupSnapshot(): FinanceSnapshot {
+    const joinedLedgerIds = new Set(
+      (this.meta.sharedLedgers || []).filter((ledger) => ledger.myRole !== 'owner').map((ledger) => ledger.ledgerId)
+    );
+    for (const ledger of this.snapshot.ledgers || []) {
+      if (ledger.isShared && ledger.myRole !== 'owner') joinedLedgerIds.add(ledger.id);
+    }
+    return this.purgeLedgerDataFromSnapshot(this.snapshot, joinedLedgerIds);
+  }
+
+  private getSharedSyncScope(data: SyncResponse) {
+    const nextSharedLedgers = Array.isArray(data.sharedLedgers) ? data.sharedLedgers : [];
+    const nextSharedCursors: Record<string, SharedLedgerCursor> = {};
+    for (const st of nextSharedLedgers) {
+      if (st.myRole !== 'owner') {
+        nextSharedCursors[st.ledgerId] = { sinceSeq: st.changeSeq, clientEpoch: st.dataEpoch };
+      }
+    }
+    const revokedSharedSet = new Set<string>(
+      Array.isArray(data.revokedSharedLedgerIds) ? data.revokedSharedLedgerIds : []
+    );
+    const returnedSharedIds = new Set(nextSharedLedgers.map((ledger) => ledger.ledgerId));
+    for (const ledger of this.meta.sharedLedgers || []) {
+      if (ledger.myRole !== 'owner' && !returnedSharedIds.has(ledger.ledgerId)) {
+        revokedSharedSet.add(ledger.ledgerId);
+      }
+    }
+    const sharedEpochMismatchSet = new Set(
+      nextSharedLedgers.filter((ledger) => ledger.epochMismatch).map((ledger) => ledger.ledgerId)
+    );
+    const isRevokedRecord = (
+      entity: string,
+      recordId: string,
+      payload?: Record<string, unknown> | null
+    ): boolean => {
+      if (entity === 'ledger') return revokedSharedSet.has(recordId);
+      const record = payload || this.findRecordInSnapshot(this.snapshot, entity, recordId) as Record<string, unknown> | null;
+      if (typeof record?.ledgerId === 'string') return revokedSharedSet.has(record.ledgerId);
+      return entity === 'savings_adjustment' && this.snapshot.assetItems.some(
+        (asset) => asset.id === record?.accountId && revokedSharedSet.has(getEffectiveLedgerId(asset))
+      );
+    };
+    const sharedFullResyncSet = new Set<string>(
+      nextSharedLedgers.filter((s) => s.fullResyncRequired || s.epochMismatch).map((s) => s.ledgerId)
+    );
+    return { nextSharedLedgers, nextSharedCursors, revokedSharedSet, sharedFullResyncSet, sharedEpochMismatchSet, isRevokedRecord };
+  }
+
   private purgeLedgerDataFromSnapshot(snap: FinanceSnapshot, ledgerIds: ReadonlySet<string>): FinanceSnapshot {
     if (ledgerIds.size === 0) return snap;
     const purgedAssetIds = new Set(
@@ -4626,6 +4678,7 @@ export class SyncEngine {
           sinceSeq: reqSinceSeq,
           clientEpoch: reqClientEpoch,
           mutations: [],
+          ...(this.meta.sharedCursors ? { sharedCursors: this.meta.sharedCursors } : {}),
           ...(writeProbe ? { writeProbe: true } : {}),
         }),
       });
@@ -4634,9 +4687,26 @@ export class SyncEngine {
       let epochFrozen = false;
       await this.runSerialized(async () => {
         const currentOutbox = await this.db.getOutbox();
+        const {
+          nextSharedLedgers, nextSharedCursors, revokedSharedSet, sharedFullResyncSet,
+          sharedEpochMismatchSet, isRevokedRecord,
+        } = this.getSharedSyncScope(data);
+        const isRevokedMutation = (m: SyncMutation) =>
+          revokedSharedSet.has(m.sharedLedgerId || '') || isRevokedRecord(m.entity, m.recordId, m.payload);
+        const conflicts = this.conflicts.filter((c) =>
+          !isRevokedRecord(c.entity, c.recordId, c.clientPayload) &&
+          !isRevokedRecord(c.entity, c.recordId, c.serverRecord)
+        );
+        const rejections = this.rejections.map((r) => {
+          if (!isRevokedRecord(r.entity, r.recordId, r.clientPayload)) return r;
+          const { clientPayload, ...summary } = r;
+          return summary;
+        });
         const nextMeta: LocalMeta = {
           ...this.meta,
           lastSyncedAt: data.serverTime,
+          sharedCursors: nextSharedCursors,
+          sharedLedgers: nextSharedLedgers,
           ...(typeof data.syncCursor === 'number' ? { syncCursor: data.syncCursor } : {}),
           ...(typeof data.dataEpoch === 'number' ? { dataEpoch: data.dataEpoch } : {}),
         };
@@ -4646,17 +4716,26 @@ export class SyncEngine {
           this.meta.dataEpoch !== data.dataEpoch;
         if ((Boolean(data.epochMismatch) || epochChanged) && currentOutbox.length > 0) {
           nextMeta.pendingFullResync = false;
-          const restoredSnap = this.mergeDelta(this.snapshot, data.delta, true);
+          const restoredSnap = this.applySharedLedgerMetadataToSnapshot(
+            this.purgeLedgerDataFromSnapshot(this.mergeDelta(this.snapshot, data.delta, true), revokedSharedSet),
+            nextSharedLedgers
+          );
           const mergedFrozen = await this.db.freezeOutboxAndApplySnapshot(
             restoredSnap,
             nextMeta,
-            this.conflicts,
-            this.rejections,
-            { annotateItem: (item) => this.annotateFrozenMutation(item, restoredSnap) }
+            conflicts,
+            rejections,
+            {
+              excludeMutationIds: currentOutbox.filter(isRevokedMutation).map((m) => m.mutationId),
+              retainFrozen: (m) => !isRevokedMutation(m),
+              annotateItem: (item) => this.annotateFrozenMutation(item, restoredSnap),
+            }
           );
           this.snapshot = restoredSnap;
           this.meta = nextMeta;
           this.frozenOutbox = mergedFrozen;
+          this.conflicts = conflicts;
+          this.rejections = rejections;
           this.emitSnapshot();
           this.broadcastDbChanged();
           this.updateStatus(this.computeStatus(0));
@@ -4667,11 +4746,33 @@ export class SyncEngine {
         if (applyAsFull) {
           nextMeta.pendingFullResync = false;
         }
-        const baseMerged = this.mergeDelta(this.snapshot, data.delta, applyAsFull);
-        const overlaid = this.overlayPendingOutboxOnSnapshot(baseMerged, currentOutbox);
-        await this.db.acknowledgeOutboxAndSave([], overlaid, nextMeta);
+        const base = this.purgeLedgerDataFromSnapshot(
+          this.snapshot, new Set([...revokedSharedSet, ...sharedFullResyncSet])
+        );
+        const baseMerged = this.applySharedLedgerMetadataToSnapshot(
+          this.purgeLedgerDataFromSnapshot(this.mergeDelta(base, data.delta, applyAsFull), revokedSharedSet),
+          nextSharedLedgers
+        );
+        const frozen = (await this.db.getFrozenOutbox()).filter((m) => !isRevokedMutation(m));
+        const clearedIds = new Set<string>();
+        for (const m of currentOutbox) {
+          if (isRevokedMutation(m)) clearedIds.add(m.mutationId);
+          else if (sharedEpochMismatchSet.has(m.sharedLedgerId || this.resolveMutationSharedLedgerId(m, this.snapshot) || '')) {
+            clearedIds.add(m.mutationId);
+            frozen.push(this.annotateFrozenMutation(m, baseMerged));
+          }
+        }
+        const overlaid = this.overlayPendingOutboxOnSnapshot(
+          baseMerged, currentOutbox.filter((m) => !clearedIds.has(m.mutationId))
+        );
+        await this.db.acknowledgeOutboxAndSave(
+          [...clearedIds], overlaid, nextMeta, conflicts, rejections, undefined, frozen
+        );
         this.snapshot = overlaid;
         this.meta = nextMeta;
+        this.frozenOutbox = frozen;
+        this.conflicts = conflicts;
+        this.rejections = rejections;
         this.emitSnapshot();
         this.broadcastDbChanged();
       });
@@ -4743,7 +4844,7 @@ export class SyncEngine {
         reqSinceSeq = fullPullPass ? null : (this.meta.syncCursor ?? null);
         // Q5 / N4: Always transmit known dataEpoch even during fullPullPass so stale-epoch mutations are caught
         reqClientEpoch = this.meta.dataEpoch ?? null;
-        reqSharedCursors = fullPullPass ? undefined : this.meta.sharedCursors;
+        reqSharedCursors = this.meta.sharedCursors;
       });
 
       this.updateStatus({
@@ -4891,18 +4992,17 @@ export class SyncEngine {
           const batchIdSet = new Set(batch.map((m) => m.mutationId));
           const currentOutbox = await this.db.getOutbox();
 
-          const nextSharedLedgers = Array.isArray(data.sharedLedgers) ? data.sharedLedgers : [];
-          const nextSharedCursors: Record<string, SharedLedgerCursor> = {};
-          for (const st of nextSharedLedgers) {
-            if (st.myRole !== 'owner') {
-              nextSharedCursors[st.ledgerId] = { sinceSeq: st.changeSeq, clientEpoch: st.dataEpoch };
-            }
-          }
-          const revokedSharedSet = new Set<string>(
-            Array.isArray(data.revokedSharedLedgerIds) ? data.revokedSharedLedgerIds : []
+          const {
+            nextSharedLedgers, nextSharedCursors, revokedSharedSet, sharedFullResyncSet,
+            sharedEpochMismatchSet, isRevokedRecord,
+          } = this.getSharedSyncScope(data);
+          const retainedFrozen = (await this.db.getFrozenOutbox()).filter((item) =>
+            !revokedSharedSet.has(item.sharedLedgerId || '') &&
+            !isRevokedRecord(item.entity, item.recordId, item.payload)
           );
-          const sharedFullResyncSet = new Set<string>(
-            nextSharedLedgers.filter((s) => s.fullResyncRequired || s.epochMismatch).map((s) => s.ledgerId)
+          nextConflicts = nextConflicts.filter((conflict) =>
+            !isRevokedRecord(conflict.entity, conflict.recordId, conflict.clientPayload) &&
+            !isRevokedRecord(conflict.entity, conflict.recordId, conflict.serverRecord)
           );
 
           const nextMeta: LocalMeta = {
@@ -4922,17 +5022,25 @@ export class SyncEngine {
 
           // P2-C4 & N3: When epoch changed (backup replace import on another device) and outbox has un-acked mutations,
           // freeze un-acked outbox items with their post-restore baseline instead of discarding or blindly applying them.
+          const revokedOutbox = currentOutbox.filter((m) =>
+            revokedSharedSet.has(m.sharedLedgerId || '') || isRevokedRecord(m.entity, m.recordId, m.payload)
+          );
           const unackedOutbox = currentOutbox.filter((m) => !clearedSet.has(m.mutationId));
           if (isEpochMismatch && unackedOutbox.length > 0) {
             nextMeta.pendingFullResync = false;
-            const restoredSnap = this.mergeDelta(this.snapshot, data.delta, true);
+            const restoredSnap = this.applySharedLedgerMetadataToSnapshot(
+              this.purgeLedgerDataFromSnapshot(this.mergeDelta(this.snapshot, data.delta, true), revokedSharedSet),
+              nextSharedLedgers
+            );
             const mergedFrozen = await this.db.freezeOutboxAndApplySnapshot(
               restoredSnap,
               nextMeta,
               nextConflicts,
               this.rejections,
               {
-                excludeMutationIds: clearedSet,
+                excludeMutationIds: [...clearedSet, ...revokedOutbox.map((m) => m.mutationId)],
+                retainFrozen: (m) => !revokedSharedSet.has(m.sharedLedgerId || '') &&
+                  !isRevokedRecord(m.entity, m.recordId, m.payload),
                 annotateItem: (item) => this.annotateFrozenMutation(item, restoredSnap),
               }
             );
@@ -5109,8 +5217,8 @@ export class SyncEngine {
           if (revokedSharedSet.size > 0) {
             const revokedAt = data.serverTime || new Date().toISOString();
             const byMutId = new Map<string, SyncRejection>(nextRejections.map((r) => [r.mutationId, r]));
-            for (const m of currentOutbox) {
-              if (!clearedSet.has(m.mutationId) && m.sharedLedgerId && revokedSharedSet.has(m.sharedLedgerId)) {
+            for (const m of revokedOutbox) {
+              if (!clearedSet.has(m.mutationId)) {
                 outboxIdsToClear.push(m.mutationId);
                 clearedSet.add(m.mutationId);
                 byMutId.set(m.mutationId, {
@@ -5120,12 +5228,15 @@ export class SyncEngine {
                   recordId: m.recordId,
                   resolutionStatus: 'rolled_back',
                   reason: '您已被移除或已退出此共同帳本，未送出之本機異動已取消並清除快取。',
-                  ...(m.payload ? { clientPayload: m.payload } : {}),
                   rejectedAt: revokedAt,
                 });
               }
             }
-            nextRejections = Array.from(byMutId.values());
+            nextRejections = Array.from(byMutId.values()).map((rejection) => {
+              if (!isRevokedRecord(rejection.entity, rejection.recordId, rejection.clientPayload)) return rejection;
+              const { clientPayload, ...summary } = rejection;
+              return summary;
+            });
           }
 
           let merged = this.mergeDelta(baseSnapshotForMerge, data.delta, applyAsFull);
@@ -5136,6 +5247,15 @@ export class SyncEngine {
           for (const rb of rejectedCreatesToRollback) {
             merged = this.removeRecordFromSnapshot(merged, rb.entity, rb.recordId);
           }
+
+          const frozenById = new Map(retainedFrozen.map((item) => [item.mutationId, item]));
+          for (const mutation of currentOutbox) {
+            if (clearedSet.has(mutation.mutationId) || !sharedEpochMismatchSet.has(mutation.sharedLedgerId || this.resolveMutationSharedLedgerId(mutation, this.snapshot) || '')) continue;
+            frozenById.set(mutation.mutationId, this.annotateFrozenMutation(mutation, merged));
+            clearedSet.add(mutation.mutationId);
+            outboxIdsToClear.push(mutation.mutationId);
+          }
+          const nextFrozen = Array.from(frozenById.values());
 
           const rebasedMutations: Array<{ oldMutationId: string; replacement: SyncMutation }> = [];
 
@@ -5238,13 +5358,15 @@ export class SyncEngine {
             nextMeta,
             nextConflicts,
             nextRejections,
-            rebasedMutations
+            rebasedMutations,
+            nextFrozen
           );
 
           this.snapshot = merged;
           this.meta = nextMeta;
           this.conflicts = nextConflicts;
           this.rejections = nextRejections;
+          this.frozenOutbox = nextFrozen;
 
           const remainingOutbox = await this.db.getOutbox();
           if (remainingOutbox.length === 0) {

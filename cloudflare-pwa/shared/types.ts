@@ -47,7 +47,7 @@ export type SharedLedgerRole = 'owner' | 'editor' | 'viewer';
 
 export interface SharedLedgerMemberDto {
   userId: string;
-  username: string;
+  username?: string;
   displayName: string;
   role: SharedLedgerRole;
   includeInNetWorth: boolean;

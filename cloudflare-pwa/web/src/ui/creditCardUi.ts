@@ -969,8 +969,10 @@ export function renderCreditCardsAndInstallmentsCard(ctx: UiContext, container: 
   addInstBtn.textContent = '+ 分期';
   addInstBtn.addEventListener('click', () => openInstallmentPlanModal(ctx, null));
 
-  headBtns.appendChild(addCardBtn);
-  headBtns.appendChild(addInstBtn);
+  if (!ctx.engine.isLedgerReadOnly(scopedLedgerId)) {
+    headBtns.appendChild(addCardBtn);
+    headBtns.appendChild(addInstBtn);
+  }
   head.appendChild(titleWrap);
   head.appendChild(headBtns);
   container.appendChild(head);
@@ -1089,11 +1091,13 @@ export function renderCreditCardsAndInstallmentsCard(ctx: UiContext, container: 
       editBtn.textContent = '編輯';
       editBtn.addEventListener('click', () => openCreditCardModal(ctx, card));
 
-      actions.appendChild(payBtn);
-      actions.appendChild(recBtn);
-      actions.appendChild(instBtn);
-      actions.appendChild(editBtn);
-      item.appendChild(actions);
+      if (!ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(card))) {
+        actions.appendChild(payBtn);
+        actions.appendChild(recBtn);
+        actions.appendChild(instBtn);
+        actions.appendChild(editBtn);
+        item.appendChild(actions);
+      }
       cardList.appendChild(item);
     }
 
@@ -1264,7 +1268,7 @@ export function renderCreditCardsAndInstallmentsCard(ctx: UiContext, container: 
       });
       actions.appendChild(delBtn);
 
-      row.appendChild(actions);
+      if (!ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(plan))) row.appendChild(actions);
       pList.appendChild(row);
     }
 

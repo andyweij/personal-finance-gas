@@ -1,3 +1,4 @@
+import { getEffectiveLedgerId } from '../../../shared/calculations';
 import { DEFAULT_LEDGER_ID } from '../../../shared/constants';
 import type { Ledger, SharedLedgerRole, SharedLedgerSummaryDto } from '../../../shared/types';
 import { bindSubmit, closeModal, el, makeInputField, openModal, showToast } from './helpers';
@@ -203,11 +204,13 @@ export function openSharedLedgerManageModal(ctx: UiContext, ledger: Ledger): voi
         rBadge.style.marginRight = '0';
         rBadge.textContent = roleLabel(m.role);
         t.appendChild(rBadge);
-        const sub = document.createElement('div');
-        sub.className = 'item-sub';
-        sub.textContent = `@${m.username}`;
         main.appendChild(t);
-        main.appendChild(sub);
+        if (m.username) {
+          const sub = document.createElement('div');
+          sub.className = 'item-sub';
+          sub.textContent = `@${m.username}`;
+          main.appendChild(sub);
+        }
 
         const right = document.createElement('div');
         right.className = 'item-right';
@@ -321,6 +324,25 @@ export function openSharedLedgerManageModal(ctx: UiContext, ledger: Ledger): voi
 
       const invForm = document.createElement('form');
       invForm.style.cssText = 'display:grid;gap:8px;margin-bottom:14px';
+      if (!summary) {
+        const snapshot = ctx.engine.getSnapshot();
+        const localAccountIds = new Set(snapshot.assetItems
+          .filter((account) => !account.deletedAt && getEffectiveLedgerId(account) === ledger.id)
+          .map((account) => account.id));
+        const isCrossLedger = (row: { deletedAt?: string | null; ledgerId?: string }, accountId?: string | null) =>
+          !row.deletedAt && getEffectiveLedgerId(row) === ledger.id && Boolean(accountId && !localAccountIds.has(accountId));
+        if (
+          snapshot.cashflowLogs.some((row) => isCrossLedger(row, row.linkedAccountId)) ||
+          snapshot.recurringItems.some((row) => isCrossLedger(row, row.linkedAccountId)) ||
+          snapshot.splitReceivables?.some((row) => isCrossLedger(row, row.sourceAccountId)) ||
+          snapshot.installmentPlans?.some((row) => isCrossLedger(row, row.cardAccountId))
+        ) {
+          const warning = document.createElement('p');
+          warning.className = 'muted';
+          warning.textContent = '部分紀錄連動至帳本外或已刪除的帳戶。分享前可由擁有者解除連動，或改為連動此帳本內的帳戶，讓成員能編輯這些紀錄。';
+          invForm.appendChild(warning);
+        }
+      }
 
       const rowInputs = document.createElement('div');
       rowInputs.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:8px';

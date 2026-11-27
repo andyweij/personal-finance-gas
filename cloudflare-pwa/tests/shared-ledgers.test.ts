@@ -141,9 +141,10 @@ describe('Phase 9 (v2.0.0) Shared Ledgers — Lifecycle, Attribution, Client Syn
     // Bob uses SyncEngine + LocalFinanceDB end-to-end
     const bobDb = new LocalFinanceDB(`shared-e2e-bob-${crypto.randomUUID()}`);
     await bobDb.open();
+    let bobOnline = true;
     const bobEngine = new SyncEngine(bobDb, {
       fetchImpl: createApiFetchAdapter(db, 'bob'),
-      isOnline: () => true,
+      isOnline: () => bobOnline,
       expectedUserId: 'bob',
     });
     await bobEngine.init();
@@ -164,6 +165,11 @@ describe('Phase 9 (v2.0.0) Shared Ledgers — Lifecycle, Attribution, Client Syn
     expect(seenAliceCf?.itemName).toBe('全聯採買');
     expect(seenAliceCf?.updatedByUserId).toBe('alice');
     expect(seenAliceCf?.updatedByName).toBe('Alice');
+
+    const bobBackup = bobEngine.getBackupSnapshot();
+    expect(bobBackup.ledgers?.map((ledger) => ledger.id)).toEqual([DEFAULT_LEDGER_ID]);
+    expect(bobBackup.assetItems).toEqual([]);
+    expect(bobBackup.cashflowLogs).toEqual([]);
 
     // Bob adds a shared expense via SyncEngine (automatically tagged with sharedLedgerId = 'led_home')
     const bobLog = await bobEngine.addCashFlow({
@@ -273,6 +279,29 @@ describe('Phase 9 (v2.0.0) Shared Ledgers — Lifecycle, Attribution, Client Syn
     expect(delWhileShared.rejected).toHaveLength(1);
     expect(delWhileShared.rejected[0].reason).toContain('仍有其他活躍成員');
 
+    bobOnline = false;
+    const pendingExpense = await bobEngine.addCashFlow({
+      date: '2026-05-03',
+      type: '日常花費',
+      category: '日用品',
+      itemName: '待同步支出',
+      amount: 50,
+      currency: 'TWD',
+      linkedAccountId: 'ast_joint',
+      ledgerId: 'led_home',
+    });
+    const backup = await exportFullSnapshot(db, 'alice');
+    await importFullSnapshot(db, 'alice', backup, 'replace');
+    bobOnline = true;
+    await bobEngine.syncNow(true);
+    expect(await bobDb.getOutbox()).toEqual([]);
+    expect(await bobDb.getFrozenOutbox()).toEqual([
+      expect.objectContaining({ recordId: pendingExpense.id }),
+    ]);
+    await bobEngine.syncNow();
+    expect((await exportFullSnapshot(db, 'alice')).cashflowLogs.map((log) => log.id))
+      .not.toContain(pendingExpense.id);
+
     // Alice removes Bob -> Bob's next sync purges led_home and its rows from IndexedDB!
     await removeOrLeaveSharedLedger(db, 'alice', 'led_home', 'bob');
     await bobEngine.syncNow();
@@ -280,6 +309,8 @@ describe('Phase 9 (v2.0.0) Shared Ledgers — Lifecycle, Attribution, Client Syn
     expect(bobAfterRevoke.ledgers?.some((l) => l.id === 'led_home')).toBe(false);
     expect(bobAfterRevoke.cashflowLogs.some((c) => c.ledgerId === 'led_home')).toBe(false);
     expect(bobAfterRevoke.assetItems.some((a) => a.ledgerId === 'led_home')).toBe(false);
+
+    expect(await bobDb.getFrozenOutbox()).toEqual([]);
 
     await bobEngine.destroy();
     await bobDb.deleteDatabase();
@@ -597,6 +628,16 @@ describe('Phase 9 (v2.0.0) Shared Ledgers — Lifecycle, Attribution, Client Syn
       lastStatus = r.status;
     }
     expect(lastStatus).toBe(429);
+
+    await importFullSnapshot(db, 'alice', {
+      ...aliceExport,
+      ledgers: aliceExport.ledgers?.filter((ledger) => ledger.id !== 'led_trip'),
+      assetItems: aliceExport.assetItems.filter((asset) => asset.ledgerId !== 'led_trip'),
+      cashflowLogs: aliceExport.cashflowLogs.filter((log) => log.ledgerId !== 'led_trip'),
+    }, 'replace');
+    const bobAfterRemoval = await processSyncRequest(db, 'bob', { mutations: [] });
+    expect(bobAfterRemoval.revokedSharedLedgerIds).toContain('led_trip');
+    expect(bobAfterRemoval.sharedLedgers?.map((ledger) => ledger.ledgerId) || []).not.toContain('led_trip');
   });
 
   it('degrades gracefully on pre-0025 DB (SL-9) and respects D1 Free Tier 50-query budget', async () => {

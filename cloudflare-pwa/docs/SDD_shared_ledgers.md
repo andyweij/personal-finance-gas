@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS ledger_invites (
 CREATE INDEX IF NOT EXISTS idx_ledger_invites_owner_ledger
   ON ledger_invites (owner_user_id, ledger_id, created_at DESC);
 ```
-- 沿用 `auth_invites` 的安全模式：產生 128-bit 隨機碼 `SHL-XXXX-XXXX-XXXX`，資料庫**僅存 SHA-256 雜湊**（`code_hash`），核銷採用單條原子條件更新：
+- 沿用 `auth_invites` 的安全模式：產生 60-bit 隨機碼 `SHL-XXXX-XXXX-XXXX`，資料庫**僅存 SHA-256 雜湊**（`code_hash`），核銷採用單條原子條件更新：
   ```sql
   UPDATE ledger_invites
   SET used_by = ?, used_at = ?
@@ -198,7 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_ledger_invites_owner_ledger
 | **SL-3 (權限提升 Viewer → Editor)** | `viewer` 直接打 `POST /api/sync` 送出 `upsert` / `delete` | Sync 進入點與 SQL `WHERE` 雙重驗證 `role IN ('owner', 'editor')`；對 `ledger` 本身（改名、刪除）進一步限定僅 `role = 'owner'`。 |
 | **SL-4 (私人資產探測與連動污染)** | 共同帳本 `editor` 新增一筆收支，將 `linkedAccountId` 指向 `owner` 的**私人活存** ID | 共享寫入的 `refGuardSql` 強制附加 `AND ledger_id = ?`（必須屬於同一共同帳本），禁止任何共享紀錄連動至 `owner` 私人帳本的資產或帳戶。 |
 | **SL-5 (跨帳本走私 / Exfiltration)** | 成員將共同帳本紀錄的 `ledgerId` 改為自己的個人帳本，或將私人紀錄搬入共同帳本 | `prepareUpsert` 強制禁止任何紀錄跨越「個人 ↔ 共享」或「共享 A ↔ 共享 B」的 `ledger_id` 變更。 |
-| **SL-6 (邀請碼暴力猜解與重放)** | 惡意成員窮舉 `SHL-XXXX-XXXX-XXXX` 加入他人帳本 | 128-bit 密碼學隨機熵（~60+ bits 可讀字元組合）＋ SHA-256 雜湊儲存 ＋ `POST /api/shared-ledgers/join` 套用既有 `checkRateLimit`（IP + 帳號雙限速）＋ 單次原子核銷 `WHERE used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`。 |
+| **SL-6 (邀請碼暴力猜解與重放)** | 惡意成員窮舉 `SHL-XXXX-XXXX-XXXX` 加入他人帳本 | 60-bit 密碼學隨機熵＋ SHA-256 雜湊儲存 ＋ `POST /api/shared-ledgers/join` 套用既有 `checkRateLimit`（IP 短期與每日限速，另計帳號失敗次數）＋ 單次原子核銷 `WHERE used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`。 |
 | **SL-7 (被移除後殘留離線資料)** | 成員被踢出共同帳本，但離線快取仍看得到舊資料或誤送離線編輯 | 下次同步回應 `revokedSharedLedgerIds`，`SyncEngine` 立即從 IndexedDB 刪除該帳本全部快取資料列並隔離其待送異動；同時伺服器端已拒絕該成員任何後續同步寫入。 |
 | **SL-8 (個人 JSON 備份覆蓋他人共享資料)** | 成員匯出 JSON 備份帶走他人共同帳本，或匯入個人備份意外覆蓋共同帳本 | 非擁有者的 `exportFullSnapshot` / `importFullSnapshot` **嚴格僅處理自己的個人帳本**（排除加入的他人共同帳本）；擁有者執行 `replace` 還原時遞增 `data_epoch` 並保留或明確提示共同帳本成員將重抓。 |
 | **SL-9 (未遷移資料庫降級)** | Worker 先部署但 D1 尚未執行 `0025_shared_ledgers.sql` | 所有 `ledger_members` / `ledger_invites` 與 `updated_by` 查詢皆具備 `no such table` / `no such column` 偵測，未遷移時個人同步照常運作、僅共享操作回報明確的 0025 遷移提示。 |

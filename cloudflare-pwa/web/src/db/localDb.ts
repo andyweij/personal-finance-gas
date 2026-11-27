@@ -761,6 +761,7 @@ export class LocalFinanceDB {
     options?: {
       excludeMutationIds?: Iterable<string>;
       annotateItem?: (item: SyncMutation) => SyncMutation;
+      retainFrozen?: (item: SyncMutation) => boolean;
     }
   ): Promise<SyncMutation[]> {
     const db = this.getDb();
@@ -784,7 +785,9 @@ export class LocalFinanceDB {
             a.clientTimestamp.localeCompare(b.clientTimestamp) || (a._seq ?? 0) - (b._seq ?? 0)
         );
         const byId = new Map<string, SyncMutation>();
-        for (const f of existingFrozen) byId.set(f.mutationId, f);
+        for (const f of existingFrozen) {
+          if (!options?.retainFrozen || options.retainFrozen(f)) byId.set(f.mutationId, f);
+        }
         for (const item of existingOutbox) {
           if (excludeSet && excludeSet.has(item.mutationId)) continue;
           const { _seq: _ignored, ...rest } = item;
@@ -975,7 +978,8 @@ export class LocalFinanceDB {
     meta: LocalMeta,
     conflicts?: SyncConflict[],
     rejections?: SyncRejection[],
-    rebasedMutations?: Array<{ oldMutationId: string; replacement: SyncMutation }>
+    rebasedMutations?: Array<{ oldMutationId: string; replacement: SyncMutation }>,
+    frozenOutbox?: SyncMutation[]
   ): Promise<void> {
     const db = this.getDb();
     return new Promise((resolve, reject) => {
@@ -1005,6 +1009,7 @@ export class LocalFinanceDB {
       }
       const kv = tx.objectStore(STORE_KV);
       kv.put(snapshot, 'snapshot');
+      if (frozenOutbox !== undefined) kv.put(frozenOutbox, 'frozen_outbox');
       this.bumpSnapshotRev(kv);
       this.putMetaKeepingAuth(kv, meta);
       if (conflicts !== undefined) {

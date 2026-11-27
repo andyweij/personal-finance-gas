@@ -128,8 +128,8 @@ export async function listSharedLedgersForUser(
 
     const members: SharedLedgerMemberDto[] = memberRows.map((r) => ({
       userId: r.member_user_id,
-      username: r.username,
-      displayName: r.display_name || r.username,
+      ...(isOwner ? { username: r.username } : {}),
+      displayName: r.display_name || '共同帳本成員',
       role: r.role,
       includeInNetWorth: Number(r.include_in_net_worth ?? 0) === 1,
       joinedAt: r.joined_at,
@@ -219,7 +219,7 @@ export async function createSharedLedgerInvite(
       .all<{ owner_user_id: string; member_user_id: string; revoked_at: string | null }>();
     const rows = existingMembers.results || [];
     if (rows.some((r) => r.owner_user_id !== ownerUserId)) {
-      throw new Error('此帳本識別碼已被其他使用者的共同帳本使用，請重新建立帳本後再分享。');
+      throw new Error('無法分享此帳本，請重新建立帳本後再試。');
     }
     const activeCount = rows.filter((r) => !r.revoked_at).length;
     if (activeCount >= MAX_MEMBERS_PER_SHARED_LEDGER) {
@@ -419,9 +419,24 @@ export async function joinSharedLedgerByCode(
       .prepare(
         `UPDATE ledger_invites
          SET used_by = ?, used_at = ?
-         WHERE id = ? AND code_hash = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`
+         WHERE id = ? AND code_hash = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+           AND EXISTS (
+             SELECT 1 FROM ledgers WHERE user_id = ledger_invites.owner_user_id
+               AND id = ledger_invites.ledger_id AND deleted_at IS NULL
+           )
+           AND (SELECT COUNT(*) FROM ledger_members WHERE member_user_id = ?
+                AND owner_user_id != ? AND revoked_at IS NULL) < ?
+           AND (SELECT COUNT(*) FROM ledger_members WHERE ledger_id = ledger_invites.ledger_id
+                AND owner_user_id = ledger_invites.owner_user_id AND revoked_at IS NULL) < ?
+           AND NOT EXISTS (
+             SELECT 1 FROM ledger_members WHERE ledger_id = ledger_invites.ledger_id
+               AND member_user_id = ? AND (revoked_at IS NULL OR owner_user_id != ledger_invites.owner_user_id)
+           )`
       )
-      .bind(userId, nowIso, invite.id, codeHash, nowIso),
+      .bind(
+        userId, nowIso, invite.id, codeHash, nowIso,
+        userId, userId, MAX_JOINED_SHARED_LEDGERS, MAX_MEMBERS_PER_SHARED_LEDGER, userId
+      ),
     db
       .prepare(
         `INSERT INTO ledger_members
@@ -447,7 +462,7 @@ export async function joinSharedLedgerByCode(
     ledgerId: invite.ledger_id,
     ledgerName: ownerLedger.name,
     ownerUserId: invite.owner_user_id,
-    ownerDisplayName: ownerUser?.display_name || ownerUser?.username || '擁有者',
+    ownerDisplayName: ownerUser?.display_name || '擁有者',
     role: invite.role,
   };
 }
@@ -514,15 +529,15 @@ export async function removeOrLeaveSharedLedger(
   }
 
   if (!row) {
-    throw new Error('找不到該共同帳本成員。');
+    throw new Error('找不到可移除的共同帳本成員。');
   }
+  if (actorUserId !== row.owner_user_id && actorUserId !== row.member_user_id) {
+    throw new Error('找不到可移除的共同帳本成員。');
+  }
+
   if (row.role === 'owner') {
     throw new Error('帳本擁有者不可直接退出，請先移除其他成員後再刪除帳本。');
   }
-  if (actorUserId !== row.owner_user_id && actorUserId !== row.member_user_id) {
-    throw new Error('僅帳本擁有者或成員本人可移除成員資格。');
-  }
-
   const nowIso = new Date().toISOString();
   await db
     .prepare(
@@ -548,7 +563,11 @@ export async function updateSharedLedgerPreference(
       .prepare(
         `SELECT owner_user_id, role
          FROM ledger_members
-         WHERE ledger_id = ? AND member_user_id = ? AND revoked_at IS NULL`
+         WHERE ledger_id = ? AND member_user_id = ? AND revoked_at IS NULL
+           AND EXISTS (
+             SELECT 1 FROM ledgers WHERE user_id = ledger_members.owner_user_id
+               AND id = ledger_members.ledger_id AND deleted_at IS NULL
+           )`
       )
       .bind(ledgerId, memberUserId)
       .first();

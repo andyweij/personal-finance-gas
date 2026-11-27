@@ -490,6 +490,8 @@ export function renderQuickTemplatesStrip(ctx: UiContext): void {
   const ledgers = getActiveLedgers(ctx);
 
   for (const tpl of templates) {
+    const target = resolveQuickTemplateForEntry(tpl, ctx.state.activeLedgerId, ledgers, snap.assetItems);
+    if (ctx.engine.isLedgerReadOnly(target.ledgerId)) continue;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'tpl-pill tnum' + (tpl.oneClick ? ' one-click' : '');

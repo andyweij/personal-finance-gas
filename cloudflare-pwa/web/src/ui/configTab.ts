@@ -183,10 +183,12 @@ export function renderConfigTab(ctx: UiContext): void {
       sw.appendChild(cb);
       sw.appendChild(sl);
 
-      right.appendChild(editBtn);
-      right.appendChild(sw);
       row.appendChild(main);
-      row.appendChild(right);
+      if (!ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(item))) {
+        right.appendChild(editBtn);
+        right.appendChild(sw);
+        row.appendChild(right);
+      }
       recList.appendChild(row);
     }
   }

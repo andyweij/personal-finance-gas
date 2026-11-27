@@ -861,7 +861,7 @@ export function bindLedgerSearchEvents(ctx: UiContext): void {
   el('ledgerClearAllBtn').addEventListener('click', resetAllFilters);
 
   el('ledgerExportCsvBtn').addEventListener('click', () => {
-    const snap = ctx.engine.getSnapshot();
+    const snap = ctx.engine.getBackupSnapshot();
     const activeLedger = resolveActiveLedger(ctx);
     const ledgers = getActiveLedgers(ctx);
     const ym = getSelectedYearMonth(ctx.state.selectedYear, ctx.state.selectedMonth);

@@ -1090,7 +1090,7 @@ export function openSecurityModal(ctx: UiContext): void {
   expJsonBtn.className = 'btn btn-outline btn-sm';
   expJsonBtn.textContent = '匯出完整 JSON';
   expJsonBtn.addEventListener('click', () => {
-    const data = ctx.engine.getSnapshot();
+    const data = ctx.engine.getBackupSnapshot();
     const ymd = todayInTimeZone(); // v1.8.15: file name uses the APP_TIMEZONE date (not UTC)
     const suffix = user ? `-${user.username}` : '';
     downloadTextFile(
@@ -1106,7 +1106,7 @@ export function openSecurityModal(ctx: UiContext): void {
   expCsvBtn.className = 'btn btn-outline btn-sm';
   expCsvBtn.textContent = '匯出流水帳 CSV';
   expCsvBtn.addEventListener('click', () => {
-    const csv = exportCashFlowCsv(ctx.engine.getSnapshot().cashflowLogs);
+    const csv = exportCashFlowCsv(ctx.engine.getBackupSnapshot().cashflowLogs);
     const ymd = todayInTimeZone();
     downloadTextFile(`CashFlow_Log-${ymd}.csv`, csv, 'text/csv;charset=utf-8');
     showToast('已匯出 UTF-8 BOM CSV', 'success');

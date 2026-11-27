@@ -1,6 +1,5 @@
 /**
- * v2.0.0 (optional shared ledgers) review — repro tests.
- * `it.fails` marks a defect that still exists; flip it to `it` once fixed.
+ * v2.0.0 (optional shared ledgers) review — regression tests.
  * See docs/reviews/2026-11-27_v2.0.0_review.md.
  */
 import { describe, expect, it } from 'vitest';
@@ -110,7 +109,7 @@ describe('v2.0.0 review — finding 1: SL-4 only checks references changed by th
     expect(res.rejected[0]?.reason).toMatch(/不屬於此共同帳本/);
   });
 
-  it.fails(
+  it(
     'an editor must not change a shared record that is linked to the owner’s private account (pre-sharing link)',
     async () => {
       const { db } = await setup({ linkPrivateBeforeSharing: true });
@@ -128,7 +127,7 @@ describe('v2.0.0 review — finding 1: SL-4 only checks references changed by th
     }
   );
 
-  it.fails('an owner write without the sharedLedgerId hint must not link a shared record to a private account', async () => {
+  it('an owner write without the sharedLedgerId hint must not link a shared record to a private account', async () => {
     const { db, epoch } = await setup();
     // e.g. an older client / a device that has not learned yet that led_home is shared
     const res = await processSyncRequest(db, 'alice', {
@@ -141,7 +140,7 @@ describe('v2.0.0 review — finding 1: SL-4 only checks references changed by th
 });
 
 describe('v2.0.0 review — finding 2: owner replace import of a backup without the shared ledger', () => {
-  it.fails('members are told the shared ledger is gone (memberships are not left active on a missing ledger)', async () => {
+  it('members are told the shared ledger is gone (memberships are not left active on a missing ledger)', async () => {
     const { db } = await setup();
     const backup = await exportFullSnapshot(db, 'alice');
     const preSharing = {

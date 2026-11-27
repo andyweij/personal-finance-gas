@@ -219,9 +219,11 @@ export async function ensureSyncBaseline(
       ...baseStmts,
       db
         .prepare(
-          `SELECT ledger_id, owner_user_id, role, include_in_net_worth, revoked_at
-           FROM ledger_members
-           WHERE member_user_id = ?`
+          `SELECT lm.ledger_id, lm.owner_user_id, lm.role, lm.include_in_net_worth,
+                  COALESCE(lm.revoked_at, CASE WHEN l.id IS NULL THEN lm.updated_at END) AS revoked_at
+           FROM ledger_members lm
+           LEFT JOIN ledgers l ON l.user_id = lm.owner_user_id AND l.id = lm.ledger_id AND l.deleted_at IS NULL
+           WHERE lm.member_user_id = ?`
         )
         .bind(uid),
     ]);
@@ -1538,6 +1540,27 @@ interface RowEntityHandler {
   prepareUpsert: (ctx: RowMutationCtx) => Promise<RowUpsertPlan> | RowUpsertPlan;
 }
 
+const SHARED_ASSET_REF_COLUMNS: Partial<Record<RowSyncEntity, readonly string[]>> = {
+  cashflow: ['linked_account_id'],
+  recurring: ['linked_account_id'],
+  savings_adjustment: ['account_id'],
+  split_receivable: ['source_account_id'],
+  installment_plan: ['card_account_id'],
+};
+
+function sharedAssetRefs(
+  entity: RowSyncEntity,
+  values: Record<string, unknown>,
+  ledgerId: string
+): RefCheck[] {
+  return (SHARED_ASSET_REF_COLUMNS[entity] || []).flatMap((column) => {
+    const id = values[column];
+    return typeof id === 'string' && id
+      ? [{ kind: 'asset', id, label: '共同帳本連動帳戶', requiredLedgerId: ledgerId }]
+      : [];
+  });
+}
+
 async function applyRowEntityMutation(
   db: D1Database,
   uid: string,
@@ -1551,9 +1574,8 @@ async function applyRowEntityMutation(
   sharedScope?: SharedWriteScope
 ): Promise<void> {
   const actorUid = sharedScope?.actorUid ?? uid;
-  const sharedLedgerId = sharedScope?.sharedLedgerId ?? null;
+  let sharedLedgerId = sharedScope?.sharedLedgerId ?? null;
   const ownedSharedLedgerIds = sharedScope?.ownedSharedLedgerIds ?? new Set<string>();
-  const isDelegatedSharedWrite = Boolean(sharedLedgerId && actorUid !== uid);
   const meta = SYNC_ENTITY_BY_NAME[entity];
   const keyColumn = meta.keyColumn as 'id' | 'period';
   const recordId = handler.normalizeRecordId ? handler.normalizeRecordId(mutation) : mutation.recordId;
@@ -1567,6 +1589,12 @@ async function applyRowEntityMutation(
     }
     throw err;
   }
+
+  if (!sharedLedgerId && existing && LEDGER_COLUMN_ENTITIES.has(entity)) {
+    const existingLedgerId = normalizeLedgerId(existing.ledger_id);
+    if (ownedSharedLedgerIds.has(existingLedgerId)) sharedLedgerId = existingLedgerId;
+  }
+  const isDelegatedSharedWrite = Boolean(sharedLedgerId && actorUid !== uid);
 
   // SL-1 / SL-5: Verify an existing row truly belongs to the target shared ledger before version check or mutation
   // (prevents an editor from probing/modifying/deleting the owner's private records via ID guessing).
@@ -1651,6 +1679,8 @@ async function applyRowEntityMutation(
     const delPlan = handler.prepareDeleteGuard
       ? await handler.prepareDeleteGuard({ ...ctx, existing })
       : {};
+    const refs = sharedLedgerId ? sharedAssetRefs(entity, existing, sharedLedgerId) : [];
+    const refGuard = refs.length ? refGuardSql(db, uid, refs) : { sql: '', binds: [] };
     const built = buildSoftDeleteSql({
       table: meta.table,
       keyColumn,
@@ -1660,10 +1690,17 @@ async function applyRowEntityMutation(
       nextVersion: check.nextVersion,
       expectedVersion: Number(existing.version ?? 1),
       expectedEpoch,
-      extraGuardSql: `${delPlan.extraGuardSql || ''}${membershipGuardSql}`,
-      extraGuardBinds: [...(delPlan.extraGuardBinds || []), ...membershipGuardBinds],
+      extraGuardSql: `${delPlan.extraGuardSql || ''}${membershipGuardSql}${refGuard.sql}`,
+      extraGuardBinds: [...(delPlan.extraGuardBinds || []), ...membershipGuardBinds, ...refGuard.binds],
     });
     const delStmt = db.prepare(built.sql).bind(...built.binds);
+    const postStatements = entity === 'ledger' && sharedScope?.hasUpdatedByCols
+      ? [db.prepare(
+          `UPDATE ledger_invites SET revoked_at = ?
+           WHERE owner_user_id = ? AND ledger_id = ? AND used_at IS NULL AND revoked_at IS NULL
+             AND EXISTS (SELECT 1 FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?)`
+        ).bind(check.writeTs, uid, recordId, actorUid, mutation.mutationId)]
+      : [];
     await commitAtomicMutation(
       db,
       uid,
@@ -1671,12 +1708,13 @@ async function applyRowEntityMutation(
       serverTime,
       expectedEpoch,
       delStmt,
-      [],
+      postStatements,
       refetchRow,
       check.legacyClientTs,
-      isDelegatedSharedWrite || delPlan.onZeroChanges
+      isDelegatedSharedWrite || refs.length || delPlan.onZeroChanges
         ? async () => {
             await checkMembershipStillWritable();
+            await rejectMissingRefs(db, uid, refs);
             await delPlan.onZeroChanges?.();
           }
         : undefined,
@@ -1709,7 +1747,11 @@ async function applyRowEntityMutation(
   // SL-4: Same-scope reference guard — shared writes may ONLY link to assets belonging to the SAME shared ledger
   const rawRefs = plan.refs ?? [];
   const refs: RefCheck[] = sharedLedgerId
-    ? rawRefs.map((r) => (r.kind === 'asset' ? { ...r, requiredLedgerId: sharedLedgerId } : r))
+    ? [
+        ...rawRefs.filter((r) => r.kind !== 'asset'),
+        ...sharedAssetRefs(entity, Object.fromEntries(plan.columns.map(({ col, value }) => [col, value])), sharedLedgerId),
+        ...(isDelegatedSharedWrite && existing ? sharedAssetRefs(entity, existing, sharedLedgerId) : []),
+      ]
     : rawRefs;
   const guard = refs.length > 0 ? refGuardSql(db, uid, refs) : { sql: '', binds: [] };
 
@@ -2837,7 +2879,7 @@ async function readSharedLedgersDelta(
   const userDisplayNames = new Map<string, string>();
   const membersByLedger = new Map<string, Array<{ userId: string; displayName: string; role: SharedLedgerRole }>>();
   for (const r of allMemberRows) {
-    const displayName = r.display_name || r.username;
+    const displayName = r.display_name || '共同帳本成員';
     userDisplayNames.set(r.member_user_id, displayName);
     const list = membersByLedger.get(r.ledger_id) || [];
     list.push({ userId: r.member_user_id, displayName, role: r.role });
@@ -3114,9 +3156,13 @@ export async function processSyncRequest(
     enrichUpdatedByName(delta.splitReceivables, shared.userDisplayNames);
     enrichUpdatedByName(delta.installmentPlans, shared.userDisplayNames);
 
+    const missingJoinedIds = joinedMemberships
+      .filter((membership) => !stateByLedger.has(membership.ledger_id))
+      .map((membership) => membership.ledger_id);
+    const revokedIds = [...new Set([...revokedSharedLedgerIds, ...missingJoinedIds])];
     return {
       ...(shared.sharedLedgers.length > 0 ? { sharedLedgers: shared.sharedLedgers } : {}),
-      ...(revokedSharedLedgerIds.length > 0 ? { revokedSharedLedgerIds } : {}),
+      ...(revokedIds.length > 0 ? { revokedSharedLedgerIds: revokedIds } : {}),
     };
   };
 
@@ -3213,6 +3259,7 @@ export async function processSyncRequest(
     | { ok: false; kind: 'reject'; reason: string }
     | { ok: false; kind: 'shared_epoch_mismatch'; ledgerId: string };
 
+  const rowPrefetch: RowPrefetch = new Map();
   const resolveMutationTarget = (m: SyncMutation): ResolvedMutationTarget => {
     const hintedSharedId =
       typeof m.sharedLedgerId === 'string' && m.sharedLedgerId.trim() ? m.sharedLedgerId.trim() : null;
@@ -3222,11 +3269,13 @@ export async function processSyncRequest(
         : null;
     const payloadMem = payloadLid ? activeByLedgerId.get(payloadLid) : undefined;
     const recordMem = m.entity === 'ledger' ? activeByLedgerId.get(m.recordId) : undefined;
-    const implicitJoinedLid =
-      !hintedSharedId &&
-      ((payloadMem && payloadMem.owner_user_id !== uid ? payloadLid : null) ||
-        (recordMem && recordMem.owner_user_id !== uid ? m.recordId : null));
-    const targetSharedId = hintedSharedId || implicitJoinedLid;
+    const table = ENTITY_ROW_TABLE[m.entity]?.table;
+    const ownRow = table ? rowPrefetch.get(`${uid}:${table}:${m.recordId}`) : undefined;
+    const ownLedgerId = normalizeLedgerId(ownRow?.ledger_id);
+    const targetSharedId = hintedSharedId ||
+      (payloadMem ? payloadLid : null) ||
+      (recordMem ? m.recordId : null) ||
+      (ownedSharedLedgerIds.has(ownLedgerId) ? ownLedgerId : null);
 
     if (!targetSharedId) {
       return {
@@ -3415,7 +3464,6 @@ export async function processSyncRequest(
   // H5: ONE batch tells which mutations were already applied and reads the current row of each mutation
   // (instead of 2 queries per mutation)
   const alreadyApplied = new Set<string>();
-  const rowPrefetch: RowPrefetch = new Map();
   if (mutations.length > 0) {
     const valid = mutations.filter(
       (m) => m && typeof m === 'object' && typeof m.mutationId === 'string' && m.mutationId.trim()
@@ -4019,7 +4067,7 @@ export async function importFullSnapshot(
 
   const optTablesRes = await db
     .prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables', 'installment_plans')"
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('financial_goals', 'split_receivables', 'installment_plans', 'ledger_members', 'ledger_invites')"
     )
     .all<{ name: string }>();
   const optTables = new Set((optTablesRes.results || []).map((r) => r.name));
@@ -4457,6 +4505,20 @@ export async function importFullSnapshot(
         v.postedInstallments, v.startYm, v.postDay, v.currency, v.status, v.note, createdAt, nowIso,
       ])
     );
+  }
+
+  if (mode === 'replace') {
+    for (const table of ['ledger_members', 'ledger_invites']) {
+      if (!optTables.has(table)) continue;
+      stmts.push(db.prepare(
+        `UPDATE ${table} SET revoked_at = ?
+         WHERE owner_user_id = ? AND revoked_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM ledgers WHERE user_id = ${table}.owner_user_id
+               AND id = ${table}.ledger_id AND deleted_at IS NULL
+           )`
+      ).bind(nowIso, uid));
+    }
   }
 
   const results = stmts.length > 0 ? await db.batch(stmts) : [];
