@@ -210,6 +210,19 @@ function formatUtcOffsetDateKey(epochSec: number, gmtOffsetSec: number): string 
   return `${y}-${m}-${d}`;
 }
 
+/**
+ * v1.12.1: the weekday before `ymd` (YYYY-MM-DD), skipping Saturday and Sunday. Exchange holidays are not known
+ * here, so a bar after a holiday does not match; callers then ask range=1d instead of guessing.
+ */
+function previousWeekdayKey(ymd: string): string {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  do {
+    dt.setUTCDate(dt.getUTCDate() - 1);
+  } while (dt.getUTCDay() === 0 || dt.getUTCDay() === 6);
+  return dt.toISOString().slice(0, 10);
+}
+
 async function fetchYahoo1dPreviousClose(
   host: string,
   symbol: string,
@@ -309,30 +322,45 @@ async function fetchYahooChartQuote(
 
       if (Number.isFinite(candidate) && candidate > 0) {
         let prevClose: number | null = null;
+        let prevBarTs: number | null = null;
         const gmtOffset = Number.isFinite(Number(meta?.gmtoffset)) ? Number(meta?.gmtoffset) : 0;
         const marketTime = Number(meta?.regularMarketTime);
+        const marketDay =
+          Number.isFinite(marketTime) && marketTime > 0 ? formatUtcOffsetDateKey(marketTime, gmtOffset) : null;
 
         if (validPairs.length >= 2) {
           const lastPair = validPairs[validPairs.length - 1];
-          if (Number.isFinite(marketTime) && marketTime > 0 && lastPair.ts !== null) {
-            const marketDay = formatUtcOffsetDateKey(marketTime, gmtOffset);
+          if (marketDay !== null && lastPair.ts !== null) {
             const lastBarDay = formatUtcOffsetDateKey(lastPair.ts, gmtOffset);
-            prevClose =
-              marketDay > lastBarDay
-                ? lastPair.close
-                : validPairs[validPairs.length - 2].close;
+            const prevPair = marketDay > lastBarDay ? lastPair : validPairs[validPairs.length - 2];
+            prevClose = prevPair.close;
+            prevBarTs = prevPair.ts;
           } else {
             prevClose = validPairs[validPairs.length - 2].close;
           }
         } else if (validPairs.length === 1) {
           const lastPair = validPairs[0];
           if (
-            Number.isFinite(marketTime) &&
-            marketTime > 0 &&
+            marketDay !== null &&
             lastPair.ts !== null &&
-            formatUtcOffsetDateKey(marketTime, gmtOffset) > formatUtcOffsetDateKey(lastPair.ts, gmtOffset)
+            marketDay > formatUtcOffsetDateKey(lastPair.ts, gmtOffset)
           ) {
             prevClose = lastPair.close;
+            prevBarTs = lastPair.ts;
+          }
+        }
+
+        // v1.12.1 (2026-11-27 report): the bar taken as the previous close must be the previous trading day of the
+        // quote. A missing bar, a null close (filtered out above) or lagging daily bars otherwise yield the close
+        // of two or more days ago, which can flip the sign of the daily change. Unverified → ask range=1d / null.
+        if (prevClose !== null && marketDay !== null && prevBarTs !== null) {
+          const prevBarDay = formatUtcOffsetDateKey(prevBarTs, gmtOffset);
+          const expectedPrevDay = previousWeekdayKey(marketDay);
+          if (prevBarDay !== expectedPrevDay) {
+            console.warn(
+              `[market] ${symbol}: previous-close bar ${prevBarDay} is not the trading day before ${marketDay} (expected ${expectedPrevDay}); verifying with range=1d`
+            );
+            prevClose = null;
           }
         }
 
@@ -579,6 +607,8 @@ export async function fetchStockQuote(
   if (TW_NUMERIC_CODE_RE.test(norm.code)) {
     const twseQuote = await fetchTwseMisQuote(norm.code, norm.twseExchange, fetchImpl);
     if (twseQuote !== null) return twseQuote;
+    // v1.12.1: record the fallback so a wrong quote can be traced to its source in Workers Logs
+    console.warn(`[market] ${norm.code}: TWSE MIS returned no usable quote; falling back to Yahoo Finance`);
   }
 
   const yfPrimary = await fetchYahooChartQuote(norm.yahooSymbol, fetchImpl);
