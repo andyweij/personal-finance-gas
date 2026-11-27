@@ -28,6 +28,7 @@ import type {
   CashFlowLog,
   FinancialGoal,
   FinanceSnapshot,
+  InstallmentPlan,
   Ledger,
   PnlColorScheme,
   RecurringItem,
@@ -47,6 +48,12 @@ import { getCurrencyDecimals, resolveFxRate } from '../../../shared/currency';
 import { roundTo } from '../../../shared/format';
 import { computeSettlementPreview, type MultiCurrencySettlementPreview } from '../../../shared/splits';
 import {
+  buildInstallmentDedupKey,
+  computeInstallmentScheduleAmounts,
+  getInstallmentEntryDate,
+  monthsBetweenYm,
+} from '../../../shared/creditCard';
+import {
   normalizeCustomCategories,
   normalizeCustomStockCategories,
   normalizeEnabledCurrencies,
@@ -61,6 +68,7 @@ import {
   validateAssetInput,
   validateCashFlowInput,
   validateFinancialGoalInput,
+  validateInstallmentPlanInput,
   validateLedgerInput,
   validateRecurringInput,
   validateSavingsAdjustmentInput,
@@ -71,6 +79,7 @@ import {
   type AssetInputPayload,
   type CashFlowInputPayload,
   type FinancialGoalInputPayload,
+  type InstallmentPlanInputPayload,
   type LedgerInputPayload,
   type RecurringInputPayload,
   type SavingsAdjustmentInputPayload,
@@ -153,6 +162,22 @@ export interface WriteOffSplitReceivableParams {
   id: string;
   date?: string;
   category?: string;
+  note?: string;
+}
+
+export interface PayCreditCardBillParams {
+  fromAccountId: string;
+  cardAccountId: string;
+  amount: number;
+  date?: string;
+  cardCreditAmount?: number;
+  fee?: number;
+  note?: string;
+}
+
+export interface PayOffInstallmentPlanParams {
+  id: string;
+  date?: string;
   note?: string;
 }
 
@@ -421,6 +446,12 @@ export class SyncEngine {
       'settleSplitReceivable',
       'writeOffSplitReceivable',
       'deleteSplitReceivable',
+      'reconcileCreditCard',
+      'payCreditCardBill',
+      'saveInstallmentPlan',
+      'deleteInstallmentPlan',
+      'postDueInstallmentsForMonth',
+      'payOffInstallmentPlanEarly',
       'saveAsset',
       'updateAssetStockCategory',
       'reorderAssets',
@@ -792,6 +823,8 @@ export class SyncEngine {
         return (snap.financialGoals || []).find((g) => g.id === recordId) || null;
       case 'split_receivable':
         return (snap.splitReceivables || []).find((s) => s.id === recordId) || null;
+      case 'installment_plan':
+        return (snap.installmentPlans || []).find((p) => p.id === recordId) || null;
       default:
         return null;
     }
@@ -983,19 +1016,27 @@ export class SyncEngine {
     const matchingSplits = (this.snapshot.splitReceivables || []).filter(
       (s) => !s.deletedAt && getEffectiveLedgerId(s) === lid
     );
+    const matchingInstallments = (this.snapshot.installmentPlans || []).filter(
+      (p) => !p.deletedAt && getEffectiveLedgerId(p) === lid
+    );
     const totalLinked =
-      matchingLogs.length + matchingAssets.length + matchingRecurring.length + matchingSplits.length;
+      matchingLogs.length +
+      matchingAssets.length +
+      matchingRecurring.length +
+      matchingSplits.length +
+      matchingInstallments.length;
 
     const mutations: SyncMutation[] = [];
     let nextLogs = this.snapshot.cashflowLogs;
     let nextAssets = this.snapshot.assetItems;
     let nextRecurring = this.snapshot.recurringItems;
     let nextSplits = this.snapshot.splitReceivables || [];
+    let nextInstallments = this.snapshot.installmentPlans || [];
 
     if (totalLinked > 0) {
       if (!opts?.migrateToLedgerId) {
         throw new Error(
-          `此帳本仍有 ${totalLinked} 筆關聯紀錄（${matchingAssets.length} 資產、${matchingLogs.length} 流水帳、${matchingRecurring.length} 固定收支${matchingSplits.length > 0 ? `、${matchingSplits.length} 拆帳代墊` : ''}），請先轉移或清除後再刪除。`
+          `此帳本仍有 ${totalLinked} 筆關聯紀錄（${matchingAssets.length} 資產、${matchingLogs.length} 流水帳、${matchingRecurring.length} 固定收支${matchingSplits.length > 0 ? `、${matchingSplits.length} 拆帳代墊` : ''}${matchingInstallments.length > 0 ? `、${matchingInstallments.length} 分期計畫` : ''}），請先轉移或清除後再刪除。`
         );
       }
       const targetLedgerId = normalizeLedgerId(opts.migrateToLedgerId);
@@ -1079,6 +1120,24 @@ export class SyncEngine {
         }
         return s;
       });
+
+      nextInstallments = nextInstallments.map((p) => {
+        if (!p.deletedAt && getEffectiveLedgerId(p) === lid) {
+          const updated: InstallmentPlan = { ...p, ledgerId: targetLedgerId, updatedAt: nowIso };
+          mutations.push({
+            mutationId: crypto.randomUUID(),
+            entity: 'installment_plan',
+            op: 'upsert',
+            recordId: updated.id,
+            clientTimestamp: nowIso,
+            baseVersion: p.version ?? null,
+            isNewRecord: false,
+            payload: { ...updated },
+          });
+          return updated;
+        }
+        return p;
+      });
     }
 
     mutations.push({
@@ -1098,6 +1157,7 @@ export class SyncEngine {
       assetItems: nextAssets,
       recurringItems: nextRecurring,
       splitReceivables: nextSplits,
+      installmentPlans: nextInstallments,
     };
 
     await this.commitAndMaybeSync(nextSnapshot, mutations);
@@ -2298,6 +2358,617 @@ export class SyncEngine {
     return { deletedReceivableCount: 1, undoneCashflow: false, undoneAdjustment: false };
   }
 
+  /* ==================== Phase 7: Credit Cards & Installment Plans ==================== */
+
+  async reconcileCreditCard(
+    accountId: string,
+    actualUnpaidNative: number,
+    anchorDate?: string
+  ): Promise<AssetItem> {
+    const existing = this.snapshot.assetItems.find(
+      (a) => !a.deletedAt && a.id === accountId && a.isCreditCard
+    );
+    if (!existing) throw new Error('找不到對應的信用卡帳戶。');
+    const dec = getCurrencyDecimals(existing.currency || 'TWD');
+    const cleanBal = roundTo(Number(actualUnpaidNative), dec);
+    if (!Number.isFinite(cleanBal) || cleanBal < 0) {
+      throw new Error('校準後的未繳卡費餘額須大於等於 0。');
+    }
+    const cleanDate = String(anchorDate || todayInTimeZone()).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) {
+      throw new Error('請輸入有效的校準基準日期（YYYY-MM-DD）。');
+    }
+    const nowIso = new Date().toISOString();
+    return this.saveAssetInner({
+      id: existing.id,
+      updateMode: '手動快照',
+      majorType: '負債',
+      subCategory: '信用卡',
+      liquidity: '負債',
+      itemName: existing.itemName,
+      quantityOrAmount: cleanBal,
+      currency: existing.currency,
+      unitPrice: 1,
+      note: existing.note,
+      isCreditCard: true,
+      creditBillingDay: existing.creditBillingDay ?? 15,
+      creditDueDay: existing.creditDueDay ?? 1,
+      creditLimit: existing.creditLimit ?? null,
+      balanceAnchorDate: cleanDate,
+      balanceAnchorAt: nowIso,
+      ledgerId: getEffectiveLedgerId(existing),
+      excludeFromNetWorth: existing.excludeFromNetWorth,
+      sortOrder: existing.sortOrder,
+    });
+  }
+
+  async payCreditCardBill(params: PayCreditCardBillParams): Promise<{
+    transferGroupId: string;
+    fromAdjustment: SavingsAdjustment | null;
+    cardAdjustment: SavingsAdjustment;
+    feeCashflow: CashFlowLog | null;
+  }> {
+    const fromAcc = this.snapshot.assetItems.find(
+      (a) => !a.deletedAt && a.id === params.fromAccountId && isTransferableAccount(a)
+    );
+    if (!fromAcc) throw new Error('找不到扣款帳戶（需為活存或可轉帳現金帳戶）。');
+    const cardAcc = this.snapshot.assetItems.find(
+      (a) => !a.deletedAt && a.id === params.cardAccountId && a.isCreditCard
+    );
+    if (!cardAcc) throw new Error('找不到對應的信用卡帳戶。');
+
+    const date = String(params.date || todayInTimeZone()).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      throw new Error('請輸入有效的繳款日期（YYYY-MM-DD）。');
+    }
+    const fromDec = getCurrencyDecimals(fromAcc.currency || 'TWD');
+    const cardDec = getCurrencyDecimals(cardAcc.currency || 'TWD');
+    const payAmount = roundTo(Number(params.amount || 0), fromDec);
+    if (!Number.isFinite(payAmount) || payAmount <= 0) {
+      throw new Error('繳卡費金額須大於 0。');
+    }
+    const fee = roundTo(Math.max(0, Number(params.fee || 0)), fromDec);
+    if (!Number.isFinite(fee) || fee < 0) {
+      throw new Error('手續費不可為負數。');
+    }
+
+    let cardCreditAmount: number;
+    if (fromAcc.currency === cardAcc.currency) {
+      cardCreditAmount = roundTo(payAmount, cardDec);
+    } else if (
+      params.cardCreditAmount !== undefined &&
+      Number.isFinite(Number(params.cardCreditAmount)) &&
+      Number(params.cardCreditAmount) > 0
+    ) {
+      cardCreditAmount = roundTo(Number(params.cardCreditAmount), cardDec);
+    } else {
+      const fromRate = resolveFxRate(fromAcc.currency || 'TWD', this.snapshot.settings);
+      const cardRate = resolveFxRate(cardAcc.currency || 'TWD', this.snapshot.settings);
+      cardCreditAmount = roundTo((payAmount * fromRate) / (cardRate || 1), cardDec);
+    }
+
+    if (!fromAcc.isLinkedSavings) {
+      const nextQty = roundTo(fromAcc.quantityOrAmount - payAmount - fee, fromDec);
+      if (nextQty < 0) {
+        throw new Error(`扣款金額超過「${fromAcc.itemName}」目前餘額。`);
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const transferGroupId = `cc-pay:${crypto.randomUUID()}`;
+    const noteSuffix = params.note ? ` · ${String(params.note).trim()}` : '';
+    const mutations: SyncMutation[] = [];
+    const newAdjs: SavingsAdjustment[] = [];
+    const updatedAssets: AssetItem[] = [];
+
+    // 1. Deduct from source bank / cash account
+    let fromAdjustment: SavingsAdjustment | null = null;
+    if (fromAcc.isLinkedSavings) {
+      const adjId = crypto.randomUUID();
+      const validated = validateSavingsAdjustmentInput(
+        {
+          accountId: fromAcc.id,
+          date,
+          amount: -payAmount,
+          currency: fromAcc.currency,
+          note: `[繳卡費] ${cardAcc.itemName}${noteSuffix}`.slice(0, 200),
+          transferGroupId,
+        },
+        this.snapshot.settings
+      );
+      fromAdjustment = {
+        id: adjId,
+        ...validated,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      newAdjs.push(fromAdjustment);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'savings_adjustment',
+        op: 'upsert',
+        recordId: adjId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId: transferGroupId,
+        payload: { ...fromAdjustment, currency: fromAcc.currency },
+      });
+    } else {
+      const updatedFrom: AssetItem = {
+        ...fromAcc,
+        quantityOrAmount: roundTo(fromAcc.quantityOrAmount - payAmount - fee, fromDec),
+        updatedAt: nowIso,
+      };
+      updatedAssets.push(updatedFrom);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'asset',
+        op: 'upsert',
+        recordId: updatedFrom.id,
+        clientTimestamp: nowIso,
+        baseVersion: fromAcc.version ?? null,
+        isNewRecord: false,
+        atomicGroupId: transferGroupId,
+        payload: { ...updatedFrom },
+      });
+    }
+
+    // 2. Reduce credit card unpaid liability (negative savings_adjustment on cardAcc, NEVER a cashflow expense!)
+    const cardAdjId = crypto.randomUUID();
+    const validatedCardAdj = validateSavingsAdjustmentInput(
+      {
+        accountId: cardAcc.id,
+        date,
+        amount: -cardCreditAmount,
+        currency: cardAcc.currency,
+        note: `[繳卡費入帳] 自 ${fromAcc.itemName}${noteSuffix}`.slice(0, 200),
+        transferGroupId,
+      },
+      this.snapshot.settings
+    );
+    const cardAdjustment: SavingsAdjustment = {
+      id: cardAdjId,
+      ...validatedCardAdj,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      deletedAt: null,
+    };
+    newAdjs.push(cardAdjustment);
+    mutations.push({
+      mutationId: crypto.randomUUID(),
+      entity: 'savings_adjustment',
+      op: 'upsert',
+      recordId: cardAdjId,
+      clientTimestamp: nowIso,
+      baseVersion: null,
+      isNewRecord: true,
+      atomicGroupId: transferGroupId,
+      payload: { ...cardAdjustment, currency: cardAcc.currency },
+    });
+
+    // 3. Optional transfer fee
+    let feeCashflow: CashFlowLog | null = null;
+    if (fee > 0) {
+      const cfId = crypto.randomUUID();
+      const validatedCf = validateCashFlowInput(
+        {
+          date,
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: '其他',
+          itemName: `繳卡費手續費 (${cardAcc.itemName})`.slice(0, 80),
+          amount: fee,
+          currency: fromAcc.currency,
+          source: '手機記帳',
+          note: `[繳卡費手續費]${noteSuffix}`.slice(0, 200),
+          linkedAccountId: fromAcc.isLinkedSavings ? fromAcc.id : null,
+          ledgerId: getEffectiveLedgerId(fromAcc),
+        },
+        this.snapshot.settings
+      );
+      feeCashflow = {
+        id: cfId,
+        ...validatedCf,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'cashflow',
+        op: 'upsert',
+        recordId: cfId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId: transferGroupId,
+        payload: { ...feeCashflow },
+      });
+    }
+
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      assetItems:
+        updatedAssets.length > 0
+          ? mergeById(this.snapshot.assetItems, updatedAssets).sort(compareBySortOrder)
+          : this.snapshot.assetItems,
+      savingsAdjustments: [...newAdjs, ...this.snapshot.savingsAdjustments].sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+      cashflowLogs: feeCashflow
+        ? this.sortCashFlows([feeCashflow, ...this.snapshot.cashflowLogs])
+        : this.snapshot.cashflowLogs,
+    };
+
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    return {
+      transferGroupId,
+      fromAdjustment,
+      cardAdjustment,
+      feeCashflow,
+    };
+  }
+
+  async saveInstallmentPlan(
+    payload: InstallmentPlanInputPayload & { id?: string; postFirstNow?: boolean }
+  ): Promise<{ plan: InstallmentPlan; firstCashflow: CashFlowLog | null }> {
+    const v = validateInstallmentPlanInput(payload);
+    const nowIso = new Date().toISOString();
+    const id = payload.id || crypto.randomUUID();
+    const currentPlans = this.snapshot.installmentPlans || [];
+    const existing = currentPlans.find((p) => p.id === id);
+
+    const postFirst = Boolean(!existing && payload.postFirstNow && v.postedInstallments === 0 && v.status === 'active');
+    const finalPosted = postFirst ? 1 : v.postedInstallments;
+    const finalStatus = finalPosted >= v.totalInstallments ? 'completed' : v.status;
+
+    const plan: InstallmentPlan = {
+      id,
+      ...v,
+      postedInstallments: finalPosted,
+      status: finalStatus,
+      createdAt: existing?.createdAt || nowIso,
+      updatedAt: nowIso,
+      deletedAt: null,
+      ...(existing?.version !== undefined ? { version: existing.version } : {}),
+    };
+
+    const atomicGroupId = postFirst ? `inst-create:${id}` : undefined;
+    const mutations: SyncMutation[] = [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'installment_plan',
+        op: 'upsert',
+        recordId: id,
+        clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
+        isNewRecord: !existing,
+        ...(atomicGroupId ? { atomicGroupId } : {}),
+        payload: { ...plan },
+      },
+    ];
+
+    let firstCashflow: CashFlowLog | null = null;
+    if (postFirst) {
+      const schedule = computeInstallmentScheduleAmounts(plan.totalAmount, plan.totalInstallments, plan.currency);
+      const firstAmt = schedule[0] ?? 0;
+      if (firstAmt > 0) {
+        const cfId = crypto.randomUUID();
+        const entryDate = getInstallmentEntryDate(plan.startYm, 1, plan.postDay);
+        const validatedCf = validateCashFlowInput(
+          {
+            date: entryDate,
+            type: CASHFLOW_TYPES.DAILY_EXPENSE,
+            category: plan.category,
+            itemName: `${plan.itemName} (1/${plan.totalInstallments}期)`.slice(0, 80),
+            amount: firstAmt,
+            currency: plan.currency,
+            source: '自動入帳',
+            note: `[分期 1/${plan.totalInstallments}]${plan.note ? ' ' + plan.note : ''}`.slice(0, 200),
+            linkedAccountId: plan.cardAccountId || null,
+            ledgerId: plan.ledgerId,
+            installmentPlanId: plan.id,
+            installmentSeq: 1,
+          },
+          this.snapshot.settings
+        );
+        firstCashflow = {
+          id: cfId,
+          ...validatedCf,
+          recurringDedupKey: buildInstallmentDedupKey(plan.id, 1),
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          deletedAt: null,
+        };
+        mutations.push({
+          mutationId: crypto.randomUUID(),
+          entity: 'cashflow',
+          op: 'upsert',
+          recordId: cfId,
+          clientTimestamp: nowIso,
+          baseVersion: null,
+          isNewRecord: true,
+          ...(atomicGroupId ? { atomicGroupId } : {}),
+          payload: { ...firstCashflow },
+        });
+      }
+    }
+
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      installmentPlans: mergeById(currentPlans, [plan]).sort(
+        (a, b) => b.startYm.localeCompare(a.startYm) || b.createdAt.localeCompare(a.createdAt)
+      ),
+      cashflowLogs: firstCashflow
+        ? this.sortCashFlows([firstCashflow, ...this.snapshot.cashflowLogs])
+        : this.snapshot.cashflowLogs,
+    };
+
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    return { plan, firstCashflow };
+  }
+
+  async deleteInstallmentPlan(id: string): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const currentPlans = this.snapshot.installmentPlans || [];
+    const existing = currentPlans.find((p) => p.id === id);
+    if (!existing) return;
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      installmentPlans: currentPlans.filter((p) => p.id !== id),
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'installment_plan',
+        op: 'delete',
+        recordId: id,
+        clientTimestamp: nowIso,
+        baseVersion: existing.version ?? null,
+      },
+    ]);
+  }
+
+  async postDueInstallmentsForMonth(yearMonth: string): Promise<{
+    postedCount: number;
+    skippedCount: number;
+  }> {
+    const cleanYm = String(yearMonth || '').trim();
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(cleanYm)) {
+      throw new Error('請輸入有效的年月格式（YYYY-MM）。');
+    }
+    const currentPlans = this.snapshot.installmentPlans || [];
+    const existingKeys = new Set<string>();
+    for (const l of this.snapshot.cashflowLogs) {
+      if (l.deletedAt) continue;
+      if (l.installmentPlanId && l.installmentSeq) {
+        existingKeys.add(buildInstallmentDedupKey(l.installmentPlanId, l.installmentSeq));
+      }
+      if (l.recurringDedupKey && l.recurringDedupKey.startsWith('inst:')) {
+        existingKeys.add(l.recurringDedupKey);
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const mutations: SyncMutation[] = [];
+    const newLogs: CashFlowLog[] = [];
+    const updatedPlans: InstallmentPlan[] = [];
+    let postedCount = 0;
+    let skippedCount = 0;
+
+    for (const plan of currentPlans) {
+      if (plan.deletedAt || plan.status !== 'active') continue;
+      const seq = monthsBetweenYm(plan.startYm, cleanYm) + 1;
+      if (seq < 1 || seq > plan.totalInstallments) continue;
+      const dedupKey = buildInstallmentDedupKey(plan.id, seq);
+      if (existingKeys.has(dedupKey) || seq <= plan.postedInstallments) {
+        skippedCount += 1;
+        continue;
+      }
+      const schedule = computeInstallmentScheduleAmounts(plan.totalAmount, plan.totalInstallments, plan.currency);
+      const amount = schedule[seq - 1] ?? 0;
+      if (amount <= 0) {
+        skippedCount += 1;
+        continue;
+      }
+
+      const atomicGroupId = `inst-post:${plan.id}:${seq}`;
+      const cfId = crypto.randomUUID();
+      const entryDate = getInstallmentEntryDate(plan.startYm, seq, plan.postDay);
+      const validatedCf = validateCashFlowInput(
+        {
+          date: entryDate,
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: plan.category,
+          itemName: `${plan.itemName} (${seq}/${plan.totalInstallments}期)`.slice(0, 80),
+          amount,
+          currency: plan.currency,
+          source: '自動入帳',
+          note: `[分期 ${seq}/${plan.totalInstallments}]${plan.note ? ' ' + plan.note : ''}`.slice(0, 200),
+          linkedAccountId: plan.cardAccountId || null,
+          ledgerId: plan.ledgerId,
+          installmentPlanId: plan.id,
+          installmentSeq: seq,
+        },
+        this.snapshot.settings
+      );
+      const cf: CashFlowLog = {
+        id: cfId,
+        ...validatedCf,
+        recurringDedupKey: dedupKey,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      const nextPosted = Math.max(plan.postedInstallments, seq);
+      const updatedPlan: InstallmentPlan = {
+        ...plan,
+        postedInstallments: nextPosted,
+        status: nextPosted >= plan.totalInstallments ? 'completed' : 'active',
+        updatedAt: nowIso,
+      };
+      newLogs.push(cf);
+      updatedPlans.push(updatedPlan);
+      mutations.push(
+        {
+          mutationId: crypto.randomUUID(),
+          entity: 'cashflow',
+          op: 'upsert',
+          recordId: cfId,
+          clientTimestamp: nowIso,
+          baseVersion: null,
+          isNewRecord: true,
+          atomicGroupId,
+          payload: { ...cf },
+        },
+        {
+          mutationId: crypto.randomUUID(),
+          entity: 'installment_plan',
+          op: 'upsert',
+          recordId: plan.id,
+          clientTimestamp: nowIso,
+          baseVersion: plan.version ?? null,
+          isNewRecord: false,
+          atomicGroupId,
+          payload: { ...updatedPlan },
+        }
+      );
+      existingKeys.add(dedupKey);
+      postedCount += 1;
+    }
+
+    if (mutations.length > 0) {
+      const nextSnapshot: FinanceSnapshot = {
+        ...this.snapshot,
+        cashflowLogs: this.sortCashFlows([...newLogs, ...this.snapshot.cashflowLogs]),
+        installmentPlans: mergeById(currentPlans, updatedPlans).sort(
+          (a, b) => b.startYm.localeCompare(a.startYm) || b.createdAt.localeCompare(a.createdAt)
+        ),
+      };
+      await this.commitAndMaybeSync(nextSnapshot, mutations);
+    }
+
+    return { postedCount, skippedCount };
+  }
+
+  async payOffInstallmentPlanEarly(params: PayOffInstallmentPlanParams): Promise<{
+    plan: InstallmentPlan;
+    cashflow: CashFlowLog | null;
+    remainingAmount: number;
+  }> {
+    const currentPlans = this.snapshot.installmentPlans || [];
+    const existing = currentPlans.find((p) => !p.deletedAt && p.id === params.id);
+    if (!existing) throw new Error('找不到這筆分期付款計畫。');
+    if (existing.status !== 'active') {
+      throw new Error('此分期計畫已結清或取消。');
+    }
+    const payoffDate = String(params.date || todayInTimeZone()).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(payoffDate)) {
+      throw new Error('請輸入有效的清償日期（YYYY-MM-DD）。');
+    }
+
+    const curr = existing.currency || 'TWD';
+    const dec = getCurrencyDecimals(curr);
+    const schedule = computeInstallmentScheduleAmounts(
+      existing.totalAmount,
+      existing.totalInstallments,
+      curr
+    );
+    const posted = Math.min(existing.totalInstallments, Math.max(0, existing.postedInstallments));
+    const remainingCount = Math.max(0, existing.totalInstallments - posted);
+    const remainingAmount = roundTo(
+      schedule.slice(posted).reduce((s, a) => s + a, 0),
+      dec
+    );
+
+    const nowIso = new Date().toISOString();
+    const atomicGroupId = `inst-payoff:${existing.id}:${Date.now()}`;
+    const updatedPlan: InstallmentPlan = {
+      ...existing,
+      postedInstallments: existing.totalInstallments,
+      status: 'completed',
+      note: params.note
+        ? existing.note
+          ? `${existing.note} · [提前清償] ${params.note}`.slice(0, 200)
+          : `[提前清償] ${params.note}`.slice(0, 200)
+        : existing.note,
+      updatedAt: nowIso,
+    };
+
+    const mutations: SyncMutation[] = [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'installment_plan',
+        op: 'upsert',
+        recordId: existing.id,
+        clientTimestamp: nowIso,
+        baseVersion: existing.version ?? null,
+        isNewRecord: false,
+        atomicGroupId,
+        payload: { ...updatedPlan },
+      },
+    ];
+
+    let createdCashflow: CashFlowLog | null = null;
+    if (remainingAmount > 0 && remainingCount > 0) {
+      const cfId = crypto.randomUUID();
+      const validatedCf = validateCashFlowInput(
+        {
+          date: payoffDate,
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: existing.category,
+          itemName: `${existing.itemName} (提前清償剩餘 ${remainingCount} 期)`.slice(0, 80),
+          amount: remainingAmount,
+          currency: curr,
+          source: '手機記帳',
+          note: params.note ? `[分期提前清償] ${params.note}`.slice(0, 200) : '[分期提前清償]',
+          linkedAccountId: existing.cardAccountId || null,
+          ledgerId: existing.ledgerId,
+          installmentPlanId: existing.id,
+          installmentSeq: existing.totalInstallments,
+        },
+        this.snapshot.settings
+      );
+      createdCashflow = {
+        id: cfId,
+        ...validatedCf,
+        recurringDedupKey: buildInstallmentDedupKey(existing.id, existing.totalInstallments),
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'cashflow',
+        op: 'upsert',
+        recordId: cfId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId,
+        payload: { ...createdCashflow },
+      });
+    }
+
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      installmentPlans: mergeById(currentPlans, [updatedPlan]).sort(
+        (a, b) => b.startYm.localeCompare(a.startYm) || b.createdAt.localeCompare(a.createdAt)
+      ),
+      cashflowLogs: createdCashflow
+        ? this.sortCashFlows([createdCashflow, ...this.snapshot.cashflowLogs])
+        : this.snapshot.cashflowLogs,
+    };
+
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    return {
+      plan: updatedPlan,
+      cashflow: createdCashflow,
+      remainingAmount,
+    };
+  }
+
   async saveAsset(payload: AssetInputPayload & { id?: string }): Promise<AssetItem> {
     return this.saveAssetInner(payload);
   }
@@ -3253,6 +3924,19 @@ export class SyncEngine {
         ),
       };
     }
+    if (entity === 'installment_plan') {
+      const filtered = (baseSnapshot.installmentPlans || []).filter((p) => p.id !== recordId);
+      const next =
+        !isDelete && record && !record.deletedAt
+          ? [record as unknown as InstallmentPlan, ...filtered]
+          : filtered;
+      return {
+        ...baseSnapshot,
+        installmentPlans: next.sort(
+          (a, b) => b.startYm.localeCompare(a.startYm) || b.createdAt.localeCompare(a.createdAt)
+        ),
+      };
+    }
     return baseSnapshot;
   }
 
@@ -3311,6 +3995,10 @@ export class SyncEngine {
       }
       case 'split_receivable': {
         const found = (delta.splitReceivables || []).find((s) => s.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'installment_plan': {
+        const found = (delta.installmentPlans || []).find((p) => p.id === recordId);
         return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
       }
       default:
@@ -4587,6 +5275,11 @@ export class SyncEngine {
           ...snap,
           splitReceivables: (snap.splitReceivables || []).filter((s) => s.id !== recordId),
         };
+      case 'installment_plan':
+        return {
+          ...snap,
+          installmentPlans: (snap.installmentPlans || []).filter((p) => p.id !== recordId),
+        };
       default:
         return snap;
     }
@@ -4600,6 +5293,7 @@ export class SyncEngine {
     const incomingStockTxs = delta.stockTransactions || [];
     const incomingGoals = Array.isArray(delta.financialGoals) ? delta.financialGoals : [];
     const incomingSplits = Array.isArray(delta.splitReceivables) ? delta.splitReceivables : [];
+    const incomingInstallments = Array.isArray(delta.installmentPlans) ? delta.installmentPlans : [];
     if (isFull) {
       const fullLedgers = ensureActiveLedgers(
         incomingLedgers.length > 0 ? incomingLedgers.filter((l) => !l.deletedAt) : [createDefaultLedger()]
@@ -4626,6 +5320,9 @@ export class SyncEngine {
         splitReceivables: incomingSplits
           .filter((s) => !s.deletedAt)
           .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+        installmentPlans: incomingInstallments
+          .filter((p) => !p.deletedAt)
+          .sort((a, b) => b.startYm.localeCompare(a.startYm) || b.createdAt.localeCompare(a.createdAt)),
       };
     }
 
@@ -4659,6 +5356,9 @@ export class SyncEngine {
       financialGoals: mergeById(current.financialGoals || [], incomingGoals).sort(compareBySortOrder),
       splitReceivables: mergeById(current.splitReceivables || [], incomingSplits).sort(
         (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+      installmentPlans: mergeById(current.installmentPlans || [], incomingInstallments).sort(
+        (a, b) => b.startYm.localeCompare(a.startYm) || b.createdAt.localeCompare(a.createdAt)
       ),
     };
   }

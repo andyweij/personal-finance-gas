@@ -72,6 +72,8 @@ export interface CashFlowLog {
   recurringDedupKey?: string | null;
   linkedAccountId?: string | null;
   ledgerId?: string;
+  installmentPlanId?: string | null;
+  installmentSeq?: number | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -139,6 +141,10 @@ export interface AssetItem {
   loanAnnualRate?: number | null;
   loanMonthlyPayment?: number | null;
   loanBillingDay?: number | null;
+  isCreditCard?: boolean;
+  creditBillingDay?: number | null;
+  creditDueDay?: number | null;
+  creditLimit?: number | null;
   stockCategory?: string;
   isWatchlist?: boolean;
   ledgerId?: string;
@@ -401,6 +407,65 @@ export interface SplitReceivable {
   version?: number;
 }
 
+export type InstallmentPlanStatus = 'active' | 'completed' | 'cancelled';
+
+export interface InstallmentPlan {
+  id: string;
+  ledgerId: string;
+  cardAccountId?: string | null;
+  itemName: string;
+  category: string;
+  totalAmount: number;
+  totalInstallments: number;
+  postedInstallments: number;
+  startYm: string; // YYYY-MM
+  postDay: number; // 1..31
+  currency: string;
+  status: InstallmentPlanStatus;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+  version?: number;
+}
+
+export interface CreditCardBillingWindow {
+  statementStart: string; // YYYY-MM-DD
+  statementEnd: string; // YYYY-MM-DD
+  paymentDueDate: string; // YYYY-MM-DD
+  unbilledStart: string; // YYYY-MM-DD
+  unbilledEnd: string; // YYYY-MM-DD
+}
+
+export interface CreditCardSummary {
+  card: AssetItem;
+  baseBalanceTwd: number;
+  adjustmentsTotalTwd: number;
+  cashflowChargesTwd: number;
+  currentBalanceNative: number;
+  currentBalanceTwd: number;
+  unbilledChargesTwd: number;
+  billedCycleChargesTwd: number;
+  billedUnpaidTwd: number;
+  activeInstallmentCount: number;
+  remainingInstallmentsNative: number;
+  remainingInstallmentsTwd: number;
+  totalExposureTwd: number;
+  creditLimit: number | null;
+  creditLimitTwd: number | null;
+  utilizationPct: number | null;
+  linkedLogCount: number;
+  adjustmentCount: number;
+  billingWindow: CreditCardBillingWindow;
+}
+
+export interface AllCreditCardsSummary {
+  cards: CreditCardSummary[];
+  totalUnpaidTwd: number;
+  totalRemainingInstallmentsTwd: number;
+  totalExposureTwd: number;
+}
+
 export interface FinanceSnapshot {
   settings: AppSettings;
   ledgers?: Ledger[];
@@ -415,6 +480,7 @@ export interface FinanceSnapshot {
   rentUtilityRents: RentUtilityRents;
   financialGoals?: FinancialGoal[];
   splitReceivables?: SplitReceivable[];
+  installmentPlans?: InstallmentPlan[];
 }
 
 export type SyncEntity =
@@ -429,7 +495,8 @@ export type SyncEntity =
   | 'utility_record'
   | 'utility_rents'
   | 'financial_goal'
-  | 'split_receivable';
+  | 'split_receivable'
+  | 'installment_plan';
 export type SyncOp = 'upsert' | 'delete';
 
 export interface SyncMutation {
@@ -512,6 +579,7 @@ export interface SyncDelta {
   rentUtilityRents: RentUtilityRents | null;
   financialGoals?: FinancialGoal[];
   splitReceivables?: SplitReceivable[];
+  installmentPlans?: InstallmentPlan[];
 }
 
 export interface SyncResponse {

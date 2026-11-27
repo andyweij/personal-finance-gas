@@ -4,6 +4,7 @@ import './styles.css';
 import { DEFAULT_LEDGER_ID } from '../../shared/constants';
 import { CURRENCY_META, SUPPORTED_CURRENCY_CODES, isValidFxRateForCurrency, resolveFxRate } from '../../shared/currency';
 import { computeAllSavingsSummary } from '../../shared/calculations';
+import { computeAllCreditCardsSummary } from '../../shared/creditCard';
 import type { PnlColorScheme } from '../../shared/types';
 import { normalizeEnabledCurrencies, normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
@@ -1075,6 +1076,19 @@ function bindEvents(ctx: UiContext): void {
         const acc = sav.accounts.find((a) => a.account.id === linkedAccountId);
         if (acc) {
           savingsSuffix = `｜${acc.account.itemName} 剩 ${fmtMoney(acc.currentBalanceTwd, ctx.state.masked)}`;
+        } else {
+          const cc = computeAllCreditCardsSummary(
+            snap.assetItems,
+            snap.cashflowLogs,
+            snap.savingsAdjustments || [],
+            snap.installmentPlans || [],
+            snap.settings,
+            ctx.state.activeLedgerId
+          );
+          const cardSum = cc.cards.find((c) => c.card.id === linkedAccountId);
+          if (cardSum) {
+            savingsSuffix = `｜💳 ${cardSum.card.itemName} 未繳 ${fmtMoney(cardSum.currentBalanceTwd, ctx.state.masked)}`;
+          }
         }
       }
 

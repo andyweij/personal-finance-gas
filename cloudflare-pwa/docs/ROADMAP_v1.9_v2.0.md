@@ -13,7 +13,7 @@
 | **Phase 4** | `v1.12.0` | 多幣別擴充（JPY / EUR / HKD / GBP 等） | `0020` (`app_settings`) | ✅ 已完成 |
 | **Phase 5** | `v1.13.0` | 財務目標與達成日期推估（存錢桶 / FIRE） | `0021` (`financial_goals`) | ✅ 已完成 |
 | **Phase 6** | `v1.14.0` | 代墊款 / 拆帳追蹤 | `0023` (`split_receivables`) | ✅ 已完成 |
-| **Phase 7** | `v1.15.0` | 信用卡帳單週期 & 分期付款管理 | `0024` (`asset_items` + `installment_plans`) | ⬜ 待實作 |
+| **Phase 7** | `v1.15.0` | 信用卡帳單週期 & 分期付款管理 | `0024` (`asset_items` + `installment_plans`) | ✅ 已完成 |
 | **Phase 8** | `v1.16.0` | *(建議前置重構)* `sync.ts` Entity Registry 輕量化 | 無 | ⬜ 待實作 |
 | **Phase 9** | `v2.0.0` | 選擇性「共同帳本」（需先寫獨立 SDD 與安全審查） | `0025+` | ⬜ 待實作 |
 
@@ -55,3 +55,10 @@
 - **帳務守恆與原子同步**：`web/src/sync/syncEngine.ts`（`createSplitExpense`、`settleSplitReceivable`、`writeOffSplitReceivable`、`deleteSplitReceivable` 皆採 `atomicGroupId` 全有或全無 D1 batch 同步；個人消費與預算僅計個人分攤，活存全額扣款、收回入帳不污染儲蓄率、免還轉支出不重複扣活存）
 - **全棧串接**：`shared/constants.ts`、`shared/types.ts`、`shared/syncOrder.ts`、`shared/validation.ts`、`worker/sync.ts`、`web/src/db/localDb.ts`、`web/src/ui/conflictUi.ts`、`web/src/ui/splitsUi.ts`、`web/src/ui/assetsTab.ts`、`web/src/main.ts`、`web/index.html`、`web/src/styles.css`
 - **測試套件**：`tests/split-receivables.test.ts`
+
+## Phase 7（`v1.15.0`）完成紀錄
+- **新增 Migration**：`migrations/0024_credit_cards_and_installments.sql`（`asset_items` 新增 `is_credit_card` / `credit_billing_day` / `credit_due_day` / `credit_limit`；新建同步表 `installment_plans`，無 `DEFAULT 'owner'`、複合主鍵 `(user_id, id)`；`cashflow_logs` 新增 `installment_plan_id` / `installment_seq` 與唯一冪等索引；未遷移資料庫平滑降級與寫入保護）
+- **核心引擎**：`shared/creditCard.ts`（結帳日／繳款日週期切分含閏年與跨年、已出帳未繳 vs 未出帳分流、額度使用率與未到期分期負債暴露、零尾差守恆分期金額表 `computeInstallmentScheduleAmounts`）
+- **排程與原子同步**：`worker/automation.ts`（`runMonthlyInstallmentsD1` 整合至排程 `catch-up` 步驟，重複執行 100% 冪等且末期自動轉 `completed`）與 `web/src/sync/syncEngine.ts`（`payCreditCardBill`、`reconcileCreditCard`、`saveInstallmentPlan`、`postDueInstallmentsForMonth`、`payOffInstallmentPlanEarly`）
+- **全棧串接**：`shared/constants.ts`、`shared/types.ts`、`shared/syncOrder.ts`、`shared/calculations.ts`、`shared/validation.ts`、`worker/sync.ts`、`web/src/db/localDb.ts`、`web/src/ui/conflictUi.ts`、`web/src/ui/creditCardUi.ts`、`web/src/ui/assetsTab.ts`、`web/src/ui/logTab.ts`、`web/src/main.ts`、`web/index.html`
+- **測試套件**：`tests/credit-card-and-installments.test.ts`

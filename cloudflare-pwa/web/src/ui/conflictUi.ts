@@ -15,6 +15,7 @@ const ENTITY_LABELS: Record<SyncEntity, string> = {
   ledger: '多帳本設定',
   financial_goal: '財務目標',
   split_receivable: '代墊 / 拆帳紀錄',
+  installment_plan: '分期付款計畫',
 };
 
 const FIELD_LABELS: Record<string, string> = {
@@ -92,6 +93,16 @@ const FIELD_LABELS: Record<string, string> = {
   settledAmount: '已收回金額',
   splitGroupId: '拆帳群組',
   sourceAccountId: '付款活存帳戶',
+  isCreditCard: '信用卡帳戶',
+  creditBillingDay: '結帳日',
+  creditDueDay: '繳款截止日',
+  creditLimit: '信用額度',
+  cardAccountId: '綁定信用卡',
+  totalInstallments: '總期數',
+  postedInstallments: '已入帳期數',
+  startYm: '首期年月',
+  installmentPlanId: '關聯分期計畫',
+  installmentSeq: '分期期數',
 };
 
 const IGNORED_DIFF_KEYS = new Set([

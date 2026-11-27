@@ -2,6 +2,7 @@ import { todayInTimeZone } from './dates';
 import { getCurrencyDecimals, resolveFxRate, type FxRateSource } from './currency';
 import { roundTo } from './format';
 import { CASHFLOW_TYPES, DEFAULT_LEDGER_ID, DEFAULT_LEDGER_NAME, STOCK_TX_TYPES } from './constants';
+import { computeCreditCardSummary } from './creditCard';
 import type {
   AllSavingsSummary,
   AssetItem,
@@ -527,7 +528,7 @@ export function computeAllSavingsSummary(
 ): AllSavingsSummary {
   const linkedAccounts = assets
     .filter((a) => {
-      if (a.deletedAt || !a.isLinkedSavings || a.isWatchlist) return false;
+      if (a.deletedAt || !a.isLinkedSavings || a.isCreditCard || a.isWatchlist) return false;
       if (ledgerId) return getEffectiveLedgerId(a) === ledgerId;
       return true;
     })
@@ -886,6 +887,9 @@ export function computeAssetEffectiveTwdValue(
   stockTransactions: StockTransaction[] = [],
   asOfDate = getTodayYmdLocal()
 ): number {
+  if (item.isCreditCard) {
+    return computeCreditCardSummary(item, logs, adjustments, [], fxSource, asOfDate).currentBalanceTwd;
+  }
   if (item.isLinkedSavings) {
     return computeSavingsAccountSummary(item, logs, adjustments, fxSource).currentBalanceTwd;
   }
@@ -1230,7 +1234,12 @@ export function computeNetWorthSummary(
         insuranceValue += twdValue;
       }
     } else if (a.majorType === '負債') {
-      totalLiabilities += twdValue;
+      if (a.isCreditCard && twdValue < 0) {
+        // Overpaid credit card (溢繳款) reduces net liability cleanly without yielding negative debt ratio
+        totalAssets += Math.abs(twdValue);
+      } else {
+        totalLiabilities += twdValue;
+      }
     }
   }
 
