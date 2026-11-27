@@ -14,7 +14,7 @@
 | **Phase 5** | `v1.13.0` | 財務目標與達成日期推估（存錢桶 / FIRE） | `0021` (`financial_goals`) | ✅ 已完成 |
 | **Phase 6** | `v1.14.0` | 代墊款 / 拆帳追蹤 | `0023` (`split_receivables`) | ✅ 已完成 |
 | **Phase 7** | `v1.15.0` | 信用卡帳單週期 & 分期付款管理 | `0024` (`asset_items` + `installment_plans`) | ✅ 已完成 |
-| **Phase 8** | `v1.16.0` | *(建議前置重構)* `sync.ts` Entity Registry 輕量化 | 無 | ⬜ 待實作 |
+| **Phase 8** | `v1.16.0` | *(建議前置重構)* `sync.ts` Entity Registry 輕量化 | 無 | ✅ 已完成 |
 | **Phase 9** | `v2.0.0` | 選擇性「共同帳本」（需先寫獨立 SDD 與安全審查） | `0025+` | ⬜ 待實作 |
 
 ---
@@ -62,3 +62,9 @@
 - **排程與原子同步**：`worker/automation.ts`（`runMonthlyInstallmentsD1` 整合至排程 `catch-up` 步驟，重複執行 100% 冪等且末期自動轉 `completed`）與 `web/src/sync/syncEngine.ts`（`payCreditCardBill`、`reconcileCreditCard`、`saveInstallmentPlan`、`postDueInstallmentsForMonth`、`payOffInstallmentPlanEarly`）
 - **全棧串接**：`shared/constants.ts`、`shared/types.ts`、`shared/syncOrder.ts`、`shared/calculations.ts`、`shared/validation.ts`、`worker/sync.ts`、`web/src/db/localDb.ts`、`web/src/ui/conflictUi.ts`、`web/src/ui/creditCardUi.ts`、`web/src/ui/assetsTab.ts`、`web/src/ui/logTab.ts`、`web/src/main.ts`、`web/index.html`
 - **測試套件**：`tests/credit-card-and-installments.test.ts`
+
+## Phase 8（`v1.16.0`）完成紀錄
+- **新增模組**：`worker/entityRegistry.ts`（單一來源集中宣告全部 13 種 `SyncEntity` 的資料表、鍵值、Delta 欄位、排序、可選表降級與錯誤訊息，並提供純函式 SQL 建構器 `buildSoftDeleteSql`、`buildRowUpsertSql`、`buildDeltaSelectSql`、`buildChunkedImportSql`）
+- **核心重構**：`worker/sync.ts` 導入通用 `applyRowEntityMutation` 執行器與宣告式 `ROW_ENTITY_HANDLERS`（涵蓋全部 11 個資料列實體及各自特殊守衛／可選欄位／伺服器報價所有權），`readDeltaWithState`、`processSyncRequest` 預取與 `importFullSnapshot` 全面改由 Entity Registry 驅動，大幅消除重複 SQL 與參數對齊樣板碼
+- **測試套件**：`tests/entity-registry.test.ts`（Registry 契約與 1:1 對齊驗證、SQL 建構器佔位符／綁定參數一致性測試、全 13 實體端對端同步與匯出匯入回歸測試），搭配既有 46 個測試檔作為 Golden Regression Suite 100% 通過
+- **Migration**：無（`DB_SCHEMA_VERSION` 維持 `'0024'`，100% 行為等價重構）
