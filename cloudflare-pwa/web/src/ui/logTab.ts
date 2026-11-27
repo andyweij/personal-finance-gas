@@ -1,5 +1,6 @@
 import { todayInTimeZone } from '../../../shared/dates';
-import { ALL_CASHFLOW_TYPES, DEFAULT_LEDGER_ID, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
+import { ALL_CASHFLOW_TYPES, DEFAULT_LEDGER_ID } from '../../../shared/constants';
+import { getEffectiveCategoriesForType } from '../../../shared/validation';
 import {
   aggregatePeriodMetrics,
   computeAllSavingsSummary,
@@ -20,6 +21,7 @@ import type { CashFlowLog, Ledger } from '../../../shared/types';
 import { openAccountTransferModal, openSavingsAccountModal } from './assetsTab';
 import { downloadTextFile, el, fmtMoney, fmtNum, showToast, TRASH_SVG, fmtPct } from './helpers';
 import { getActiveLedgers, renderLedgerSwitcherBar, resolveActiveLedger } from './ledgerUi';
+import { openCustomCategoriesModal, renderQuickTemplatesStrip } from './quickTemplatesUi';
 import { createDefaultLedgerSearchState, type UiContext } from './state';
 
 export function getSelectedYearMonth(year: number, month: number): string {
@@ -33,7 +35,8 @@ export function getTodayYmd(): string {
 export function renderLogCategories(ctx: UiContext): void {
   const box = el('categoryChips');
   box.innerHTML = '';
-  const cats = WEBAPP_CATEGORY_MAP[ctx.state.logType] || ['其他'];
+  const snap = ctx.engine.getSnapshot();
+  const cats = getEffectiveCategoriesForType(ctx.state.logType, snap.settings.customCategories);
   if (!cats.includes(ctx.state.logCategory)) {
     ctx.state.logCategory = cats[0];
   }
@@ -48,6 +51,13 @@ export function renderLogCategories(ctx: UiContext): void {
     });
     box.appendChild(b);
   }
+  const addCatBtn = document.createElement('button');
+  addCatBtn.type = 'button';
+  addCatBtn.className = 'chip-btn sm cat-add-chip';
+  addCatBtn.textContent = '+ 自訂';
+  addCatBtn.title = `管理「${ctx.state.logType}」自訂分類`;
+  addCatBtn.addEventListener('click', () => openCustomCategoriesModal(ctx, ctx.state.logType));
+  box.appendChild(addCatBtn);
 }
 
 export function updateFxPreview(ctx: UiContext): void {
@@ -792,6 +802,8 @@ export function renderLogTab(ctx: UiContext): void {
       : '獨立帳本（不計總資產）';
   }
 
+  renderQuickTemplatesStrip(ctx);
+  renderLogCategories(ctx);
   renderSavingsStripAndChips(ctx);
   renderLedgerSearchControls(ctx, activeLedger, ledgers, ym, searchResult);
 

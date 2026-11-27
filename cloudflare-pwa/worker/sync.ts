@@ -35,9 +35,11 @@ import {
   validateUtilityRentsInput,
 } from '../shared/rentUtility';
 import {
+  normalizeCustomCategories,
   normalizeCustomStockCategories,
   normalizeLedgerId,
   normalizePnlColorScheme,
+  normalizeQuickTemplates,
   normalizeRebalanceTargets,
   normalizeSortOrder,
   normalizeStockCategory,
@@ -93,6 +95,8 @@ function mapAppSettingsRow(row: Record<string, unknown>): AppSettings {
     pnlColorScheme: normalizePnlColorScheme(row.pnl_color_scheme),
     customStockCategories: normalizeCustomStockCategories(row.custom_stock_categories),
     rebalanceTargets: normalizeRebalanceTargets(row.rebalance_targets_json),
+    customCategories: normalizeCustomCategories(row.custom_categories_json),
+    quickTemplates: normalizeQuickTemplates(row.quick_templates_json),
     updatedAt: String(row.updated_at),
     version: Number(row.version ?? 1),
   };
@@ -179,6 +183,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       pnl_color_scheme?: string | null;
       custom_stock_categories?: string | null;
       rebalance_targets_json?: string | null;
+      custom_categories_json?: string | null;
+      quick_templates_json?: string | null;
       updated_at: string;
       version?: number;
     }>();
@@ -193,6 +199,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       pnlColorScheme: normalizePnlColorScheme(row.pnl_color_scheme),
       customStockCategories: normalizeCustomStockCategories(row.custom_stock_categories),
       rebalanceTargets: normalizeRebalanceTargets(row.rebalance_targets_json),
+      customCategories: normalizeCustomCategories(row.custom_categories_json),
+      quickTemplates: normalizeQuickTemplates(row.quick_templates_json),
       updatedAt: row.updated_at,
       version: Number(row.version ?? 1),
     };
@@ -231,6 +239,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
     pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
     customStockCategories: [],
     rebalanceTargets: [],
+    customCategories: {},
+    quickTemplates: [],
     updatedAt: nowIso,
     version: 1,
   };
@@ -1082,51 +1092,51 @@ async function applySingleMutation(
       p.rebalanceTargets !== undefined
         ? normalizeRebalanceTargets(p.rebalanceTargets)
         : existing.rebalanceTargets || [];
-    const hasRebalanceCol = existingRow ? 'rebalance_targets_json' in existingRow : true;
-    const writeStmt = hasRebalanceCol
-      ? db
-          .prepare(
-            `UPDATE app_settings
-             SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, rebalance_targets_json = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
-          )
-          .bind(
-            budget,
-            months,
-            validFx,
-            autoFxEnabled ? 1 : 0,
-            pnlScheme,
-            JSON.stringify(customStockCats),
-            JSON.stringify(rebalanceTargets),
-            check.writeTs,
-            check.nextVersion,
-            uid,
-            uid,
-            expectedVersion,
-            uid,
-            expectedEpoch
-          )
-      : db
-          .prepare(
-            `UPDATE app_settings
-             SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
-             WHERE user_id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
-          )
-          .bind(
-            budget,
-            months,
-            validFx,
-            autoFxEnabled ? 1 : 0,
-            pnlScheme,
-            JSON.stringify(customStockCats),
-            check.writeTs,
-            check.nextVersion,
-            uid,
-            uid,
-            expectedVersion,
-            uid,
-            expectedEpoch
-          );
+    const customCategories =
+      p.customCategories !== undefined
+        ? normalizeCustomCategories(p.customCategories)
+        : existing.customCategories || {};
+    const quickTemplates =
+      p.quickTemplates !== undefined
+        ? normalizeQuickTemplates(p.quickTemplates)
+        : existing.quickTemplates || [];
+    const extraCols: string[] = [];
+    const extraVals: unknown[] = [];
+    if (!existingRow || 'rebalance_targets_json' in existingRow) {
+      extraCols.push('rebalance_targets_json = ?');
+      extraVals.push(JSON.stringify(rebalanceTargets));
+    }
+    if (!existingRow || 'custom_categories_json' in existingRow) {
+      extraCols.push('custom_categories_json = ?');
+      extraVals.push(JSON.stringify(customCategories));
+    }
+    if (!existingRow || 'quick_templates_json' in existingRow) {
+      extraCols.push('quick_templates_json = ?');
+      extraVals.push(JSON.stringify(quickTemplates));
+    }
+    const extraSql = extraCols.length ? `, ${extraCols.join(', ')}` : '';
+    const writeStmt = db
+      .prepare(
+        `UPDATE app_settings
+         SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?${extraSql}, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL}
+         WHERE user_id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+      )
+      .bind(
+        budget,
+        months,
+        validFx,
+        autoFxEnabled ? 1 : 0,
+        pnlScheme,
+        JSON.stringify(customStockCats),
+        ...extraVals,
+        check.writeTs,
+        check.nextVersion,
+        uid,
+        uid,
+        expectedVersion,
+        uid,
+        expectedEpoch
+      );
     await commitAtomicMutation(db, uid, mutation, serverTime, expectedEpoch, writeStmt, [], async () => {
       const row = await db
         .prepare('SELECT * FROM app_settings WHERE user_id = ?')
@@ -3364,6 +3374,12 @@ export async function importFullSnapshot(
     const rebalanceTargets = normalizeRebalanceTargets(
       data.settings.rebalanceTargets ?? (mode === 'replace' ? [] : currentSettings.rebalanceTargets)
     );
+    const customCategories = normalizeCustomCategories(
+      data.settings.customCategories ?? (mode === 'replace' ? {} : currentSettings.customCategories)
+    );
+    const quickTemplates = normalizeQuickTemplates(
+      data.settings.quickTemplates ?? (mode === 'replace' ? [] : currentSettings.quickTemplates)
+    );
     const autoFxEnabled =
       data.settings.autoFxEnabled !== undefined
         ? Boolean(data.settings.autoFxEnabled)
@@ -3374,7 +3390,7 @@ export async function importFullSnapshot(
       db
         .prepare(
           `UPDATE app_settings
-           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, rebalance_targets_json = ?, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
+           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, rebalance_targets_json = ?, custom_categories_json = ?, quick_templates_json = ?, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
            WHERE user_id = ?`
         )
         .bind(
@@ -3385,6 +3401,8 @@ export async function importFullSnapshot(
           normalizePnlColorScheme(data.settings.pnlColorScheme ?? currentSettings.pnlColorScheme),
           JSON.stringify(customStockCategories),
           JSON.stringify(rebalanceTargets),
+          JSON.stringify(customCategories),
+          JSON.stringify(quickTemplates),
           nowIso,
           uid,
           uid
