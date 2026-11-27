@@ -361,8 +361,28 @@ describe('v1.8.15 B7 tenant column', () => {
         if (!cols.includes('user_id')) offenders.push(`${f}: INSERT INTO ${m[1]} (${m[3] ?? '— no column list —'})`);
       }
     }
-    expect(checked).toBeGreaterThan(20);
+    expect(checked).toBeGreaterThanOrEqual(15);
     expect(offenders).toEqual([]);
+    // v1.16.0: row-entity INSERTs are generated centrally by worker/entityRegistry.ts; verify those also name user_id
+    const { SYNC_ENTITY_METAS, buildRowUpsertSql, buildChunkedImportSql } = await import('../worker/entityRegistry');
+    for (const meta of SYNC_ENTITY_METAS.filter((m) => m.kind === 'row')) {
+      const keyCol = meta.keyColumn as 'id' | 'period';
+      const ins = buildRowUpsertSql({
+        table: meta.table,
+        keyColumn: keyCol,
+        isUpdate: false,
+        uid: 'u1',
+        recordId: 'r1',
+        columns: [],
+        createdAt: '2026-01-01T00:00:00.000Z',
+        writeTs: '2026-01-01T00:00:00.000Z',
+        nextVersion: 1,
+        expectedEpoch: 1,
+      });
+      expect(ins.sql).toMatch(new RegExp(`INSERT INTO ${meta.table}\\s*\\(\\s*user_id,`, 'i'));
+      const imp = buildChunkedImportSql({ table: meta.table, keyColumn: keyCol, jsonColumns: [keyCol, 'created_at', 'updated_at'] });
+      expect(imp).toMatch(new RegExp(`INSERT INTO ${meta.table}\\s*\\(\\s*user_id,`, 'i'));
+    }
   });
 });
 
