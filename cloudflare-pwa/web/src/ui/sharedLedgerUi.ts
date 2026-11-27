@@ -326,11 +326,12 @@ export function openSharedLedgerManageModal(ctx: UiContext, ledger: Ledger): voi
       invForm.style.cssText = 'display:grid;gap:8px;margin-bottom:14px';
       if (!summary) {
         const snapshot = ctx.engine.getSnapshot();
-        const localAccountIds = new Set(snapshot.assetItems
-          .filter((account) => !account.deletedAt && getEffectiveLedgerId(account) === ledger.id)
+        // aa75631 review R1: only a link to a LIVE account of another ledger restricts members (deleted accounts don't)
+        const outsideAccountIds = new Set(snapshot.assetItems
+          .filter((account) => !account.deletedAt && getEffectiveLedgerId(account) !== ledger.id)
           .map((account) => account.id));
         const isCrossLedger = (row: { deletedAt?: string | null; ledgerId?: string }, accountId?: string | null) =>
-          !row.deletedAt && getEffectiveLedgerId(row) === ledger.id && Boolean(accountId && !localAccountIds.has(accountId));
+          !row.deletedAt && getEffectiveLedgerId(row) === ledger.id && Boolean(accountId && outsideAccountIds.has(accountId));
         if (
           snapshot.cashflowLogs.some((row) => isCrossLedger(row, row.linkedAccountId)) ||
           snapshot.recurringItems.some((row) => isCrossLedger(row, row.linkedAccountId)) ||
@@ -339,7 +340,7 @@ export function openSharedLedgerManageModal(ctx: UiContext, ledger: Ledger): voi
         ) {
           const warning = document.createElement('p');
           warning.className = 'muted';
-          warning.textContent = '部分紀錄連動至帳本外或已刪除的帳戶。分享前可由擁有者解除連動，或改為連動此帳本內的帳戶，讓成員能編輯這些紀錄。';
+          warning.textContent = '部分紀錄連動至此帳本以外的帳戶。分享後成員無法修改或刪除這些紀錄（以免動到該帳戶餘額）；如需讓成員編輯，請先解除連動或改為連動此帳本內的帳戶。';
           invForm.appendChild(warning);
         }
       }

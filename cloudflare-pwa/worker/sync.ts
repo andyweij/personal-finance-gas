@@ -727,6 +727,12 @@ interface RefCheck {
   label: string;
   /** Phase 9 (SL-4): when set on an asset ref inside a shared ledger, the asset MUST live in this exact ledger. */
   requiredLedgerId?: string;
+  /**
+   * aa75631 review R1: an asset reference a member's write keeps or removes must not point at a LIVE account of
+   * ANOTHER ledger (that would change the owner's private balance). A deleted account, or one in the same ledger,
+   * is fine — otherwise records linked to a since-deleted account could never be edited or deleted again.
+   */
+  forbidLiveOutsideLedgerId?: string;
 }
 
 function collectChangedRefs(
@@ -763,7 +769,10 @@ function refGuardSql(db: D1Database, uid: string, refs: RefCheck[]): { sql: stri
   const binds: unknown[] = [];
   for (const ref of refs) {
     const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
-    if (ref.kind === 'asset' && ref.requiredLedgerId) {
+    if (ref.kind === 'asset' && ref.forbidLiveOutsideLedgerId) {
+      sql += ` AND NOT EXISTS (SELECT 1 FROM asset_items WHERE user_id = ? AND id = ? AND ledger_id != ? AND deleted_at IS NULL)`;
+      binds.push(uid, ref.id, ref.forbidLiveOutsideLedgerId);
+    } else if (ref.kind === 'asset' && ref.requiredLedgerId) {
       // SL-4: cross-tenant shared writes NEVER allow lenient mode and MUST stay within the same shared ledger
       sql += ` AND EXISTS (SELECT 1 FROM asset_items WHERE user_id = ? AND id = ? AND ledger_id = ? AND deleted_at IS NULL)`;
       binds.push(uid, ref.id, ref.requiredLedgerId);
@@ -782,6 +791,16 @@ async function rejectMissingRefs(db: D1Database, uid: string, refs: RefCheck[]):
   const lenient = isLegacyRefRequest(db);
   for (const ref of refs) {
     const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
+    if (ref.kind === 'asset' && ref.forbidLiveOutsideLedgerId) {
+      const row = await db
+        .prepare('SELECT id FROM asset_items WHERE user_id = ? AND id = ? AND ledger_id != ? AND deleted_at IS NULL')
+        .bind(uid, ref.id, ref.forbidLiveOutsideLedgerId)
+        .first();
+      if (row) {
+        throw new RejectError('此紀錄連動至共同帳本以外的帳戶，僅帳本擁有者可修改或刪除。');
+      }
+      continue;
+    }
     if (ref.kind === 'asset' && ref.requiredLedgerId) {
       const row = await db
         .prepare('SELECT id FROM asset_items WHERE user_id = ? AND id = ? AND ledger_id = ? AND deleted_at IS NULL')
@@ -1548,16 +1567,33 @@ const SHARED_ASSET_REF_COLUMNS: Partial<Record<RowSyncEntity, readonly string[]>
   installment_plan: ['card_account_id'],
 };
 
+/**
+ * SL-4 asset references of a write inside a shared ledger (aa75631 review R1):
+ * - a NEW or CHANGED reference must point at a live account of the same shared ledger (owner and members);
+ * - for a member's write, the reference the row currently holds (kept, replaced or removed, and on delete) must
+ *   not be a live account of another ledger — that is the owner's private balance. The owner may keep / delete
+ *   their own pre-sharing links, and records linked to a since-deleted account stay editable and deletable.
+ * `values` is null for a delete.
+ */
 function sharedAssetRefs(
   entity: RowSyncEntity,
-  values: Record<string, unknown>,
-  ledgerId: string
+  values: Record<string, unknown> | null,
+  existing: Record<string, unknown> | null,
+  ledgerId: string,
+  isDelegated: boolean
 ): RefCheck[] {
+  const asId = (v: unknown) => (typeof v === 'string' && v ? v : '');
   return (SHARED_ASSET_REF_COLUMNS[entity] || []).flatMap((column) => {
-    const id = values[column];
-    return typeof id === 'string' && id
-      ? [{ kind: 'asset', id, label: '共同帳本連動帳戶', requiredLedgerId: ledgerId }]
-      : [];
+    const out: RefCheck[] = [];
+    const prevId = existing ? asId(existing[column]) : '';
+    const nextId = values ? asId(values[column]) : '';
+    if (nextId && nextId !== prevId) {
+      out.push({ kind: 'asset', id: nextId, label: '共同帳本連動帳戶', requiredLedgerId: ledgerId });
+    }
+    if (isDelegated && prevId) {
+      out.push({ kind: 'asset', id: prevId, label: '共同帳本連動帳戶', forbidLiveOutsideLedgerId: ledgerId });
+    }
+    return out;
   });
 }
 
@@ -1679,7 +1715,9 @@ async function applyRowEntityMutation(
     const delPlan = handler.prepareDeleteGuard
       ? await handler.prepareDeleteGuard({ ...ctx, existing })
       : {};
-    const refs = sharedLedgerId ? sharedAssetRefs(entity, existing, sharedLedgerId) : [];
+    const refs = sharedLedgerId
+      ? sharedAssetRefs(entity, null, existing, sharedLedgerId, isDelegatedSharedWrite)
+      : [];
     const refGuard = refs.length ? refGuardSql(db, uid, refs) : { sql: '', binds: [] };
     const built = buildSoftDeleteSql({
       table: meta.table,
@@ -1749,8 +1787,13 @@ async function applyRowEntityMutation(
   const refs: RefCheck[] = sharedLedgerId
     ? [
         ...rawRefs.filter((r) => r.kind !== 'asset'),
-        ...sharedAssetRefs(entity, Object.fromEntries(plan.columns.map(({ col, value }) => [col, value])), sharedLedgerId),
-        ...(isDelegatedSharedWrite && existing ? sharedAssetRefs(entity, existing, sharedLedgerId) : []),
+        ...sharedAssetRefs(
+          entity,
+          Object.fromEntries(plan.columns.map(({ col, value }) => [col, value])),
+          existing,
+          sharedLedgerId,
+          isDelegatedSharedWrite
+        ),
       ]
     : rawRefs;
   const guard = refs.length > 0 ? refGuardSql(db, uid, refs) : { sql: '', binds: [] };

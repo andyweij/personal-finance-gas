@@ -1177,6 +1177,26 @@ export function openSecurityModal(ctx: UiContext): void {
     setLoading(true);
     try {
       const parsed = JSON.parse(await file.text());
+      // v2.0.0 review finding 4 (SL-8): restoring a backup overwrites the records of ledgers the owner shares with
+      // other members (their later edits included) — say so before doing it.
+      const backupLedgerIds = new Set(
+        ((parsed.data || parsed)?.ledgers || []).map((l: { id?: unknown }) => String(l?.id || ''))
+      );
+      const sharedWithOthers = (ctx.engine.getMeta().sharedLedgers || []).filter(
+        (s) => s.myRole === 'owner' && s.memberCount > 1 && backupLedgerIds.has(s.ledgerId)
+      );
+      if (sharedWithOthers.length > 0) {
+        const names = sharedWithOthers
+          .map((s) => ctx.engine.getSnapshot().ledgers?.find((l) => l.id === s.ledgerId)?.name || s.ledgerId)
+          .join('、');
+        if (
+          !confirm(
+            `備份中包含你與其他成員共用的帳本（${names}）。還原會以備份內容覆蓋這些帳本中的同一筆紀錄，成員在備份之後所做的修改可能被覆寫。確定要還原嗎？`
+          )
+        ) {
+          return;
+        }
+      }
       const headers: Record<string, string> = { 'content-type': 'application/json' };
       if (ctx.state.currentUser?.id) headers['x-expected-user'] = ctx.state.currentUser.id;
       const res = await fetch('/api/import/json', {
