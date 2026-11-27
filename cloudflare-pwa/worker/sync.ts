@@ -15,6 +15,8 @@ import type {
   AppSettings,
   AssetItem,
   CashFlowLog,
+  FinancialGoal,
+  FinancialGoalType,
   FinanceSnapshot,
   Ledger,
   NetWorthHistory,
@@ -41,6 +43,7 @@ import {
   normalizeEnabledCurrencies,
   normalizeFxRates,
   normalizeLedgerId,
+  normalizeLinkedAssetIds,
   normalizePnlColorScheme,
   normalizeQuickTemplates,
   normalizeRebalanceTargets,
@@ -49,6 +52,7 @@ import {
   toSafeNumber,
   validateAssetInput,
   validateCashFlowInput,
+  validateFinancialGoalInput,
   validateLedgerInput,
   validateRecurringInput,
   validateSavingsAdjustmentInput,
@@ -347,6 +351,33 @@ function mapSinkingRow(r: Record<string, unknown>): SinkingFundItem {
     status: String(r.status),
     note: String(r.note || ''),
     sortOrder: Number(r.sort_order ?? 0),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+    deletedAt: r.deleted_at ? String(r.deleted_at) : null,
+    version: Number(r.version ?? 1),
+  };
+}
+
+function mapFinancialGoalRow(r: Record<string, unknown>): FinancialGoal {
+  return {
+    id: String(r.id),
+    name: String(r.name),
+    goalType: (String(r.goal_type || 'manual') as FinancialGoalType),
+    targetAmount: Number(r.target_amount),
+    currency: String(r.currency || 'TWD'),
+    linkedLedgerId: r.linked_ledger_id ? String(r.linked_ledger_id) : null,
+    linkedAssetIds: normalizeLinkedAssetIds(r.linked_asset_ids_json),
+    currentManualAmount: Number(r.current_manual_amount ?? 0),
+    expectedAnnualReturnPct: Number(r.expected_annual_return_pct ?? 0),
+    monthlyContributionOverride:
+      r.monthly_contribution_override !== null && r.monthly_contribution_override !== undefined
+        ? Number(r.monthly_contribution_override)
+        : null,
+    fireSwrPct:
+      r.fire_swr_pct !== null && r.fire_swr_pct !== undefined ? Number(r.fire_swr_pct) : null,
+    targetDate: r.target_date ? String(r.target_date) : null,
+    sortOrder: Number(r.sort_order ?? 0),
+    note: String(r.note || ''),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -680,6 +711,7 @@ const ENTITY_ROW_TABLE: Record<string, { table: string; keyColumn: 'id' | 'perio
   asset: { table: 'asset_items', keyColumn: 'id' },
   savings_adjustment: { table: 'savings_adjustments', keyColumn: 'id' },
   stock_tx: { table: 'stock_transactions', keyColumn: 'id' },
+  financial_goal: { table: 'financial_goals', keyColumn: 'id' },
 };
 
 function runValidation<T>(fn: () => T): T {
@@ -780,6 +812,7 @@ const ALLOWED_SYNC_ENTITIES = new Set<string>([
   'stock_tx',
   'utility_record',
   'utility_rents',
+  'financial_goal',
 ]);
 
 const ALLOWED_SYNC_OPS = new Set<string>(['upsert', 'delete']);
@@ -1795,6 +1828,199 @@ async function applySingleMutation(
     return;
   }
 
+  if (mutation.entity === 'financial_goal') {
+    let existing: Record<string, unknown> | null = null;
+    try {
+      existing = await readExistingRow(db, uid, 'financial_goals', 'id', mutation.recordId);
+    } catch (err) {
+      if (/no such table:\s*financial_goals/i.test(err instanceof Error ? err.message : String(err))) {
+        throw new RejectError(
+          '伺服器資料庫尚未完成升級（缺少財務目標資料表），請先執行資料庫遷移後再重試。'
+        );
+      }
+      throw err;
+    }
+    const check = checkVersionOrThrow(
+      mutation,
+      existing,
+      existing ? (mapFinancialGoalRow(existing) as unknown as Record<string, unknown>) : null,
+      serverTime,
+      legacyCompareTs
+    );
+    if (!check.shouldApply) {
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+      return;
+    }
+
+    const refetchGoal = async () => {
+      const row = await db
+        .prepare('SELECT * FROM financial_goals WHERE user_id = ? AND id = ?')
+        .bind(uid, mutation.recordId)
+        .first<Record<string, unknown>>();
+      return {
+        row,
+        mapped: row ? (mapFinancialGoalRow(row) as unknown as Record<string, unknown>) : null,
+      };
+    };
+
+    if (mutation.op === 'delete') {
+      if (!existing) {
+        await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+        return;
+      }
+      const delStmt = db
+        .prepare(
+          `UPDATE financial_goals SET deleted_at = ?, updated_at = ?, version = ?, change_seq = ${NEXT_SEQ_SQL} WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}`
+        )
+        .bind(
+          check.writeTs,
+          check.writeTs,
+          check.nextVersion,
+          uid,
+          uid,
+          mutation.recordId,
+          Number(existing.version ?? 1),
+          uid,
+          expectedEpoch
+        );
+      await commitAtomicMutation(
+        db,
+        uid,
+        mutation,
+        serverTime,
+        expectedEpoch,
+        delStmt,
+        [],
+        refetchGoal,
+        check.legacyClientTs
+      );
+      return;
+    }
+
+    const p = mutation.payload || {};
+    const v = runValidation(() =>
+      validateFinancialGoalInput({
+        name: String(p.name || ''),
+        goalType: String(p.goalType || 'manual'),
+        targetAmount: Number(p.targetAmount),
+        currency: String(p.currency || 'TWD'),
+        linkedLedgerId: p.linkedLedgerId !== undefined ? (p.linkedLedgerId as string | null) : null,
+        linkedAssetIds: p.linkedAssetIds as string[] | string | undefined,
+        currentManualAmount: p.currentManualAmount !== undefined ? Number(p.currentManualAmount) : 0,
+        expectedAnnualReturnPct:
+          p.expectedAnnualReturnPct !== undefined ? Number(p.expectedAnnualReturnPct) : 0,
+        monthlyContributionOverride:
+          p.monthlyContributionOverride !== undefined && p.monthlyContributionOverride !== null
+            ? Number(p.monthlyContributionOverride)
+            : null,
+        fireSwrPct: p.fireSwrPct !== undefined && p.fireSwrPct !== null ? Number(p.fireSwrPct) : null,
+        targetDate: p.targetDate !== undefined && p.targetDate !== null ? String(p.targetDate) : null,
+        sortOrder:
+          p.sortOrder !== undefined
+            ? normalizeSortOrder(p.sortOrder, 0)
+            : existing?.sort_order !== undefined
+              ? Number(existing.sort_order)
+              : 0,
+        note: String(p.note || ''),
+      })
+    );
+
+    const refs: RefCheck[] = [];
+    if (v.linkedLedgerId && v.linkedLedgerId !== DEFAULT_LEDGER_ID) {
+      const prevLid = existing?.linked_ledger_id ? String(existing.linked_ledger_id) : '';
+      if (!existing || prevLid !== v.linkedLedgerId) {
+        refs.push({ kind: 'ledger', id: v.linkedLedgerId, label: '目標綁定帳本' });
+      }
+    }
+    if (v.linkedAssetIds.length > 0) {
+      const prevAssetIds = new Set(existing ? normalizeLinkedAssetIds(existing.linked_asset_ids_json) : []);
+      for (const aid of v.linkedAssetIds) {
+        if (!existing || !prevAssetIds.has(aid)) {
+          refs.push({ kind: 'asset', id: aid, label: '目標綁定資產' });
+        }
+      }
+    }
+    const guard = refGuardSql(db, uid, refs);
+
+    const writeStmt = existing
+      ? db
+          .prepare(
+            `UPDATE financial_goals
+             SET name = ?, goal_type = ?, target_amount = ?, currency = ?, linked_ledger_id = ?, linked_asset_ids_json = ?, current_manual_amount = ?, expected_annual_return_pct = ?, monthly_contribution_override = ?, fire_swr_pct = ?, target_date = ?, sort_order = ?, note = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
+             WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${guard.sql}`
+          )
+          .bind(
+            v.name,
+            v.goalType,
+            v.targetAmount,
+            v.currency,
+            v.linkedLedgerId,
+            JSON.stringify(v.linkedAssetIds),
+            v.currentManualAmount,
+            v.expectedAnnualReturnPct,
+            v.monthlyContributionOverride,
+            v.fireSwrPct,
+            v.targetDate,
+            v.sortOrder,
+            v.note,
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            uid,
+            mutation.recordId,
+            Number(existing.version ?? 1),
+            uid,
+            expectedEpoch,
+            ...guard.binds
+          )
+      : db
+          .prepare(
+            `INSERT INTO financial_goals
+              (user_id, id, name, goal_type, target_amount, currency, linked_ledger_id, linked_asset_ids_json, current_manual_amount, expected_annual_return_pct, monthly_contribution_override, fire_swr_pct, target_date, sort_order, note, created_at, updated_at, deleted_at, version, change_seq)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+             WHERE ${EPOCH_GUARD_SQL}${guard.sql}
+             ON CONFLICT(user_id, id) DO NOTHING`
+          )
+          .bind(
+            uid,
+            mutation.recordId,
+            v.name,
+            v.goalType,
+            v.targetAmount,
+            v.currency,
+            v.linkedLedgerId,
+            JSON.stringify(v.linkedAssetIds),
+            v.currentManualAmount,
+            v.expectedAnnualReturnPct,
+            v.monthlyContributionOverride,
+            v.fireSwrPct,
+            v.targetDate,
+            v.sortOrder,
+            v.note,
+            String(p.createdAt || check.writeTs),
+            check.writeTs,
+            check.nextVersion,
+            uid,
+            uid,
+            expectedEpoch,
+            ...guard.binds
+          );
+
+    await commitAtomicMutation(
+      db,
+      uid,
+      mutation,
+      serverTime,
+      expectedEpoch,
+      writeStmt,
+      [],
+      refetchGoal,
+      check.legacyClientTs,
+      () => rejectMissingRefs(db, uid, refs)
+    );
+    return;
+  }
+
   if (mutation.entity === 'asset') {
     const existing = await readExistingRow(db, uid, 'asset_items', 'id', mutation.recordId);
     const check = checkVersionOrThrow(
@@ -2621,7 +2847,7 @@ async function readDeltaWithState(
   uid: string,
   mode: DeltaMode
 ): Promise<{ delta: SyncDelta; changeSeq: number; dataEpoch: number }> {
-  const tables: Array<{ table: string; order: string; liveOnlyWhenFull: boolean }> = [
+  const coreTables: Array<{ table: string; order: string; liveOnlyWhenFull: boolean }> = [
     { table: 'ledgers', order: 'sort_order ASC, created_at ASC', liveOnlyWhenFull: true },
     { table: 'cashflow_logs', order: 'date DESC', liveOnlyWhenFull: true },
     { table: 'recurring_items', order: 'sort_order ASC, created_at ASC', liveOnlyWhenFull: true },
@@ -2632,11 +2858,12 @@ async function readDeltaWithState(
     { table: 'networth_history', order: 'year_month DESC', liveOnlyWhenFull: false },
     { table: 'rent_utility_records', order: '', liveOnlyWhenFull: true },
   ];
+  const goalTable = { table: 'financial_goals', order: 'sort_order ASC, created_at ASC', liveOnlyWhenFull: true };
   const upper =
     mode.kind === 'seq' && typeof mode.maxSeq === 'number'
       ? { sql: '?', binds: [mode.maxSeq] as unknown[] }
       : { sql: '(SELECT change_seq FROM user_sync_state WHERE user_id = ?)', binds: [uid] as unknown[] };
-  const entityStmts = tables.map(({ table, order, liveOnlyWhenFull }) => {
+  const buildEntityStmt = ({ table, order, liveOnlyWhenFull }: { table: string; order: string; liveOnlyWhenFull: boolean }) => {
     const orderSql = order ? ` ORDER BY ${order}` : '';
     if (mode.kind === 'seq') {
       return db
@@ -2649,13 +2876,24 @@ async function readDeltaWithState(
     return db
       .prepare(`SELECT * FROM ${table} WHERE user_id = ?${liveOnlyWhenFull ? ' AND deleted_at IS NULL' : ''}${orderSql}`)
       .bind(uid);
-  });
-  const results = await db.batch([
+  };
+  const headerStmts = [
     db.prepare('SELECT change_seq, data_epoch FROM user_sync_state WHERE user_id = ?').bind(uid),
     db.prepare('SELECT * FROM app_settings WHERE user_id = ?').bind(uid),
     db.prepare('SELECT * FROM rent_utility_settings WHERE user_id = ?').bind(uid),
-    ...entityStmts,
-  ]);
+  ];
+  const coreStmts = coreTables.map(buildEntityStmt);
+  let includeGoals = true;
+  let results: D1Result<unknown>[];
+  try {
+    results = await db.batch([...headerStmts, ...coreStmts, buildEntityStmt(goalTable)]);
+  } catch (err) {
+    if (!/no such table:\s*financial_goals/i.test(err instanceof Error ? err.message : String(err))) {
+      throw err;
+    }
+    includeGoals = false;
+    results = await db.batch([...headerStmts, ...coreStmts]);
+  }
   const rowsOf = (i: number) => (results[i]?.results || []) as Record<string, unknown>[];
   const stateRow = rowsOf(0)[0];
   const settingsRow = rowsOf(1)[0];
@@ -2687,6 +2925,7 @@ async function readDeltaWithState(
     netWorthHistory: rowsOf(base + 7).map(mapNetWorthRow),
     rentUtilityRecords: rowsOf(base + 8).map(mapUtilityRecordRow),
     rentUtilityRents: includeRents ? rents : null,
+    financialGoals: includeGoals ? rowsOf(base + 9).map(mapFinancialGoalRow) : [],
   };
   return { delta, changeSeq, dataEpoch };
 }
@@ -2906,13 +3145,31 @@ export async function processSyncRequest(
       );
     }
     if (stmts.length > 0) {
-      const results = await db.batch(stmts);
+      let results: D1Result<unknown>[];
+      let prefetchedRowKeys = rowKeys;
+      try {
+        results = await db.batch(stmts);
+      } catch (err) {
+        if (!/no such table:\s*financial_goals/i.test(err instanceof Error ? err.message : String(err))) {
+          throw err;
+        }
+        // Pre-0021 DB: drop financial_goals from prefetch so applySingleMutation rejects it cleanly
+        const fallbackStmts = stmts.slice(0, idemStatements);
+        prefetchedRowKeys = [];
+        rowKeys.forEach((key, idx) => {
+          if (!key.startsWith('financial_goals:')) {
+            prefetchedRowKeys.push(key);
+            fallbackStmts.push(stmts[idemStatements + idx]);
+          }
+        });
+        results = await db.batch(fallbackStmts);
+      }
       for (let i = 0; i < idemStatements; i++) {
         for (const r of (results[i]?.results || []) as Array<{ mutation_id: string }>) {
           alreadyApplied.add(String(r.mutation_id));
         }
       }
-      rowKeys.forEach((key, i) => {
+      prefetchedRowKeys.forEach((key, i) => {
         const row = (results[idemStatements + i]?.results?.[0] ?? null) as Record<string, unknown> | null;
         rowPrefetch.set(key, row);
       });
@@ -3100,6 +3357,7 @@ export async function exportFullSnapshot(
     netWorthHistory: delta.netWorthHistory,
     rentUtilityRecords: delta.rentUtilityRecords,
     rentUtilityRents: delta.rentUtilityRents || (await ensureRentUtilitySettings(db, uid)),
+    financialGoals: delta.financialGoals || [],
   };
 }
 
@@ -3138,6 +3396,7 @@ export async function importFullSnapshot(
     'stockTransactions',
     'netWorthHistory',
     'rentUtilityRecords',
+    'financialGoals',
   ] as const) {
     const list = (data as Record<string, unknown>)[field];
     if (list === undefined || list === null) continue;
@@ -3325,6 +3584,31 @@ export async function importFullSnapshot(
     };
   });
 
+  const validatedGoals: Array<{
+    id: string;
+    v: ReturnType<typeof validateFinancialGoalInput>;
+    createdAt: string;
+  }> = [];
+  for (const g of data.financialGoals || []) {
+    if (!g || g.deletedAt) continue;
+    validatedGoals.push({
+      id: importText(g.id, 'id') || crypto.randomUUID(),
+      v: validateFinancialGoalInput(g),
+      createdAt: importText(g.createdAt, 'createdAt') || nowIso,
+    });
+  }
+
+  const hasGoalsTable = Boolean(
+    await db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'financial_goals'")
+      .first()
+  );
+  if (!hasGoalsTable && validatedGoals.length > 0) {
+    throw new Error(
+      '伺服器資料庫尚未完成升級（缺少財務目標資料表），請先執行資料庫遷移後再匯入備份。'
+    );
+  }
+
   await ensureUserSyncState(db, uid);
 
   // 2. Assemble ALL DELETE + INSERT statements into a single atomic D1 batch
@@ -3347,6 +3631,9 @@ export async function importFullSnapshot(
       db.prepare('DELETE FROM stock_transactions WHERE user_id = ?').bind(uid),
       db.prepare('DELETE FROM networth_history WHERE user_id = ?').bind(uid)
     );
+    if (hasGoalsTable) {
+      stmts.push(db.prepare('DELETE FROM financial_goals WHERE user_id = ?').bind(uid));
+    }
     if (validatedUtilityRecords.length > 0) {
       stmts.push(db.prepare('DELETE FROM rent_utility_records WHERE user_id = ?').bind(uid));
     }
@@ -3709,6 +3996,43 @@ export async function importFullSnapshot(
       v.curA, v.curB, v.curC, createdAt, nowIso,
     ])
   );
+
+  if (hasGoalsTable && validatedGoals.length > 0) {
+    chunked(
+      `INSERT INTO financial_goals
+        (user_id, id, name, goal_type, target_amount, currency, linked_ledger_id, linked_asset_ids_json, current_manual_amount, expected_annual_return_pct, monthly_contribution_override, fire_swr_pct, target_date, sort_order, note, created_at, updated_at, deleted_at, version, change_seq)`,
+      16,
+      tailLive,
+      `ON CONFLICT(user_id, id) DO UPDATE SET
+         name = excluded.name, goal_type = excluded.goal_type, target_amount = excluded.target_amount,
+         currency = excluded.currency, linked_ledger_id = excluded.linked_ledger_id,
+         linked_asset_ids_json = excluded.linked_asset_ids_json, current_manual_amount = excluded.current_manual_amount,
+         expected_annual_return_pct = excluded.expected_annual_return_pct,
+         monthly_contribution_override = excluded.monthly_contribution_override,
+         fire_swr_pct = excluded.fire_swr_pct, target_date = excluded.target_date,
+         sort_order = excluded.sort_order, note = excluded.note, updated_at = excluded.updated_at,
+         version = financial_goals.version + 1, change_seq = excluded.change_seq
+       WHERE financial_goals.deleted_at IS NULL`,
+      validatedGoals.map(({ id, v, createdAt }) => [
+        id,
+        v.name,
+        v.goalType,
+        v.targetAmount,
+        v.currency,
+        v.linkedLedgerId,
+        JSON.stringify(v.linkedAssetIds),
+        v.currentManualAmount,
+        v.expectedAnnualReturnPct,
+        v.monthlyContributionOverride,
+        v.fireSwrPct,
+        v.targetDate,
+        v.sortOrder,
+        v.note,
+        createdAt,
+        nowIso,
+      ])
+    );
+  }
 
   const results = stmts.length > 0 ? await db.batch(stmts) : [];
   // Count rows actually written: merge mode skips rows that are soft-deleted on the server

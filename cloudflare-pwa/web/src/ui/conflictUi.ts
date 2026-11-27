@@ -13,6 +13,7 @@ const ENTITY_LABELS: Record<SyncEntity, string> = {
   utility_record: '水電分攤紀錄',
   utility_rents: '固定房租設定',
   ledger: '多帳本設定',
+  financial_goal: '財務目標',
 };
 
 const FIELD_LABELS: Record<string, string> = {
@@ -76,6 +77,15 @@ const FIELD_LABELS: Record<string, string> = {
   rentA: '5A 房租',
   rentB: '5B 房租',
   rentC: '5C 房租',
+  goalType: '目標類型',
+  targetAmount: '目標金額',
+  linkedLedgerId: '綁定帳本',
+  linkedAssetIds: '綁定資產',
+  currentManualAmount: '目前手動累積金額',
+  expectedAnnualReturnPct: '預期年化報酬率 (%)',
+  monthlyContributionOverride: '自訂每月投入',
+  fireSwrPct: 'FIRE 提領率 (%)',
+  targetDate: '期望達成日',
 };
 
 const IGNORED_DIFF_KEYS = new Set([
@@ -102,7 +112,7 @@ function formatDiffVal(val: unknown): string {
 function getConflictTitle(conflict: SyncConflict): string {
   const src = conflict.clientPayload || conflict.serverRecord || {};
   const label = ENTITY_LABELS[conflict.entity] || conflict.entity;
-  const name = src.itemName || src.period || src.date || (conflict.entity === 'settings' ? '全站預算參數' : conflict.recordId.slice(0, 8));
+  const name = src.itemName || src.name || src.period || src.date || (conflict.entity === 'settings' ? '全站預算參數' : conflict.recordId.slice(0, 8));
   return `${label}：${String(name)}`;
 }
 

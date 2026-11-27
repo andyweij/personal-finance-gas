@@ -25,6 +25,7 @@ import type {
   AppSettings,
   AssetItem,
   CashFlowLog,
+  FinancialGoal,
   FinanceSnapshot,
   Ledger,
   PnlColorScheme,
@@ -56,6 +57,7 @@ import {
   validateAccountTransferInput,
   validateAssetInput,
   validateCashFlowInput,
+  validateFinancialGoalInput,
   validateLedgerInput,
   validateRecurringInput,
   validateSavingsAdjustmentInput,
@@ -64,6 +66,7 @@ import {
   type AccountTransferInputPayload,
   type AssetInputPayload,
   type CashFlowInputPayload,
+  type FinancialGoalInputPayload,
   type LedgerInputPayload,
   type RecurringInputPayload,
   type SavingsAdjustmentInputPayload,
@@ -740,6 +743,8 @@ export class SyncEngine {
         return (snap.stockTransactions || []).find((t) => t.id === recordId) || null;
       case 'utility_record':
         return (snap.rentUtilityRecords || []).find((u) => u.period === recordId) || null;
+      case 'financial_goal':
+        return (snap.financialGoals || []).find((g) => g.id === recordId) || null;
       default:
         return null;
     }
@@ -1520,6 +1525,95 @@ export class SyncEngine {
       {
         mutationId: crypto.randomUUID(),
         entity: 'sinking',
+        op: 'delete',
+        recordId: id,
+        clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
+      },
+    ]);
+  }
+
+  async saveFinancialGoal(payload: FinancialGoalInputPayload & { id?: string }): Promise<FinancialGoal> {
+    const v = validateFinancialGoalInput(payload);
+    const nowIso = new Date().toISOString();
+    const id = payload.id || crypto.randomUUID();
+    const currentGoals = this.snapshot.financialGoals || [];
+    const existing = currentGoals.find((g) => g.id === id);
+    const sortOrder =
+      payload.sortOrder !== undefined
+        ? v.sortOrder
+        : existing
+          ? existing.sortOrder ?? 0
+          : this.nextSortOrderFor(currentGoals);
+    const goal: FinancialGoal = {
+      id,
+      ...v,
+      sortOrder,
+      createdAt: existing?.createdAt || nowIso,
+      updatedAt: nowIso,
+      deletedAt: null,
+      ...(existing?.version !== undefined ? { version: existing.version } : {}),
+    };
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      financialGoals: mergeById(currentGoals, [goal]).sort(compareBySortOrder),
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'financial_goal',
+        op: 'upsert',
+        recordId: id,
+        clientTimestamp: nowIso,
+        baseVersion: existing?.version ?? null,
+        isNewRecord: !existing,
+        payload: { ...goal },
+      },
+    ]);
+    return goal;
+  }
+
+  async reorderFinancialGoals(orderedSubsetIds: string[]): Promise<number> {
+    const currentGoals = this.snapshot.financialGoals || [];
+    const { nextItems, changedItems } = applySubsetReorder(currentGoals, orderedSubsetIds);
+    if (!changedItems.length) return 0;
+    const nowIso = new Date().toISOString();
+    const changedIdSet = new Set(changedItems.map((i) => i.id));
+    const stampedItems = nextItems.map((item) =>
+      changedIdSet.has(item.id) ? { ...item, updatedAt: nowIso } : item
+    );
+    const mutations: SyncMutation[] = stampedItems
+      .filter((item) => changedIdSet.has(item.id))
+      .map((item) => ({
+        mutationId: crypto.randomUUID(),
+        entity: 'financial_goal',
+        op: 'upsert',
+        recordId: item.id,
+        clientTimestamp: nowIso,
+        baseVersion: item.version ?? null,
+        isNewRecord: false,
+        payload: { ...item },
+      }));
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      financialGoals: stampedItems,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    return mutations.length;
+  }
+
+  async deleteFinancialGoal(id: string): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const currentGoals = this.snapshot.financialGoals || [];
+    const existing = currentGoals.find((g) => g.id === id);
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      financialGoals: currentGoals.filter((g) => g.id !== id),
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'financial_goal',
         op: 'delete',
         recordId: id,
         clientTimestamp: nowIso,
@@ -2462,6 +2556,14 @@ export class SyncEngine {
       const next = !isDelete && record && !record.deletedAt ? [...filtered, record as unknown as RentUtilityRecord] : filtered;
       return { ...baseSnapshot, rentUtilityRecords: sortUtilityRecords(next) };
     }
+    if (entity === 'financial_goal') {
+      const filtered = (baseSnapshot.financialGoals || []).filter((g) => g.id !== recordId);
+      const next =
+        !isDelete && record && !record.deletedAt
+          ? [...filtered, record as unknown as FinancialGoal]
+          : filtered;
+      return { ...baseSnapshot, financialGoals: next.sort(compareBySortOrder) };
+    }
     return baseSnapshot;
   }
 
@@ -2512,6 +2614,10 @@ export class SyncEngine {
       }
       case 'utility_record': {
         const found = (delta.rentUtilityRecords || []).find((u) => u.period === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'financial_goal': {
+        const found = (delta.financialGoals || []).find((g) => g.id === recordId);
         return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
       }
       default:
@@ -3778,6 +3884,11 @@ export class SyncEngine {
           ...snap,
           rentUtilityRecords: (snap.rentUtilityRecords || []).filter((u) => u.period !== recordId),
         };
+      case 'financial_goal':
+        return {
+          ...snap,
+          financialGoals: (snap.financialGoals || []).filter((g) => g.id !== recordId),
+        };
       default:
         return snap;
     }
@@ -3789,6 +3900,7 @@ export class SyncEngine {
     const incomingUtilityRents = delta.rentUtilityRents || current.rentUtilityRents;
     const incomingAdjs = delta.savingsAdjustments || [];
     const incomingStockTxs = delta.stockTransactions || [];
+    const incomingGoals = Array.isArray(delta.financialGoals) ? delta.financialGoals : [];
     if (isFull) {
       const fullLedgers = ensureActiveLedgers(
         incomingLedgers.length > 0 ? incomingLedgers.filter((l) => !l.deletedAt) : [createDefaultLedger()]
@@ -3811,6 +3923,7 @@ export class SyncEngine {
           .sort((a, b) => b.yearMonth.localeCompare(a.yearMonth)),
         rentUtilityRecords: sortUtilityRecords(incomingUtilityRecords),
         rentUtilityRents: incomingUtilityRents,
+        financialGoals: incomingGoals.filter((g) => !g.deletedAt).sort(compareBySortOrder),
       };
     }
 
@@ -3841,6 +3954,7 @@ export class SyncEngine {
       ),
       rentUtilityRecords: mergeUtilityRecords(current.rentUtilityRecords || [], incomingUtilityRecords),
       rentUtilityRents: incomingUtilityRents,
+      financialGoals: mergeById(current.financialGoals || [], incomingGoals).sort(compareBySortOrder),
     };
   }
 }

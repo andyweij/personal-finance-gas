@@ -13,9 +13,19 @@ export function mutationReferenceKeys(m: unknown): string[] {
   const keys: string[] = [];
   const ledgerId = typeof p.ledgerId === 'string' ? p.ledgerId.trim() : '';
   if (ledgerId && ledgerId !== 'default' && mut.entity !== 'ledger') keys.push(`ledger:${ledgerId}`);
+  const linkedLedgerId = typeof p.linkedLedgerId === 'string' ? p.linkedLedgerId.trim() : '';
+  if (linkedLedgerId && linkedLedgerId !== 'default' && mut.entity !== 'ledger') {
+    keys.push(`ledger:${linkedLedgerId}`);
+  }
   for (const field of ['linkedAccountId', 'accountId', 'assetId']) {
     const v = typeof p[field] === 'string' ? (p[field] as string).trim() : '';
     if (v && !(mut.entity === 'asset' && v === mut.recordId)) keys.push(`asset:${v}`);
+  }
+  if (Array.isArray(p.linkedAssetIds)) {
+    for (const rawId of p.linkedAssetIds) {
+      const v = typeof rawId === 'string' ? rawId.trim() : '';
+      if (v && !(mut.entity === 'asset' && v === mut.recordId)) keys.push(`asset:${v}`);
+    }
   }
   return keys;
 }

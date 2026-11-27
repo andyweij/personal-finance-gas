@@ -350,6 +350,29 @@ export interface RentUtilityRents {
   version?: number;
 }
 
+export type FinancialGoalType = 'net_worth' | 'fire' | 'ledger_bucket' | 'asset_bucket' | 'manual';
+
+export interface FinancialGoal {
+  id: string;
+  name: string;
+  goalType: FinancialGoalType;
+  targetAmount: number;
+  currency: string;
+  linkedLedgerId?: string | null;
+  linkedAssetIds: string[];
+  currentManualAmount: number;
+  expectedAnnualReturnPct: number;
+  monthlyContributionOverride?: number | null;
+  fireSwrPct?: number | null;
+  targetDate?: string | null; // YYYY-MM
+  sortOrder?: number;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+  version?: number;
+}
+
 export interface FinanceSnapshot {
   settings: AppSettings;
   ledgers?: Ledger[];
@@ -362,6 +385,7 @@ export interface FinanceSnapshot {
   netWorthHistory: NetWorthHistory[];
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents;
+  financialGoals?: FinancialGoal[];
 }
 
 export type SyncEntity =
@@ -374,7 +398,8 @@ export type SyncEntity =
   | 'stock_tx'
   | 'settings'
   | 'utility_record'
-  | 'utility_rents';
+  | 'utility_rents'
+  | 'financial_goal';
 export type SyncOp = 'upsert' | 'delete';
 
 export interface SyncMutation {
@@ -455,6 +480,7 @@ export interface SyncDelta {
   netWorthHistory: NetWorthHistory[];
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents | null;
+  financialGoals?: FinancialGoal[];
 }
 
 export interface SyncResponse {

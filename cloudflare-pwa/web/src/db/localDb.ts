@@ -61,6 +61,7 @@ export function createEmptySnapshot(): FinanceSnapshot {
     netWorthHistory: [],
     rentUtilityRecords: [],
     rentUtilityRents: { ...DEFAULT_UTILITY_RENTS },
+    financialGoals: [],
   };
 }
 
@@ -249,6 +250,7 @@ export class LocalFinanceDB {
           netWorthHistory: Array.isArray(raw.netWorthHistory) ? raw.netWorthHistory : [],
           rentUtilityRecords: Array.isArray(raw.rentUtilityRecords) ? raw.rentUtilityRecords : [],
           rentUtilityRents: raw.rentUtilityRents || empty.rentUtilityRents,
+          financialGoals: Array.isArray(raw.financialGoals) ? raw.financialGoals : [],
         });
       };
       req.onerror = () => reject(req.error);

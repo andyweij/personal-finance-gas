@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.12.0 / D1 Schema `0020`）
+# 資料庫 Schema 設計架構（v1.13.0 / D1 Schema `0021`）
 
-> **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（24 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0020_multi_currency.sql`](../migrations/0020_multi_currency.sql)  
-> **對應版本**：`APP_VERSION = 1.12.0` / `DB_SCHEMA_VERSION = 0020` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
+> **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（25 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
+> **最新 Migration**：[`0021_financial_goals.sql`](../migrations/0021_financial_goals.sql)  
+> **對應版本**：`APP_VERSION = 1.13.0` / `DB_SCHEMA_VERSION = 0021` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
 
 ---
 
@@ -266,7 +266,7 @@ flowchart LR
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0017`）
+## 5. Migration 演進總覽（`0001` → `0021`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -287,6 +287,10 @@ flowchart LR
 | `0015` | `0015_security_events.sql` | 新增 `auth_security_events` 稽核表（例如以管理員重置碼重設密碼），成員登入時顯示 30 天內的安全通知 |
 | `0016` | `0016_automation_runs.sql` | 新增 `automation_runs` 排程執行紀錄，支援錯過的常態入帳與月底快照自動補跑（v1.8.13） |
 | `0017` | `0017_drop_owner_default.sql` | 重建 12 張租戶資料表，移除 `0007` 留下的 `user_id DEFAULT 'owner'`；欄位、資料與索引不變，漏填 `user_id` 的 INSERT 改為直接失敗（v1.8.16） |
+| `0018` | `0018_rebalance_targets.sql` | `app_settings` 新增 `rebalance_targets_json`（資產再平衡目標比例，v1.10.0） |
+| `0019` | `0019_custom_categories_and_templates.sql` | `app_settings` 新增 `custom_categories_json` 與 `quick_templates_json`（自訂分類與常用範本，v1.11.0） |
+| `0020` | `0020_multi_currency.sql` | `app_settings` 新增 `enabled_currencies_json` 與 `fx_rates_json`（多幣別與交叉匯率表，v1.12.0） |
+| `0021` | `0021_financial_goals.sql` | 新增 `financial_goals` 同步表（複合主鍵 `(user_id, id)`、無 `DEFAULT 'owner'`、支援 5 種目標追蹤與達成日期推估，v1.13.0） |
 
 ---
 

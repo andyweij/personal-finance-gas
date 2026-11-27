@@ -48,7 +48,7 @@ describe('PWA assets & D1 migration integrity', () => {
     expect(code).toContain('caches.open');
   });
 
-  it('initializes all 24 D1 tables cleanly from migrations (including multi-tenant users, invites, resets, ledgers, and sync state)', async () => {
+  it('initializes all 25 D1 tables cleanly from migrations (including multi-tenant users, invites, resets, ledgers, financial goals, and sync state)', async () => {
     const db = createTestD1();
     const res = await db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
@@ -68,6 +68,7 @@ describe('PWA assets & D1 migration integrity', () => {
       'auth_sessions',
       'automation_runs',
       'cashflow_logs',
+      'financial_goals',
       'ledgers',
       'networth_history',
       'recurring_items',
