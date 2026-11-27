@@ -17,6 +17,7 @@ import {
   saveRememberedAccount,
   setAuthExpectedUser,
 } from './auth/authClient';
+import { resetCreditCardUiState } from './ui/creditCardUi';
 import { createCrossTabChannel } from './sync/crossTab';
 import { closeModal, el, fmtMoney, isDesktopDevice, openModal, setLoading, showToast, bindSubmit } from './ui/helpers';
 import {
@@ -484,6 +485,7 @@ async function bootstrap(): Promise<void> {
         state.ledgerPage = 1;
         state.networthChartSelectedYm = null;
         state.dividendCalendarYear = getDatePartsInTimeZone(new Date()).year;
+        resetCreditCardUiState();
         state.dividendCalendarSelectedMonth = null;
         state.rebalanceContribution = '';
         state.rebalanceExcludeUntargeted = false;

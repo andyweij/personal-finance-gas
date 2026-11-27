@@ -386,17 +386,18 @@ export function openQuickTemplateModal(
     noneOpt.textContent = '不連動活存';
     accSel.appendChild(noneOpt);
     const targetLedgerId = base.ledgerId || activeLedger.id;
+    // v1.15.0 review finding 5: a template can also charge a credit card (saved from a card entry)
     const savingsAccs = snap.assetItems.filter(
-      (a) => !a.deletedAt && a.isLinkedSavings && getEffectiveLedgerId(a) === targetLedgerId
+      (a) => !a.deletedAt && (a.isLinkedSavings || a.isCreditCard) && getEffectiveLedgerId(a) === targetLedgerId
     );
     for (const a of savingsAccs) {
       const o = document.createElement('option');
       o.value = a.id;
-      o.textContent = a.itemName;
+      o.textContent = a.isCreditCard ? `💳 ${a.itemName}` : a.itemName;
       if (a.id === base.linkedAccountId) o.selected = true;
       accSel.appendChild(o);
     }
-    form.appendChild(makeField('預設連動活存', accSel));
+    form.appendChild(makeField('預設連動活存／信用卡', accSel));
 
     const noteInp = document.createElement('input');
     noteInp.type = 'text';

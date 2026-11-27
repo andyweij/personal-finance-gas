@@ -2,7 +2,7 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.16.1';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.16.2';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0024';
@@ -10,6 +10,7 @@ export const DB_SCHEMA_VERSION = '0024';
 export const SW_CACHE_VERSION = 'finance-pwa';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.16.2：信用卡細節修正（外幣卡或外幣扣款帳戶繳卡費時，預設金額依扣款帳戶幣別換算，切換扣款帳戶會重新計算；刪除信用卡與分期前先確認，信用卡仍有進行中的分期時不可刪除；常用範本與流水帳篩選、名稱顯示支援信用卡；新增分期預設選目前帳本的卡片；已入帳的分期不可再改總額與期數；隱藏金額時遮住額度使用率；切換帳號重置分期篩選）',
   'v1.16.1：修正 v1.8.17 審查發現（還原 JSON 備份時，若有紀錄指向不存在的帳本，改為自動重建「復原的帳本」承接，該帳本不計入淨資產、總額與匯出前相同，不再整份備份無法還原；同步排序不再讓同一筆紀錄的後續編輯排到它自己的新增之前）；修正 v1.15.0 審查發現：信用卡在刷卡當天對帳校準不再重複計入當天的刷卡；分期付款改為補入「已入帳期數」之後到本月為止的所有期數，起始月份在過去或月中才建立的分期不再漏期，補入的期數記在各自的月份）',
   'v1.16.0：同步引擎 Entity Registry 輕量化重構（新增 worker/entityRegistry.ts 集中宣告全部 13 種同步實體的資料表、鍵值、排序、可選表降級與 SQL 建構器，並統一 worker/sync.ts 的樂觀鎖 CRUD／軟刪除／Delta 查詢與批次匯入管線；100% 行為等價、無須資料庫遷移，為 v2.0.0 共同帳本做好架構鋪路）',
   'v1.15.0：信用卡帳單週期與分期付款管理（資產頁新增「信用卡與分期付款」專區、快速記帳支援刷卡連動；刷卡立即計入本月消費預算與信用卡未繳負債而不扣活存，並嚴格排除於高流動緊急預備金外；自動切分已出帳未繳／未出帳金額、繳款截止日與額度使用率；一鍵「💳 繳卡費」原子扣減活存並沖銷未繳餘額而不重複計消費；支援 2～60 期零尾差守恆分期計畫、每月排程冪等自動入帳、提前清償剩餘期數與 JSON 備份還原）',

@@ -40,7 +40,12 @@ export function resolveQuickTemplateForEntry(
     return { ledgerId, linkedAccountId: null, fallbackLedger, fallbackAccount: false };
   }
 
-  const accExists = ledgerSavings.some((a) => a.id === desiredAcc);
+  // v1.15.0 review finding 5: a template bound to a credit card of this ledger keeps charging that card
+  const accExists =
+    ledgerSavings.some((a) => a.id === desiredAcc) ||
+    (assets || []).some(
+      (a) => !a.deletedAt && a.isCreditCard && a.id === desiredAcc && getEffectiveLedgerId(a) === ledgerId
+    );
   if (accExists) {
     return { ledgerId, linkedAccountId: desiredAcc, fallbackLedger, fallbackAccount: false };
   }

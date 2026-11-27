@@ -6,7 +6,9 @@
 import 'fake-indexeddb/auto';
 import { describe, expect, it } from 'vitest';
 import { CASHFLOW_TYPES, DEFAULT_LEDGER_ID } from '../shared/constants';
-import { addMonthsToYm, computeCreditCardSummary } from '../shared/creditCard';
+import { addMonthsToYm, computeCreditCardSummary, computeDefaultCardPayment } from '../shared/creditCard';
+import { resolveQuickTemplateForEntry } from '../shared/autocomplete';
+import type { AssetItem } from '../shared/types';
 import { todayInTimeZone } from '../shared/dates';
 import { runMonthlyInstallmentsD1, runScheduledAutomation } from '../worker/automation';
 import { processSyncRequest } from '../worker/sync';
@@ -234,5 +236,69 @@ describe('發現 2（已修正）：用戶端補入期數', () => {
 
     // 再按一次不會重複入帳
     expect((await engine.postDueInstallmentsForMonth(thisYm)).postedCount).toBe(0);
+  });
+});
+
+describe('發現 3（已修正）：繳卡費預設金額以扣款帳戶的幣別計算', () => {
+  const fx = { usdTwdRate: 32, fxRates: { USD: 32 } };
+
+  it('台幣卡＋台幣帳戶：預設為本期已出帳未繳', () => {
+    expect(computeDefaultCardPayment({ billedUnpaidTwd: 3000, currentBalanceNative: 5000 }, 'TWD', 'TWD', fx)).toEqual({
+      payAmount: 3000,
+      cardCreditAmount: 3000,
+    });
+  });
+
+  it('美元卡欠 100 USD（尚未出帳）、從台幣帳戶繳：預設 NT$3,200，沖銷 100 USD（修正前預設 100，只繳 NT$100）', () => {
+    expect(computeDefaultCardPayment({ billedUnpaidTwd: 0, currentBalanceNative: 100 }, 'USD', 'TWD', fx)).toEqual({
+      payAmount: 3200,
+      cardCreditAmount: 100,
+    });
+  });
+
+  it('台幣卡已出帳 NT$3,200、從美元帳戶繳：預設 100 USD（修正前把台幣數字當美元扣）', () => {
+    expect(computeDefaultCardPayment({ billedUnpaidTwd: 3200, currentBalanceNative: 3200 }, 'TWD', 'USD', fx)).toEqual({
+      payAmount: 100,
+      cardCreditAmount: 3200,
+    });
+  });
+
+  it('美元卡已出帳的部分以卡片幣別計算，且不超過全部未繳', () => {
+    expect(computeDefaultCardPayment({ billedUnpaidTwd: 1600, currentBalanceNative: 80 }, 'USD', 'USD', fx)).toEqual({
+      payAmount: 50,
+      cardCreditAmount: 50,
+    });
+    expect(computeDefaultCardPayment({ billedUnpaidTwd: 9999, currentBalanceNative: 80 }, 'USD', 'USD', fx).payAmount).toBe(80);
+  });
+
+  it('沒有未繳時預設為 0', () => {
+    expect(computeDefaultCardPayment({ billedUnpaidTwd: 0, currentBalanceNative: 0 }, 'TWD', 'TWD', fx)).toEqual({
+      payAmount: 0,
+      cardCreditAmount: 0,
+    });
+  });
+});
+
+describe('發現 5（已修正）：範本可綁定信用卡', () => {
+  const ledgers = [{ id: 'trip', name: '旅行', includeInNetWorth: false }] as never;
+  const assets = [
+    { id: 'bank', isLinkedSavings: true, isDefaultSavings: true, ledgerId: DEFAULT_LEDGER_ID },
+    { id: 'card', isCreditCard: true, ledgerId: DEFAULT_LEDGER_ID },
+    { id: 'trip-card', isCreditCard: true, ledgerId: 'trip' },
+  ] as unknown as AssetItem[];
+  const tpl = (linkedAccountId: string) => ({ ledgerId: DEFAULT_LEDGER_ID, linkedAccountId }) as never;
+
+  it('綁定同帳本的信用卡：照樣刷該卡，不退回預設活存（修正前退回活存，等於改從活存扣款）', () => {
+    expect(resolveQuickTemplateForEntry(tpl('card'), DEFAULT_LEDGER_ID, ledgers, assets)).toEqual({
+      ledgerId: DEFAULT_LEDGER_ID,
+      linkedAccountId: 'card',
+      fallbackLedger: false,
+      fallbackAccount: false,
+    });
+  });
+
+  it('綁定別的帳本的信用卡：視為帳戶已異動（一鍵直記會中止）', () => {
+    const r = resolveQuickTemplateForEntry(tpl('trip-card'), DEFAULT_LEDGER_ID, ledgers, assets);
+    expect(r.fallbackAccount).toBe(true);
   });
 });
