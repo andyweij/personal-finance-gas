@@ -1,3 +1,4 @@
+import { normalizeRecurringPostDay } from '../shared/recurring';
 import { atomicGroupKeyOf, orderMutationsByDependencies } from '../shared/syncOrder';
 import type { FxRateSource } from '../shared/currency';
 import { countD1Queries } from './d1Budget';
@@ -328,6 +329,7 @@ function mapRecurringRow(r: Record<string, unknown>): RecurringItem {
     currency: String(r.currency),
     cycle: String(r.cycle),
     billingSpec: String(r.billing_spec || ''),
+    postDay: normalizeRecurringPostDay(r.post_day),
     status: String(r.status),
     note: String(r.note || ''),
     linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
@@ -682,6 +684,22 @@ function isLegacyRefRequest(db: D1Database): boolean {
 function getRowPrefetch(db: D1Database): RowPrefetch | undefined {
   return (db as unknown as { [ROW_PREFETCH]?: RowPrefetch })[ROW_PREFETCH];
 }
+
+/**
+ * v1.13.1: whether migration 0022 (recurring_items.post_day) has been applied. One cheap query; only used when a
+ * write needs the column and no existing row tells us already.
+ */
+async function hasRecurringPostDayColumn(db: D1Database): Promise<boolean> {
+  try {
+    await db.prepare('SELECT post_day FROM recurring_items LIMIT 0').all();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const RECURRING_POST_DAY_MIGRATION_ERROR =
+  '伺服器資料庫尚未完成升級（缺少「入帳日」欄位），請先執行資料庫遷移後再重試。';
 
 async function readExistingRow(
   db: D1Database,
@@ -1607,6 +1625,13 @@ async function applySingleMutation(
         currency: String(p.currency || 'TWD'),
         cycle: String(p.cycle || '月繳'),
         billingSpec: String(p.billingSpec || ''),
+        // v1.13.1: a client older than v1.13.1 does not send postDay — keep the stored day instead of resetting it
+        postDay:
+          p.postDay !== undefined && p.postDay !== null
+            ? (p.postDay as number | string)
+            : existing?.post_day !== undefined && existing?.post_day !== null
+              ? Number(existing.post_day)
+              : undefined,
         status: String(p.status || '啟用'),
         note: String(p.note || ''),
         linkedAccountId: p.linkedAccountId ? String(p.linkedAccountId) : null,
@@ -1630,11 +1655,22 @@ async function applySingleMutation(
     ]);
     const refGuard = refGuardSql(db, uid, changedRefs);
 
+    // v1.13.1: post_day (migration 0022). Before the migration a non-default day is rejected (never silently
+    // dropped); the default day 1 is simply not written (the column default / previous behaviour applies).
+    const postDayColumnKnown = existing ? 'post_day' in existing : v.postDay === 1 ? false : await hasRecurringPostDayColumn(db);
+    if (!postDayColumnKnown && v.postDay !== 1) {
+      throw new RejectError(RECURRING_POST_DAY_MIGRATION_ERROR);
+    }
+    const postDaySet = postDayColumnKnown ? ', post_day = ?' : '';
+    const postDayBind = postDayColumnKnown ? [v.postDay] : [];
+    const postDayInsertCol = postDayColumnKnown ? ', post_day' : '';
+    const postDayInsertVal = postDayColumnKnown ? ', ?' : '';
+
     const writeStmt = existing
       ? db
           .prepare(
             `UPDATE recurring_items
-             SET item_name = ?, category = ?, type = ?, amount = ?, currency = ?, cycle = ?, billing_spec = ?, status = ?, note = ?, linked_account_id = ?, ledger_id = ?, sort_order = ?, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
+             SET item_name = ?, category = ?, type = ?, amount = ?, currency = ?, cycle = ?, billing_spec = ?, status = ?, note = ?, linked_account_id = ?, ledger_id = ?, sort_order = ?${postDaySet}, updated_at = ?, deleted_at = NULL, version = ?, change_seq = ${NEXT_SEQ_SQL}
              WHERE user_id = ? AND id = ? AND version = ? AND ${EPOCH_GUARD_SQL}${refGuard.sql}`
           )
           .bind(
@@ -1650,6 +1686,7 @@ async function applySingleMutation(
             v.linkedAccountId,
             v.ledgerId,
             v.sortOrder,
+            ...postDayBind,
             check.writeTs,
             check.nextVersion,
             uid,
@@ -1663,8 +1700,8 @@ async function applySingleMutation(
       : db
           .prepare(
             `INSERT INTO recurring_items
-              (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
+              (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order${postDayInsertCol}, created_at, updated_at, deleted_at, version, change_seq)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${postDayInsertVal}, ?, ?, NULL, ?, ${NEXT_SEQ_SQL}
              WHERE ${EPOCH_GUARD_SQL}${refGuard.sql}
              ON CONFLICT(user_id, id) DO NOTHING`
           )
@@ -1683,6 +1720,7 @@ async function applySingleMutation(
             v.linkedAccountId,
             v.ledgerId,
             v.sortOrder,
+            ...postDayBind,
             String(p.createdAt || check.writeTs),
             check.writeTs,
             check.nextVersion,
@@ -3848,21 +3886,27 @@ export async function importFullSnapshot(
     ])
   );
 
+  // v1.13.1: post_day only when migration 0022 is applied; without it a non-default day fails the import loudly
+  const recurringPostDayCol = await hasRecurringPostDayColumn(db);
+  if (!recurringPostDayCol && validatedRecurring.some((r) => r.v.postDay !== 1)) {
+    throw new Error('伺服器資料庫尚未完成升級（缺少「入帳日」欄位），請先執行資料庫遷移後再匯入備份。');
+  }
   const recurringRange = chunked(
     `INSERT INTO recurring_items
-      (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at, deleted_at, version, change_seq)`,
-    15,
+      (user_id, id, item_name, category, type, amount, currency, cycle, billing_spec, status, note, linked_account_id, ledger_id, sort_order, created_at, updated_at${recurringPostDayCol ? ', post_day' : ''}, deleted_at, version, change_seq)`,
+    recurringPostDayCol ? 16 : 15,
     tailLive,
     `ON CONFLICT(user_id, id) DO UPDATE SET
        item_name = excluded.item_name, category = excluded.category, type = excluded.type, amount = excluded.amount,
        currency = excluded.currency, cycle = excluded.cycle, billing_spec = excluded.billing_spec, status = excluded.status,
        note = excluded.note, linked_account_id = excluded.linked_account_id, ledger_id = excluded.ledger_id,
-       sort_order = excluded.sort_order, updated_at = excluded.updated_at,
+       sort_order = excluded.sort_order, updated_at = excluded.updated_at,${recurringPostDayCol ? ' post_day = excluded.post_day,' : ''}
        version = recurring_items.version + 1, change_seq = excluded.change_seq
      WHERE recurring_items.deleted_at IS NULL`,
     validatedRecurring.map(({ id, v, createdAt }) => [
       id, v.itemName, v.category, v.type, v.amount, v.currency, v.cycle, v.billingSpec, v.status, v.note,
       v.linkedAccountId, v.ledgerId, v.sortOrder, createdAt, nowIso,
+      ...(recurringPostDayCol ? [v.postDay] : []),
     ])
   );
 

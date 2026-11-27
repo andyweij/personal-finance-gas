@@ -1,3 +1,4 @@
+import { normalizeRecurringPostDay } from '../../../shared/recurring';
 import {
   BILLING_CYCLES,
   CASHFLOW_TYPES,
@@ -144,11 +145,14 @@ export function renderConfigTab(ctx: UiContext): void {
         sub.appendChild(lgBadge);
       }
       const specText = item.billingSpec ? ` (${item.billingSpec})` : '';
+      // v1.13.1: show the posting day when it is not the default 1st
+      const postDay = normalizeRecurringPostDay(item.postDay);
+      const postDayText = postDay !== 1 ? ` · ${postDay} 日入帳` : '';
       const monthlyTwd = computeRecurringMonthlyTwd(item, rate);
       const linkedName = item.linkedAccountId ? savingsMap.get(item.linkedAccountId) : null;
       sub.appendChild(
         document.createTextNode(
-          `${item.cycle}${specText} · ${fmtRaw(item.amount, item.currency, ctx.state.masked)} · 月均 ${fmtMoney(monthlyTwd, ctx.state.masked)}${linkedName ? ` · 活存:${linkedName}` : ''}`
+          `${item.cycle}${specText}${postDayText} · ${fmtRaw(item.amount, item.currency, ctx.state.masked)} · 月均 ${fmtMoney(monthlyTwd, ctx.state.masked)}${linkedName ? ` · 活存:${linkedName}` : ''}`
         )
       );
       main.appendChild(title);
@@ -297,6 +301,19 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
   r3.appendChild(makeSelectField('狀態', 'recStatus', ['啟用', '停用'], existing?.status || '啟用'));
   form.appendChild(r3);
 
+  // v1.13.1: posting day — the auto-posted entry is dated on this day of the month (affects linked savings balances)
+  const postDayField = makeInputField(
+    '入帳日（每月幾號，1～31；該月沒有這天則記在月底）',
+    'recPostDay',
+    'number',
+    normalizeRecurringPostDay(existing?.postDay),
+    '1',
+    true
+  );
+  const postDayInput = postDayField.querySelector('input');
+  if (postDayInput) postDayInput.inputMode = 'numeric';
+  form.appendChild(postDayField);
+
   form.appendChild(
     makeInputField(
       '生效月份（月繳留空｜年繳填 1-12｜特定月填 3,6,9,12｜一次填 2026-12）',
@@ -387,6 +404,7 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
         currency: el<HTMLSelectElement>('recCurr').value,
         cycle: el<HTMLSelectElement>('recCycle').value,
         billingSpec: el<HTMLInputElement>('recSpec').value.trim(),
+        postDay: el<HTMLInputElement>('recPostDay').value.trim(),
         status: el<HTMLSelectElement>('recStatus').value,
         linkedAccountId: el<HTMLSelectElement>('recLinkedAccount').value || null,
         ledgerId: el<HTMLSelectElement>('recLedger').value || DEFAULT_LEDGER_ID,
