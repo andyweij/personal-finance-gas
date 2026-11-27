@@ -5,7 +5,7 @@
   - 006208：現價 208.00，漲跌 +4.85（+2.39%），推得昨收 203.15，更新時間 14:39
   - 00878：現價 29.26，昨收 28.60
 - **審查對象**：main `a0d3575`（v1.11.1）；複查 main `11b5bce`（v1.12.0）：`worker/market.ts` 只改了匯率抓取，昨收邏輯未變動，缺陷仍在
-- **性質**：唯讀調查；新增重現測試，未修改產品程式碼
+- **性質**：調查並重現；**已於 v1.12.1 修正**（見文末「v1.12.1 修正」）
 - **結論**：已確認為昨收取錯日期（取到前天的收盤）；程式碼中對應的缺陷已以測試重現
 - **限制**：審查環境無法連線到 TWSE MIS 與 Yahoo Finance（proxy 回 403），無法自行取得 11/25～11/27 的實際行情。
 - **使用者核對結果（已確認）**：00878 畫面上的昨收 28.60 是 **11/25（前天）的收盤價**，不是 11/26 的收盤價。昨收取錯日期，導致漲跌方向相反。
@@ -69,7 +69,32 @@
 1. **驗證昨收所屬的交易日**：在 `fetchYahooChartQuote` 中，被選為昨收的 K 棒日期應為 `regularMarketTime` 日期的上一個交易日。至少以「跳過週末」判斷：兩者之間若隔了任何工作日，就視為缺漏。國定假日可能被誤判為缺漏，此時退回下一步即可，不會顯示錯誤方向。
 2. **缺漏時改用 `range=1d`**：`fetchYahoo1dPreviousClose` 已會比對 `regularMarketTime` 的日期，可直接沿用；仍無法確認時回傳 `previousClose: null`，畫面顯示「待更新」。寧可不顯示漲跌，也不要顯示錯誤方向。
 3. **記錄報價來源並查明 MIS 為何沒有回傳**：`StockQuoteResult` 加上 `source: 'mis' | 'yahoo' | 'stooq'`，寫入 `console.log`（Workers Logs 可查）並放進 `/api/market/refresh` 的 `updatedTickers`，方便日後追查。
-4. 修正後把 `tests/stock-prev-close-yahoo-gap-repro.test.ts` 的 4 個 `it.fails` 改為 `it`。
+4. 修正後把 `tests/stock-prev-close-yahoo-gap-repro.test.ts` 的 4 個 `it.fails` 改為 `it`。（第 1～4 點已於 v1.12.1 完成；查明 MIS 為何沒有回傳仍待部署後觀察 log）
+
+## v1.12.1 修正
+
+**`worker/market.ts`**
+- 新增 `previousWeekdayKey`：取某日之前的上一個工作日（跳過週六、週日）。
+- `fetchYahooChartQuote`：從日 K 選出昨收後，檢查那根 K 棒的日期是否為 `regularMarketTime` 日期的上一個工作日。不符時寫 log 並捨棄，改走既有的備援：
+  1. `range=5d` 的 `meta.previousClose`（有提供時）。
+  2. `range=1d` 的昨收（`fetchYahoo1dPreviousClose`，會比對行情日期）。
+  3. 都沒有時 `previousClose` 為 null，畫面顯示「待更新」，不顯示漲跌。
+- 國定假日：假日後第一個交易日的上一根 K 棒在假日前，會被判為不符而改查 `range=1d`。`range=1d` 由 Yahoo 依交易所行事曆提供昨收，結果正確；查不到時顯示「待更新」，不會顯示錯誤方向。
+- `regularMarketTime` 或 K 棒時間缺漏時無法判斷日期，維持原本的行為。
+- `fetchStockQuote`：台股 MIS 沒有回傳可用報價、改走 Yahoo 時寫入 `console.warn`，日後可在 Workers Logs 查到報價來源。
+
+**沒有變動的部分**
+- 不需要 migration，D1 查詢數不變。
+- 對外請求：只有在昨收日期不符時才多一次 `range=1d`，已包含在既有的 `MAX_FETCHES_PER_QUOTE = 8` 預算內。
+- MIS 的報價邏輯不變。
+
+**測試**（`tests/stock-prev-close-yahoo-gap-repro.test.ts`，共 11 項）
+- 原本以 `it.fails` 標記的 4 項改為 `it` 並通過。
+- 新增 3 項邊界：國定假日後第一個交易日（`range=1d` 有提供／沒有提供）、美股缺上一個交易日的 K 棒。
+
+**部署後**
+- 已經寫入錯誤昨收的持股，會在下一次更新報價時被覆寫（手動按「更新股價匯率」，或台北 23:00 的排程）。
+- 若 Workers Logs 經常出現 `TWSE MIS returned no usable quote`，代表 MIS 從 Worker 連不上或常被略過，需另外追查。
 
 ## 驗證
 

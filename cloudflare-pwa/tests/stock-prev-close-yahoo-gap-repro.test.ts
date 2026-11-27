@@ -2,7 +2,7 @@
  * 重現測試：台股改走 Yahoo 報價時，昨收可能取到兩天前的收盤，使漲跌方向相反。
  * 分析見 docs/reviews/2026-11-27_prev_close_direction_review.md。
  *
- * it.fails：bug 仍存在時本測試「預期失敗」；修好後請改回 it。
+ * v1.12.1 已修正：原本以 it.fails 標記的 4 項已改為 it。
  *
  * 模擬行情：11/25 收 88.90、11/26 收 92.40、11/27（今天）收 91.00 → 今天應為下跌 -1.40。
  * 正確的昨收是 92.40；若無法確認上一個交易日，應回傳 null（畫面顯示「待更新」），不可回傳 88.90。
@@ -121,8 +121,8 @@ describe('昨收漲跌方向：Yahoo 日 K 缺漏時的昨收（2026-11-27 使�
     });
   });
 
-  describe('Bug：昨收取到兩天前的收盤', () => {
-    it.fails('Yahoo 缺昨天（11/26）的 K 棒：昨收不應是 11/25 的 88.90', async () => {
+  describe('已修正（v1.12.1）：昨收不可取到兩天前的收盤', () => {
+    it('Yahoo 缺昨天（11/26）的 K 棒：昨收不應是 11/25 的 88.90', async () => {
       const yahoo = yahoo5d(
         [
           ['2026-11-24', 88.0],
@@ -133,11 +133,11 @@ describe('昨收漲跌方向：Yahoo 日 K 缺漏時的昨收（2026-11-27 使�
         TODAY
       );
       const q = await fetchStockQuote('0050', mkFetch({ yahoo }), TW_HINT);
-      // 目前回傳 previousClose = 88.90 → 顯示 +2.10（+2.36%），實際應為 -1.40
+      // 修正前回傳 previousClose = 88.90 → 顯示 +2.10（+2.36%），實際應為 -1.40
       expectSafePreviousClose(q);
     });
 
-    it.fails('Yahoo 昨天的 K 棒收盤價為 null：昨收不應是 11/25 的 88.90', async () => {
+    it('Yahoo 昨天的 K 棒收盤價為 null：昨收不應是 11/25 的 88.90', async () => {
       const yahoo = yahoo5d(
         [
           ['2026-11-25', 88.9],
@@ -151,7 +151,7 @@ describe('昨收漲跌方向：Yahoo 日 K 缺漏時的昨收（2026-11-27 使�
       expectSafePreviousClose(q);
     });
 
-    it.fails('Yahoo 日 K 落後兩天（沒有昨天也沒有今天）：昨收不應是 11/25 的 88.90', async () => {
+    it('Yahoo 日 K 落後兩天（沒有昨天也沒有今天）：昨收不應是 11/25 的 88.90', async () => {
       const yahoo = yahoo5d(
         [
           ['2026-11-21', 87.5],
@@ -165,7 +165,7 @@ describe('昨收漲跌方向：Yahoo 日 K 缺漏時的昨收（2026-11-27 使�
       expectSafePreviousClose(q);
     });
 
-    it.fails('Yahoo 缺昨天的 K 棒、但 range=1d 提供正確昨收：應採用 range=1d 的 92.40', async () => {
+    it('Yahoo 缺昨天的 K 棒、但 range=1d 提供正確昨收：應採用 range=1d 的 92.40', async () => {
       const yahoo = yahoo5d(
         [
           ['2026-11-24', 88.0],
@@ -177,6 +177,76 @@ describe('昨收漲跌方向：Yahoo 日 K 缺漏時的昨收（2026-11-27 使�
       );
       const q = await fetchStockQuote('0050', mkFetch({ yahoo, yahoo1dPrev: 92.4 }), TW_HINT);
       expect(q).toEqual({ price: 91, previousClose: 92.4 });
+    });
+  });
+
+  describe('邊界（v1.12.1）', () => {
+    it('國定假日後第一個交易日：上一根 K 棒在假日前，改用 range=1d 的昨收', async () => {
+      // 2026-10-09（五）國慶日休市；10/12（一）的上一個交易日是 10/08（四）
+      const yahoo = yahoo5d(
+        [
+          ['2026-10-07', 90.0],
+          ['2026-10-08', 91.0],
+          ['2026-10-12', 92.0],
+        ],
+        92.0,
+        '2026-10-12'
+      );
+      const fetchImpl: FetchLike = async (url: string) => {
+        if (url.includes('mis.twse.com.tw')) return new Response('unavailable', { status: 503 });
+        if (url.includes('range=1d')) {
+          return new Response(
+            JSON.stringify({
+              chart: { result: [{ meta: { previousClose: 91.0, regularMarketTime: marketTs('2026-10-12'), gmtoffset: 28800 } }] },
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify(yahoo), { status: 200 });
+      };
+      const q = await fetchStockQuote('0050', fetchImpl, TW_HINT);
+      expect(q).toEqual({ price: 92, previousClose: 91 });
+    });
+
+    it('國定假日後第一個交易日、range=1d 也無法提供：昨收為 null（顯示待更新），不猜測', async () => {
+      const yahoo = yahoo5d(
+        [
+          ['2026-10-07', 90.0],
+          ['2026-10-08', 91.0],
+          ['2026-10-12', 92.0],
+        ],
+        92.0,
+        '2026-10-12'
+      );
+      const q = await fetchStockQuote('0050', mkFetch({ yahoo }), TW_HINT);
+      expect(q).toEqual({ price: 92, previousClose: null });
+    });
+
+    it('美股缺上一個交易日的 K 棒：同樣不取兩天前的收盤', async () => {
+      // 美東時間：K 棒約 09:30（UTC 14:30），gmtoffset -18000
+      const usTs = (ymd: string, h: number) => {
+        const [y, m, d] = ymd.split('-').map(Number);
+        return Date.UTC(y, m - 1, d, h, 30) / 1000;
+      };
+      const yahoo = {
+        chart: {
+          result: [
+            {
+              meta: { regularMarketPrice: 500, regularMarketTime: usTs('2026-11-25', 21), gmtoffset: -18000 },
+              timestamp: [usTs('2026-11-20', 14), usTs('2026-11-21', 14), usTs('2026-11-25', 14)],
+              indicators: { quote: [{ close: [480, 490, 500] }] },
+            },
+          ],
+        },
+      };
+      const fetchImpl: FetchLike = async (url: string) => {
+        if (url.includes('range=1d')) return new Response(JSON.stringify({ chart: { result: [{ meta: {} }] } }), { status: 200 });
+        if (url.includes('finance.yahoo.com')) return new Response(JSON.stringify(yahoo), { status: 200 });
+        return new Response('not found', { status: 404 });
+      };
+      const q = await fetchStockQuote('VOO', fetchImpl, { subCategory: '美股/ETF', currency: 'USD' });
+      // 11/25（三）的上一個交易日是 11/24（二），日 K 缺 11/24 → 不可回傳 11/21 的 490
+      expect(q).toEqual({ price: 500, previousClose: null });
     });
   });
 });
