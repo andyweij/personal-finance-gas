@@ -1185,11 +1185,18 @@ export function openSecurityModal(ctx: UiContext): void {
         headers,
         body: JSON.stringify({ mode: 'merge', data: parsed.data || parsed }),
       });
-      const json = (await res.json()) as { ok?: boolean; error?: string };
+      const json = (await res.json()) as { ok?: boolean; error?: string; recoveredLedgers?: number };
       if (!res.ok) throw new Error(json.error || 'JSON 還原失敗');
       await ctx.engine.syncNow(true);
       closeModal();
-      showToast('完整 JSON 備份還原完成！', 'success');
+      const recovered = Number(json.recoveredLedgers || 0);
+      // v1.8.17 review finding 2: records pointing at a missing ledger are kept under a recovered ledger
+      showToast(
+        recovered > 0
+          ? `完整 JSON 備份還原完成！有紀錄指向不存在的帳本，已重建 ${recovered} 個「復原的帳本」（不計入淨資產），請到帳本管理確認或轉移。`
+          : '完整 JSON 備份還原完成！',
+        'success'
+      );
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'JSON 還原失敗', 'error');
     } finally {
