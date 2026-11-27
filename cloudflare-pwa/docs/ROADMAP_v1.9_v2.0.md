@@ -11,7 +11,7 @@
 | **Phase 2** | `v1.10.0` | 淨資產歷史走勢圖 ＋ 持股配息月曆 ＋ 資產再平衡試算 | `0018` (`app_settings`) | ✅ 已完成 |
 | **Phase 3** | `v1.11.0` | 自訂分類、常用範本與輸入自動補齊 | `0019` (`app_settings`) | ✅ 已完成 |
 | **Phase 4** | `v1.12.0` | 多幣別擴充（JPY / EUR / HKD / GBP 等） | `0020` (`app_settings`) | ✅ 已完成 |
-| **Phase 5** | `v1.13.0` | 財務目標與達成日期推估（存錢桶 / FIRE） | `0021` (`financial_goals`) | ⬜ 待實作 |
+| **Phase 5** | `v1.13.0` | 財務目標與達成日期推估（存錢桶 / FIRE） | `0021` (`financial_goals`) | ✅ 已完成 |
 | **Phase 6** | `v1.14.0` | 代墊款 / 拆帳追蹤 | `0022` (`split_receivables`) | ⬜ 待實作 |
 | **Phase 7** | `v1.15.0` | 信用卡帳單週期 & 分期付款管理 | `0023` (`asset_items` + `installment_plans`) | ⬜ 待實作 |
 | **Phase 8** | `v1.16.0` | *(建議前置重構)* `sync.ts` Entity Registry 輕量化 | 無 | ⬜ 待實作 |
@@ -42,3 +42,9 @@
 - **核心模組**：`shared/currency.ts`（9 幣別小數／符號／合理區間定義、`FxRateSource` 向下相容解析、`computeCrossTwdRatesFromUsdBase` 單請求交叉匯率計算）
 - **全棧串接**：`shared/calculations.ts`、`shared/validation.ts`、`shared/analytics.ts`、`shared/csv.ts`、`worker/market.ts`、`worker/automation.ts`、`worker/sync.ts`、`web/src/sync/syncEngine.ts` 及前端多幣別選擇器與匯率設定彈窗
 - **測試套件**：`tests/multi-currency.test.ts`
+
+## Phase 5（`v1.13.0`）完成紀錄
+- **新增 Migration**：`migrations/0021_financial_goals.sql`（新建同步表 `financial_goals`，無 `DEFAULT 'owner'`、複合主鍵 `(user_id, id)`、`idx_financial_goals_user_seq` 索引；未遷移資料庫平滑降級與寫入保護）
+- **核心引擎**：`shared/goals.ts`（支援 5 種目標模式 `net_worth` / `fire` / `ledger_bucket` / `asset_bucket` / `manual`、近 12 月平均儲蓄估算、`r = 0%` 線性與複利月期推估、100 年上限防呆、期望達成日反推每月應存金額與 FIRE 4% 法則建議額）
+- **全棧串接**：`shared/types.ts`、`shared/validation.ts`、`shared/syncOrder.ts`、`worker/sync.ts`、`web/src/db/localDb.ts`、`web/src/sync/syncEngine.ts`、`web/src/ui/conflictUi.ts`、`web/src/ui/goalsUi.ts`、`web/src/ui/overviewTab.ts`
+- **測試套件**：`tests/financial-goals.test.ts`

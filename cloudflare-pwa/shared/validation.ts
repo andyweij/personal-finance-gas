@@ -9,6 +9,7 @@ import {
   DEFAULT_LEDGER_ID,
   DEFAULT_PNL_COLOR_SCHEME,
   DEFAULT_STOCK_CATEGORIES,
+  FINANCIAL_GOAL_TYPES,
   LIQUIDITY_LEVELS,
   PNL_COLOR_SCHEMES,
   QUICK_ENTRY_TYPES,
@@ -20,6 +21,7 @@ import {
 } from './constants';
 import type {
   CustomCategoriesMap,
+  FinancialGoalType,
   PnlColorScheme,
   QuickEntryTemplate,
   RebalanceTargetKind,
@@ -1040,6 +1042,161 @@ export function validateStockTransactionInput(payload: StockTransactionInputPayl
     totalAmount,
     fee,
     linkedCashflowId,
+    note,
+  };
+}
+
+export function normalizeLinkedAssetIds(value: unknown): string[] {
+  let raw: unknown[] = [];
+  if (Array.isArray(value)) {
+    raw = value;
+  } else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) raw = parsed;
+    } catch {
+      raw = [];
+    }
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw) {
+    const id = String(item ?? '').trim().slice(0, 80);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+export interface FinancialGoalInputPayload {
+  name: string;
+  goalType?: FinancialGoalType | string;
+  targetAmount: number | string;
+  currency?: string;
+  linkedLedgerId?: string | null;
+  linkedAssetIds?: string[] | string;
+  currentManualAmount?: number | string;
+  expectedAnnualReturnPct?: number | string;
+  monthlyContributionOverride?: number | string | null;
+  fireSwrPct?: number | string | null;
+  targetDate?: string | null;
+  sortOrder?: number;
+  note?: string;
+}
+
+export function validateFinancialGoalInput(payload: FinancialGoalInputPayload) {
+  const name = String(payload.name || '').trim().slice(0, 60);
+  if (!name) throw new Error('請輸入財務目標名稱。');
+
+  const rawType = String(payload.goalType || 'manual').trim();
+  if (!(FINANCIAL_GOAL_TYPES as readonly string[]).includes(rawType)) {
+    throw new Error(`不支援的目標類型：${rawType}`);
+  }
+  const goalType = rawType as FinancialGoalType;
+
+  const targetAmountNum = Number(payload.targetAmount);
+  if (Number.isNaN(targetAmountNum) || !Number.isFinite(targetAmountNum) || targetAmountNum <= 0) {
+    throw new Error('目標金額須大於 0。');
+  }
+  const targetAmount = roundTo(targetAmountNum, 2);
+
+  const currency = String(payload.currency || 'TWD').trim().toUpperCase();
+  if (!CURRENCIES.includes(currency)) {
+    throw new Error(`不支援的幣別：${currency}`);
+  }
+
+  let linkedLedgerId: string | null = null;
+  if (goalType === 'ledger_bucket') {
+    const rawLid = String(payload.linkedLedgerId || '').trim();
+    if (!rawLid) throw new Error('選擇「特定帳本」目標時，請指定綁定帳本。');
+    linkedLedgerId = normalizeLedgerId(rawLid);
+  }
+
+  const linkedAssetIds = goalType === 'asset_bucket' ? normalizeLinkedAssetIds(payload.linkedAssetIds) : [];
+  if (goalType === 'asset_bucket' && linkedAssetIds.length === 0) {
+    throw new Error('選擇「指定資產」目標時，請至少勾選 1 項資產或活存帳戶。');
+  }
+
+  const manualNum =
+    goalType === 'manual' && payload.currentManualAmount !== undefined && payload.currentManualAmount !== ''
+      ? Number(payload.currentManualAmount)
+      : 0;
+  if (Number.isNaN(manualNum) || !Number.isFinite(manualNum) || manualNum < 0) {
+    throw new Error('目前累積金額需大於等於 0。');
+  }
+  const currentManualAmount = roundTo(manualNum, 2);
+
+  const retRaw =
+    payload.expectedAnnualReturnPct !== undefined &&
+    payload.expectedAnnualReturnPct !== null &&
+    String(payload.expectedAnnualReturnPct).trim() !== ''
+      ? Number(payload.expectedAnnualReturnPct)
+      : 0;
+  if (Number.isNaN(retRaw) || !Number.isFinite(retRaw) || retRaw < 0 || retRaw > 30) {
+    throw new Error('預期年化報酬率需介於 0% ～ 30%。');
+  }
+  const expectedAnnualReturnPct = roundTo(retRaw, 2);
+
+  let monthlyContributionOverride: number | null = null;
+  if (
+    payload.monthlyContributionOverride !== undefined &&
+    payload.monthlyContributionOverride !== null &&
+    String(payload.monthlyContributionOverride).trim() !== ''
+  ) {
+    const mc = Number(payload.monthlyContributionOverride);
+    if (Number.isNaN(mc) || !Number.isFinite(mc) || mc < 0) {
+      throw new Error('自訂每月投入金額需大於等於 0。');
+    }
+    monthlyContributionOverride = roundTo(mc, 2);
+  }
+
+  let fireSwrPct: number | null = null;
+  if (goalType === 'fire') {
+    const swrRaw =
+      payload.fireSwrPct !== undefined &&
+      payload.fireSwrPct !== null &&
+      String(payload.fireSwrPct).trim() !== ''
+        ? Number(payload.fireSwrPct)
+        : 4;
+    if (Number.isNaN(swrRaw) || !Number.isFinite(swrRaw) || swrRaw < 1 || swrRaw > 15) {
+      throw new Error('FIRE 安全提領率需介於 1% ～ 15%。');
+    }
+    fireSwrPct = roundTo(swrRaw, 2);
+  }
+
+  let targetDate: string | null = null;
+  if (payload.targetDate !== undefined && payload.targetDate !== null && String(payload.targetDate).trim() !== '') {
+    const ym = String(payload.targetDate).trim();
+    const match = /^(\d{4})-(\d{2})$/.exec(ym);
+    if (!match) {
+      throw new Error('期望達成日期格式錯誤（應為 YYYY-MM）。');
+    }
+    const y = Number(match[1]);
+    const mo = Number(match[2]);
+    if (y < 1970 || y > 2200 || mo < 1 || mo > 12) {
+      throw new Error('期望達成日期超出有效範圍。');
+    }
+    targetDate = ym;
+  }
+
+  const sortOrder = normalizeSortOrder(payload.sortOrder, 0);
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  return {
+    name,
+    goalType,
+    targetAmount,
+    currency,
+    linkedLedgerId,
+    linkedAssetIds,
+    currentManualAmount,
+    expectedAnnualReturnPct,
+    monthlyContributionOverride,
+    fireSwrPct,
+    targetDate,
+    sortOrder,
     note,
   };
 }

@@ -76,6 +76,8 @@ export const STOCK_TX_TYPES = {
   STOCK_DIVIDEND: 'stock_dividend',
 } as const;
 
+export const FINANCIAL_GOAL_TYPES = ['net_worth', 'fire', 'ledger_bucket', 'asset_bucket', 'manual'] as const;
+
 export const ALL_STOCK_TX_TYPES: string[] = [
   STOCK_TX_TYPES.BUY,
   STOCK_TX_TYPES.SELL,

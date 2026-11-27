@@ -8,6 +8,7 @@ import {
   filterCashFlowsByLedgerScope,
 } from '../../../shared/calculations';
 import { el, fmtMoney, fmtPct } from './helpers';
+import { renderFinancialGoalsCard } from './goalsUi';
 import { getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { getSelectedYearMonth } from './logTab';
 import type { UiContext } from './state';
@@ -197,6 +198,9 @@ export function renderOverviewTab(ctx: UiContext): void {
 
   el<HTMLInputElement>('budgetInput').value = String(snap.settings.monthlyDailyBudget);
   el<HTMLInputElement>('emergencyInput').value = String(snap.settings.emergencyTargetMonths);
+
+  const goalsCard = document.getElementById('overviewGoalsCard');
+  if (goalsCard) renderFinancialGoalsCard(ctx, goalsCard);
 
   renderTrendChart(ctx);
 }
