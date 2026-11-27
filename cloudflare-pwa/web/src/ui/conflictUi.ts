@@ -57,6 +57,7 @@ const FIELD_LABELS: Record<string, string> = {
   autoFxEnabled: '自動更新美元匯率',
   pnlColorScheme: '正負配色風格',
   customStockCategories: '自訂持股分類',
+  rebalanceTargets: '再平衡目標比例',
   stockCategory: '持股分類',
   sortOrder: '排序順序',
   shares: '股數',

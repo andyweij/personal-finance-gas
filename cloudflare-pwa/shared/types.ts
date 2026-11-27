@@ -1,5 +1,15 @@
 export type PnlColorScheme = 'intl' | 'tw' | 'tw_stocks';
 
+export type RebalanceTargetKind = 'category' | 'ticker';
+
+export interface RebalanceTargetRule {
+  id: string;
+  kind: RebalanceTargetKind;
+  key: string;
+  label: string;
+  targetPct: number;
+}
+
 export interface AppSettings {
   monthlyDailyBudget: number;
   emergencyTargetMonths: number;
@@ -8,6 +18,7 @@ export interface AppSettings {
   fxUpdatedAt?: string | null;
   pnlColorScheme?: PnlColorScheme;
   customStockCategories?: string[];
+  rebalanceTargets?: RebalanceTargetRule[];
   updatedAt: string;
   version?: number;
 }

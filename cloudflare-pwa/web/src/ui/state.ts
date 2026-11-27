@@ -1,4 +1,5 @@
-import type { AuthUser, CachedPasskeyDto, PnlColorScheme } from '../../../shared/types';
+import type { AuthUser, CachedPasskeyDto, PnlColorScheme, RebalanceTargetKind } from '../../../shared/types';
+import type { RebalanceMode } from '../../../shared/analytics';
 import type { LedgerDatePreset } from '../../../shared/ledgerSearch';
 import type { SyncEngine } from '../sync/syncEngine';
 import type { LocalMeta } from '../db/localDb';
@@ -61,7 +62,15 @@ export interface AppUiState {
   recurringFilter: 'all' | 'income' | 'invest' | 'fixed' | 'sub';
   allocMode: 'both' | 'pct' | 'amt';
   allocHighlight: string | null;
+  networthChartMode: 'line' | 'area';
+  networthChartRange: '12m' | 'all';
+  networthChartSelectedYm: string | null;
   stocksSubtab: 'holdings' | 'watchlist';
+  dividendCalendarYear: number;
+  dividendCalendarSelectedMonth: number | null;
+  rebalanceKind: RebalanceTargetKind;
+  rebalanceMode: RebalanceMode;
+  rebalanceContribution: string;
   stockPriceViewMode: 'unit' | 'total';
   stockCardDisplayMode: StockCardDisplayMode;
   flippedStockIds: string[];

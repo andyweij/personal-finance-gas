@@ -16,7 +16,8 @@ import {
   STATUS_OPTIONS,
   STOCK_TX_TYPES,
 } from './constants';
-import type { PnlColorScheme, StockTransactionType } from './types';
+import type { PnlColorScheme, RebalanceTargetKind, RebalanceTargetRule, StockTransactionType } from './types';
+import { roundTo } from './format';
 
 export interface ParsedLocalDate {
   year: number;
@@ -107,6 +108,59 @@ export function normalizeCustomStockCategories(value: unknown): string[] {
     if (out.length >= 30) break;
   }
   return out;
+}
+
+export function normalizeRebalanceTargets(value: unknown): RebalanceTargetRule[] {
+  let rawList: unknown[] = [];
+  if (Array.isArray(value)) {
+    rawList = value;
+  } else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) rawList = parsed;
+    } catch {
+      rawList = [];
+    }
+  }
+  const seen = new Set<string>();
+  const out: RebalanceTargetRule[] = [];
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const rawKind = String(obj.kind || '').trim();
+    if (rawKind !== 'category' && rawKind !== 'ticker') continue;
+    const kind = rawKind as RebalanceTargetKind;
+    const key = String(obj.key || '').trim().slice(0, 64);
+    if (!key) continue;
+    const dedupKey = `${kind}:${key}`;
+    if (seen.has(dedupKey)) continue;
+    const label = String(obj.label || key).trim().slice(0, 40) || key;
+    const rawPct = Number(obj.targetPct);
+    if (!Number.isFinite(rawPct) || rawPct < 0 || rawPct > 100) continue;
+    const targetPct = roundTo(rawPct, 2);
+    const id = String(obj.id || dedupKey).trim().slice(0, 64) || dedupKey;
+    seen.add(dedupKey);
+    out.push({ id, kind, key, label, targetPct });
+    if (out.length >= 30) break;
+  }
+  return out;
+}
+
+export function validateRebalanceTargetsForSave(rules: unknown): RebalanceTargetRule[] {
+  const normalized = normalizeRebalanceTargets(rules);
+  for (const kind of ['category', 'ticker'] as const) {
+    const group = normalized.filter((r) => r.kind === kind);
+    if (!group.length) continue;
+    const sum = roundTo(
+      group.reduce((s, r) => s + r.targetPct, 0),
+      2
+    );
+    if (Math.abs(sum - 100) > 0.01) {
+      const kindLabel = kind === 'category' ? '分類目標' : '標的目標';
+      throw new Error(`${kindLabel}比例合計需為 100%（目前為 ${sum.toFixed(1)}%）`);
+    }
+  }
+  return normalized;
 }
 
 export function parseLocalDate(ymd: string): ParsedLocalDate {

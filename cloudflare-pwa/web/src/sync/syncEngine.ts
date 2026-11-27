@@ -44,7 +44,9 @@ import {
   normalizeCustomStockCategories,
   normalizeLedgerId,
   normalizePnlColorScheme,
+  normalizeRebalanceTargets,
   normalizeStockCategory,
+  validateRebalanceTargetsForSave,
   validateAccountTransferInput,
   validateAssetInput,
   validateCashFlowInput,
@@ -355,6 +357,7 @@ export class SyncEngine {
       'saveFxSettings',
       'savePnlColorScheme',
       'saveCustomStockCategories',
+      'saveRebalanceTargets',
       'saveRecurring',
       'reorderRecurring',
       'deleteRecurring',
@@ -1225,6 +1228,33 @@ export class SyncEngine {
       },
     ]);
     return normalized;
+  }
+
+  async saveRebalanceTargets(rules: import('../../../shared/types').RebalanceTargetRule[]): Promise<import('../../../shared/types').RebalanceTargetRule[]> {
+    const validated = validateRebalanceTargetsForSave(rules);
+    const nowIso = new Date().toISOString();
+    const baseVersion = this.snapshot.settings.version;
+    const nextSettings: AppSettings = {
+      ...this.snapshot.settings,
+      rebalanceTargets: validated,
+      updatedAt: nowIso,
+    };
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      settings: nextSettings,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'settings',
+        op: 'upsert',
+        recordId: '1',
+        clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
+        payload: { ...nextSettings },
+      },
+    ]);
+    return validated;
   }
 
   async saveRecurring(payload: RecurringInputPayload & { id?: string }): Promise<RecurringItem> {
@@ -2608,6 +2638,7 @@ export class SyncEngine {
             ...(p.autoFxEnabled !== undefined ? { autoFxEnabled: p.autoFxEnabled } : {}),
             ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
             ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
+            ...(p.rebalanceTargets !== undefined ? { rebalanceTargets: normalizeRebalanceTargets(p.rebalanceTargets) } : {}),
           },
         };
       } else if (pendingMut.op === 'delete') {
@@ -3226,6 +3257,7 @@ export class SyncEngine {
                 ...(p.autoFxEnabled !== undefined ? { autoFxEnabled: p.autoFxEnabled } : {}),
                 ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
                 ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
+                ...(p.rebalanceTargets !== undefined ? { rebalanceTargets: normalizeRebalanceTargets(p.rebalanceTargets) } : {}),
               };
               merged = { ...merged, settings: rebasedSettings };
               if (canRebaseVersion && effectiveServerVersion !== undefined) {

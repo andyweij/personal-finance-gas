@@ -313,7 +313,15 @@ async function bootstrap(): Promise<void> {
     recurringFilter: 'all',
     allocMode: storedAlloc === 'pct' || storedAlloc === 'amt' ? storedAlloc : 'both',
     allocHighlight: null,
+    networthChartMode: 'line',
+    networthChartRange: '12m',
+    networthChartSelectedYm: null,
     stocksSubtab: 'holdings',
+    dividendCalendarYear: getDatePartsInTimeZone(now).year,
+    dividendCalendarSelectedMonth: null,
+    rebalanceKind: 'category',
+    rebalanceMode: 'buy_only',
+    rebalanceContribution: '',
     stockPriceViewMode: storedStockView === 'total' ? 'total' : 'unit',
     stockCardDisplayMode: validCardMode,
     flippedStockIds: [],
@@ -466,6 +474,9 @@ async function bootstrap(): Promise<void> {
         state.logLinkedAccountTouched = false;
         state.ledgerSearch = createDefaultLedgerSearchState();
         state.ledgerPage = 1;
+        state.networthChartSelectedYm = null;
+        state.dividendCalendarSelectedMonth = null;
+        state.rebalanceContribution = '';
       } else {
         ctx.engine?.setExpectedUserId(user.id);
       }

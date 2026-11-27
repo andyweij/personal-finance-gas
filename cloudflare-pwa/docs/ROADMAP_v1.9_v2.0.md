@@ -8,7 +8,7 @@
 | Phase | 目標版本 | 功能項目 | Migration | 狀態 |
 | --- | --- | --- | --- | --- |
 | **Phase 1** | `v1.9.0` | 跨月全文搜尋與條件篩選加總（流水帳） | 無 | ✅ 已完成 |
-| **Phase 2** | `v1.10.0` | 淨資產歷史走勢圖 ＋ 持股配息月曆 ＋ 資產再平衡試算 | `0018` (`app_settings`) | ⬜ 待實作 |
+| **Phase 2** | `v1.10.0` | 淨資產歷史走勢圖 ＋ 持股配息月曆 ＋ 資產再平衡試算 | `0018` (`app_settings`) | ✅ 已完成 |
 | **Phase 3** | `v1.11.0` | 自訂分類、常用範本與輸入自動補齊 | `0019` (`app_settings`) | ⬜ 待實作 |
 | **Phase 4** | `v1.12.0` | 多幣別擴充（JPY / EUR / HKD / GBP 等） | `0020` (`app_settings`) | ⬜ 待實作 |
 | **Phase 5** | `v1.13.0` | 財務目標與達成日期推估（存錢桶 / FIRE） | `0021` (`financial_goals`) | ⬜ 待實作 |
@@ -24,3 +24,9 @@
 - **介面整合**：`web/index.html`、`web/src/ui/state.ts`、`web/src/ui/logTab.ts`、`web/src/main.ts`、`web/src/styles.css`
 - **測試套件**：`tests/ledger-search.test.ts`
 - **Migration**：無（0 D1 查詢成本，免執行 `db:migrate:remote`）
+
+## Phase 2（`v1.10.0`）完成紀錄
+- **新增 Migration**：`migrations/0018_rebalance_targets.sql`（`app_settings.rebalance_targets_json TEXT NOT NULL DEFAULT '[]'`，向後相容、+0 D1 查詢成本）
+- **核心引擎**：`shared/analytics.ts`（淨資產序列與成長計算、年度配息月曆與消費覆蓋率、只買不賣水填法與買賣調倉整數零尾差再平衡演算法）
+- **介面模組**：`web/src/ui/networthChart.ts`、`web/src/ui/dividendCalendarUi.ts`、`web/src/ui/rebalanceUi.ts`
+- **測試套件**：`tests/analytics-and-rebalance.test.ts`（涵蓋單元、D1 同步、樂觀鎖衝突、JSON 備份還原與 D1 查詢預算檢查）

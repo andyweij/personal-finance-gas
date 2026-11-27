@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.8.17 / D1 Schema `0017`）
+# 資料庫 Schema 設計架構（v1.10.0 / D1 Schema `0018`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（24 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0017_drop_owner_default.sql`](../migrations/0017_drop_owner_default.sql)  
-> **對應版本**：`APP_VERSION = 1.8.17` / `DB_SCHEMA_VERSION = 0017` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
+> **最新 Migration**：[`0018_rebalance_targets.sql`](../migrations/0018_rebalance_targets.sql)  
+> **對應版本**：`APP_VERSION = 1.10.0` / `DB_SCHEMA_VERSION = 0018` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
 
 ---
 
@@ -83,6 +83,7 @@ erDiagram
 | `fx_updated_at` | `TEXT` | `NULL` | 匯率最後自動更新時間（ISO 8601） |
 | `pnl_color_scheme` | `TEXT` | `NOT NULL DEFAULT 'intl'` | 配色方案：`intl` / `tw` / `tw_stocks`（`0008`） |
 | `custom_stock_categories` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON 陣列，使用者自訂持股分類（`0009`） |
+| `rebalance_targets_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON 陣列，資產再平衡目標比例規則（依分類／標的，合計 100%，`0018`） |
 | `updated_at` | `TEXT` | `NOT NULL` | 最後更新時間 |
 | `version` | `INTEGER` | `NOT NULL DEFAULT 1` | 樂觀鎖版號 |
 

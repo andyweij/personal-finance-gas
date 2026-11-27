@@ -24,6 +24,8 @@ import {
   openModal,
   showToast,
   TRASH_SVG, fmtPct, bindSubmit } from './helpers';
+import { renderDividendCalendarCard } from './dividendCalendarUi';
+import { renderRebalanceCard } from './rebalanceUi';
 import { renderReorderList } from './reorderHelper';
 import { renderStockChartCard } from './stockCharts';
 import type { UiContext } from './state';
@@ -390,14 +392,20 @@ export function renderStocksTab(ctx: UiContext): void {
     unrecoveredText.textContent = `未回本成本 ${fmtMoney(portfolio.totalUnrecoveredCostTwd, masked)}`;
   }
 
-  // Render stock allocation chart card (holdings only; hide when on watchlist subtab)
+  // Render stock allocation chart, dividend calendar, and rebalance cards (holdings only)
   const chartCard = el('stocksChartCard');
+  const dividendCard = el('stocksDividendCard');
+  const rebalanceCard = el('stocksRebalanceCard');
   if (subtab === 'holdings') {
     renderStockChartCard(ctx, portfolio, chartCard, {
       onManageCategories: () => openStockCategoryManagerModal(ctx),
     });
+    renderDividendCalendarCard(ctx, dividendCard);
+    renderRebalanceCard(ctx, portfolio, rebalanceCard);
   } else {
     chartCard.style.display = 'none';
+    dividendCard.style.display = 'none';
+    rebalanceCard.style.display = 'none';
   }
 
   // Action button label & reorder button visibility

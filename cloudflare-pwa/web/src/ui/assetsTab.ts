@@ -30,6 +30,7 @@ import {
   showToast,
   TRASH_SVG, fmtPct, bindSubmit } from './helpers';
 import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
+import { renderNetWorthChartCard } from './networthChart';
 import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
 
@@ -724,6 +725,8 @@ export function renderAssetsTab(ctx: UiContext): void {
       indepSec.style.display = 'none';
     }
   }
+
+  renderNetWorthChartCard(ctx, el('networthChartCard'));
 
   const hList = el('historyList');
   hList.innerHTML = '';
