@@ -1,10 +1,22 @@
 import { buildAutocompleteSuggestions, resolveQuickTemplateForEntry } from '../../../shared/autocomplete';
-import { ALL_CASHFLOW_TYPES, CURRENCIES, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
+import { ALL_CASHFLOW_TYPES, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
+import { formatCurrencyRaw, isSupportedCurrency } from '../../../shared/currency';
 import type { QuickEntryTemplate } from '../../../shared/types';
-import { getEffectiveCategoriesForType, validateQuickTemplateInput } from '../../../shared/validation';
+import {
+  getEffectiveCategoriesForType,
+  normalizeEnabledCurrencies,
+  validateQuickTemplateInput,
+} from '../../../shared/validation';
 import { bindSubmit, closeModal, el, fmtMoney, fmtNum, openModal, showToast } from './helpers';
 import { getActiveLedgers, resolveActiveLedger } from './ledgerUi';
-import { getTodayYmd, renderLogCategories, renderLogTab, updateFxPreview, updateSavingsPreview } from './logTab';
+import {
+  getTodayYmd,
+  renderLogCategories,
+  renderLogCurrencyButtons,
+  renderLogTab,
+  updateFxPreview,
+  updateSavingsPreview,
+} from './logTab';
 import type { UiContext } from './state';
 
 const QUICK_ENTRY_TYPES = ['日常花費', '稅金與大額', '其他收入', '投資流出', '固定支出'];
@@ -187,7 +199,7 @@ export function openQuickTemplateModal(
       t.textContent = `${tpl.oneClick ? '⚡ ' : ''}${tpl.label}`;
       const sub = document.createElement('div');
       sub.className = 'item-sub tnum';
-      const amtStr = tpl.amount ? `${tpl.currency === 'USD' ? 'US$' : 'NT$ '}${fmtNum(tpl.amount)}` : '記帳時輸入金額';
+      const amtStr = tpl.amount ? formatCurrencyRaw(tpl.amount, tpl.currency, false) : '記帳時輸入金額';
       sub.textContent = `${tpl.type} · ${tpl.category} · ${tpl.itemName} · ${amtStr}`;
       main.appendChild(t);
       main.appendChild(sub);
@@ -307,7 +319,11 @@ export function openQuickTemplateModal(
     amtInp.value = base.amount !== null && base.amount !== undefined ? String(base.amount) : '';
 
     const currSel = document.createElement('select');
-    for (const c of CURRENCIES) {
+    const enabledCurrs = normalizeEnabledCurrencies(snap.settings.enabledCurrencies);
+    const currOptions = base.currency && !enabledCurrs.includes(base.currency)
+      ? [...enabledCurrs, base.currency]
+      : enabledCurrs;
+    for (const c of currOptions) {
       const o = document.createElement('option');
       o.value = c;
       o.textContent = c;
@@ -433,7 +449,7 @@ export function renderQuickTemplatesStrip(ctx: UiContext): void {
     btn.className = 'tpl-pill tnum' + (tpl.oneClick ? ' one-click' : '');
     const amtHint =
       tpl.amount !== null && !ctx.state.masked
-        ? ` ${tpl.currency === 'USD' ? '$' : ''}${fmtNum(tpl.amount)}`
+        ? ` ${tpl.currency === 'TWD' ? fmtNum(tpl.amount) : formatCurrencyRaw(tpl.amount, tpl.currency, false)}`
         : '';
     btn.textContent = `${tpl.oneClick ? '⚡ ' : ''}${tpl.label}${amtHint}`;
     btn.title = tpl.oneClick ? `一鍵直記：${tpl.itemName}` : `套用範本：${tpl.itemName}`;
@@ -562,9 +578,7 @@ export function bindQuickTemplatesAndAutocompleteEvents(ctx: UiContext): void {
       left.textContent = s.itemName;
       const right = document.createElement('span');
       right.className = 'ac-meta tnum';
-      const amtTxt = ctx.state.masked
-        ? '•••'
-        : `${s.currency === 'USD' ? 'US$' : 'NT$ '}${fmtNum(s.suggestedAmount)}`;
+      const amtTxt = formatCurrencyRaw(s.suggestedAmount, s.currency, ctx.state.masked);
       right.textContent = `${s.category} · ${amtTxt}`;
       opt.appendChild(left);
       opt.appendChild(right);
@@ -579,8 +593,10 @@ export function bindQuickTemplatesAndAutocompleteEvents(ctx: UiContext): void {
         // Never overwrite an amount the user already typed
         if (!amtInput.value.trim() && s.suggestedAmount > 0) {
           amtInput.value = String(s.suggestedAmount);
-          if (s.currency === 'USD' || s.currency === 'TWD') {
+          const enabledCurrs = normalizeEnabledCurrencies(ctx.engine.getSnapshot().settings.enabledCurrencies);
+          if (isSupportedCurrency(s.currency) && enabledCurrs.includes(s.currency)) {
             ctx.state.logCurrency = s.currency;
+            renderLogCurrencyButtons(ctx);
             syncLogFormTypeAndCurrencyDom(ctx);
           }
           updateFxPreview(ctx);

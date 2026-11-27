@@ -26,7 +26,7 @@ export function renderDividendCalendarCard(ctx: UiContext, container: HTMLElemen
   const cal = computeDividendCalendar(
     snap.assetItems,
     snap.stockTransactions || [],
-    rate,
+    snap.settings,
     year,
     monthlyCons
   );
@@ -203,7 +203,7 @@ export function renderDividendCalendarCard(ctx: UiContext, container: HTMLElemen
       const meta = document.createElement('div');
       meta.className = 'muted';
       meta.style.fontSize = '11px';
-      meta.textContent = `${item.date}${item.currency === 'USD' ? ` · 原幣 ${fmtRaw(item.rawAmount, 'USD', masked)}` : ''}${item.note ? ` · ${item.note}` : ''}`;
+      meta.textContent = `${item.date}${item.currency !== 'TWD' ? ` · 原幣 ${fmtRaw(item.rawAmount, item.currency, masked)}` : ''}${item.note ? ` · ${item.note}` : ''}`;
       left.appendChild(name);
       left.appendChild(meta);
 

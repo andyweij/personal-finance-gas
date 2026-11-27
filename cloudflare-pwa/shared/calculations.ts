@@ -1,4 +1,5 @@
 import { todayInTimeZone } from './dates';
+import { getCurrencyDecimals, resolveFxRate, type FxRateSource } from './currency';
 import { roundTo } from './format';
 import { CASHFLOW_TYPES, DEFAULT_LEDGER_ID, DEFAULT_LEDGER_NAME, STOCK_TX_TYPES } from './constants';
 import type {
@@ -193,14 +194,14 @@ function nextBillingDateAfter(ymd: string, billingDay: number): string {
 
 export function computeLoanAmortizationSummary(
   item: AssetItem,
-  usdTwdRate: number,
+  fxSource: FxRateSource,
   asOfDate = getTodayYmdLocal()
 ): LoanAmortizationSummary {
-  // v1.8.15: amounts are kept in the loan's currency precision (USD cents, TWD whole dollars)
+  // v1.8.15+: amounts are kept in the loan's currency precision (USD/EUR cents, TWD/JPY whole units)
   const dp = loanCurrencyDecimals(item.currency);
   const money = (n: number) => roundTo(n, dp);
   const baseBalance = Math.max(0, money(item.quantityOrAmount * (item.unitPrice || 1)));
-  const fxRate = item.currency === 'USD' ? usdTwdRate : 1;
+  const fxRate = resolveFxRate(item.currency, fxSource);
 
   if (
     !item.isAmortizingLoan ||
@@ -435,15 +436,15 @@ export function computeSavingsAccountSummary(
   account: AssetItem,
   logs: CashFlowLog[],
   adjustments: SavingsAdjustment[],
-  usdTwdRate: number
+  fxSource: FxRateSource
 ): SavingsAccountSummary {
-  // M8 (v1.8.12): a non-TWD account is summed in its own currency and converted ONCE at the current rate, so the
-  // balance never drifts with the exchange rate each entry happened to be recorded at.
-  const isForeign = account.currency === 'USD';
-  const rate = isForeign ? usdTwdRate : 1;
+  // M8 (v1.8.12) & v1.12.0: any non-TWD account (USD, JPY, EUR, ...) is summed in its own native currency
+  // and converted ONCE at the current rate, so the balance never drifts with historical entry FX rates.
+  const isForeign = String(account.currency || 'TWD').toUpperCase() !== 'TWD';
+  const rate = resolveFxRate(account.currency, fxSource);
   const price = account.ticker ? account.unitPrice : account.unitPrice || 1;
   const baseNative = isForeign ? account.quantityOrAmount * price : 0;
-  const baseBalanceTwd = computeAssetTwdValue(account, usdTwdRate);
+  const baseBalanceTwd = computeAssetTwdValue(account, fxSource);
 
   let adjustmentsTotalTwd = 0;
   let adjustmentsNative = 0;
@@ -521,7 +522,7 @@ export function computeAllSavingsSummary(
   assets: AssetItem[],
   logs: CashFlowLog[],
   adjustments: SavingsAdjustment[],
-  usdTwdRate: number,
+  fxSource: FxRateSource,
   ledgerId?: string
 ): AllSavingsSummary {
   const linkedAccounts = assets
@@ -533,7 +534,7 @@ export function computeAllSavingsSummary(
     .slice()
     .sort(compareBySortOrder);
   const accounts = linkedAccounts.map((acc) =>
-    computeSavingsAccountSummary(acc, logs, adjustments, usdTwdRate)
+    computeSavingsAccountSummary(acc, logs, adjustments, fxSource)
   );
   const totalSavingsTwd = accounts.reduce((sum, a) => sum + a.currentBalanceTwd, 0);
   const explicitDefault = linkedAccounts.find((a) => a.isDefaultSavings);
@@ -567,7 +568,7 @@ function round2(n: number): number {
 
 /** v1.8.15: decimals a loan is tracked in (USD cents, TWD whole dollars) */
 function loanCurrencyDecimals(currency: string): number {
-  return currency === 'USD' ? 2 : 0;
+  return getCurrencyDecimals(currency);
 }
 
 /** v1.8.15: upper bound of a loan's annual rate (validation and the implied-rate solver use the same value) */
@@ -600,9 +601,9 @@ export function computeStockDailyMetrics(
 export function computeStockPositionSummary(
   asset: AssetItem,
   stockTransactions: StockTransaction[],
-  usdTwdRate: number
+  fxSource: FxRateSource
 ): StockPositionSummary {
-  const fxRate = asset.currency === 'USD' ? usdTwdRate : 1;
+  const fxRate = resolveFxRate(asset.currency, fxSource);
   const baselineShares = Math.max(0, Number(asset.quantityOrAmount || 0));
   const baselineHasCost = asset.costBasis !== null && asset.costBasis !== undefined;
   const baselineCostBasis = baselineHasCost ? Math.max(0, Number(asset.costBasis)) : 0;
@@ -752,14 +753,14 @@ export function computeStockPositionSummary(
 export function computeStockPortfolioSummary(
   assets: AssetItem[],
   stockTransactions: StockTransaction[],
-  usdTwdRate: number
+  fxSource: FxRateSource
 ): StockPortfolioSummary {
   const stockAssets = (assets || [])
     .filter((a) => isStockAsset(a))
     .slice()
     .sort(compareBySortOrder);
   const positions = stockAssets.map((a) =>
-    computeStockPositionSummary(a, stockTransactions || [], usdTwdRate)
+    computeStockPositionSummary(a, stockTransactions || [], fxSource)
   );
 
   let totalMarketValueTwd = 0;
@@ -879,27 +880,27 @@ export function computeAssetEffectiveShares(
 
 export function computeAssetEffectiveTwdValue(
   item: AssetItem,
-  usdTwdRate: number,
+  fxSource: FxRateSource,
   logs: CashFlowLog[] = [],
   adjustments: SavingsAdjustment[] = [],
   stockTransactions: StockTransaction[] = [],
   asOfDate = getTodayYmdLocal()
 ): number {
   if (item.isLinkedSavings) {
-    return computeSavingsAccountSummary(item, logs, adjustments, usdTwdRate).currentBalanceTwd;
+    return computeSavingsAccountSummary(item, logs, adjustments, fxSource).currentBalanceTwd;
   }
   if (stockTransactions.length > 0 && isStockAsset(item)) {
-    return computeStockPositionSummary(item, stockTransactions, usdTwdRate).marketValueTwd;
+    return computeStockPositionSummary(item, stockTransactions, fxSource).marketValueTwd;
   }
   if (item.majorType === '負債' && item.isAmortizingLoan) {
-    return computeLoanAmortizationSummary(item, usdTwdRate, asOfDate).currentBalanceTwd;
+    return computeLoanAmortizationSummary(item, fxSource, asOfDate).currentBalanceTwd;
   }
-  return computeAssetTwdValue(item, usdTwdRate);
+  return computeAssetTwdValue(item, fxSource);
 }
 
-export function computeRecurringMonthlyTwd(item: RecurringItem, usdTwdRate: number): number {
+export function computeRecurringMonthlyTwd(item: RecurringItem, fxSource: FxRateSource): number {
   if (item.status !== '啟用' || item.cycle === '一次性') return 0;
-  const rate = item.currency === 'USD' ? usdTwdRate : 1;
+  const rate = resolveFxRate(item.currency, fxSource);
   let mult = 0;
   if (item.cycle === '月繳') {
     mult = 1;
@@ -920,8 +921,8 @@ export function computeSinkingMonthlyReserve(item: SinkingFundItem): number {
   return Math.round(item.totalAmount / months);
 }
 
-export function computeAssetTwdValue(item: AssetItem, usdTwdRate: number): number {
-  const rate = item.currency === 'USD' ? usdTwdRate : 1;
+export function computeAssetTwdValue(item: AssetItem, fxSource: FxRateSource): number {
+  const rate = resolveFxRate(item.currency, fxSource);
   const price = item.ticker ? item.unitPrice : item.unitPrice || 1;
   return Math.round(item.quantityOrAmount * price * rate);
 }
@@ -1189,7 +1190,7 @@ export function computeMonthlyTrend(logs: CashFlowLog[], year: number): MonthlyT
 
 export function computeNetWorthSummary(
   assets: AssetItem[],
-  usdTwdRate: number,
+  fxSource: FxRateSource,
   monthlyTotalConsumption: number,
   logs: CashFlowLog[] = [],
   adjustments: SavingsAdjustment[] = [],
@@ -1216,7 +1217,7 @@ export function computeNetWorthSummary(
           );
 
   for (const a of scopedAssets) {
-    const twdValue = computeAssetEffectiveTwdValue(a, usdTwdRate, logs, adjustments, stockTransactions, asOfDate);
+    const twdValue = computeAssetEffectiveTwdValue(a, fxSource, logs, adjustments, stockTransactions, asOfDate);
     if (a.majorType === '資產') {
       totalAssets += twdValue;
       if (a.liquidity === '高流動' || a.isLinkedSavings) highLiquidityAssets += twdValue;

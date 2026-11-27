@@ -10,7 +10,7 @@
 | **Phase 1** | `v1.9.0` | 跨月全文搜尋與條件篩選加總（流水帳） | 無 | ✅ 已完成 |
 | **Phase 2** | `v1.10.0` | 淨資產歷史走勢圖 ＋ 持股配息月曆 ＋ 資產再平衡試算 | `0018` (`app_settings`) | ✅ 已完成 |
 | **Phase 3** | `v1.11.0` | 自訂分類、常用範本與輸入自動補齊 | `0019` (`app_settings`) | ✅ 已完成 |
-| **Phase 4** | `v1.12.0` | 多幣別擴充（JPY / EUR / HKD / GBP 等） | `0020` (`app_settings`) | ⬜ 待實作 |
+| **Phase 4** | `v1.12.0` | 多幣別擴充（JPY / EUR / HKD / GBP 等） | `0020` (`app_settings`) | ✅ 已完成 |
 | **Phase 5** | `v1.13.0` | 財務目標與達成日期推估（存錢桶 / FIRE） | `0021` (`financial_goals`) | ⬜ 待實作 |
 | **Phase 6** | `v1.14.0` | 代墊款 / 拆帳追蹤 | `0022` (`split_receivables`) | ⬜ 待實作 |
 | **Phase 7** | `v1.15.0` | 信用卡帳單週期 & 分期付款管理 | `0023` (`asset_items` + `installment_plans`) | ⬜ 待實作 |
@@ -36,3 +36,9 @@
 - **核心模組**：`shared/autocomplete.ts`（頻率×近期衰減自動補齊排序、範本失效帳本／活存參照安全降級）與 `shared/validation.ts`（自訂分類／範本驗證與上限保護）
 - **介面模組**：`web/src/ui/quickTemplatesUi.ts`（常用範本快捷列、⚡一鍵直記、☆存範本、自訂分類管理與項目名稱自動補齊下拉）
 - **測試套件**：`tests/categories-and-templates.test.ts`
+
+## Phase 4（`v1.12.0`）完成紀錄
+- **新增 Migration**：`migrations/0020_multi_currency.sql`（`app_settings` 新增 `enabled_currencies_json` 與 `fx_rates_json`，`usd_twd_rate` 持續雙向同步，+0 D1 查詢成本、+0 外部請求）
+- **核心模組**：`shared/currency.ts`（9 幣別小數／符號／合理區間定義、`FxRateSource` 向下相容解析、`computeCrossTwdRatesFromUsdBase` 單請求交叉匯率計算）
+- **全棧串接**：`shared/calculations.ts`、`shared/validation.ts`、`shared/analytics.ts`、`shared/csv.ts`、`worker/market.ts`、`worker/automation.ts`、`worker/sync.ts`、`web/src/sync/syncEngine.ts` 及前端多幣別選擇器與匯率設定彈窗
+- **測試套件**：`tests/multi-currency.test.ts`

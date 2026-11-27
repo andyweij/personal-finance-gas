@@ -1,3 +1,4 @@
+import { formatCurrencyRaw } from '../../../shared/currency';
 import { formatPercent, roundTo } from '../../../shared/format';
 export const EYE_OPEN_SVG =
   '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>';
@@ -68,8 +69,7 @@ export function fmtPct(n: number, decimals = 1, signed = false): string {
 }
 
 export function fmtRaw(n: number, curr: string, masked: boolean): string {
-  if (masked) return curr + ' •••';
-  return (curr === 'USD' ? 'US$' : 'NT$ ') + roundTo(Number(n || 0), 2).toLocaleString('zh-TW', { maximumFractionDigits: 2 }); // never "-0"
+  return formatCurrencyRaw(n, curr, masked);
 }
 
 /* v1.8.15 accessibility: Esc closes the modal, focus moves into it (and stays inside on Tab) and returns to

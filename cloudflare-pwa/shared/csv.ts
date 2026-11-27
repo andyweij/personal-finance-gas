@@ -1,4 +1,5 @@
 import { DEFAULT_LEDGER_ID, DEFAULT_LEDGER_NAME, DEFAULT_USD_TWD_RATE } from './constants';
+import type { FxRateSource } from './currency';
 import type { CashFlowLog, NetWorthHistory } from './types';
 import {
   validateAssetInput,
@@ -166,7 +167,7 @@ export function exportCashFlowCsv(logs: CashFlowLog[], options?: ExportCashFlowC
  */
 export function parseCashFlowCsv(
   csvText: string,
-  defaultUsdTwdRate = DEFAULT_USD_TWD_RATE
+  fxSource: FxRateSource = DEFAULT_USD_TWD_RATE
 ): ValidatedCashFlowInput[] {
   const rows = parseCsvRows(csvText);
   if (rows.length < 2) return [];
@@ -194,7 +195,7 @@ export function parseCashFlowCsv(
           source: cols[9] || '匯入',
           note: cols[10] || '',
         },
-        defaultUsdTwdRate
+        fxSource
       )
     );
   }
