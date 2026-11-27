@@ -375,6 +375,32 @@ export interface FinancialGoal {
   version?: number;
 }
 
+export type SplitReceivableStatus = 'open' | 'partial' | 'settled' | 'written_off';
+
+export interface SplitReceivable {
+  id: string;
+  ledgerId: string;
+  splitGroupId: string;
+  counterparty: string;
+  date: string; // YYYY-MM-DD
+  itemName: string;
+  category: string;
+  amount: number;
+  settledAmount: number;
+  currency: string;
+  fxRate: number;
+  twdAmount: number;
+  status: SplitReceivableStatus;
+  sourceCashflowId?: string | null;
+  sourceAccountId?: string | null;
+  sourceAdjustmentId?: string | null;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+  version?: number;
+}
+
 export interface FinanceSnapshot {
   settings: AppSettings;
   ledgers?: Ledger[];
@@ -388,6 +414,7 @@ export interface FinanceSnapshot {
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents;
   financialGoals?: FinancialGoal[];
+  splitReceivables?: SplitReceivable[];
 }
 
 export type SyncEntity =
@@ -401,7 +428,8 @@ export type SyncEntity =
   | 'settings'
   | 'utility_record'
   | 'utility_rents'
-  | 'financial_goal';
+  | 'financial_goal'
+  | 'split_receivable';
 export type SyncOp = 'upsert' | 'delete';
 
 export interface SyncMutation {
@@ -483,6 +511,7 @@ export interface SyncDelta {
   rentUtilityRecords: RentUtilityRecord[];
   rentUtilityRents: RentUtilityRents | null;
   financialGoals?: FinancialGoal[];
+  splitReceivables?: SplitReceivable[];
 }
 
 export interface SyncResponse {

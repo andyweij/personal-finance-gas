@@ -51,6 +51,7 @@ import {
   renderStocksTab,
 } from './ui/stocksTab';
 import { bindUtilityTabEvents, renderUtilityTab } from './ui/utilityTab';
+import { openCreateSplitModal } from './ui/splitsUi';
 import { cancelReorder, startReorder } from './ui/reorderHelper';
 import {
   closeLockScreen,
@@ -963,6 +964,10 @@ function bindEvents(ctx: UiContext): void {
 
   bindLedgerSearchEvents(ctx);
   bindQuickTemplatesAndAutocompleteEvents(ctx);
+
+  document.getElementById('openSplitExpenseBtn')?.addEventListener('click', () => {
+    openCreateSplitModal(ctx);
+  });
 
   const shiftMonth = (delta: number) => {
     let y = ctx.state.selectedYear;

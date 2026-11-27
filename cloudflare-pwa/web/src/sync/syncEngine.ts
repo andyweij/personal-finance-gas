@@ -35,6 +35,7 @@ import type {
   RentUtilityRents,
   SavingsAdjustment,
   SinkingFundItem,
+  SplitReceivable,
   StockTransaction,
   SyncConflict,
   SyncDelta,
@@ -44,6 +45,7 @@ import type {
 } from '../../../shared/types';
 import { getCurrencyDecimals, resolveFxRate } from '../../../shared/currency';
 import { roundTo } from '../../../shared/format';
+import { computeSettlementPreview, type MultiCurrencySettlementPreview } from '../../../shared/splits';
 import {
   normalizeCustomCategories,
   normalizeCustomStockCategories,
@@ -63,6 +65,7 @@ import {
   validateRecurringInput,
   validateSavingsAdjustmentInput,
   validateSinkingInput,
+  validateSplitReceivableInput,
   validateStockTransactionInput,
   type AccountTransferInputPayload,
   type AssetInputPayload,
@@ -117,6 +120,40 @@ export interface SyncEngineOptions {
   onAuthRequired?: () => void;
   onAccountMismatch?: (info: { error: string; expectedUserId?: string; actualUserId?: string }) => void;
   onError?: (message: string) => void;
+}
+
+export interface SplitParticipantInput {
+  counterparty: string;
+  amount: number;
+  note?: string;
+}
+
+export interface CreateSplitExpenseParams {
+  date?: string;
+  itemName: string;
+  category?: string;
+  currency?: string;
+  myShareAmount: number;
+  participants: SplitParticipantInput[];
+  sourceAccountId?: string | null;
+  ledgerId?: string | null;
+  note?: string;
+}
+
+export interface SettleSplitReceivableParams {
+  id: string;
+  settleAmount: number;
+  date?: string;
+  depositAccountId?: string | null;
+  customDepositAmount?: number | null;
+  note?: string;
+}
+
+export interface WriteOffSplitReceivableParams {
+  id: string;
+  date?: string;
+  category?: string;
+  note?: string;
 }
 
 /**
@@ -377,6 +414,13 @@ export class SyncEngine {
       'saveSinking',
       'reorderSinking',
       'deleteSinking',
+      'saveFinancialGoal',
+      'reorderFinancialGoals',
+      'deleteFinancialGoal',
+      'createSplitExpense',
+      'settleSplitReceivable',
+      'writeOffSplitReceivable',
+      'deleteSplitReceivable',
       'saveAsset',
       'updateAssetStockCategory',
       'reorderAssets',
@@ -746,6 +790,8 @@ export class SyncEngine {
         return (snap.rentUtilityRecords || []).find((u) => u.period === recordId) || null;
       case 'financial_goal':
         return (snap.financialGoals || []).find((g) => g.id === recordId) || null;
+      case 'split_receivable':
+        return (snap.splitReceivables || []).find((s) => s.id === recordId) || null;
       default:
         return null;
     }
@@ -934,17 +980,22 @@ export class SyncEngine {
     const matchingRecurring = this.snapshot.recurringItems.filter(
       (r) => !r.deletedAt && getEffectiveLedgerId(r) === lid
     );
-    const totalLinked = matchingLogs.length + matchingAssets.length + matchingRecurring.length;
+    const matchingSplits = (this.snapshot.splitReceivables || []).filter(
+      (s) => !s.deletedAt && getEffectiveLedgerId(s) === lid
+    );
+    const totalLinked =
+      matchingLogs.length + matchingAssets.length + matchingRecurring.length + matchingSplits.length;
 
     const mutations: SyncMutation[] = [];
     let nextLogs = this.snapshot.cashflowLogs;
     let nextAssets = this.snapshot.assetItems;
     let nextRecurring = this.snapshot.recurringItems;
+    let nextSplits = this.snapshot.splitReceivables || [];
 
     if (totalLinked > 0) {
       if (!opts?.migrateToLedgerId) {
         throw new Error(
-          `此帳本仍有 ${totalLinked} 筆關聯紀錄（${matchingAssets.length} 資產、${matchingLogs.length} 流水帳、${matchingRecurring.length} 固定收支），請先轉移或清除後再刪除。`
+          `此帳本仍有 ${totalLinked} 筆關聯紀錄（${matchingAssets.length} 資產、${matchingLogs.length} 流水帳、${matchingRecurring.length} 固定收支${matchingSplits.length > 0 ? `、${matchingSplits.length} 拆帳代墊` : ''}），請先轉移或清除後再刪除。`
         );
       }
       const targetLedgerId = normalizeLedgerId(opts.migrateToLedgerId);
@@ -1010,6 +1061,24 @@ export class SyncEngine {
         }
         return r;
       });
+
+      nextSplits = nextSplits.map((s) => {
+        if (!s.deletedAt && getEffectiveLedgerId(s) === lid) {
+          const updated: SplitReceivable = { ...s, ledgerId: targetLedgerId, updatedAt: nowIso };
+          mutations.push({
+            mutationId: crypto.randomUUID(),
+            entity: 'split_receivable',
+            op: 'upsert',
+            recordId: updated.id,
+            clientTimestamp: nowIso,
+            baseVersion: s.version ?? null,
+            isNewRecord: false,
+            payload: { ...updated },
+          });
+          return updated;
+        }
+        return s;
+      });
     }
 
     mutations.push({
@@ -1028,6 +1097,7 @@ export class SyncEngine {
       cashflowLogs: nextLogs,
       assetItems: nextAssets,
       recurringItems: nextRecurring,
+      splitReceivables: nextSplits,
     };
 
     await this.commitAndMaybeSync(nextSnapshot, mutations);
@@ -1627,6 +1697,605 @@ export class SyncEngine {
         baseVersion: existing?.version ?? null,
       },
     ]);
+  }
+
+  async createSplitExpense(params: CreateSplitExpenseParams): Promise<{
+    splitGroupId: string;
+    cashflow: CashFlowLog | null;
+    savingsAdjustment: SavingsAdjustment | null;
+    receivables: SplitReceivable[];
+  }> {
+    const date = String(params.date || todayInTimeZone()).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      throw new Error('請輸入有效的日期格式（YYYY-MM-DD）。');
+    }
+    const itemName = String(params.itemName || '').trim();
+    if (!itemName || itemName.length > 80) {
+      throw new Error('請輸入項目名稱（1～80 字）。');
+    }
+    const category = String(params.category || '餐飲').trim() || '其他';
+    const currency = String(params.currency || 'TWD').trim().toUpperCase() || 'TWD';
+    const dec = getCurrencyDecimals(currency);
+    const myShareAmount = roundTo(Number(params.myShareAmount || 0), dec);
+    if (!Number.isFinite(myShareAmount) || myShareAmount < 0) {
+      throw new Error('個人分攤金額不可小於 0。');
+    }
+
+    const rawParticipants = Array.isArray(params.participants) ? params.participants : [];
+    const cleanedParticipants: Array<{ counterparty: string; amount: number; note: string }> = [];
+    for (const p of rawParticipants) {
+      const cp = String(p.counterparty || '').trim();
+      const amt = roundTo(Number(p.amount || 0), dec);
+      if (!cp && amt <= 0) continue;
+      if (!cp) throw new Error('請填寫每位分攤對象的姓名或稱呼。');
+      if (!Number.isFinite(amt) || amt <= 0) {
+        throw new Error(`「${cp}」的代墊金額需大於 0。`);
+      }
+      cleanedParticipants.push({
+        counterparty: cp,
+        amount: amt,
+        note: String(p.note || params.note || '').trim(),
+      });
+    }
+    if (!cleanedParticipants.length) {
+      throw new Error('請至少新增 1 位代墊對象與金額。');
+    }
+
+    const sourceAccount = params.sourceAccountId
+      ? this.snapshot.assetItems.find(
+          (a) => !a.deletedAt && a.id === params.sourceAccountId && a.isLinkedSavings
+        )
+      : undefined;
+    if (params.sourceAccountId && !sourceAccount) {
+      throw new Error('找不到對應的連動活存帳戶。');
+    }
+
+    const ledgerId = normalizeLedgerId(
+      params.ledgerId || (sourceAccount ? getEffectiveLedgerId(sourceAccount) : DEFAULT_LEDGER_ID)
+    );
+    const splitGroupId = crypto.randomUUID();
+    const atomicGroupId = `split-create:${splitGroupId}`;
+    const nowIso = new Date().toISOString();
+    const mutations: SyncMutation[] = [];
+
+    // 1. Personal share -> cashflow_logs ONLY for myShareAmount (budget & savings rate see only personal spend)
+    let createdCashflow: CashFlowLog | null = null;
+    if (myShareAmount > 0) {
+      const cfId = crypto.randomUUID();
+      const validatedCf = validateCashFlowInput(
+        {
+          date,
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category,
+          itemName,
+          amount: myShareAmount,
+          currency,
+          source: '手機記帳',
+          note: params.note ? `[拆帳] ${params.note}` : '[拆帳]',
+          linkedAccountId: sourceAccount ? sourceAccount.id : null,
+          ledgerId,
+        },
+        this.snapshot.settings
+      );
+      createdCashflow = {
+        id: cfId,
+        ...validatedCf,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'cashflow',
+        op: 'upsert',
+        recordId: cfId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId,
+        payload: { ...createdCashflow },
+      });
+    }
+
+    // 2. Total advanced portion -> negative savings_adjustment on sourceAccount so bank balance drops by FULL total
+    const totalAdvanced = roundTo(
+      cleanedParticipants.reduce((sum, p) => sum + p.amount, 0),
+      dec
+    );
+    let createdAdj: SavingsAdjustment | null = null;
+    if (sourceAccount && totalAdvanced > 0) {
+      const adjId = crypto.randomUUID();
+      const accCurr = sourceAccount.currency || 'TWD';
+      const accDec = getCurrencyDecimals(accCurr);
+      const payRate = resolveFxRate(currency, this.snapshot.settings);
+      const accRate = resolveFxRate(accCurr, this.snapshot.settings);
+      const adjNativeAmount =
+        currency === accCurr
+          ? -totalAdvanced
+          : -roundTo((totalAdvanced * payRate) / (accRate || 1), accDec);
+      const cpNames = cleanedParticipants.map((p) => p.counterparty).join('、');
+      const validatedAdj = validateSavingsAdjustmentInput(
+        {
+          accountId: sourceAccount.id,
+          date,
+          amount: adjNativeAmount,
+          currency: accCurr,
+          note: `[代墊] ${itemName} (${cpNames})${params.note ? ' · ' + params.note : ''}`.slice(0, 200),
+          transferGroupId: `split:${splitGroupId}`,
+        },
+        this.snapshot.settings
+      );
+      createdAdj = {
+        id: adjId,
+        ...validatedAdj,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'savings_adjustment',
+        op: 'upsert',
+        recordId: adjId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId,
+        payload: { ...createdAdj, currency: accCurr },
+      });
+    }
+
+    // 3. One split_receivable per counterparty
+    const createdReceivables: SplitReceivable[] = [];
+    for (const p of cleanedParticipants) {
+      const recId = crypto.randomUUID();
+      const validatedRec = validateSplitReceivableInput(
+        {
+          ledgerId,
+          splitGroupId,
+          counterparty: p.counterparty,
+          date,
+          itemName,
+          category,
+          amount: p.amount,
+          settledAmount: 0,
+          currency,
+          status: 'open',
+          sourceCashflowId: createdCashflow ? createdCashflow.id : null,
+          sourceAccountId: sourceAccount ? sourceAccount.id : null,
+          sourceAdjustmentId: createdAdj ? createdAdj.id : null,
+          note: p.note,
+        },
+        this.snapshot.settings
+      );
+      const rec: SplitReceivable = {
+        id: recId,
+        ...validatedRec,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      createdReceivables.push(rec);
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'split_receivable',
+        op: 'upsert',
+        recordId: recId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId,
+        payload: { ...rec },
+      });
+    }
+
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      cashflowLogs: createdCashflow
+        ? this.sortCashFlows([createdCashflow, ...this.snapshot.cashflowLogs])
+        : this.snapshot.cashflowLogs,
+      savingsAdjustments: createdAdj
+        ? [createdAdj, ...this.snapshot.savingsAdjustments].sort(
+            (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+          )
+        : this.snapshot.savingsAdjustments,
+      splitReceivables: [...createdReceivables, ...(this.snapshot.splitReceivables || [])].sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+    };
+
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    return {
+      splitGroupId,
+      cashflow: createdCashflow,
+      savingsAdjustment: createdAdj,
+      receivables: createdReceivables,
+    };
+  }
+
+  async settleSplitReceivable(params: SettleSplitReceivableParams): Promise<{
+    receivable: SplitReceivable;
+    savingsAdjustment: SavingsAdjustment | null;
+    preview: MultiCurrencySettlementPreview;
+  }> {
+    const currentSplits = this.snapshot.splitReceivables || [];
+    const existing = currentSplits.find((s) => s.id === params.id && !s.deletedAt);
+    if (!existing) throw new Error('找不到這筆代墊款紀錄。');
+    if (existing.status === 'settled' || existing.status === 'written_off') {
+      throw new Error('這筆代墊款已經結清或免還。');
+    }
+
+    const settleDate = String(params.date || todayInTimeZone()).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(settleDate)) {
+      throw new Error('請輸入有效的收款日期（YYYY-MM-DD）。');
+    }
+
+    const dec = getCurrencyDecimals(existing.currency || 'TWD');
+    const eps = Math.pow(10, -dec) * 0.5;
+    const settleAmount = roundTo(Number(params.settleAmount || 0), dec);
+    const remaining = roundTo(Math.max(0, existing.amount - existing.settledAmount), dec);
+    if (!Number.isFinite(settleAmount) || settleAmount <= 0) {
+      throw new Error('收回金額需大於 0。');
+    }
+    if (settleAmount > remaining + eps) {
+      throw new Error(`收回金額不可超過尚未收回餘額（${remaining} ${existing.currency}）。`);
+    }
+
+    const depositAcc = params.depositAccountId
+      ? this.snapshot.assetItems.find(
+          (a) => !a.deletedAt && a.id === params.depositAccountId && a.isLinkedSavings
+        )
+      : undefined;
+    if (params.depositAccountId && !depositAcc) {
+      throw new Error('找不到對應的入帳活存帳戶。');
+    }
+
+    const preview = computeSettlementPreview({
+      receivable: existing,
+      settleAmountNative: settleAmount,
+      depositCurrency: depositAcc?.currency || existing.currency || 'TWD',
+      fxSource: this.snapshot.settings,
+      customDepositAmount: params.customDepositAmount,
+    });
+
+    const rawNextSettled = roundTo(existing.settledAmount + settleAmount, dec);
+    const isFullSettled = rawNextSettled + eps >= existing.amount;
+    const nextSettled = isFullSettled ? existing.amount : rawNextSettled;
+
+    const validatedRec = validateSplitReceivableInput(
+      {
+        ledgerId: existing.ledgerId,
+        splitGroupId: existing.splitGroupId,
+        counterparty: existing.counterparty,
+        date: existing.date,
+        itemName: existing.itemName,
+        category: existing.category,
+        amount: existing.amount,
+        settledAmount: nextSettled,
+        currency: existing.currency,
+        fxRate: existing.fxRate,
+        status: isFullSettled ? 'settled' : 'partial',
+        sourceCashflowId: existing.sourceCashflowId,
+        sourceAccountId: existing.sourceAccountId,
+        sourceAdjustmentId: existing.sourceAdjustmentId,
+        note: existing.note,
+      },
+      this.snapshot.settings
+    );
+
+    const nowIso = new Date().toISOString();
+    const settleBatchId = crypto.randomUUID();
+    const atomicGroupId = `split-settle:${settleBatchId}`;
+
+    const updatedRec: SplitReceivable = {
+      ...existing,
+      ...validatedRec,
+      updatedAt: nowIso,
+      deletedAt: null,
+    };
+
+    const mutations: SyncMutation[] = [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'split_receivable',
+        op: 'upsert',
+        recordId: updatedRec.id,
+        clientTimestamp: nowIso,
+        baseVersion: existing.version ?? null,
+        isNewRecord: false,
+        atomicGroupId,
+        payload: { ...updatedRec },
+      },
+    ];
+
+    let createdAdj: SavingsAdjustment | null = null;
+    if (depositAcc && preview.actualDepositAmount > 0) {
+      const adjId = crypto.randomUUID();
+      const depCurr = depositAcc.currency || 'TWD';
+      const validatedAdj = validateSavingsAdjustmentInput(
+        {
+          accountId: depositAcc.id,
+          date: settleDate,
+          amount: preview.actualDepositAmount,
+          currency: depCurr,
+          note: `[代墊收回] ${existing.counterparty} · ${existing.itemName}${params.note ? ' · ' + params.note : ''}`.slice(
+            0,
+            200
+          ),
+          transferGroupId: `split-settle:${settleBatchId}`,
+        },
+        this.snapshot.settings
+      );
+      createdAdj = {
+        id: adjId,
+        ...validatedAdj,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'savings_adjustment',
+        op: 'upsert',
+        recordId: adjId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId,
+        payload: { ...createdAdj, currency: depCurr },
+      });
+    }
+
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      splitReceivables: mergeById(currentSplits, [updatedRec]).sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+      savingsAdjustments: createdAdj
+        ? [createdAdj, ...this.snapshot.savingsAdjustments].sort(
+            (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+          )
+        : this.snapshot.savingsAdjustments,
+    };
+
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    return {
+      receivable: updatedRec,
+      savingsAdjustment: createdAdj,
+      preview,
+    };
+  }
+
+  async writeOffSplitReceivable(params: WriteOffSplitReceivableParams): Promise<{
+    receivable: SplitReceivable;
+    cashflow: CashFlowLog | null;
+  }> {
+    const currentSplits = this.snapshot.splitReceivables || [];
+    const existing = currentSplits.find((s) => s.id === params.id && !s.deletedAt);
+    if (!existing) throw new Error('找不到這筆代墊款紀錄。');
+    if (existing.status === 'settled' || existing.status === 'written_off') {
+      throw new Error('這筆代墊款已經結清或免還。');
+    }
+
+    const writeOffDate = String(params.date || todayInTimeZone()).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(writeOffDate)) {
+      throw new Error('請輸入有效的日期格式（YYYY-MM-DD）。');
+    }
+
+    const dec = getCurrencyDecimals(existing.currency || 'TWD');
+    const remaining = roundTo(Math.max(0, existing.amount - existing.settledAmount), dec);
+    const nowIso = new Date().toISOString();
+    const atomicGroupId = `split-writeoff:${crypto.randomUUID()}`;
+
+    const mergedNote = params.note
+      ? existing.note
+        ? `${existing.note} · [免還] ${params.note}`.slice(0, 200)
+        : `[免還] ${params.note}`.slice(0, 200)
+      : existing.note;
+
+    const validatedRec = validateSplitReceivableInput(
+      {
+        ledgerId: existing.ledgerId,
+        splitGroupId: existing.splitGroupId,
+        counterparty: existing.counterparty,
+        date: existing.date,
+        itemName: existing.itemName,
+        category: existing.category,
+        amount: existing.amount,
+        settledAmount: existing.settledAmount,
+        currency: existing.currency,
+        fxRate: existing.fxRate,
+        status: 'written_off',
+        sourceCashflowId: existing.sourceCashflowId,
+        sourceAccountId: existing.sourceAccountId,
+        sourceAdjustmentId: existing.sourceAdjustmentId,
+        note: mergedNote,
+      },
+      this.snapshot.settings
+    );
+
+    const updatedRec: SplitReceivable = {
+      ...existing,
+      ...validatedRec,
+      updatedAt: nowIso,
+      deletedAt: null,
+    };
+
+    const mutations: SyncMutation[] = [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'split_receivable',
+        op: 'upsert',
+        recordId: updatedRec.id,
+        clientTimestamp: nowIso,
+        baseVersion: existing.version ?? null,
+        isNewRecord: false,
+        atomicGroupId,
+        payload: { ...updatedRec },
+      },
+    ];
+
+    // Convert remaining uncollected advance into personal daily expense with linkedAccountId = null
+    // (cash ALREADY left the bank account when initially paid — NEVER double-deduct!)
+    let createdCashflow: CashFlowLog | null = null;
+    if (remaining > 0) {
+      const cfId = crypto.randomUUID();
+      const validatedCf = validateCashFlowInput(
+        {
+          date: writeOffDate,
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: String(params.category || existing.category || '其他').trim() || '其他',
+          itemName: `[免還轉支出] ${existing.counterparty} · ${existing.itemName}`.slice(0, 80),
+          amount: remaining,
+          currency: existing.currency,
+          fxRate: existing.fxRate,
+          source: '手機記帳',
+          note: params.note ? `[呆帳/免還] ${params.note}`.slice(0, 200) : '[呆帳/免還，不重複扣活存]',
+          linkedAccountId: null,
+          ledgerId: existing.ledgerId || DEFAULT_LEDGER_ID,
+        },
+        this.snapshot.settings
+      );
+      createdCashflow = {
+        id: cfId,
+        ...validatedCf,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        deletedAt: null,
+      };
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'cashflow',
+        op: 'upsert',
+        recordId: cfId,
+        clientTimestamp: nowIso,
+        baseVersion: null,
+        isNewRecord: true,
+        atomicGroupId,
+        payload: { ...createdCashflow },
+      });
+    }
+
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      splitReceivables: mergeById(currentSplits, [updatedRec]).sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
+      cashflowLogs: createdCashflow
+        ? this.sortCashFlows([createdCashflow, ...this.snapshot.cashflowLogs])
+        : this.snapshot.cashflowLogs,
+    };
+
+    await this.commitAndMaybeSync(nextSnapshot, mutations);
+    return {
+      receivable: updatedRec,
+      cashflow: createdCashflow,
+    };
+  }
+
+  async deleteSplitReceivable(
+    id: string,
+    opts?: { undoWholeGroup?: boolean }
+  ): Promise<{ deletedReceivableCount: number; undoneCashflow: boolean; undoneAdjustment: boolean }> {
+    const currentSplits = this.snapshot.splitReceivables || [];
+    const existing = currentSplits.find((s) => s.id === id && !s.deletedAt);
+    if (!existing) {
+      return { deletedReceivableCount: 0, undoneCashflow: false, undoneAdjustment: false };
+    }
+    const nowIso = new Date().toISOString();
+
+    if (opts?.undoWholeGroup) {
+      const groupItems = currentSplits.filter(
+        (s) => !s.deletedAt && s.splitGroupId === existing.splitGroupId
+      );
+      const hasSettled = groupItems.some((s) => s.settledAmount > 0 || s.status !== 'open');
+      if (hasSettled) {
+        throw new Error('此拆帳群組已有收回或免還紀錄，請改為單筆刪除。');
+      }
+      const atomicGroupId = `split-undo:${existing.splitGroupId}`;
+      const mutations: SyncMutation[] = [];
+      const groupIdSet = new Set(groupItems.map((s) => s.id));
+      for (const s of groupItems) {
+        mutations.push({
+          mutationId: crypto.randomUUID(),
+          entity: 'split_receivable',
+          op: 'delete',
+          recordId: s.id,
+          clientTimestamp: nowIso,
+          baseVersion: s.version ?? null,
+          atomicGroupId,
+        });
+      }
+
+      let nextAdjs = this.snapshot.savingsAdjustments;
+      let undoneAdjustment = false;
+      const adjId = existing.sourceAdjustmentId;
+      if (adjId) {
+        const adj = nextAdjs.find((a) => a.id === adjId);
+        if (adj) {
+          undoneAdjustment = true;
+          nextAdjs = nextAdjs.filter((a) => a.id !== adjId);
+          mutations.push({
+            mutationId: crypto.randomUUID(),
+            entity: 'savings_adjustment',
+            op: 'delete',
+            recordId: adjId,
+            clientTimestamp: nowIso,
+            baseVersion: adj.version ?? null,
+            atomicGroupId,
+          });
+        }
+      }
+
+      let nextLogs = this.snapshot.cashflowLogs;
+      let undoneCashflow = false;
+      const cfId = existing.sourceCashflowId;
+      if (cfId) {
+        const cf = nextLogs.find((l) => l.id === cfId);
+        if (cf) {
+          undoneCashflow = true;
+          nextLogs = nextLogs.filter((l) => l.id !== cfId);
+          mutations.push({
+            mutationId: crypto.randomUUID(),
+            entity: 'cashflow',
+            op: 'delete',
+            recordId: cfId,
+            clientTimestamp: nowIso,
+            baseVersion: cf.version ?? null,
+            atomicGroupId,
+          });
+        }
+      }
+
+      const nextSnapshot: FinanceSnapshot = {
+        ...this.snapshot,
+        splitReceivables: currentSplits.filter((s) => !groupIdSet.has(s.id)),
+        savingsAdjustments: nextAdjs,
+        cashflowLogs: nextLogs,
+      };
+      await this.commitAndMaybeSync(nextSnapshot, mutations);
+      return {
+        deletedReceivableCount: groupItems.length,
+        undoneCashflow,
+        undoneAdjustment,
+      };
+    }
+
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      splitReceivables: currentSplits.filter((s) => s.id !== id),
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'split_receivable',
+        op: 'delete',
+        recordId: id,
+        clientTimestamp: nowIso,
+        baseVersion: existing.version ?? null,
+      },
+    ]);
+    return { deletedReceivableCount: 1, undoneCashflow: false, undoneAdjustment: false };
   }
 
   async saveAsset(payload: AssetInputPayload & { id?: string }): Promise<AssetItem> {
@@ -2571,6 +3240,19 @@ export class SyncEngine {
           : filtered;
       return { ...baseSnapshot, financialGoals: next.sort(compareBySortOrder) };
     }
+    if (entity === 'split_receivable') {
+      const filtered = (baseSnapshot.splitReceivables || []).filter((s) => s.id !== recordId);
+      const next =
+        !isDelete && record && !record.deletedAt
+          ? [record as unknown as SplitReceivable, ...filtered]
+          : filtered;
+      return {
+        ...baseSnapshot,
+        splitReceivables: next.sort(
+          (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+        ),
+      };
+    }
     return baseSnapshot;
   }
 
@@ -2625,6 +3307,10 @@ export class SyncEngine {
       }
       case 'financial_goal': {
         const found = (delta.financialGoals || []).find((g) => g.id === recordId);
+        return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
+      }
+      case 'split_receivable': {
+        const found = (delta.splitReceivables || []).find((s) => s.id === recordId);
         return found ? { record: found as unknown as Record<string, unknown>, version: found.version } : null;
       }
       default:
@@ -3896,6 +4582,11 @@ export class SyncEngine {
           ...snap,
           financialGoals: (snap.financialGoals || []).filter((g) => g.id !== recordId),
         };
+      case 'split_receivable':
+        return {
+          ...snap,
+          splitReceivables: (snap.splitReceivables || []).filter((s) => s.id !== recordId),
+        };
       default:
         return snap;
     }
@@ -3908,6 +4599,7 @@ export class SyncEngine {
     const incomingAdjs = delta.savingsAdjustments || [];
     const incomingStockTxs = delta.stockTransactions || [];
     const incomingGoals = Array.isArray(delta.financialGoals) ? delta.financialGoals : [];
+    const incomingSplits = Array.isArray(delta.splitReceivables) ? delta.splitReceivables : [];
     if (isFull) {
       const fullLedgers = ensureActiveLedgers(
         incomingLedgers.length > 0 ? incomingLedgers.filter((l) => !l.deletedAt) : [createDefaultLedger()]
@@ -3931,6 +4623,9 @@ export class SyncEngine {
         rentUtilityRecords: sortUtilityRecords(incomingUtilityRecords),
         rentUtilityRents: incomingUtilityRents,
         financialGoals: incomingGoals.filter((g) => !g.deletedAt).sort(compareBySortOrder),
+        splitReceivables: incomingSplits
+          .filter((s) => !s.deletedAt)
+          .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
       };
     }
 
@@ -3962,6 +4657,9 @@ export class SyncEngine {
       rentUtilityRecords: mergeUtilityRecords(current.rentUtilityRecords || [], incomingUtilityRecords),
       rentUtilityRents: incomingUtilityRents,
       financialGoals: mergeById(current.financialGoals || [], incomingGoals).sort(compareBySortOrder),
+      splitReceivables: mergeById(current.splitReceivables || [], incomingSplits).sort(
+        (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+      ),
     };
   }
 }

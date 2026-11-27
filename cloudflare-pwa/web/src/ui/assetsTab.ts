@@ -34,6 +34,7 @@ import {
 import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { renderNetWorthChartCard } from './networthChart';
 import { renderReorderList } from './reorderHelper';
+import { renderSplitReceivablesCard } from './splitsUi';
 import type { UiContext } from './state';
 
 function resolveAssetsScope(ctx: UiContext): string {
@@ -726,6 +727,11 @@ export function renderAssetsTab(ctx: UiContext): void {
     } else {
       indepSec.style.display = 'none';
     }
+  }
+
+  const splitsCard = document.getElementById('assetsSplitsCard');
+  if (splitsCard) {
+    renderSplitReceivablesCard(ctx, splitsCard);
   }
 
   renderNetWorthChartCard(ctx, el('networthChartCard'));

@@ -9,12 +9,14 @@ import {
   DEFAULT_LEDGER_ID,
   DEFAULT_PNL_COLOR_SCHEME,
   DEFAULT_STOCK_CATEGORIES,
+  DEFAULT_USD_TWD_RATE,
   FINANCIAL_GOAL_TYPES,
   LIQUIDITY_LEVELS,
   PNL_COLOR_SCHEMES,
   QUICK_ENTRY_TYPES,
   RECURRING_CASHFLOW_TYPES,
   SOURCE_OPTIONS,
+  SPLIT_RECEIVABLE_STATUSES,
   STATUS_OPTIONS,
   STOCK_TX_TYPES,
   WEBAPP_CATEGORY_MAP,
@@ -26,6 +28,7 @@ import type {
   QuickEntryTemplate,
   RebalanceTargetKind,
   RebalanceTargetRule,
+  SplitReceivableStatus,
   StockTransactionType,
 } from './types';
 import {
@@ -1222,6 +1225,110 @@ export function validateFinancialGoalInput(payload: FinancialGoalInputPayload) {
     fireSwrPct,
     targetDate,
     sortOrder,
+    note,
+  };
+}
+
+export interface SplitReceivableInputPayload {
+  ledgerId?: string;
+  splitGroupId?: string;
+  counterparty: string;
+  date: string;
+  itemName: string;
+  category?: string;
+  amount: number | string;
+  settledAmount?: number | string;
+  currency?: string;
+  fxRate?: number | string;
+  status?: SplitReceivableStatus | string;
+  sourceCashflowId?: string | null;
+  sourceAccountId?: string | null;
+  sourceAdjustmentId?: string | null;
+  note?: string;
+}
+
+export function validateSplitReceivableInput(
+  payload: SplitReceivableInputPayload,
+  fxSource: FxRateSource = DEFAULT_USD_TWD_RATE
+) {
+  const counterparty = String(payload.counterparty || '').trim().slice(0, 40);
+  if (!counterparty) throw new Error('請輸入代墊對象名稱。');
+
+  const date = String(payload.date || '').trim();
+  parseLocalDate(date);
+
+  const itemName = String(payload.itemName || '').trim().slice(0, 80);
+  if (!itemName) throw new Error('請輸入拆帳／代墊項目名稱。');
+
+  const category = String(payload.category || '').trim().slice(0, 40) || '其他';
+  const currency = String(payload.currency || 'TWD').trim().toUpperCase();
+  if (!CURRENCIES.includes(currency)) {
+    throw new Error(`不支援的幣別：${currency}`);
+  }
+
+  const rawAmount = Number(payload.amount);
+  if (Number.isNaN(rawAmount) || !Number.isFinite(rawAmount) || rawAmount <= 0) {
+    throw new Error('代墊金額須大於 0。');
+  }
+  const amount = roundTo(rawAmount, 2);
+
+  const rawSettled =
+    payload.settledAmount !== undefined && payload.settledAmount !== null && String(payload.settledAmount).trim() !== ''
+      ? Number(payload.settledAmount)
+      : 0;
+  if (Number.isNaN(rawSettled) || !Number.isFinite(rawSettled) || rawSettled < 0) {
+    throw new Error('已收回金額不可為負數。');
+  }
+  if (rawSettled > amount + 1e-6) {
+    throw new Error('已收回金額不可超過代墊總額。');
+  }
+  const settledAmount = Math.min(amount, roundTo(rawSettled, 2));
+
+  const rawStatus = String(payload.status || '').trim();
+  if (rawStatus && !(SPLIT_RECEIVABLE_STATUSES as readonly string[]).includes(rawStatus)) {
+    throw new Error(`不支援的代墊狀態：${rawStatus}`);
+  }
+  let status: SplitReceivableStatus;
+  if (rawStatus === 'written_off') {
+    status = 'written_off';
+  } else if (settledAmount >= amount - 1e-6) {
+    status = 'settled';
+  } else if (settledAmount > 0) {
+    status = 'partial';
+  } else {
+    status = 'open';
+  }
+
+  const defaultRate = resolveFxRate(currency, fxSource);
+  const explicitFx = toSafeNumber(payload.fxRate, 0);
+  const fxRate = currency === 'TWD' ? 1 : explicitFx > 0 ? explicitFx : defaultRate;
+  const twdAmount = Math.round(amount * fxRate);
+
+  const ledgerId = normalizeLedgerId(payload.ledgerId);
+  const splitGroupId = String(payload.splitGroupId || '').trim().slice(0, 80);
+  const sourceCashflowId = payload.sourceCashflowId ? String(payload.sourceCashflowId).trim().slice(0, 80) : null;
+  const sourceAccountId = payload.sourceAccountId ? String(payload.sourceAccountId).trim().slice(0, 80) : null;
+  const sourceAdjustmentId = payload.sourceAdjustmentId
+    ? String(payload.sourceAdjustmentId).trim().slice(0, 80)
+    : null;
+  const note = String(payload.note || '').trim().slice(0, 200);
+
+  return {
+    ledgerId,
+    splitGroupId,
+    counterparty,
+    date,
+    itemName,
+    category,
+    amount,
+    settledAmount,
+    currency,
+    fxRate,
+    twdAmount,
+    status,
+    sourceCashflowId,
+    sourceAccountId,
+    sourceAdjustmentId,
     note,
   };
 }

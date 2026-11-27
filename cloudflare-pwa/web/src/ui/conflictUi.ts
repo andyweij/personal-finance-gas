@@ -14,6 +14,7 @@ const ENTITY_LABELS: Record<SyncEntity, string> = {
   utility_rents: '固定房租設定',
   ledger: '多帳本設定',
   financial_goal: '財務目標',
+  split_receivable: '代墊 / 拆帳紀錄',
 };
 
 const FIELD_LABELS: Record<string, string> = {
@@ -87,6 +88,10 @@ const FIELD_LABELS: Record<string, string> = {
   monthlyContributionOverride: '自訂每月投入',
   fireSwrPct: 'FIRE 提領率 (%)',
   targetDate: '期望達成日',
+  counterparty: '對象',
+  settledAmount: '已收回金額',
+  splitGroupId: '拆帳群組',
+  sourceAccountId: '付款活存帳戶',
 };
 
 const IGNORED_DIFF_KEYS = new Set([
