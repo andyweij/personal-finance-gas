@@ -178,7 +178,8 @@ export function openRebalanceTargetsModal(
     const inp = document.createElement('input');
     inp.type = 'number';
     inp.inputMode = 'decimal';
-    inp.step = '0.5';
+    // v1.12.3: a 0.5 step made the browser block e.g. 33.33 / 33.33 / 33.34 (stepMismatch) before our own checks
+    inp.step = 'any';
     inp.min = '0';
     inp.max = '100';
     inp.className = 'tnum reb-pct-input';

@@ -778,7 +778,9 @@ function bindEvents(ctx: UiContext): void {
           const inp = document.createElement('input');
           inp.type = 'number';
           inp.inputMode = 'decimal';
-          inp.step = meta.defaultTwdRate < 1 ? '0.0001' : '0.01';
+          // v1.12.3: auto-updated rates carry 4–6 decimals; a fixed step made the browser's native validation
+          // (stepMismatch) silently block the whole form. Range checks are done by isValidFxRateForCurrency.
+          inp.step = 'any';
           inp.className = 'tnum reb-pct-input';
           inp.style.width = '96px';
           inp.value = String(draftRates[code] ?? meta.defaultTwdRate);
