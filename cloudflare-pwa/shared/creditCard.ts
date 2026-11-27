@@ -375,3 +375,37 @@ export function computeAllCreditCardsSummary(
     totalExposureTwd,
   };
 }
+
+/**
+ * v1.15.0 review finding 3: default amount of a card bill payment. The amount is entered in the PAYING account's
+ * currency (payCreditCardBill debits it in that currency and converts it to the card's currency for the credit).
+ * Due = the statement's billed unpaid amount, or the whole unpaid balance when nothing is billed — in the card's
+ * currency — converted to the paying account's currency at the current rates.
+ * Returns the paying-currency amount and the card-currency amount it settles (0 when nothing is due).
+ */
+export function computeDefaultCardPayment(
+  summary: Pick<CreditCardSummary, 'billedUnpaidTwd' | 'currentBalanceNative'>,
+  cardCurrency: string,
+  payingCurrency: string,
+  fxSource: FxRateSource
+): { payAmount: number; cardCreditAmount: number } {
+  const cardCurr = String(cardCurrency || 'TWD').toUpperCase();
+  const payCurr = String(payingCurrency || 'TWD').toUpperCase();
+  const cardDec = getCurrencyDecimals(cardCurr);
+  const cardRate = resolveFxRate(cardCurr, fxSource);
+  const unpaidNative = Math.max(0, Number(summary.currentBalanceNative) || 0);
+  const billedTwd = Math.max(0, Number(summary.billedUnpaidTwd) || 0);
+  const dueNative =
+    billedTwd > 0
+      ? cardCurr === 'TWD'
+        ? Math.min(unpaidNative, billedTwd)
+        : Math.min(unpaidNative, roundTo(billedTwd / (cardRate || 1), cardDec))
+      : unpaidNative;
+  if (dueNative <= 0) return { payAmount: 0, cardCreditAmount: 0 };
+  if (payCurr === cardCurr) return { payAmount: roundTo(dueNative, cardDec), cardCreditAmount: roundTo(dueNative, cardDec) };
+  const payRate = resolveFxRate(payCurr, fxSource);
+  return {
+    payAmount: roundTo((dueNative * cardRate) / (payRate || 1), getCurrencyDecimals(payCurr)),
+    cardCreditAmount: roundTo(dueNative, cardDec),
+  };
+}

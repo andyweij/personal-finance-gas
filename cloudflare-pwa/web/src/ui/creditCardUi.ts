@@ -2,6 +2,7 @@ import { getEffectiveLedgerId, isTransferableAccount } from '../../../shared/cal
 import { CASHFLOW_TYPES, DEFAULT_LEDGER_ID } from '../../../shared/constants';
 import {
   computeAllCreditCardsSummary,
+  computeDefaultCardPayment,
   computeInstallmentPlanProgress,
   computeInstallmentScheduleAmounts,
   isCreditCardAsset,
@@ -31,6 +32,11 @@ import { buildLedgerSelectField, getActiveLedgers } from './ledgerUi';
 import type { UiContext } from './state';
 
 let instFilterMode: 'active' | 'all' = 'active';
+
+/** v1.15.0 review (low): module-level view state must not carry over to another signed-in user */
+export function resetCreditCardUiState(): void {
+  instFilterMode = 'active';
+}
 
 const INST_STATUS_META: Record<InstallmentPlanStatus, { label: string; cls: string }> = {
   active: { label: '進行中', cls: 'badge amber' },
@@ -207,6 +213,20 @@ export function openCreditCardModal(
     delBtn.className = 'btn btn-danger';
     delBtn.textContent = '刪除此信用卡帳戶';
     delBtn.addEventListener('click', async () => {
+      // v1.15.0 review finding 4: confirm, and never delete a card that active installment plans still post to
+      const activePlans = (ctx.engine.getSnapshot().installmentPlans || []).filter(
+        (p) => !p.deletedAt && p.status === 'active' && p.cardAccountId === existing.id
+      );
+      if (activePlans.length > 0) {
+        showToast(
+          `「${existing.itemName}」仍有 ${activePlans.length} 筆進行中的分期，請先提前清償或刪除分期後再刪除信用卡。`,
+          'error'
+        );
+        return;
+      }
+      if (!confirm(`確定刪除信用卡「${existing.itemName}」？已記錄的刷卡流水不會刪除，但不再計入任何信用卡的未繳金額。`)) {
+        return;
+      }
       delBtn.disabled = true;
       try {
         await ctx.engine.deleteAsset(existing.id);
@@ -316,10 +336,21 @@ export function openPayCreditCardModal(ctx: UiContext, summary: CreditCardSummar
   }
   form.appendChild(makeField('扣款活存 / 現金帳戶', fromSel));
 
-  const defaultPayAmt =
-    summary.billedUnpaidTwd > 0 && card.currency === 'TWD'
-      ? summary.billedUnpaidTwd
-      : Math.max(0, summary.currentBalanceNative);
+  // v1.15.0 review finding 3: payCreditCardBill takes the amount in the PAYING account's currency. The default is the
+  // statement's billed unpaid amount (or, with nothing billed, the whole unpaid balance) in the card's currency,
+  // converted to the selected paying account's currency — and recomputed when another paying account is chosen.
+  const cardCurr = card.currency || 'TWD';
+  const defaultFor = (accId: string) =>
+    computeDefaultCardPayment(
+      summary,
+      cardCurr,
+      fromAccounts.find((a) => a.id === accId)?.currency || 'TWD',
+      snap.settings
+    );
+  const defaultAmountFor = (accId: string): number => defaultFor(accId).payAmount;
+  const dueCardNative = defaultFor(fromSel.value).cardCreditAmount;
+  const defaultPayAmt = defaultAmountFor(fromSel.value);
+  let amountTouched = false;
 
   const amtInp = document.createElement('input');
   amtInp.type = 'number';
@@ -338,7 +369,14 @@ export function openPayCreditCardModal(ctx: UiContext, summary: CreditCardSummar
 
   const row1 = document.createElement('div');
   row1.className = 'row-2';
-  row1.appendChild(makeField('繳款金額', amtInp));
+  const amtField = makeField('繳款金額', amtInp);
+  const amtLabel = amtField.querySelector('label');
+  const refreshAmountLabel = () => {
+    const acc = fromAccounts.find((a) => a.id === fromSel.value);
+    if (amtLabel) amtLabel.textContent = `繳款金額（${acc?.currency || 'TWD'}，自扣款帳戶扣除）`;
+  };
+  refreshAmountLabel();
+  row1.appendChild(amtField);
   row1.appendChild(makeField('繳款日期', dateInp));
   form.appendChild(row1);
 
@@ -364,7 +402,10 @@ export function openPayCreditCardModal(ctx: UiContext, summary: CreditCardSummar
     }
     crossWrap.style.display = '';
     const amt = Number(amtInp.value || 0);
-    if (amt > 0) {
+    if (!amountTouched && amt > 0 && dueCardNative > 0) {
+      // untouched default: credit exactly the amount due on the card (no round-trip rounding)
+      cardCreditInp.value = String(dueCardNative);
+    } else if (amt > 0) {
       const fRate = resolveFxRate(acc.currency, snap.settings);
       const cRate = resolveFxRate(card.currency, snap.settings);
       const dec = getCurrencyDecimals(card.currency);
@@ -372,8 +413,18 @@ export function openPayCreditCardModal(ctx: UiContext, summary: CreditCardSummar
       cardCreditInp.value = String(est);
     }
   };
-  fromSel.addEventListener('change', updateCross);
-  amtInp.addEventListener('input', updateCross);
+  fromSel.addEventListener('change', () => {
+    if (!amountTouched) {
+      const next = defaultAmountFor(fromSel.value);
+      amtInp.value = next > 0 ? String(next) : '';
+    }
+    refreshAmountLabel();
+    updateCross();
+  });
+  amtInp.addEventListener('input', () => {
+    amountTouched = true;
+    updateCross();
+  });
   updateCross();
 
   const feeInp = document.createElement('input');
@@ -566,7 +617,12 @@ export function openInstallmentPlanModal(
   noCardOpt.value = '';
   noCardOpt.textContent = '不綁定信用卡（一般分期）';
   cardSel.appendChild(noCardOpt);
-  const selectedCardId = existing ? existing.cardAccountId || '' : presetCardId || cards[0]?.id || '';
+  // v1.15.0 review (low): the plan's ledger follows the chosen card, so default to a card of the current ledger;
+  // without one, default to "no card" so the plan stays in the current ledger instead of moving to another one
+  const activeLedgerId = ctx.state.activeLedgerId || DEFAULT_LEDGER_ID;
+  const selectedCardId = existing
+    ? existing.cardAccountId || ''
+    : presetCardId || cards.find((c) => getEffectiveLedgerId(c) === activeLedgerId)?.id || '';
   for (const c of cards) {
     const o = document.createElement('option');
     o.value = c.id;
@@ -656,6 +712,17 @@ export function openInstallmentPlanModal(
   startYmInp.className = 'tnum';
   startYmInp.required = true;
   startYmInp.value = existing?.startYm || currentYm;
+
+  // v1.15.0 review (low): once installments are posted, changing the total, the count, the currency or the start
+  // month would make the remaining schedule disagree with the entries already posted
+  if (existing && existing.postedInstallments > 0) {
+    for (const inp of [totalInp, instCountInp, currSel, startYmInp]) inp.disabled = true;
+    const lockHint = document.createElement('div');
+    lockHint.className = 'muted';
+    lockHint.style.cssText = 'font-size:11px';
+    lockHint.textContent = `已入帳 ${existing.postedInstallments} 期，總金額、期數、幣別與首期年月不可修改；如需調整請提前清償或刪除後重建。`;
+    form.appendChild(lockHint);
+  }
 
   const postDayInp = document.createElement('input');
   postDayInp.type = 'number';
@@ -962,7 +1029,8 @@ export function renderCreditCardsAndInstallmentsCard(ctx: UiContext, container: 
         uBadge.className =
           cs.utilizationPct >= 80 ? 'badge red' : cs.utilizationPct >= 50 ? 'badge amber' : 'badge green';
         uBadge.style.marginRight = '0';
-        uBadge.textContent = `額度 ${fmtPct(cs.utilizationPct, 1)}`;
+        // v1.15.0 review (low): the utilization reveals the balance relative to the limit; hide it when masked
+        uBadge.textContent = ctx.state.masked ? '額度 ••%' : `額度 ${fmtPct(cs.utilizationPct, 1)}`;
         titleRow.appendChild(uBadge);
       }
 
@@ -1174,6 +1242,14 @@ export function renderCreditCardsAndInstallmentsCard(ctx: UiContext, container: 
       delBtn.className = 'btn btn-outline btn-sm';
       delBtn.textContent = '刪除';
       delBtn.addEventListener('click', async () => {
+        // v1.15.0 review finding 4: confirm before deleting
+        if (
+          !confirm(
+            `確定刪除分期計畫「${plan.itemName}」？已入帳的 ${plan.postedInstallments} 期流水會保留，之後不再自動入帳。`
+          )
+        ) {
+          return;
+        }
         delBtn.disabled = true;
         try {
           await ctx.engine.deleteInstallmentPlan(plan.id);

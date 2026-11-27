@@ -19,12 +19,29 @@ import {
   type LedgerSearchFilter,
   type LedgerSearchResult,
 } from '../../../shared/ledgerSearch';
-import type { CashFlowLog, Ledger } from '../../../shared/types';
+import type { AssetItem, CashFlowLog, Ledger } from '../../../shared/types';
 import { openAccountTransferModal, openSavingsAccountModal } from './assetsTab';
 import { downloadTextFile, el, fmtMoney, fmtNum, showToast, TRASH_SVG, fmtPct } from './helpers';
 import { getActiveLedgers, renderLedgerSwitcherBar, resolveActiveLedger } from './ledgerUi';
 import { openCustomCategoriesModal, renderQuickTemplatesStrip } from './quickTemplatesUi';
 import { createDefaultLedgerSearchState, type UiContext } from './state';
+
+
+/**
+ * v1.15.0 review finding 5: accounts an entry can be linked to — linked savings and credit cards (a card charge links
+ * the entry to the card). Used for the account name shown on a row, the account filter and account-name search.
+ */
+function linkableAccountNames(snap: { assetItems: AssetItem[] }): Map<string, string> {
+  return new Map(
+    snap.assetItems
+      .filter((a) => !a.deletedAt && (a.isLinkedSavings || a.isCreditCard))
+      .map((a) => [a.id, a.itemName] as [string, string])
+  );
+}
+
+function creditCardIds(snap: { assetItems: AssetItem[] }): Set<string> {
+  return new Set(snap.assetItems.filter((a) => !a.deletedAt && a.isCreditCard).map((a) => a.id));
+}
 
 export function getSelectedYearMonth(year: number, month: number): string {
   return `${year}-${String(month).padStart(2, '0')}`;
@@ -512,7 +529,9 @@ function createLedgerRow(
   sub.appendChild(document.createTextNode(' · '));
   appendHighlightedText(sub, item.category, tokens);
   if (accName) {
-    sub.appendChild(document.createTextNode(' · 活存:'));
+    sub.appendChild(
+      document.createTextNode(creditCardIds(ctx.engine.getSnapshot()).has(item.linkedAccountId || '') ? ' · 刷卡:' : ' · 活存:')
+    );
     appendHighlightedText(sub, accName, tokens);
   }
   if (item.note) {
@@ -648,11 +667,11 @@ function renderLedgerSearchControls(
   noneAccOpt.value = '__none__';
   noneAccOpt.textContent = '未連動活存';
   accSel.appendChild(noneAccOpt);
-  const savingsAccs = snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings);
+  const savingsAccs = snap.assetItems.filter((a) => !a.deletedAt && (a.isLinkedSavings || a.isCreditCard));
   for (const acc of savingsAccs) {
     const opt = document.createElement('option');
     opt.value = acc.id;
-    opt.textContent = acc.itemName;
+    opt.textContent = acc.isCreditCard ? `💳 ${acc.itemName}` : acc.itemName;
     accSel.appendChild(opt);
   }
   accSel.value = s.linkedAccountId;
@@ -836,9 +855,7 @@ export function bindLedgerSearchEvents(ctx: UiContext): void {
     const activeLedger = resolveActiveLedger(ctx);
     const ledgers = getActiveLedgers(ctx);
     const ym = getSelectedYearMonth(ctx.state.selectedYear, ctx.state.selectedMonth);
-    const savingsNameById = new Map(
-      snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
-    );
+    const savingsNameById = linkableAccountNames(snap);
     const filter = buildLedgerSearchFilter(ctx, activeLedger.id, ym);
     const result = searchCashFlowLogs(snap.cashflowLogs, filter, ledgers, activeLedger.id, {
       accountNameById: savingsNameById,
@@ -904,9 +921,7 @@ export function renderLogTab(ctx: UiContext): void {
     ? snap.settings.monthlyDailyBudget
     : Number(activeLedger.monthlyDailyBudget || 0);
 
-  const savingsNameById = new Map(
-    snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
-  );
+  const savingsNameById = linkableAccountNames(snap);
   const searchFilter = buildLedgerSearchFilter(ctx, activeLedger.id, ym);
   const searchResult = searchCashFlowLogs(snap.cashflowLogs, searchFilter, ledgers, activeLedger.id, {
     accountNameById: savingsNameById,
