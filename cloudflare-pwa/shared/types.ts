@@ -176,11 +176,33 @@ export interface SinkingFundItem {
   dueNote: string;
   status: string;
   note: string;
+  /** v2.1.0 (0026): 開始月份 YYYY-MM；null／未設定 = 舊項目，啟用即每月計入（不限期間） */
+  startYm?: string | null;
+  /** v2.1.0 (0026): true = 每年從開始月份重新起算一輪；false = 期滿（開始月 + 月數 − 1）自動結束 */
+  repeatYearly?: boolean;
+  /** v2.1.0 (0026): 先存後付（預備金）或已付分攤（成本攤提），只影響顯示 */
+  fundKind?: SinkingFundKind;
   sortOrder?: number;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
   version?: number;
+}
+
+export type SinkingFundKind = 'save_first' | 'amortize';
+
+/** v2.1.0: 某筆攤提在指定月份的狀態 */
+export type SinkingScheduleState = 'unscheduled' | 'upcoming' | 'active' | 'off_cycle' | 'ended' | 'disabled';
+
+export interface SinkingSchedule {
+  state: SinkingScheduleState;
+  /** 本輪第幾期（1 起算），僅 active 時有值 */
+  periodIndex: number | null;
+  /** 本輪（或唯一一輪）的開始與結束月份；未排程時為 null */
+  cycleStartYm: string | null;
+  cycleEndYm: string | null;
+  /** 下一次開始計入的月份（upcoming／off_cycle 時有值） */
+  nextStartYm: string | null;
 }
 
 export interface AssetItem {

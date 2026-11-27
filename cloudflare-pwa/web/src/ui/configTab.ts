@@ -5,12 +5,16 @@ import {
   DEFAULT_LEDGER_ID,
   RECURRING_CASHFLOW_TYPES,
   SINKING_FUND_CATEGORIES,
+  SINKING_FUND_KIND_LABELS,
 } from '../../../shared/constants';
+import { todayInTimeZone } from '../../../shared/dates';
 import {
   compareBySortOrder,
   computeRecurringMonthlyTwd,
   computeSinkingMonthlyReserve,
+  computeSinkingReserveForMonth,
   computeSinkingYtdSpent,
+  getSinkingSchedule,
   getEffectiveLedgerId,
 } from '../../../shared/calculations';
 import type { RecurringItem, SinkingFundItem } from '../../../shared/types';
@@ -28,6 +32,16 @@ import {
 import { buildLedgerSelectField, getActiveLedgers, renderLedgerSwitcherBar } from './ledgerUi';
 import { renderReorderList } from './reorderHelper';
 import type { UiContext } from './state';
+
+const SINKING_END_AUTO = '期滿自動結束';
+const SINKING_END_REPEAT = '每年重複';
+
+function addMonthsToYm(ym: string, n: number): string {
+  const [y, m] = ym.split('-').map(Number);
+  const idx = y * 12 + (m - 1) + n;
+  const ny = Math.floor(idx / 12);
+  return `${ny}-${String(idx - ny * 12 + 1).padStart(2, '0')}`;
+}
 
 export function getFilteredRecurringItems(ctx: UiContext): RecurringItem[] {
   const snap = ctx.engine.getSnapshot();
@@ -193,10 +207,19 @@ export function renderConfigTab(ctx: UiContext): void {
     }
   }
 
-  // Sinking fund list
+  // Sinking fund list (v2.1.0: grouped by schedule state for the current month)
   const activeSinking = getActiveSinkingItems(ctx);
-  const monthlyTotal = activeSinking.reduce((s, i) => s + computeSinkingMonthlyReserve(i), 0);
+  const nowYm = currentYearMonth();
+  const nextYm = nextYearMonth(nowYm);
+  const monthlyTotal = computeSinkingReserveForMonth(activeSinking, nowYm);
+  const nextMonthTotal = computeSinkingReserveForMonth(activeSinking, nextYm);
   el('sinkingMonthlyTotal').textContent = fmtMoney(monthlyTotal, ctx.state.masked);
+  const nextHint = el('sinkingNextMonthHint');
+  nextHint.textContent =
+    nextMonthTotal !== monthlyTotal
+      ? `下個月（${formatYmShort(nextYm)}）起變為 ${fmtMoney(nextMonthTotal, ctx.state.masked)}`
+      : '';
+  nextHint.style.display = nextHint.textContent ? '' : 'none';
 
   const sinkReorderBtn = el<HTMLButtonElement>('reorderSinkingBtn');
   const isReorderingSink = ctx.state.reorderSection === 'sinking';
@@ -220,50 +243,31 @@ export function renderConfigTab(ctx: UiContext): void {
   } else if (!activeSinking.length) {
     const e = document.createElement('div');
     e.className = 'list-empty';
-    e.textContent = '尚無不定期攤提項目，點右上角「+ 新增攤提」';
+    e.textContent = '尚無攤提項目，點右上角「+ 新增攤提」';
     sList.appendChild(e);
   } else {
+    const current: SinkingFundItem[] = [];
+    const ended: SinkingFundItem[] = [];
     for (const item of activeSinking) {
-      const reserve = computeSinkingMonthlyReserve(item);
-      const ytd = computeSinkingYtdSpent(snap.cashflowLogs, ctx.state.selectedYear, item.itemName);
-      const row = document.createElement('div');
-      row.className = 'list-row' + (item.status === '停用' ? ' inactive' : '');
-
-      const main = document.createElement('div');
-      main.className = 'item-main';
-      const title = document.createElement('div');
-      title.className = 'item-title';
-      title.textContent = item.itemName;
-      const sub = document.createElement('div');
-      sub.className = 'item-sub tnum';
-      const badge = document.createElement('span');
-      badge.className = 'badge warn';
-      badge.textContent = `${item.months} 個月`;
-      sub.appendChild(badge);
-      sub.appendChild(
-        document.createTextNode(
-          `總額 ${fmtMoney(item.totalAmount, ctx.state.masked)} · 本年已繳 ${fmtMoney(ytd, ctx.state.masked)}`
-        )
-      );
-      main.appendChild(title);
-      main.appendChild(sub);
-
-      const right = document.createElement('div');
-      right.className = 'item-right';
-      const amt = document.createElement('div');
-      amt.className = 'item-amount';
-      amt.textContent = fmtMoney(reserve, ctx.state.masked) + '/月';
-      const editBtn = document.createElement('button');
-      editBtn.type = 'button';
-      editBtn.className = 'btn btn-outline btn-sm';
-      editBtn.textContent = '調整';
-      editBtn.addEventListener('click', () => openSinkingModal(ctx, item));
-
-      right.appendChild(amt);
-      right.appendChild(editBtn);
-      row.appendChild(main);
-      row.appendChild(right);
-      sList.appendChild(row);
+      const state = getSinkingSchedule(item, nowYm).state;
+      (state === 'ended' ? ended : current).push(item);
+    }
+    for (const item of current) sList.appendChild(buildSinkingRow(ctx, item, nowYm));
+    if (!current.length) {
+      const e = document.createElement('div');
+      e.className = 'list-empty';
+      e.textContent = '目前沒有進行中的攤提';
+      sList.appendChild(e);
+    }
+    if (ended.length) {
+      const details = document.createElement('details');
+      details.className = 'sinking-ended-group';
+      const summary = document.createElement('summary');
+      summary.className = 'list-row';
+      summary.textContent = `已結束 · ${ended.length}`;
+      details.appendChild(summary);
+      for (const item of ended) details.appendChild(buildSinkingRow(ctx, item, nowYm));
+      sList.appendChild(details);
     }
   }
 }
@@ -427,10 +431,96 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
   });
 }
 
+function currentYearMonth(): string {
+  return todayInTimeZone().slice(0, 7);
+}
+
+function nextYearMonth(ym: string): string {
+  const [y, m] = ym.split('-').map(Number);
+  return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+}
+
+function formatYmShort(ym: string | null): string {
+  if (!ym) return '';
+  const [y, m] = ym.split('-');
+  return `${y}/${m}`;
+}
+
+/** v2.1.0: one-line description of where an item is in its schedule this month */
+export function describeSinkingSchedule(item: SinkingFundItem, ym: string): { badge: string; badgeClass: string; text: string } {
+  const sch = getSinkingSchedule(item, ym);
+  const months = Math.max(1, Math.round(item.months || 12));
+  const range = `${formatYmShort(sch.cycleStartYm)}–${formatYmShort(sch.cycleEndYm)}`;
+  switch (sch.state) {
+    case 'disabled':
+      return { badge: '停用', badgeClass: 'badge red', text: '不計入' };
+    case 'unscheduled':
+      return { badge: `${months} 個月`, badgeClass: 'badge warn', text: '未設開始月份，每月持續計入' };
+    case 'upcoming':
+      return { badge: '即將開始', badgeClass: 'badge', text: `${range}，共 ${months} 期` };
+    case 'active': {
+      const perCycle = item.repeatYearly ? Math.min(months, 12) : months;
+      const isLast = !item.repeatYearly && sch.periodIndex === perCycle;
+      const tail = item.repeatYearly ? '每年重複' : isLast ? '最後一期，月底後自動結束' : `${formatYmShort(sch.cycleEndYm)} 結束`;
+      return { badge: `第 ${sch.periodIndex}/${perCycle} 期`, badgeClass: isLast ? 'badge warn' : 'badge green', text: tail };
+    }
+    case 'off_cycle':
+      return { badge: '本輪已存滿', badgeClass: 'badge', text: `${formatYmShort(sch.nextStartYm)} 開始下一輪` };
+    case 'ended':
+      return { badge: '已結束', badgeClass: 'badge', text: range };
+  }
+}
+
+function buildSinkingRow(ctx: UiContext, item: SinkingFundItem, ym: string): HTMLDivElement {
+  const snap = ctx.engine.getSnapshot();
+  const reserve = computeSinkingMonthlyReserve(item);
+  const contributingNow = computeSinkingMonthlyReserve(item, ym) > 0;
+  const ytd = computeSinkingYtdSpent(snap.cashflowLogs, ctx.state.selectedYear, item.itemName);
+  const desc = describeSinkingSchedule(item, ym);
+  const row = document.createElement('div');
+  row.className = 'list-row' + (contributingNow ? '' : ' inactive');
+
+  const main = document.createElement('div');
+  main.className = 'item-main';
+  const title = document.createElement('div');
+  title.className = 'item-title';
+  title.textContent = item.itemName;
+  const sub = document.createElement('div');
+  sub.className = 'item-sub tnum';
+  const badge = document.createElement('span');
+  badge.className = desc.badgeClass;
+  badge.textContent = desc.badge;
+  sub.appendChild(badge);
+  sub.appendChild(document.createTextNode(desc.text));
+  const sub2 = document.createElement('div');
+  sub2.className = 'item-sub tnum';
+  const kind = SINKING_FUND_KIND_LABELS[item.fundKind === 'amortize' ? 'amortize' : 'save_first'];
+  sub2.textContent = `${kind} · 總額 ${fmtMoney(item.totalAmount, ctx.state.masked)} · 本年已繳 ${fmtMoney(ytd, ctx.state.masked)}`;
+  main.appendChild(title);
+  main.appendChild(sub);
+  main.appendChild(sub2);
+
+  const right = document.createElement('div');
+  right.className = 'item-right';
+  const amt = document.createElement('div');
+  amt.className = 'item-amount';
+  amt.textContent = fmtMoney(reserve, ctx.state.masked) + '/月';
+  const editBtn = document.createElement('button');
+  editBtn.type = 'button';
+  editBtn.className = 'btn btn-outline btn-sm';
+  editBtn.textContent = '調整';
+  editBtn.addEventListener('click', () => openSinkingModal(ctx, item));
+  right.appendChild(amt);
+  right.appendChild(editBtn);
+  row.appendChild(main);
+  row.appendChild(right);
+  return row;
+}
+
 export function openSinkingModal(ctx: UiContext, existing: SinkingFundItem | null): void {
-  const body = openModal(existing ? '調整不定期攤提與月數' : '新增不定期攤提');
+  const body = openModal(existing ? '調整攤提' : '新增攤提');
   const form = document.createElement('form');
-  form.appendChild(makeInputField('項目名稱', 'sfName', 'text', existing?.itemName || '', '如：綜合所得稅、出國旅遊', true));
+  form.appendChild(makeInputField('項目名稱', 'sfName', 'text', existing?.itemName || '', '如：所得稅、保費、牙齒矯正、出國旅遊', true));
   form.appendChild(makeSelectField('分類', 'sfCat', SINKING_FUND_CATEGORIES, existing?.category || SINKING_FUND_CATEGORIES[0]));
 
   const r2 = document.createElement('div');
@@ -445,15 +535,44 @@ export function openSinkingModal(ctx: UiContext, existing: SinkingFundItem | nul
   const updatePreview = () => {
     const a = parseFloat(el<HTMLInputElement>('sfAmt').value) || 0;
     const m = Math.max(1, parseInt(el<HTMLInputElement>('sfMonths').value, 10) || 12);
-    preview.textContent = `試算每月應提撥：NT$ ${fmtNum(Math.round(a / m))} / 月`;
+    const start = el<HTMLInputElement>('sfStart')?.value || '';
+    const repeat = el<HTMLSelectElement>('sfRepeat')?.value === SINKING_END_REPEAT;
+    let period = '';
+    if (start) {
+      const endYm = addMonthsToYm(start, m - 1);
+      period = repeat
+        ? ` · 每年 ${Number(start.slice(5))} 月起提撥 ${Math.min(m, 12)} 個月`
+        : ` · ${formatYmShort(start)}–${formatYmShort(endYm)}，期滿自動結束`;
+    } else {
+      period = ' · 未設開始月份：不限期間，停用前每月都計入';
+    }
+    preview.textContent = `每月提撥 NT$ ${fmtNum(Math.round(a / m))}${period}`;
   };
-  form.appendChild(preview);
+  // v2.1.0: schedule — start month + auto end / yearly repeat
+  const rKind = document.createElement('div');
+  rKind.className = 'row-2';
+  rKind.appendChild(
+    makeSelectField(
+      '這筆錢是',
+      'sfKind',
+      [SINKING_FUND_KIND_LABELS.save_first, SINKING_FUND_KIND_LABELS.amortize],
+      SINKING_FUND_KIND_LABELS[existing?.fundKind === 'amortize' ? 'amortize' : 'save_first']
+    )
+  );
+  rKind.appendChild(
+    makeSelectField('結束後', 'sfRepeat', [SINKING_END_AUTO, SINKING_END_REPEAT], existing?.repeatYearly ? SINKING_END_REPEAT : SINKING_END_AUTO)
+  );
+  form.appendChild(rKind);
 
-  const r3 = document.createElement('div');
-  r3.className = 'row-2';
-  r3.appendChild(makeInputField('預計繳款月份', 'sfDue', 'text', existing?.dueNote || '', '例如 5月'));
-  r3.appendChild(makeSelectField('狀態', 'sfStatus', ['啟用', '停用'], existing?.status || '啟用'));
-  form.appendChild(r3);
+  const rStart = document.createElement('div');
+  rStart.className = 'row-2';
+  // A new item starts this month; an existing legacy item keeps an empty start (= unlimited, previous behaviour)
+  const startDefault = existing ? existing.startYm || '' : currentYearMonth();
+  rStart.appendChild(makeInputField('開始月份', 'sfStart', 'month', startDefault));
+  rStart.appendChild(makeSelectField('狀態', 'sfStatus', ['啟用', '停用'], existing?.status || '啟用'));
+  form.appendChild(rStart);
+  form.appendChild(preview);
+  form.appendChild(makeInputField('預計繳款月份', 'sfDue', 'text', existing?.dueNote || '', '例如 5月'));
   form.appendChild(makeInputField('備註', 'sfNote', 'text', existing?.note || ''));
 
   const btns = document.createElement('div');
@@ -499,9 +618,13 @@ export function openSinkingModal(ctx: UiContext, existing: SinkingFundItem | nul
         dueNote: el<HTMLInputElement>('sfDue').value.trim(),
         status: el<HTMLSelectElement>('sfStatus').value,
         note: el<HTMLInputElement>('sfNote').value.trim(),
+        startYm: el<HTMLInputElement>('sfStart').value.trim() || null,
+        repeatYearly: el<HTMLSelectElement>('sfRepeat').value === SINKING_END_REPEAT,
+        fundKind:
+          el<HTMLSelectElement>('sfKind').value === SINKING_FUND_KIND_LABELS.amortize ? 'amortize' : 'save_first',
       });
       closeModal();
-      showToast('已儲存不定期攤提設定', 'success');
+      showToast('已儲存攤提設定', 'success');
       ctx.scheduleSync();
     } catch (err) {
       showToast(err instanceof Error ? err.message : '儲存失敗', 'error');
@@ -511,5 +634,7 @@ export function openSinkingModal(ctx: UiContext, existing: SinkingFundItem | nul
   body.appendChild(form);
   el('sfAmt').addEventListener('input', updatePreview);
   el('sfMonths').addEventListener('input', updatePreview);
+  el('sfStart').addEventListener('input', updatePreview);
+  el('sfRepeat').addEventListener('change', updatePreview);
   updatePreview();
 }

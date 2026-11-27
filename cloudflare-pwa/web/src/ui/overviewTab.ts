@@ -4,7 +4,8 @@ import {
   computeMonthlyTrend,
   computeNetWorthSummary,
   computeOverviewBreakdownGroups,
-  computeSinkingMonthlyReserve,
+  computeSinkingReserveForMonth,
+  computeSinkingReserveForYear,
   filterCashFlowsByLedgerScope,
 } from '../../../shared/calculations';
 import { el, fmtMoney, fmtPct } from './helpers';
@@ -46,14 +47,12 @@ export function renderOverviewTab(ctx: UiContext): void {
   const yearLogs = activeLogs.filter((l) => l.yearMonth.startsWith(`${year}-`));
 
   const includeSinking = scope === 'net_worth' || scope === 'all' || scope === DEFAULT_LEDGER_ID;
-  const monthlySinking = includeSinking
-    ? snap.sinkingItems
-        .filter((s) => !s.deletedAt)
-        .reduce((sum, s) => sum + computeSinkingMonthlyReserve(s), 0)
-    : 0;
+  // v2.1.0: 依檢視中的月份計算（只計入當月在期間內的攤提），回看過去月份不再套用今天的設定
+  const monthlySinking = includeSinking ? computeSinkingReserveForMonth(snap.sinkingItems, ym) : 0;
+  const yearlySinking = includeSinking ? computeSinkingReserveForYear(snap.sinkingItems, year) : 0;
 
   const monthly = aggregatePeriodMetrics(monthLogs, monthlySinking, includeSinking);
-  const yearly = aggregatePeriodMetrics(yearLogs, monthlySinking * 12, false);
+  const yearly = aggregatePeriodMetrics(yearLogs, yearlySinking, false);
   const nw = computeNetWorthSummary(
     snap.assetItems,
     snap.settings,
@@ -112,7 +111,8 @@ export function renderOverviewTab(ctx: UiContext): void {
     yearLogs,
     includeSinking ? snap.sinkingItems : [],
     monthly,
-    yearly
+    yearly,
+    ym
   );
   const expandedSet = new Set(ctx.state.overviewExpandedGroups);
 

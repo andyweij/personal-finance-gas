@@ -19,6 +19,8 @@ import {
   SOURCE_OPTIONS,
   SPLIT_RECEIVABLE_STATUSES,
   STATUS_OPTIONS,
+  SINKING_FUND_KINDS,
+  SINKING_REPEAT_MAX_MONTHS,
   STOCK_TX_TYPES,
   WEBAPP_CATEGORY_MAP,
 } from './constants';
@@ -30,6 +32,7 @@ import type {
   QuickEntryTemplate,
   RebalanceTargetKind,
   RebalanceTargetRule,
+  SinkingFundKind,
   SplitReceivableStatus,
   StockTransactionType,
 } from './types';
@@ -635,6 +638,27 @@ export interface SinkingInputPayload {
   status?: string;
   note?: string;
   sortOrder?: number;
+  startYm?: string | null;
+  repeatYearly?: boolean | number | string | null;
+  fundKind?: string | null;
+}
+
+/** v2.1.0: 'YYYY-MM' 開始月份；空值回傳 null（舊項目，不限期間） */
+export function normalizeSinkingStartYm(raw: unknown): string | null {
+  const t = String(raw ?? '').trim();
+  if (!t) return null;
+  const m = /^(\d{4})-(\d{2})$/.exec(t);
+  if (!m) throw new Error('開始月份格式需為 YYYY-MM。');
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  if (y < 2000 || y > 2100 || mo < 1 || mo > 12) throw new Error('開始月份無效。');
+  return t;
+}
+
+function normalizeSinkingRepeatYearly(raw: unknown): boolean {
+  if (raw === true || raw === 1) return true;
+  if (typeof raw === 'string') return raw === 'true' || raw === '1';
+  return false;
 }
 
 export function validateSinkingInput(payload: SinkingInputPayload) {
@@ -652,7 +676,17 @@ export function validateSinkingInput(payload: SinkingInputPayload) {
   if (Number.isNaN(months) || months < 1 || months > 120) throw new Error('分攤月數需介於 1～120 個月。');
   if (!STATUS_OPTIONS.includes(status)) throw new Error('狀態無效。');
 
-  return { itemName, category, totalAmount, months, dueNote, status, note, sortOrder };
+  const startYm = normalizeSinkingStartYm(payload.startYm);
+  const repeatYearly = normalizeSinkingRepeatYearly(payload.repeatYearly);
+  if (repeatYearly && !startYm) throw new Error('每年重複需要設定開始月份。');
+  if (repeatYearly && months > SINKING_REPEAT_MAX_MONTHS) {
+    throw new Error(`每年重複的攤提，每輪最多 ${SINKING_REPEAT_MAX_MONTHS} 個月。`);
+  }
+  const rawKind = String(payload.fundKind ?? '').trim() || 'save_first';
+  if (!(SINKING_FUND_KINDS as readonly string[]).includes(rawKind)) throw new Error('攤提類型無效。');
+  const fundKind = rawKind as SinkingFundKind;
+
+  return { itemName, category, totalAmount, months, dueNote, status, note, sortOrder, startYm, repeatYearly, fundKind };
 }
 
 export interface AssetInputPayload {

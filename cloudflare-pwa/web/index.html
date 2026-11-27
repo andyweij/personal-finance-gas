@@ -597,11 +597,11 @@
       <div class="stocks-list" id="stocksWatchlistList" style="display:none"></div>
     </section>
 
-    <!-- ==================== TAB 5: 工具（固定收支 / 稅金分攤 / 水電分攤） ==================== -->
+    <!-- ==================== TAB 5: 工具（固定收支 / 大額攤提 / 水電分攤） ==================== -->
     <section class="tab-view" id="tab-tools">
       <div class="seg-bar cols-3" id="toolsSubtabBar">
         <button type="button" class="seg-btn active" data-tools-sub="recurring">固定收支</button>
-        <button type="button" class="seg-btn" data-tools-sub="sinking">稅金分攤</button>
+        <button type="button" class="seg-btn" data-tools-sub="sinking">大額攤提</button>
         <button type="button" class="seg-btn" data-tools-sub="utility">水電分攤</button>
       </div>
 
@@ -633,8 +633,9 @@
       <div id="subtab-sinking" style="display:none;flex-direction:column;gap:12px">
         <div class="card compact" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
           <div>
-            <div class="muted" style="font-weight:600">每月合計應提撥預備金</div>
+            <div class="muted" style="font-weight:600">本月合計提撥</div>
             <div class="tnum" style="font-size:24px;font-weight:700;color:var(--primary);margin-top:2px" id="sinkingMonthlyTotal">NT$ --</div>
+            <div class="muted tnum" id="sinkingNextMonthHint" style="display:none;margin-top:2px"></div>
           </div>
           <div style="display:flex;gap:6px">
             <button type="button" class="btn btn-outline btn-sm" id="reorderSinkingBtn" style="display:none">⇅ 排序</button>

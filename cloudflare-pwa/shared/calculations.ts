@@ -17,6 +17,7 @@ import type {
   SavingsAccountSummary,
   SavingsAdjustment,
   SinkingFundItem,
+  SinkingSchedule,
   StockPortfolioSummary,
   StockPositionSummary,
   StockTransaction,
@@ -919,10 +920,88 @@ export function computeRecurringMonthlyTwd(item: RecurringItem, fxSource: FxRate
   return Math.round(item.amount * rate * mult);
 }
 
-export function computeSinkingMonthlyReserve(item: SinkingFundItem): number {
-  if (item.status !== '啟用') return 0;
-  const months = Math.max(1, Math.round(item.months || 12));
-  return Math.round(item.totalAmount / months);
+function ymToIndex(ym: string): number | null {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(ym || ''));
+  if (!m) return null;
+  return Number(m[1]) * 12 + (Number(m[2]) - 1);
+}
+
+function indexToYm(idx: number): string {
+  const y = Math.floor(idx / 12);
+  const mo = idx - y * 12 + 1;
+  return `${y}-${String(mo).padStart(2, '0')}`;
+}
+
+function sinkingMonths(item: SinkingFundItem): number {
+  return Math.max(1, Math.round(item.months || 12));
+}
+
+/**
+ * v2.1.0: 一筆攤提在 `ym` 月份的排程狀態。
+ * - 沒有開始月份（舊項目）→ 'unscheduled'：啟用就每月計入，與 v2.0 行為相同。
+ * - 一次性：開始月 ～ 開始月 + 月數 − 1 計入，之後 'ended'。
+ * - 每年重複：每 12 個月從開始月重新起算，每輪前 `月數` 個月計入，其餘月份 'off_cycle'。
+ * 停用的項目一律 'disabled'。
+ */
+export function getSinkingSchedule(item: SinkingFundItem, ym: string): SinkingSchedule {
+  const none = { periodIndex: null, cycleStartYm: null, cycleEndYm: null, nextStartYm: null };
+  if (item.deletedAt || item.status !== '啟用') return { state: 'disabled', ...none };
+  const startIdx = item.startYm ? ymToIndex(item.startYm) : null;
+  if (startIdx === null) return { state: 'unscheduled', ...none };
+  const curIdx = ymToIndex(ym);
+  if (curIdx === null) return { state: 'unscheduled', ...none };
+
+  const months = sinkingMonths(item);
+  if (curIdx < startIdx) {
+    return {
+      state: 'upcoming',
+      periodIndex: null,
+      cycleStartYm: indexToYm(startIdx),
+      cycleEndYm: indexToYm(startIdx + months - 1),
+      nextStartYm: indexToYm(startIdx),
+    };
+  }
+
+  const offset = curIdx - startIdx;
+  if (!item.repeatYearly) {
+    const cycle = { cycleStartYm: indexToYm(startIdx), cycleEndYm: indexToYm(startIdx + months - 1) };
+    if (offset < months) return { state: 'active', periodIndex: offset + 1, ...cycle, nextStartYm: null };
+    return { state: 'ended', periodIndex: null, ...cycle, nextStartYm: null };
+  }
+
+  const perCycle = Math.min(months, 12);
+  const cycleStartIdx = startIdx + Math.floor(offset / 12) * 12;
+  const posInCycle = offset % 12;
+  const cycle = { cycleStartYm: indexToYm(cycleStartIdx), cycleEndYm: indexToYm(cycleStartIdx + perCycle - 1) };
+  if (posInCycle < perCycle) return { state: 'active', periodIndex: posInCycle + 1, ...cycle, nextStartYm: null };
+  return { state: 'off_cycle', periodIndex: null, ...cycle, nextStartYm: indexToYm(cycleStartIdx + 12) };
+}
+
+/**
+ * 每月應提撥金額。傳入 `ym` 時只有該月在期間內才計入（v2.1.0）；
+ * 不傳 `ym` 則不看期間，只看啟用狀態（舊版行為，僅供沒有月份情境的呼叫端）。
+ */
+export function computeSinkingMonthlyReserve(item: SinkingFundItem, ym?: string): number {
+  if (item.deletedAt || item.status !== '啟用') return 0;
+  if (ym !== undefined) {
+    const { state } = getSinkingSchedule(item, ym);
+    if (state !== 'active' && state !== 'unscheduled') return 0;
+  }
+  return Math.round(item.totalAmount / sinkingMonths(item));
+}
+
+/** v2.1.0: 指定月份所有攤提的提撥合計 */
+export function computeSinkingReserveForMonth(items: SinkingFundItem[], ym: string): number {
+  return (items || []).reduce((sum, item) => sum + computeSinkingMonthlyReserve(item, ym), 0);
+}
+
+/** v2.1.0: 指定年度 1～12 月的提撥合計（各月依當月期間分別計算） */
+export function computeSinkingReserveForYear(items: SinkingFundItem[], year: number): number {
+  let total = 0;
+  for (let mo = 1; mo <= 12; mo++) {
+    total += computeSinkingReserveForMonth(items, `${year}-${String(mo).padStart(2, '0')}`);
+  }
+  return total;
 }
 
 export function computeAssetTwdValue(item: AssetItem, fxSource: FxRateSource): number {
@@ -1042,7 +1121,9 @@ export function computeOverviewBreakdownGroups(
   yearLogs: CashFlowLog[],
   sinkingItems: SinkingFundItem[],
   monthly: PeriodMetrics,
-  yearly: PeriodMetrics
+  yearly: PeriodMetrics,
+  /** v2.1.0: 檢視中的月份；傳入時只列出該月在期間內的攤提 */
+  ym?: string
 ): Array<{
   key: string;
   label: string;
@@ -1061,7 +1142,8 @@ export function computeOverviewBreakdownGroups(
     .slice()
     .sort(compareBySortOrder);
   for (const sf of activeSinking) {
-    const reserve = computeSinkingMonthlyReserve(sf);
+    const reserve = computeSinkingMonthlyReserve(sf, ym);
+    if (ym !== undefined && reserve === 0 && getSinkingSchedule(sf, ym).state !== 'active') continue;
     const cur = sinkingChildrenMap.get(sf.itemName) || { monthly: 0, yearly: 0 };
     cur.monthly += reserve;
     sinkingChildrenMap.set(sf.itemName, cur);

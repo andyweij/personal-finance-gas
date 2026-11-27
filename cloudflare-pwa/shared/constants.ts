@@ -88,6 +88,14 @@ export const ALL_STOCK_TX_TYPES: string[] = [
   STOCK_TX_TYPES.STOCK_DIVIDEND,
 ];
 
+export const SINKING_FUND_KINDS = ['save_first', 'amortize'] as const;
+export const SINKING_FUND_KIND_LABELS: Record<(typeof SINKING_FUND_KINDS)[number], string> = {
+  save_first: '先存後付',
+  amortize: '已付分攤',
+};
+/** 每年重複時，一輪最多 12 個月 */
+export const SINKING_REPEAT_MAX_MONTHS = 12;
+
 export const SINKING_FUND_CATEGORIES: string[] = [
   '所得稅',
   '房屋/地價稅',

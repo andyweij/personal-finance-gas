@@ -1151,7 +1151,7 @@ function bindEvents(ctx: UiContext): void {
     }
   });
 
-  // Tab 5 Tools 3-way subtab events (固定收支 / 稅金分攤 / 水電分攤)
+  // Tab 5 Tools 3-way subtab events (固定收支 / 大額攤提 / 水電分攤)
   document.querySelectorAll<HTMLButtonElement>('#toolsSubtabBar [data-tools-sub]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const sub = btn.dataset.toolsSub as AppUiState['toolsSubtab'];

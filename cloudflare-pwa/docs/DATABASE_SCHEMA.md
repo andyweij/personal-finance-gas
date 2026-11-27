@@ -206,10 +206,11 @@ erDiagram
 
 ---
 
-#### 8. `sinking_fund_items`（不定期稅金與大額攤提項目）
+#### 8. `sinking_fund_items`（攤提與預備金項目）
 - **主鍵**：`PRIMARY KEY (user_id, id)`
 - **索引**：`idx_sinking_user_updated (user_id, updated_at)`、`idx_sinking_user_sort (user_id, sort_order, created_at)`
-- **欄位**：`user_id`, `id`, `item_name`, `category`, `total_amount`, `months`（預設 `12`）, `due_note`, `status`, `sort_order`, `note`, `created_at`, `updated_at`, `deleted_at`, `version`。
+- **欄位**：`user_id`, `id`, `item_name`, `category`, `total_amount`, `months`（預設 `12`）, `due_note`, `status`, `start_ym`（`0026`，開始月份 `YYYY-MM`；`NULL` = 不限期間的舊項目）, `repeat_yearly`（`0026`，`1` = 每年從開始月份重新起算，`0` = 開始月 + 月數 − 1 後自動結束）, `fund_kind`（`0026`，`save_first` 先存後付／`amortize` 已付分攤，只影響顯示）, `sort_order`, `note`, `created_at`, `updated_at`, `deleted_at`, `version`。
+- **計入規則（v2.1.0）**：某月的提撥 ＝ 該月在期間內的啟用項目 `round(total_amount / months)` 合計；總覽、記帳頁預算與月底快照都依各自的月份計算。
 
 ---
 
@@ -294,6 +295,7 @@ flowchart LR
 | `0022` | `0022_recurring_post_day.sql` | `recurring_items` 新增 `post_day INTEGER NOT NULL DEFAULT 1`（固定收支每月入帳日，自動入帳的流水帳記在此日；既有項目維持 1 日，v1.13.1） |
 | `0023` | `0023_split_receivables.sql` | 新增 `split_receivables` 同步表（複合主鍵 `(user_id, id)`、無 `DEFAULT 'owner'`、支援多對象拆帳代墊、部分／全額收回、跨幣別匯差、免還轉列支出與原子群組同步，v1.14.0） |
 | `0024` | `0024_credit_cards_and_installments.sql` | `asset_items` 新增信用卡帳單週期／額度欄位；新增 `installment_plans` 同步表（複合主鍵 `(user_id, id)`、無 `DEFAULT 'owner'`）；`cashflow_logs` 新增 `installment_plan_id` / `installment_seq` 與唯一冪等索引（v1.15.0） |
+| `0026` | `0026_sinking_schedule.sql` | `sinking_fund_items` 新增 `start_ym`、`repeat_yearly`、`fund_kind`（攤提期間：期滿自動結束或每年重複；既有項目 `start_ym` 為 `NULL`，維持不限期間的原行為，v2.1.0） |
 
 ---
 

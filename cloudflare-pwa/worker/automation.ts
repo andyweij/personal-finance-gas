@@ -8,7 +8,7 @@ import {
   computeAssetEffectiveTwdValue,
   computeAssetTwdValue,
   computeSavingsAccountSummary,
-  computeSinkingMonthlyReserve,
+  computeSinkingReserveForMonth,
   getEffectiveLedgerId,
   isAssetIncludedInNetWorth,
   isLedgerIncludedInNetWorth,
@@ -419,10 +419,8 @@ export async function runMonthEndSnapshotD1(
     }
   }
 
-  let monthlySinking = 0;
-  for (const s of full.sinkingItems) {
-    monthlySinking += computeSinkingMonthlyReserve(s);
-  }
+  // v2.1.0: 只計入快照月份在期間內的攤提
+  const monthlySinking = computeSinkingReserveForMonth(full.sinkingItems, yearMonth);
 
   const totalConsumption = Math.round(monthlyCoreExpense + monthlySinking);
   const savingsRate =
