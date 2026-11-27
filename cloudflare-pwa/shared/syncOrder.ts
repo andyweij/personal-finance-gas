@@ -60,9 +60,10 @@ export function atomicGroupKeyOf(m: unknown): string | null {
 }
 
 /**
- * Stable dependency order: every pending upsert of a record that another mutation references is moved in front of
- * the referencing mutation (together with the earlier mutations of that same record, so a record's own mutations
- * never change order). Everything else keeps its position. Cycles are broken by keeping the original order.
+ * Stable dependency order: the first pending upsert of a record that another mutation references is moved in front
+ * of the referencing mutation (together with the earlier mutations of that same record, so a record's own mutations
+ * never change order; its later edits keep their position). Everything else keeps its position. Cycles are broken by
+ * keeping the original order.
  *
  * Post-deploy review fix (v1.8.17): an atomic group (see atomicGroupKeyOf) is one node — the dependencies of ALL
  * its members are placed first and the members are then emitted together. The server applies a whole group at
@@ -99,10 +100,17 @@ export function orderMutationsByDependencies<T>(list: T[]): T[] {
     // earlier mutations of the same record first
     if (k) for (const j of byKey.get(k) || []) if (j < i) visit(j);
     for (const ref of mutationReferenceKeys(m)) {
+      // v1.8.17 review finding 1: only the referenced record's FIRST pending upsert has to come first (it creates or
+      // restores the record; its earlier mutations follow it via the rule above). Pulling its later edits as well
+      // could put such an edit before the record's own create when that create is a member of the group currently
+      // being visited (still in `visiting`, so the "earlier mutations first" rule skipped it).
       for (const j of byKey.get(ref) || []) {
         if (j === i) continue;
         const dep = list[j] as Partial<SyncMutation>;
-        if (dep && dep.op === 'upsert') visit(j);
+        if (dep && dep.op === 'upsert') {
+          visit(j);
+          break;
+        }
       }
     }
   };

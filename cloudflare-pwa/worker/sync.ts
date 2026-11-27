@@ -2963,7 +2963,14 @@ export async function importFullSnapshot(
   userId: string,
   data: Partial<FinanceSnapshot>,
   mode: 'merge' | 'replace' = 'merge'
-): Promise<{ importedLogs: number; importedRecurring: number; importedSinking: number; importedAssets: number }> {
+): Promise<{
+  importedLogs: number;
+  importedRecurring: number;
+  importedSinking: number;
+  importedAssets: number;
+  /** v1.8.17 review: ledgers recreated because imported records pointed at a ledger missing from the backup */
+  recoveredLedgers: number;
+}> {
   const uid = assertUserId(userId);
   const nowIso = new Date().toISOString();
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -3122,31 +3129,56 @@ export async function importFullSnapshot(
   }
 
   // M3: every ledger reference must resolve to the default ledger, a ledger in this import, or (merge mode) an
-  // active ledger already on the server — otherwise the money would silently drop out of every total.
+  // active ledger already on the server — otherwise the money would silently drop out of every total. Since the
+  // v1.8.17 review, an unresolved ledger is recreated as a recovered ledger (below) instead of failing the import.
   // Asset references (linked account / adjustment account / stock asset) are not rejected here: exports legitimately
   // contain records whose account was deleted earlier (those rows are inert), and refusing them would make such
-  // backups impossible to restore. New dangling asset references are blocked on the sync write path instead.
+  // backups impossible to restore. The sync write path blocks new dangling references for current clients
+  // (v1.8.11 clients get the lenient check, see refGuardSql).
+  let recoveredLedgerCount = 0;
   {
     const knownLedgers = new Set<string>([DEFAULT_LEDGER_ID, ...validatedLedgers.map((l) => l.id)]);
+    const deletedLedgerIds = new Set<string>();
     if (mode === 'merge') {
       const existingLedgers = await db
-        .prepare('SELECT id FROM ledgers WHERE user_id = ? AND deleted_at IS NULL')
+        .prepare('SELECT id, deleted_at FROM ledgers WHERE user_id = ?')
         .bind(uid)
-        .all<{ id: string }>();
-      for (const r of existingLedgers.results || []) knownLedgers.add(String(r.id));
+        .all<{ id: string; deleted_at: string | null }>();
+      for (const r of existingLedgers.results || []) {
+        if (r.deleted_at) deletedLedgerIds.add(String(r.id));
+        else knownLedgers.add(String(r.id));
+      }
     }
-    const dangling: string[] = [];
-    const checkLedger = (kind: string, id: string, ledgerId: string) => {
-      if (!knownLedgers.has(normalizeLedgerId(ledgerId))) dangling.push(`${kind} ${id} → ${ledgerId}`);
+    // v1.8.17 review finding 2: a record can point at a ledger that never reached the server (accepted by the
+    // lenient M3 path for v1.8.11 clients). Rejecting such records made the user's own backup impossible to
+    // restore. Instead, recreate each missing ledger as a "recovered" ledger that is excluded from net worth —
+    // the records become visible again and every total stays exactly as it was before the export.
+    const recoveredLedgerIds = new Map<string, string>();
+    const resolveImportLedger = (ledgerId: string): string => {
+      const lid = normalizeLedgerId(ledgerId);
+      if (knownLedgers.has(lid)) return lid;
+      let target = recoveredLedgerIds.get(lid);
+      if (!target) {
+        // a soft-deleted ledger with the same id would not be revived by the upsert below — use a fresh id
+        target = deletedLedgerIds.has(lid) ? crypto.randomUUID() : lid;
+        recoveredLedgerIds.set(lid, target);
+        knownLedgers.add(target);
+        validatedLedgers.push({
+          id: target,
+          v: validateLedgerInput({
+            name: `復原的帳本 ${lid.slice(0, 8)}`,
+            includeInNetWorth: false,
+            note: `匯入時自動重建：備份中有紀錄指向不存在的帳本（原 id：${lid.slice(0, 64)}）`,
+          }),
+          createdAt: nowIso,
+        });
+      }
+      return target;
     };
-    for (const r of validatedLogs) checkLedger('流水帳', r.id, r.v.ledgerId);
-    for (const r of validatedRecurring) checkLedger('常態收支', r.id, r.v.ledgerId);
-    for (const r of validatedAssets) checkLedger('資產', r.id, r.v.ledgerId);
-    if (dangling.length > 0) {
-      throw new Error(
-        `匯入資料中有 ${dangling.length} 筆紀錄指向不存在的帳本（例如：${dangling.slice(0, 3).join('、')}），請先確認帳本資料後再匯入。`
-      );
-    }
+    for (const r of validatedLogs) r.v.ledgerId = resolveImportLedger(r.v.ledgerId);
+    for (const r of validatedRecurring) r.v.ledgerId = resolveImportLedger(r.v.ledgerId);
+    for (const r of validatedAssets) r.v.ledgerId = resolveImportLedger(r.v.ledgerId);
+    recoveredLedgerCount = recoveredLedgerIds.size;
   }
 
   const validatedHistory = (data.netWorthHistory || []).map((h, i) => {
@@ -3667,5 +3699,6 @@ export async function importFullSnapshot(
     importedRecurring: countChanged(recurringRange),
     importedSinking: countChanged(sinkingRange),
     importedAssets: countChanged(assetsRange),
+    recoveredLedgers: recoveredLedgerCount,
   };
 }

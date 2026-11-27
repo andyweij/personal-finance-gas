@@ -287,12 +287,26 @@ describe('v1.8.12 server referential integrity (M3)', () => {
     await expectRejected(db, m);
   });
 
-  it('import rejects records pointing at an unknown ledger', async () => {
+  // v1.8.17 review finding 2 changed this from "rejects": rejecting made the user's own backup impossible to restore
+  // when a record pointed at a ledger that never reached the server. The goal of M3 here — money must not silently
+  // drop out of every total — is kept: the record is placed under a recreated ledger, excluded from net worth, so it
+  // is visible and every total is the same as before the export.
+  it('import keeps records pointing at an unknown ledger under a recovered ledger (excluded from net worth)', async () => {
     const db = createTestD1();
     const { importFullSnapshot } = await import('../worker/sync');
-    await expect(
-      importFullSnapshot(db, UID, { cashflowLogs: [{ ...cfPayload('x'), id: 'imp-1', ledgerId: 'NOPE' } as never] }, 'merge')
-    ).rejects.toThrow(/帳本/);
+    const res = await importFullSnapshot(
+      db,
+      UID,
+      { cashflowLogs: [{ ...cfPayload('x'), id: 'imp-1', ledgerId: 'NOPE' } as never] },
+      'merge'
+    );
+    expect(res.recoveredLedgers).toBe(1);
+    const recovered = await db
+      .prepare("SELECT l.id, l.name, l.include_in_net_worth FROM cashflow_logs c JOIN ledgers l ON l.user_id = c.user_id AND l.id = c.ledger_id WHERE c.id = 'imp-1'")
+      .first<{ id: string; name: string; include_in_net_worth: number }>();
+    expect(recovered?.id).toBe('NOPE');
+    expect(recovered?.name).toMatch(/復原的帳本/);
+    expect(recovered?.include_in_net_worth).toBe(0);
     // A ledger contained in the same import is fine
     await importFullSnapshot(
       db,

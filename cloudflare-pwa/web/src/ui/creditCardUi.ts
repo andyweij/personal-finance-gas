@@ -44,6 +44,26 @@ function fmtCardNative(amount: number, currency: string, masked: boolean): strin
   return fmtRaw(amount, currency, false);
 }
 
+
+/**
+ * v1.15.0 review finding 1: the anchor time of a card's base balance. Same rule as linked savings (assetsTab): a past
+ * anchor date starts at the beginning of that day; an unchanged anchor (same date and same base balance) keeps its
+ * time; otherwise the balance is "as of now", so charges entered earlier today are not counted a second time.
+ */
+function resolveCardAnchorAt(existing: AssetItem | null | undefined, anchorDate: string, baseBalance: number): string {
+  const today = todayInTimeZone();
+  if (anchorDate && anchorDate < today) return `${anchorDate}T00:00:00.000Z`;
+  if (
+    existing &&
+    existing.balanceAnchorAt &&
+    existing.balanceAnchorDate === anchorDate &&
+    Number(existing.quantityOrAmount) === baseBalance
+  ) {
+    return existing.balanceAnchorAt;
+  }
+  return new Date().toISOString();
+}
+
 export function openCreditCardModal(
   ctx: UiContext,
   existing: AssetItem | null,
@@ -223,7 +243,7 @@ export function openCreditCardModal(
         creditDueDay: Number(dueDayInp.value || 1),
         creditLimit: limitVal !== '' ? Number(limitVal) : null,
         balanceAnchorDate: anchorInp.value,
-        balanceAnchorAt: existing?.balanceAnchorAt || new Date().toISOString(),
+        balanceAnchorAt: resolveCardAnchorAt(existing, anchorInp.value, Number(balInp.value || 0)),
         ledgerId: ledgerSel?.value || defaultLedgerId,
         note: noteInp.value.trim(),
       });
@@ -611,7 +631,8 @@ export function openInstallmentPlanModal(
   const row3 = document.createElement('div');
   row3.className = 'row-2';
   row3.appendChild(makeField('總期數 (2～60)', instCountInp));
-  row3.appendChild(makeField('已入帳期數', postedInp));
+  // v1.15.0 review finding 2: posting resumes after this count, so it means installments already paid before tracking
+  row3.appendChild(makeField('已入帳期數（開始記帳前已繳的期數）', postedInp));
   form.appendChild(row3);
 
   // Quick period chips
@@ -661,7 +682,8 @@ export function openInstallmentPlanModal(
     postFirstChk.type = 'checkbox';
     postFirstChk.checked = true;
     const span = document.createElement('span');
-    span.textContent = '同時立即入帳第 1 期消費至流水帳與信用卡未繳（後續期數每月自動入帳）';
+    span.textContent =
+      '同時立即入帳到本月為止的期數（扣除「已入帳期數」；首期在未來則先入帳第 1 期），後續期數每月自動入帳';
     chkLabel.appendChild(postFirstChk);
     chkLabel.appendChild(span);
     form.appendChild(chkLabel);
