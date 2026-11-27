@@ -93,26 +93,27 @@ describe('Phase 1 (v1.9.0) — shared/ledgerSearch', () => {
       });
     });
 
-    it('computes 3m preset across year boundaries accurately', () => {
-      expect(resolveDatePresetRange('3m', '2026-01')).toEqual({
+    it('computes 3m preset anchored to todayYm across year boundaries (not historical anchorYm)', () => {
+      // Review #1: even if user browsed 2025-03, '3m' uses todayYm (2026-01 or 2026-11)
+      expect(resolveDatePresetRange('3m', '2025-03', undefined, undefined, '2026-01')).toEqual({
         from: '2025-11-01',
         to: '2026-01-31',
         swapped: false,
       });
-      expect(resolveDatePresetRange('3m', '2026-11')).toEqual({
+      expect(resolveDatePresetRange('3m', '2025-03', undefined, undefined, '2026-11')).toEqual({
         from: '2026-09-01',
         to: '2026-11-30',
         swapped: false,
       });
     });
 
-    it('computes year and all presets', () => {
-      expect(resolveDatePresetRange('year', '2026-11')).toEqual({
+    it('computes year preset anchored to todayYm (not historical anchorYm) and all preset', () => {
+      expect(resolveDatePresetRange('year', '2025-03', undefined, undefined, '2026-11')).toEqual({
         from: '2026-01-01',
         to: '2026-12-31',
         swapped: false,
       });
-      expect(resolveDatePresetRange('all', '2026-11')).toEqual({
+      expect(resolveDatePresetRange('all', '2025-03', undefined, undefined, '2026-11')).toEqual({
         from: null,
         to: null,
         swapped: false,
@@ -372,9 +373,68 @@ describe('Phase 1 (v1.9.0) — shared/ledgerSearch', () => {
       expect(cats).toContain('家電/維修');
       expect(cats).not.toContain('副業/兼職');
     });
+
+    it('v1.9.0 review #3: searches by linked savings account name and cross-ledger name', () => {
+      const accountNameById = new Map([
+        ['acc-esun', '玉山活存'],
+        ['acc-ctbc', '中信薪轉'],
+      ]);
+      // Search by linked savings account name
+      const byAcc = searchCashFlowLogs(
+        logs,
+        { query: '玉山活存', datePreset: 'all', anchorYm: '2026-11', ledgerScope: DEFAULT_LEDGER_ID },
+        sampleLedgers,
+        DEFAULT_LEDGER_ID,
+        { accountNameById }
+      );
+      expect(byAcc.items.map((i) => i.id)).toEqual(['l1', 'l2']);
+
+      // Search by ledger name in cross-ledger mode ('all')
+      const byLedger = searchCashFlowLogs(
+        logs,
+        { query: '日本旅遊公帳', datePreset: 'all', anchorYm: '2026-11', ledgerScope: 'all' },
+        sampleLedgers,
+        DEFAULT_LEDGER_ID,
+        { accountNameById }
+      );
+      expect(byLedger.items.map((i) => i.id)).toEqual(['l7-isolated']);
+    });
+
+    it('v1.9.0 review #2: includes 帳本 column when exporting cross-ledger CSV and keeps roundtrip safe', () => {
+      const ledgerNameById = new Map(sampleLedgers.map((l) => [l.id, l.name]));
+      const crossLogs = logs.filter((l) => l.id === 'l1' || l.id === 'l7-isolated');
+      const csvWithLedger = exportCashFlowCsv(crossLogs, { ledgerNameById });
+      const lines = csvWithLedger.replace(/^\uFEFF/, '').split('\n');
+      expect(lines[0]).toContain(',帳本');
+      expect(lines[1]).toContain(',個人主帳本');
+      expect(lines[2]).toContain(',日本旅遊公帳');
+
+      // Re-importing 12-column CSV still parses cleanly via parseCashFlowCsv
+      const reparsed = parseCashFlowCsv(csvWithLedger);
+      expect(reparsed).toHaveLength(2);
+
+      // Single-ledger export without option keeps original 11-column header
+      const csvDefault = exportCashFlowCsv(crossLogs);
+      expect(csvDefault.replace(/^\uFEFF/, '').split('\n')[0].endsWith(',備註')).toBe(true);
+    });
   });
 
   describe('splitHighlightSegments', () => {
+    it('v1.9.0 review #4: aligns highlight indices accurately when toLowerCase() expands UTF-16 length (e.g. İ)', () => {
+      const segs = splitHighlightSegments('İstanbul 早餐', ['早餐']);
+      expect(segs).toEqual([
+        { text: 'İstanbul ', match: false },
+        { text: '早餐', match: true },
+      ]);
+
+      const multi = splitHighlightSegments('İzmir 與 İstanbul 咖啡', ['咖啡', 'zmir']);
+      expect(multi).toEqual([
+        { text: 'İ', match: false },
+        { text: 'zmir', match: true },
+        { text: ' 與 İstanbul ', match: false },
+        { text: '咖啡', match: true },
+      ]);
+    });
     it('merges overlapping case-insensitive matches cleanly without RegExp or HTML', () => {
       const segs = splitHighlightSegments('Apple Pay at APPLE store', ['apple', 'pay']);
       expect(segs).toEqual([
