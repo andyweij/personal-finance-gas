@@ -1,5 +1,6 @@
 import { computeDividendCalendar } from '../../../shared/analytics';
-import { aggregatePeriodMetrics, filterCashFlowsByLedgerScope } from '../../../shared/calculations';
+import { aggregatePeriodMetrics, filterCashFlowsByLedgerScope, isStockAsset } from '../../../shared/calculations';
+import { todayInTimeZone } from '../../../shared/dates';
 import { fmtMoney, fmtPct, fmtRaw } from './helpers';
 import { getActiveLedgers } from './ledgerUi';
 import type { UiContext } from './state';
@@ -19,7 +20,6 @@ function estimateMonthlyConsumptionTwd(ctx: UiContext, year: number): number {
 export function renderDividendCalendarCard(ctx: UiContext, container: HTMLElement): void {
   const snap = ctx.engine.getSnapshot();
   const masked = ctx.state.masked;
-  const rate = snap.settings.usdTwdRate || 32.5;
   const year = ctx.state.dividendCalendarYear || ctx.state.selectedYear;
   const monthlyCons = estimateMonthlyConsumptionTwd(ctx, year);
 
@@ -28,14 +28,16 @@ export function renderDividendCalendarCard(ctx: UiContext, container: HTMLElemen
     snap.stockTransactions || [],
     snap.settings,
     year,
-    monthlyCons
+    monthlyCons,
+    {
+      cashflowLogs: snap.cashflowLogs,
+      referenceDateYmd: todayInTimeZone(),
+    }
   );
 
   container.innerHTML = '';
   // Show card whenever user has at least 1 holding or any dividend record
-  const hasAnyHolding = snap.assetItems.some(
-    (a) => !a.deletedAt && !a.isWatchlist && (a.subCategory === '台股' || a.subCategory === '美股/ETF')
-  );
+  const hasAnyHolding = snap.assetItems.some((a) => isStockAsset(a));
   if (!hasAnyHolding && cal.txCount === 0 && cal.availableYears.length <= 1) {
     container.style.display = 'none';
     return;
@@ -53,7 +55,9 @@ export function renderDividendCalendarCard(ctx: UiContext, container: HTMLElemen
   title.textContent = '持股配息月曆';
   const sub = document.createElement('div');
   sub.className = 'muted';
-  sub.textContent = '點擊月份柱狀檢視各檔配息明細';
+  sub.textContent = cal.hasEstimatedFx
+    ? '點擊月份柱狀檢視明細 · 未連動流水帳之外幣配息以現行匯率估算'
+    : '點擊月份柱狀檢視各檔配息明細';
   titleWrap.appendChild(title);
   titleWrap.appendChild(sub);
 
@@ -80,9 +84,11 @@ export function renderDividendCalendarCard(ctx: UiContext, container: HTMLElemen
   // KPI strip
   const kpiRow = document.createElement('div');
   kpiRow.className = 'nw-detail-grid tnum';
+  const avgLabel =
+    cal.averageMonthsCount < 12 ? `月均被動收入（前${cal.averageMonthsCount}月）` : '月均被動收入（全年）';
   const kpis: Array<[string, string, string]> = [
-    ['全年累計配息', fmtMoney(cal.annualTotalTwd, masked), cal.annualTotalTwd > 0 ? 'pos' : ''],
-    ['月均被動收入', fmtMoney(cal.monthlyAverageTwd, masked), 'inv'],
+    ['累計配息總額', fmtMoney(cal.annualTotalTwd, masked), cal.annualTotalTwd > 0 ? 'pos' : ''],
+    [avgLabel, fmtMoney(cal.monthlyAverageTwd, masked), 'inv'],
     [
       '月均消費覆蓋率',
       cal.expenseCoveragePct !== null

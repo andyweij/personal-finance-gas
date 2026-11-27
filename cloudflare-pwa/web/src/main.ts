@@ -325,6 +325,7 @@ async function bootstrap(): Promise<void> {
     rebalanceKind: 'category',
     rebalanceMode: 'buy_only',
     rebalanceContribution: '',
+    rebalanceExcludeUntargeted: false,
     stockPriceViewMode: storedStockView === 'total' ? 'total' : 'unit',
     stockCardDisplayMode: validCardMode,
     flippedStockIds: [],
@@ -480,8 +481,10 @@ async function bootstrap(): Promise<void> {
         state.ledgerSearch = createDefaultLedgerSearchState();
         state.ledgerPage = 1;
         state.networthChartSelectedYm = null;
+        state.dividendCalendarYear = getDatePartsInTimeZone(new Date()).year;
         state.dividendCalendarSelectedMonth = null;
         state.rebalanceContribution = '';
+        state.rebalanceExcludeUntargeted = false;
       } else {
         ctx.engine?.setExpectedUserId(user.id);
       }

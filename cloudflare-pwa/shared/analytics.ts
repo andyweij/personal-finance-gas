@@ -3,12 +3,23 @@ import { resolveFxRate, type FxRateSource } from './currency';
 import { roundTo } from './format';
 import type {
   AssetItem,
+  CashFlowLog,
   NetWorthHistory,
   RebalanceTargetKind,
   RebalanceTargetRule,
   StockPortfolioSummary,
   StockTransaction,
 } from './types';
+
+function shiftYearMonth(ym: string, deltaMonths: number): string | null {
+  const m = /^(\d{4})-(\d{2})$/.exec(ym.trim());
+  if (!m) return null;
+  const total = Number(m[1]) * 12 + (Number(m[2]) - 1) + deltaMonths;
+  if (total < 0) return '0000-01';
+  const y = Math.floor(total / 12);
+  const mo = (total % 12) + 1;
+  return `${String(y).padStart(4, '0')}-${String(mo).padStart(2, '0')}`;
+}
 
 export interface NetWorthTrendPoint {
   yearMonth: string;
@@ -48,7 +59,16 @@ export function computeNetWorthTrendSeries(
   }
 
   const sorted = Array.from(byYm.values()).sort((a, b) => a.yearMonth.localeCompare(b.yearMonth));
-  const sliced = range === '12m' && sorted.length > 12 ? sorted.slice(sorted.length - 12) : sorted;
+  let sliced = sorted;
+  if (range === '12m' && sorted.length > 0) {
+    const latestYm = sorted[sorted.length - 1].yearMonth;
+    const cutoffYm = shiftYearMonth(latestYm, -11);
+    sliced = cutoffYm
+      ? sorted.filter((h) => h.yearMonth >= cutoffYm)
+      : sorted.length > 12
+        ? sorted.slice(sorted.length - 12)
+        : sorted;
+  }
 
   const points: NetWorthTrendPoint[] = sliced.map((h) => {
     const totalAssets = roundTo(Number(h.totalAssets || 0), 0);
@@ -124,6 +144,7 @@ export interface DividendDetailItem {
   currency: string;
   rawAmount: number;
   twdAmount: number;
+  usedHistoricalFx: boolean;
   note: string;
 }
 
@@ -140,11 +161,18 @@ export interface DividendCalendarSummary {
   availableYears: number[];
   months: DividendMonthBucket[];
   annualTotalTwd: number;
+  averageMonthsCount: number;
   monthlyAverageTwd: number;
   maxMonthTwd: number;
   peakMonth: number | null;
   expenseCoveragePct: number | null;
+  hasEstimatedFx: boolean;
   txCount: number;
+}
+
+export interface DividendCalendarOptions {
+  cashflowLogs?: CashFlowLog[];
+  referenceDateYmd?: string;
 }
 
 export function computeDividendCalendar(
@@ -152,12 +180,19 @@ export function computeDividendCalendar(
   transactions: StockTransaction[],
   fxSource: FxRateSource,
   year: number,
-  monthlyConsumptionTwd?: number
+  monthlyConsumptionTwd?: number,
+  options?: DividendCalendarOptions
 ): DividendCalendarSummary {
   const assetById = new Map<string, AssetItem>();
   for (const a of assets || []) {
     if (!a || a.deletedAt || a.isWatchlist) continue;
     assetById.set(a.id, a);
+  }
+
+  const cashflowById = new Map<string, CashFlowLog>();
+  for (const log of options?.cashflowLogs || []) {
+    if (!log || log.deletedAt) continue;
+    cashflowById.set(log.id, log);
   }
 
   const yearSet = new Set<number>();
@@ -173,6 +208,7 @@ export function computeDividendCalendar(
   });
 
   let txCount = 0;
+  let hasEstimatedFx = false;
   for (const tx of transactions || []) {
     if (!tx || tx.deletedAt) continue;
     if (tx.txType !== STOCK_TX_TYPES.CASH_DIVIDEND) continue;
@@ -191,8 +227,21 @@ export function computeDividendCalendar(
     if (txYear !== year) continue;
 
     const currency = String(asset.currency || 'TWD').toUpperCase();
-    const rate = resolveFxRate(currency, fxSource);
-    const twdAmount = roundTo(rawAmount * rate, 0);
+    let twdAmount: number;
+    let usedHistoricalFx = false;
+    if (currency === 'TWD') {
+      twdAmount = roundTo(rawAmount, 0);
+    } else {
+      const linkedCf = tx.linkedCashflowId ? cashflowById.get(tx.linkedCashflowId) : undefined;
+      if (linkedCf && Number.isFinite(Number(linkedCf.twdAmount)) && Number(linkedCf.twdAmount) > 0) {
+        twdAmount = roundTo(Number(linkedCf.twdAmount), 0);
+        usedHistoricalFx = true;
+      } else {
+        const rate = resolveFxRate(currency, fxSource);
+        twdAmount = roundTo(rawAmount * rate, 0);
+        hasEstimatedFx = true;
+      }
+    }
     const bucket = months[txMonth - 1];
     bucket.items.push({
       txId: tx.id,
@@ -203,6 +252,7 @@ export function computeDividendCalendar(
       currency,
       rawAmount,
       twdAmount,
+      usedHistoricalFx,
       note: tx.note || '',
     });
     bucket.count += 1;
@@ -225,8 +275,20 @@ export function computeDividendCalendar(
     }
   }
 
+  let averageMonthsCount = 12;
+  if (options?.referenceDateYmd) {
+    const refMatch = /^(\d{4})-(\d{2})-\d{2}$/.exec(options.referenceDateYmd.trim());
+    if (refMatch) {
+      const refYear = Number(refMatch[1]);
+      const refMonth = Number(refMatch[2]);
+      if (year === refYear && refMonth >= 1 && refMonth <= 12) {
+        averageMonthsCount = refMonth;
+      }
+    }
+  }
+
   const annualTotalTwd = roundTo(annualRaw, 0);
-  const monthlyAverageTwd = roundTo(annualTotalTwd / 12, 0);
+  const monthlyAverageTwd = roundTo(annualTotalTwd / averageMonthsCount, 0);
   const cons = Number(monthlyConsumptionTwd || 0);
   const expenseCoveragePct =
     Number.isFinite(cons) && cons > 0 ? roundTo((monthlyAverageTwd / cons) * 100, 1) : null;
@@ -239,10 +301,12 @@ export function computeDividendCalendar(
     availableYears,
     months,
     annualTotalTwd,
+    averageMonthsCount,
     monthlyAverageTwd,
     maxMonthTwd,
     peakMonth,
     expenseCoveragePct,
+    hasEstimatedFx,
     txCount,
   };
 }
@@ -261,11 +325,13 @@ export interface RebalanceRow {
   postValueTwd: number;
   postPct: number;
   isUntargeted: boolean;
+  isMissingHolding: boolean;
 }
 
 export interface RebalancePlan {
   mode: RebalanceMode;
   kind: RebalanceTargetKind;
+  excludeUntargeted: boolean;
   currentTotalTwd: number;
   newContributionTwd: number;
   projectedTotalTwd: number;
@@ -274,6 +340,10 @@ export interface RebalancePlan {
   rows: RebalanceRow[];
   totalBuyTwd: number;
   totalSellTwd: number;
+}
+
+export interface RebalancePlanOptions {
+  excludeUntargeted?: boolean;
 }
 
 /**
@@ -304,9 +374,11 @@ export function computeRebalancePlan(
   rules: RebalanceTargetRule[],
   kind: RebalanceTargetKind,
   newContributionTwd: number,
-  mode: RebalanceMode = 'buy_only'
+  mode: RebalanceMode = 'buy_only',
+  options?: RebalancePlanOptions
 ): RebalancePlan {
   const contribution = Math.max(0, roundTo(Number(newContributionTwd || 0), 0));
+  const excludeUntargeted = Boolean(options?.excludeUntargeted);
   const kindRules = (rules || []).filter((r) => r.kind === kind);
   const targetPctSum = roundTo(
     kindRules.reduce((s, r) => s + Number(r.targetPct || 0), 0),
@@ -317,7 +389,14 @@ export function computeRebalancePlan(
   // Aggregate current holdings by key
   const buckets = new Map<
     string,
-    { key: string; label: string; currentValueTwd: number; targetPct: number; isUntargeted: boolean }
+    {
+      key: string;
+      label: string;
+      currentValueTwd: number;
+      targetPct: number;
+      isUntargeted: boolean;
+      matchedHolding: boolean;
+    }
   >();
 
   for (const r of kindRules) {
@@ -327,6 +406,7 @@ export function computeRebalancePlan(
       currentValueTwd: 0,
       targetPct: roundTo(Number(r.targetPct || 0), 2),
       isUntargeted: false,
+      matchedHolding: false,
     });
   }
 
@@ -358,6 +438,7 @@ export function computeRebalancePlan(
     const existing = buckets.get(resolvedKey);
     if (existing) {
       existing.currentValueTwd = roundTo(existing.currentValueTwd + val, 0);
+      existing.matchedHolding = true;
     } else {
       buckets.set(resolvedKey, {
         key: resolvedKey,
@@ -365,6 +446,7 @@ export function computeRebalancePlan(
         currentValueTwd: val,
         targetPct: 0,
         isUntargeted: true,
+        matchedHolding: true,
       });
     }
   }
@@ -376,12 +458,33 @@ export function computeRebalancePlan(
   );
   const projectedTotalTwd = roundTo(currentTotalTwd + contribution, 0);
 
+  const targetedCurrentTwd = roundTo(
+    list.reduce((s, b) => s + (b.isUntargeted ? 0 : b.currentValueTwd), 0),
+    0
+  );
+  const effectiveCurrentBase = excludeUntargeted ? targetedCurrentTwd : currentTotalTwd;
+  const effectiveProjectedBase = roundTo(effectiveCurrentBase + contribution, 0);
+
   let actions: number[] = list.map(() => 0);
 
   if (isValidTargets) {
     if (mode === 'full') {
-      const ideals = list.map((b) => projectedTotalTwd * (b.targetPct / 100) - b.currentValueTwd);
-      actions = roundToExactSum(ideals, contribution);
+      if (excludeUntargeted) {
+        const targetedIndices: number[] = [];
+        list.forEach((b, i) => {
+          if (!b.isUntargeted) targetedIndices.push(i);
+        });
+        const ideals = targetedIndices.map(
+          (i) => effectiveProjectedBase * (list[i].targetPct / 100) - list[i].currentValueTwd
+        );
+        const rounded = roundToExactSum(ideals, contribution);
+        targetedIndices.forEach((idx, pos) => {
+          actions[idx] = rounded[pos];
+        });
+      } else {
+        const ideals = list.map((b) => projectedTotalTwd * (b.targetPct / 100) - b.currentValueTwd);
+        actions = roundToExactSum(ideals, contribution);
+      }
     } else if (contribution > 0) {
       // buy_only water-fill: never sell overweight buckets; distribute 100% of `contribution` to most-underweight targets
       const activeIndices = new Set<number>();
@@ -431,11 +534,16 @@ export function computeRebalancePlan(
     if (actionTwd > 0) totalBuyTwd += actionTwd;
     else if (actionTwd < 0) totalSellTwd += Math.abs(actionTwd);
 
-    const currentPct = currentTotalTwd > 0 ? roundTo((b.currentValueTwd / currentTotalTwd) * 100, 1) : 0;
+    const isExcludedRow = excludeUntargeted && b.isUntargeted;
+    const pctBaseCur = isExcludedRow ? currentTotalTwd : effectiveCurrentBase;
+    const pctBasePost = isExcludedRow ? projectedTotalTwd : effectiveProjectedBase;
+    const currentPct = pctBaseCur > 0 ? roundTo((b.currentValueTwd / pctBaseCur) * 100, 1) : 0;
     const postValueTwd = roundTo(b.currentValueTwd + actionTwd, 0);
-    const postPct = projectedTotalTwd > 0 ? roundTo((postValueTwd / projectedTotalTwd) * 100, 1) : 0;
-    const targetValueAfterTwd = roundTo(projectedTotalTwd * (b.targetPct / 100), 0);
-    const driftPct = roundTo(currentPct - b.targetPct, 1);
+    const postPct = pctBasePost > 0 ? roundTo((postValueTwd / pctBasePost) * 100, 1) : 0;
+    const targetValueAfterTwd = isExcludedRow
+      ? b.currentValueTwd
+      : roundTo(effectiveProjectedBase * (b.targetPct / 100), 0);
+    const driftPct = isExcludedRow ? 0 : roundTo(currentPct - b.targetPct, 1);
 
     return {
       key: b.key,
@@ -449,6 +557,7 @@ export function computeRebalancePlan(
       postValueTwd,
       postPct,
       isUntargeted: b.isUntargeted,
+      isMissingHolding: kind === 'ticker' && !b.isUntargeted && !b.matchedHolding,
     };
   });
 
@@ -460,6 +569,7 @@ export function computeRebalancePlan(
   return {
     mode,
     kind,
+    excludeUntargeted,
     currentTotalTwd,
     newContributionTwd: contribution,
     projectedTotalTwd,

@@ -71,6 +71,7 @@ export interface AppUiState {
   rebalanceKind: RebalanceTargetKind;
   rebalanceMode: RebalanceMode;
   rebalanceContribution: string;
+  rebalanceExcludeUntargeted: boolean;
   stockPriceViewMode: 'unit' | 'total';
   stockCardDisplayMode: StockCardDisplayMode;
   flippedStockIds: string[];

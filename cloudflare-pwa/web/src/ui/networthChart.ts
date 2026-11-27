@@ -90,8 +90,8 @@ function buildLineChartSvg(
     }
   }
 
-  // Zero baseline when negative net worth exists
-  if (minVal < 0 && maxVal > 0) {
+  // Zero baseline when negative net worth exists (hidden when masked so sign is not leaked)
+  if (!masked && minVal < 0 && maxVal > 0) {
     const y0 = yAt(0);
     svg.appendChild(
       svgEl('line', {
@@ -207,10 +207,13 @@ function buildLineChartSvg(
       })
     );
 
-    const hit = svgEl('circle', {
-      cx: cx.toFixed(1),
-      cy: cy.toFixed(1),
-      r: 13,
+    const leftX = i === 0 ? padL : (xAt(i - 1) + cx) / 2;
+    const rightX = i === points.length - 1 ? W - padR : (cx + xAt(i + 1)) / 2;
+    const hit = svgEl('rect', {
+      x: leftX.toFixed(1),
+      y: padT,
+      width: Math.max(1, rightX - leftX).toFixed(1),
+      height: plotH,
       fill: 'transparent',
       style: 'cursor:pointer',
     });
@@ -363,10 +366,12 @@ function buildStackedAreaSvg(
       );
     }
 
+    const leftX = i === 0 ? padL : (xAt(i - 1) + cx) / 2;
+    const rightX = i === points.length - 1 ? W - padR : (cx + xAt(i + 1)) / 2;
     const hit = svgEl('rect', {
-      x: (cx - Math.max(10, plotW / Math.max(2, points.length * 2))).toFixed(1),
+      x: leftX.toFixed(1),
       y: padT,
-      width: Math.max(20, plotW / Math.max(1, points.length)).toFixed(1),
+      width: Math.max(1, rightX - leftX).toFixed(1),
       height: plotH,
       fill: 'transparent',
       style: 'cursor:pointer',
@@ -428,7 +433,13 @@ export function renderNetWorthChartCard(ctx: UiContext, container: HTMLElement):
     sub.textContent = masked
       ? `期間變化：•••••`
       : `期間變化：${sign}${fmtMoney(trend.deltaAmount, false)}${pctPart}`;
-    sub.style.color = trend.deltaAmount > 0 ? 'var(--pos)' : trend.deltaAmount < 0 ? 'var(--neg)' : 'var(--text-secondary)';
+    sub.style.color = masked
+      ? 'var(--text-secondary)'
+      : trend.deltaAmount > 0
+        ? 'var(--pos)'
+        : trend.deltaAmount < 0
+          ? 'var(--neg)'
+          : 'var(--text-secondary)';
   } else {
     sub.textContent = '累積 2 期以上快照即可檢視成長曲線';
   }
@@ -536,9 +547,9 @@ export function renderNetWorthChartCard(ctx: UiContext, container: HTMLElement):
   const pairs: Array<[string, string, string]> =
     mode === 'line'
       ? [
-          ['淨資產', fmtMoney(selectedPoint.netWorth, masked), selectedPoint.netWorth >= 0 ? 'pos' : 'neg'],
+          ['淨資產', fmtMoney(selectedPoint.netWorth, masked), masked ? '' : selectedPoint.netWorth >= 0 ? 'pos' : 'neg'],
           ['總資產', fmtMoney(selectedPoint.totalAssets, masked), ''],
-          ['總負債', fmtMoney(selectedPoint.totalLiabilities, masked), selectedPoint.totalLiabilities > 0 ? 'neg' : ''],
+          ['總負債', fmtMoney(selectedPoint.totalLiabilities, masked), masked ? '' : selectedPoint.totalLiabilities > 0 ? 'neg' : ''],
         ]
       : [
           ['高流動', fmtMoney(selectedPoint.highLiquidityAssets, masked), ''],

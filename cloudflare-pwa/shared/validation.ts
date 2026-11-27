@@ -126,7 +126,9 @@ export function normalizeCustomStockCategories(value: unknown): string[] {
   return out;
 }
 
-export function normalizeRebalanceTargets(value: unknown): RebalanceTargetRule[] {
+export const MAX_REBALANCE_TARGETS_PER_KIND = 100;
+
+function parseRebalanceTargetItems(value: unknown): RebalanceTargetRule[] {
   let rawList: unknown[] = [];
   if (Array.isArray(value)) {
     rawList = value;
@@ -157,26 +159,42 @@ export function normalizeRebalanceTargets(value: unknown): RebalanceTargetRule[]
     const id = String(obj.id || dedupKey).trim().slice(0, 64) || dedupKey;
     seen.add(dedupKey);
     out.push({ id, kind, key, label, targetPct });
-    if (out.length >= 30) break;
+  }
+  return out;
+}
+
+export function normalizeRebalanceTargets(value: unknown): RebalanceTargetRule[] {
+  const parsed = parseRebalanceTargetItems(value);
+  const counts: Record<RebalanceTargetKind, number> = { category: 0, ticker: 0 };
+  const out: RebalanceTargetRule[] = [];
+  for (const rule of parsed) {
+    if (counts[rule.kind] >= MAX_REBALANCE_TARGETS_PER_KIND) continue;
+    counts[rule.kind] += 1;
+    out.push(rule);
   }
   return out;
 }
 
 export function validateRebalanceTargetsForSave(rules: unknown): RebalanceTargetRule[] {
-  const normalized = normalizeRebalanceTargets(rules);
+  const parsed = parseRebalanceTargetItems(rules);
   for (const kind of ['category', 'ticker'] as const) {
-    const group = normalized.filter((r) => r.kind === kind);
+    const group = parsed.filter((r) => r.kind === kind);
     if (!group.length) continue;
+    const kindLabel = kind === 'category' ? '分類目標' : '標的目標';
+    if (group.length > MAX_REBALANCE_TARGETS_PER_KIND) {
+      throw new Error(
+        `${kindLabel}最多可設定 ${MAX_REBALANCE_TARGETS_PER_KIND} 筆（目前為 ${group.length} 筆），請精簡後再儲存。`
+      );
+    }
     const sum = roundTo(
       group.reduce((s, r) => s + r.targetPct, 0),
       2
     );
     if (Math.abs(sum - 100) > 0.01) {
-      const kindLabel = kind === 'category' ? '分類目標' : '標的目標';
       throw new Error(`${kindLabel}比例合計需為 100%（目前為 ${sum.toFixed(1)}%）`);
     }
   }
-  return normalized;
+  return normalizeRebalanceTargets(parsed);
 }
 
 export function normalizeCustomCategories(value: unknown): CustomCategoriesMap {

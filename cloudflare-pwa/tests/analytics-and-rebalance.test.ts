@@ -8,11 +8,13 @@ import {
   computeRebalancePlan,
 } from '../shared/analytics';
 import {
+  MAX_REBALANCE_TARGETS_PER_KIND,
   normalizeRebalanceTargets,
   validateRebalanceTargetsForSave,
 } from '../shared/validation';
 import type {
   AssetItem,
+  CashFlowLog,
   NetWorthHistory,
   RebalanceTargetRule,
   StockTransaction,
@@ -343,6 +345,237 @@ describe('Phase 2 (v1.10.0) — Analytics, Dividend Calendar & Rebalance', () =>
       await importFullSnapshot(rawD1, 'u-reb', legacyPayload, 'replace');
       const afterLegacy = await exportFullSnapshot(rawD1, 'u-reb');
       expect(Array.isArray(afterLegacy.settings.rebalanceTargets)).toBe(true);
+    });
+  });
+
+  describe('5. v1.10.0 Review Fixes Regression Tests (#1, #2, 4-4, 4-6, 4-7, 4-8, 4-9)', () => {
+    it('#1: rejects non-empty rebalanceTargets on pre-0018 DB instead of silently dropping, and aligns importFullSnapshot', async () => {
+      const dbPre18 = createTestD1({ stopBefore: '0018' });
+      await seedUser(dbPre18, 'u-pre18');
+
+      // Saving regular budget without rebalanceTargets still works on pre-0018 schema
+      const budgetRes = await processSyncRequest(dbPre18, 'u-pre18', {
+        sinceSeq: 0,
+        clientEpoch: 1,
+        mutations: [
+          {
+            mutationId: 'm-budget-ok',
+            entity: 'settings',
+            op: 'upsert',
+            recordId: '1',
+            clientTimestamp: '2026-11-27T01:00:00.000Z',
+            baseVersion: 1,
+            payload: { monthlyDailyBudget: 25000, rebalanceTargets: [] },
+          },
+        ],
+      });
+      expect(budgetRes.ackedMutationIds).toContain('m-budget-ok');
+      expect(budgetRes.rejected).toEqual([]);
+
+      // Saving non-empty rebalanceTargets on pre-0018 DB MUST be rejected (not silently acked)
+      const rebRes = await processSyncRequest(dbPre18, 'u-pre18', {
+        sinceSeq: 0,
+        clientEpoch: 1,
+        mutations: [
+          {
+            mutationId: 'm-reb-reject',
+            entity: 'settings',
+            op: 'upsert',
+            recordId: '1',
+            clientTimestamp: '2026-11-27T01:01:00.000Z',
+            baseVersion: 2,
+            payload: {
+              monthlyDailyBudget: 25000,
+              rebalanceTargets: [
+                { id: 'c1', kind: 'category', key: 'ETF', label: 'ETF', targetPct: 100 },
+              ],
+            },
+          },
+        ],
+      });
+      expect(rebRes.ackedMutationIds).not.toContain('m-reb-reject');
+      expect(rebRes.rejected).toHaveLength(1);
+      expect(rebRes.rejected[0].reason).toMatch(/尚未完成升級|資料庫遷移/);
+
+      // importFullSnapshot behaves consistently: rejects backup with rebalanceTargets, allows legacy backup without
+      const exported = await exportFullSnapshot(dbPre18, 'u-pre18');
+      await expect(
+        importFullSnapshot(
+          dbPre18,
+          'u-pre18',
+          {
+            ...exported,
+            settings: {
+              ...exported.settings,
+              rebalanceTargets: [{ id: 'c1', kind: 'category', key: 'ETF', label: 'ETF', targetPct: 100 }],
+            },
+          },
+          'replace'
+        )
+      ).rejects.toThrow(/尚未完成升級|資料庫遷移/);
+
+      await expect(
+        importFullSnapshot(
+          dbPre18,
+          'u-pre18',
+          {
+            ...exported,
+            settings: {
+              ...exported.settings,
+              rebalanceTargets: undefined,
+              customCategories: undefined,
+              quickTemplates: undefined,
+              enabledCurrencies: undefined,
+              fxRates: undefined,
+            },
+          },
+          'replace'
+        )
+      ).resolves.toBeTruthy();
+    });
+
+    it('#2: tracks rebalance rule limits independently per kind and throws explicit error when exceeding cap', () => {
+      // 25 ticker rules (4% each) + 10 category rules (10% each) = 35 total -> MUST NOT truncate!
+      const ticker25: RebalanceTargetRule[] = Array.from({ length: 25 }, (_, i) => ({
+        id: `t-${i}`,
+        kind: 'ticker',
+        key: `T${i}`,
+        label: `Ticker ${i}`,
+        targetPct: 4,
+      }));
+      const cat10: RebalanceTargetRule[] = Array.from({ length: 10 }, (_, i) => ({
+        id: `c-${i}`,
+        kind: 'category',
+        key: `Cat${i}`,
+        label: `Cat ${i}`,
+        targetPct: 10,
+      }));
+      const merged = validateRebalanceTargetsForSave([...ticker25, ...cat10]);
+      expect(merged.filter((r) => r.kind === 'ticker')).toHaveLength(25);
+      expect(merged.filter((r) => r.kind === 'category')).toHaveLength(10);
+
+      // 35 ticker rules summing to 100% -> succeeds
+      const ticker35: RebalanceTargetRule[] = Array.from({ length: 35 }, (_, i) => ({
+        id: `s-${i}`,
+        kind: 'ticker',
+        key: `S${i}`,
+        label: `Stock ${i}`,
+        targetPct: i === 0 ? 3.1 : 2.85,
+      }));
+      expect(validateRebalanceTargetsForSave(ticker35)).toHaveLength(35);
+
+      // Exceeding MAX_REBALANCE_TARGETS_PER_KIND throws explicit count error, not misleading sum error
+      const overCap: RebalanceTargetRule[] = Array.from(
+        { length: MAX_REBALANCE_TARGETS_PER_KIND + 1 },
+        (_, i) => ({
+          id: `o-${i}`,
+          kind: 'ticker',
+          key: `O${i}`,
+          label: `Over ${i}`,
+          targetPct: 0.5,
+        })
+      );
+      expect(() => validateRebalanceTargetsForSave(overCap)).toThrow(/最多可設定/);
+    });
+
+    it('4-4 & 4-8: flags missing holdings in ticker mode and supports excluding untargeted holdings in full mode', () => {
+      const assets: AssetItem[] = [
+        makeStockAsset({ id: 'a-etf', itemName: '0050', ticker: '0050', quantityOrAmount: 1000, unitPrice: 600, stockCategory: 'ETF' }), // 600k
+        makeStockAsset({ id: 'a-bond', itemName: '00679B', ticker: '00679B', quantityOrAmount: 2500, unitPrice: 40, stockCategory: '債券ETF' }), // 100k
+        makeStockAsset({ id: 'a-untagged', itemName: '零股', ticker: '2884', quantityOrAmount: 1000, unitPrice: 50, stockCategory: '' }), // 50k untargeted
+      ];
+      const portfolio = computeStockPortfolioSummary(assets, [], 32);
+
+      // 4-4: ticker rule pointing to a deleted/sold-out asset gets isMissingHolding = true
+      const tickerRules: RebalanceTargetRule[] = [
+        { id: 't1', kind: 'ticker', key: 'a-etf', label: '0050', targetPct: 60 },
+        { id: 't2', kind: 'ticker', key: 'a-deleted-stock', label: '已賣光 (9999)', targetPct: 40 },
+      ];
+      const tickerPlan = computeRebalancePlan(portfolio, tickerRules, 'ticker', 0, 'buy_only');
+      expect(tickerPlan.rows.find((r) => r.key === 'a-etf')?.isMissingHolding).toBe(false);
+      expect(tickerPlan.rows.find((r) => r.key === 'a-deleted-stock')?.isMissingHolding).toBe(true);
+
+      // 4-8: full mode with excludeUntargeted = false sells untargeted; with true leaves untargeted untouched
+      const catRules: RebalanceTargetRule[] = [
+        { id: 'c1', kind: 'category', key: 'ETF', label: 'ETF', targetPct: 50 },
+        { id: 'c2', kind: 'category', key: '債券ETF', label: '債券ETF', targetPct: 50 },
+      ];
+      const fullDefault = computeRebalancePlan(portfolio, catRules, 'category', 0, 'full');
+      expect(fullDefault.rows.find((r) => r.key === '未分類')?.actionTwd).toBe(-50_000);
+
+      const fullExcluded = computeRebalancePlan(portfolio, catRules, 'category', 0, 'full', {
+        excludeUntargeted: true,
+      });
+      const untargetedRow = fullExcluded.rows.find((r) => r.key === '未分類')!;
+      expect(untargetedRow.actionTwd).toBe(0);
+      expect(untargetedRow.postValueTwd).toBe(50_000);
+      // Targeted 700k rebalanced 50/50 -> ETF -250k, 債券ETF +250k
+      expect(fullExcluded.rows.find((r) => r.key === 'ETF')?.actionTwd).toBe(-250_000);
+      expect(fullExcluded.rows.find((r) => r.key === '債券ETF')?.actionTwd).toBe(250_000);
+      expect(fullExcluded.totalBuyTwd).toBe(250_000);
+      expect(fullExcluded.totalSellTwd).toBe(250_000);
+    });
+
+    it('4-6 & 4-9: divides current-year dividends by elapsed months and uses historical linkedCashflowId TWD amount', () => {
+      const assets: AssetItem[] = [
+        makeStockAsset({ id: 'a-voo', itemName: 'VOO', ticker: 'VOO', subCategory: '美股/ETF', currency: 'USD' }),
+      ];
+      const linkedCf: CashFlowLog = {
+        id: 'cf-div-1',
+        date: '2026-03-15',
+        yearMonth: '2026-03',
+        type: '其他收入',
+        category: '股息',
+        itemName: 'VOO 現金配息',
+        amount: 100,
+        currency: 'USD',
+        fxRate: 31.5,
+        twdAmount: 3150,
+        source: '手動',
+        note: '',
+        createdAt: '2026-03-15T00:00:00.000Z',
+        updatedAt: '2026-03-15T00:00:00.000Z',
+        deletedAt: null,
+      };
+      const txs: StockTransaction[] = [
+        makeStockTx({ id: 't-linked', assetId: 'a-voo', date: '2026-03-15', totalAmount: 100, linkedCashflowId: 'cf-div-1' }),
+        makeStockTx({ id: 't-unlinked', assetId: 'a-voo', date: '2026-06-15', totalAmount: 100 }),
+      ];
+
+      // Current FX is 35, but linked tx must stay 3150; unlinked uses 3500; referenceDateYmd = 2026-06-20 -> 6 elapsed months
+      const cal = computeDividendCalendar(assets, txs, 35, 2026, 10_000, {
+        cashflowLogs: [linkedCf],
+        referenceDateYmd: '2026-06-20',
+      });
+      expect(cal.months[2].totalTwd).toBe(3150);
+      expect(cal.months[2].items[0].usedHistoricalFx).toBe(true);
+      expect(cal.months[5].totalTwd).toBe(3500);
+      expect(cal.months[5].items[0].usedHistoricalFx).toBe(false);
+      expect(cal.hasEstimatedFx).toBe(true);
+      expect(cal.annualTotalTwd).toBe(6650);
+      expect(cal.averageMonthsCount).toBe(6);
+      expect(cal.monthlyAverageTwd).toBe(Math.round(6650 / 6));
+
+      // Past year still divides by full 12 months
+      const calPast = computeDividendCalendar(assets, txs, 35, 2025, 10_000, {
+        cashflowLogs: [linkedCf],
+        referenceDateYmd: '2026-06-20',
+      });
+      expect(calPast.averageMonthsCount).toBe(12);
+    });
+
+    it('4-7: 12m net worth range filters strictly by last 12 calendar months even with gaps', () => {
+      const sparse = [
+        makeHistory('2025-01', { netWorth: 500_000 }),
+        makeHistory('2025-11', { netWorth: 700_000 }),
+        makeHistory('2026-10', { netWorth: 900_000 }),
+      ];
+      const last12 = computeNetWorthTrendSeries(sparse, '12m');
+      // Window for latest 2026-10 is 2025-11..2026-10 (12 calendar months); 2025-01 must be excluded
+      expect(last12.points.map((p) => p.yearMonth)).toEqual(['2025-11', '2026-10']);
+
+      const all = computeNetWorthTrendSeries(sparse, 'all');
+      expect(all.points.map((p) => p.yearMonth)).toEqual(['2025-01', '2025-11', '2026-10']);
     });
   });
 });

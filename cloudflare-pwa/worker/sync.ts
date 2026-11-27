@@ -1120,27 +1120,56 @@ async function applySingleMutation(
       p.quickTemplates !== undefined
         ? normalizeQuickTemplates(p.quickTemplates)
         : existing.quickTemplates || [];
+    const optionalSettingCols: Array<{
+      col: string;
+      hasNonDefaultPayload: boolean;
+      value: string;
+      label: string;
+    }> = [
+      {
+        col: 'rebalance_targets_json',
+        hasNonDefaultPayload: p.rebalanceTargets !== undefined && rebalanceTargets.length > 0,
+        value: JSON.stringify(rebalanceTargets),
+        label: '再平衡目標',
+      },
+      {
+        col: 'custom_categories_json',
+        hasNonDefaultPayload: p.customCategories !== undefined && Object.keys(customCategories).length > 0,
+        value: JSON.stringify(customCategories),
+        label: '自訂分類',
+      },
+      {
+        col: 'quick_templates_json',
+        hasNonDefaultPayload: p.quickTemplates !== undefined && quickTemplates.length > 0,
+        value: JSON.stringify(quickTemplates),
+        label: '快速記帳範本',
+      },
+      {
+        col: 'enabled_currencies_json',
+        hasNonDefaultPayload:
+          p.enabledCurrencies !== undefined && enabledCurrencies.some((c) => c !== 'TWD' && c !== 'USD'),
+        value: JSON.stringify(enabledCurrencies),
+        label: '多幣別清單',
+      },
+      {
+        col: 'fx_rates_json',
+        hasNonDefaultPayload:
+          p.fxRates !== undefined && Object.keys(fxRates).some((k) => k !== 'USD'),
+        value: JSON.stringify(fxRates),
+        label: '多幣別匯率',
+      },
+    ];
     const extraCols: string[] = [];
     const extraVals: unknown[] = [];
-    if (!existingRow || 'rebalance_targets_json' in existingRow) {
-      extraCols.push('rebalance_targets_json = ?');
-      extraVals.push(JSON.stringify(rebalanceTargets));
-    }
-    if (!existingRow || 'custom_categories_json' in existingRow) {
-      extraCols.push('custom_categories_json = ?');
-      extraVals.push(JSON.stringify(customCategories));
-    }
-    if (!existingRow || 'quick_templates_json' in existingRow) {
-      extraCols.push('quick_templates_json = ?');
-      extraVals.push(JSON.stringify(quickTemplates));
-    }
-    if (!existingRow || 'enabled_currencies_json' in existingRow) {
-      extraCols.push('enabled_currencies_json = ?');
-      extraVals.push(JSON.stringify(enabledCurrencies));
-    }
-    if (!existingRow || 'fx_rates_json' in existingRow) {
-      extraCols.push('fx_rates_json = ?');
-      extraVals.push(JSON.stringify(fxRates));
+    for (const opt of optionalSettingCols) {
+      if (!existingRow || opt.col in existingRow) {
+        extraCols.push(`${opt.col} = ?`);
+        extraVals.push(opt.value);
+      } else if (opt.hasNonDefaultPayload) {
+        throw new RejectError(
+          `伺服器資料庫尚未完成升級（缺少「${opt.label}」欄位），請先執行資料庫遷移後再重試。`
+        );
+      }
     }
     const extraSql = extraCols.length ? `, ${extraCols.join(', ')}` : '';
     const writeStmt = db
@@ -3400,6 +3429,10 @@ export async function importFullSnapshot(
   }
 
   if (data.settings) {
+    const existingSettingsRow = await db
+      .prepare('SELECT * FROM app_settings WHERE user_id = ?')
+      .bind(uid)
+      .first<Record<string, unknown>>();
     const customStockCategories = normalizeCustomStockCategories(
       data.settings.customStockCategories ?? currentSettings.customStockCategories
     );
@@ -3425,11 +3458,66 @@ export async function importFullSnapshot(
         : currentSettings.autoFxEnabled !== undefined
           ? currentSettings.autoFxEnabled
           : true;
+
+    const optionalImportCols: Array<{
+      col: string;
+      hasNonDefaultPayload: boolean;
+      value: string;
+      label: string;
+    }> = [
+      {
+        col: 'rebalance_targets_json',
+        hasNonDefaultPayload: data.settings.rebalanceTargets !== undefined && rebalanceTargets.length > 0,
+        value: JSON.stringify(rebalanceTargets),
+        label: '再平衡目標',
+      },
+      {
+        col: 'custom_categories_json',
+        hasNonDefaultPayload:
+          data.settings.customCategories !== undefined && Object.keys(customCategories).length > 0,
+        value: JSON.stringify(customCategories),
+        label: '自訂分類',
+      },
+      {
+        col: 'quick_templates_json',
+        hasNonDefaultPayload: data.settings.quickTemplates !== undefined && quickTemplates.length > 0,
+        value: JSON.stringify(quickTemplates),
+        label: '快速記帳範本',
+      },
+      {
+        col: 'enabled_currencies_json',
+        hasNonDefaultPayload:
+          data.settings.enabledCurrencies !== undefined &&
+          enabledCurrencies.some((c) => c !== 'TWD' && c !== 'USD'),
+        value: JSON.stringify(enabledCurrencies),
+        label: '多幣別清單',
+      },
+      {
+        col: 'fx_rates_json',
+        hasNonDefaultPayload:
+          data.settings.fxRates !== undefined && Object.keys(fxRates).some((k) => k !== 'USD'),
+        value: JSON.stringify(fxRates),
+        label: '多幣別匯率',
+      },
+    ];
+    const importExtraCols: string[] = [];
+    const importExtraVals: unknown[] = [];
+    for (const opt of optionalImportCols) {
+      if (!existingSettingsRow || opt.col in existingSettingsRow) {
+        importExtraCols.push(`${opt.col} = ?`);
+        importExtraVals.push(opt.value);
+      } else if (opt.hasNonDefaultPayload) {
+        throw new Error(
+          `伺服器資料庫尚未完成升級（缺少「${opt.label}」欄位），請先執行資料庫遷移後再匯入備份。`
+        );
+      }
+    }
+    const importExtraSql = importExtraCols.length ? `, ${importExtraCols.join(', ')}` : '';
     stmts.push(
       db
         .prepare(
           `UPDATE app_settings
-           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, rebalance_targets_json = ?, custom_categories_json = ?, quick_templates_json = ?, enabled_currencies_json = ?, fx_rates_json = ?, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
+           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?${importExtraSql}, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
            WHERE user_id = ?`
         )
         .bind(
@@ -3439,11 +3527,7 @@ export async function importFullSnapshot(
           autoFxEnabled ? 1 : 0,
           normalizePnlColorScheme(data.settings.pnlColorScheme ?? currentSettings.pnlColorScheme),
           JSON.stringify(customStockCategories),
-          JSON.stringify(rebalanceTargets),
-          JSON.stringify(customCategories),
-          JSON.stringify(quickTemplates),
-          JSON.stringify(enabledCurrencies),
-          JSON.stringify(fxRates),
+          ...importExtraVals,
           nowIso,
           uid,
           uid
