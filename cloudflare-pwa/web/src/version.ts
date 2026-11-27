@@ -2,7 +2,7 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '2.1.0';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '2.2.0';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0026';
@@ -10,6 +10,7 @@ export const DB_SCHEMA_VERSION = '0026';
 export const SW_CACHE_VERSION = 'finance-pwa';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v2.2.0：新增「簡潔版」介面，可在「設定」或「更多」切換，兩個版本共用同一份資料，只套用在這台裝置。簡潔版的底部導覽為首頁、明細、＋記一筆、資產、更多：首頁顯示本月還可以花、收入、總支出、儲蓄率與最近交易；記帳改成底部面板，次要欄位收進「更多選項」；資產頁的操作收成一顆「＋」並加上台股持股入口；計算機改放在金額欄位旁。',
   'v2.1.0：「稅金分攤」改為「大額攤提」，可設定開始月份。一次性攤提期滿自動結束，不用再記得停用；所得稅、保費等可選「每年重複」。總覽、記帳頁預算與月底快照改依各自的月份計算，回看過去月份不再套用今天的設定。沒有開始月份的舊項目維持原行為。需執行資料庫遷移 0026。',
   'v2.0.1：匯出 JSON 和流水帳 CSV 時會排除加入的他人帳本。還原包含自己共同帳本的備份前會先提示。若擁有者覆蓋還原，受影響帳本的待送異動會暫停上傳。成員資格撤銷後，下次同步會清除該帳本的本機資料。',
   'v2.0.0：可為自建帳本產生一次性邀請碼，邀請已註冊的成員共同記帳或僅檢視。加入的帳本可自行選擇是否納入個人淨值。',

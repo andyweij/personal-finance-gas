@@ -56,3 +56,11 @@ export function ymdInTimeZone(iso: string, timeZone: string = APP_TIMEZONE): str
   if (Number.isNaN(d.getTime())) return String(iso || '').slice(0, 10);
   return getDatePartsInTimeZone(d, timeZone).ymd;
 }
+
+/** 本月剩餘天數（含今天）；檢視的不是本月時回傳 null */
+export function remainingDaysInMonth(ym: string, todayYmd: string): number | null {
+  if (todayYmd.slice(0, 7) !== ym) return null;
+  const [y, m] = ym.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return lastDay - Number(todayYmd.slice(8, 10)) + 1;
+}

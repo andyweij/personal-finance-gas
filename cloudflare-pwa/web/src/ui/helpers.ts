@@ -1,5 +1,7 @@
 import { formatCurrencyRaw } from '../../../shared/currency';
 import { formatPercent, roundTo } from '../../../shared/format';
+import { openCalculatorFor } from './calculatorUi';
+
 export const EYE_OPEN_SVG =
   '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>';
 export const EYE_OFF_SVG =
@@ -155,6 +157,9 @@ export function closeModal(): void {
   if (back && document.contains(back)) back.focus();
 }
 
+const CALC_ICON_SVG =
+  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M8 6h8M8 11h.01M12 11h.01M16 11h.01M8 15h.01M12 15h.01M16 15h.01M8 19h.01M12 19h.01M16 19h.01"/></svg>';
+
 export function makeInputField(
   label: string,
   id: string,
@@ -181,6 +186,21 @@ export function makeInputField(
   if (placeholder) inp.placeholder = placeholder;
   if (required) inp.required = true;
   wrap.appendChild(lbl);
+  // v2.2.0 簡潔版：數字欄位旁放計算機鍵（取代浮動計算機按鈕），算完直接帶回這個欄位
+  if (type === 'number' && document.documentElement.dataset.ui === 'simple') {
+    const row = document.createElement('div');
+    row.className = 'input-with-calc';
+    const calcBtn = document.createElement('button');
+    calcBtn.type = 'button';
+    calcBtn.className = 'input-calc-btn';
+    calcBtn.setAttribute('aria-label', `用計算機輸入「${label}」`);
+    calcBtn.innerHTML = CALC_ICON_SVG;
+    calcBtn.addEventListener('click', () => openCalculatorFor(inp));
+    row.appendChild(inp);
+    row.appendChild(calcBtn);
+    wrap.appendChild(row);
+    return wrap;
+  }
   wrap.appendChild(inp);
   return wrap;
 }

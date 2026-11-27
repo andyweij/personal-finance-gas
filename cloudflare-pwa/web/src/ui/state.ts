@@ -48,7 +48,8 @@ export type ReorderSectionKey =
 
 export interface AppUiState {
   masked: boolean;
-  activeTab: 'log' | 'overview' | 'assets' | 'stocks' | 'tools';
+  /** v2.2.0: 'home' and 'more' exist only in the 簡潔版 */
+  activeTab: 'home' | 'log' | 'overview' | 'assets' | 'stocks' | 'tools' | 'more';
   logSubtab: 'entry' | 'ledger';
   ledgerMode: 'list' | 'calendar';
   ledgerPage: number;
@@ -115,6 +116,10 @@ export interface UiContext {
   switchAccountDb: (user: AuthUser) => Promise<void>;
   applyUtilityTabVisibility: () => void;
   applyPnlColorScheme: (scheme: PnlColorScheme) => void;
+  /** v2.2.0: switch between the 簡潔版 and 經典版 on this device */
+  setUiVariant: (variant: 'classic' | 'simple') => void;
+  /** v2.2.0: open the 記一筆 sheet (簡潔版); in the 經典版 it goes to the entry form */
+  openQuickAdd: () => void;
 }
 
 

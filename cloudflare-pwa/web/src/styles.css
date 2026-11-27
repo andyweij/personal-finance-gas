@@ -3148,3 +3148,136 @@ mark.search-hit {
     color: #fbbf24;
   }
 }
+
+/* =====================================================================
+   v2.2.0 簡潔版（:root[data-ui="simple"]）
+   只重新排列既有區塊；經典版不受影響。
+   ===================================================================== */
+.simple-nav,
+.simple-subhead,
+.simple-page-title,
+.simple-assets-head,
+.simple-stocks-row,
+.qa-type-seg,
+.qa-more-toggle,
+.amount-calc-btn,
+.label-simple,
+.input-calc-btn { display: none; }
+
+:root[data-ui="simple"] .label-classic { display: none; }
+:root[data-ui="simple"] .label-simple { display: inline; }
+:root[data-ui="simple"] #bottomNav,
+:root[data-ui="simple"] #calcFabBtn,
+:root[data-ui="simple"] #fxTopPill,
+:root[data-ui="simple"] #refreshBtn { display: none !important; }
+
+/* 底部導覽：首頁／明細／＋記一筆／資產／更多 */
+:root[data-ui="simple"] .simple-nav {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  display: grid; grid-template-columns: repeat(5, 1fr); align-items: center;
+  padding: 6px 4px calc(7px + env(safe-area-inset-bottom, 0px));
+  background: var(--glass); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-top: 0.5px solid var(--sep);
+}
+.simple-nav .nav-btn { min-height: 46px; }
+.simple-nav-add {
+  justify-self: center; width: 56px; height: 56px; margin-top: -20px; border: none; border-radius: 999px;
+  background: var(--primary); color: #FFFFFF; display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 6px 16px rgba(47, 111, 208, 0.35); cursor: pointer;
+}
+.simple-nav-add:active { transform: scale(0.94); }
+
+/* 頁面標題與次要頁的返回列 */
+:root[data-ui="simple"] .simple-page-title { display: block; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; padding: 0 2px; }
+:root[data-ui="simple"] .simple-subhead { display: flex; align-items: center; gap: 6px; min-height: 44px; }
+.simple-back {
+  display: inline-flex; align-items: center; gap: 2px; min-height: 44px; padding: 0 8px 0 0;
+  border: none; background: none; color: var(--primary); font-size: 16px; cursor: pointer;
+}
+.simple-subhead-title { font-size: 17px; font-weight: 700; }
+
+/* 首頁 */
+.home-hero { display: flex; flex-direction: column; gap: 12px; }
+.home-hero-head { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.home-hero .big-num { font-size: 38px; }
+.home-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.home-stat { background: var(--surface); border: 0.5px solid var(--border); border-radius: var(--radius-group); padding: 11px 13px; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.home-stat-label { font-size: 12px; color: var(--text-secondary); }
+.home-stat-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.home-link, .simple-stocks-row {
+  width: 100%; display: flex; align-items: center; gap: 10px; text-align: left; cursor: pointer;
+  font: inherit; color: var(--text); min-height: 56px;
+}
+.home-link { justify-content: space-between; }
+.home-link-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.home-link-title { font-size: 15px; font-weight: 600; }
+.home-link > svg, .simple-stocks-row > svg { color: var(--text-muted); flex-shrink: 0; }
+.link-btn { border: none; background: none; color: var(--primary); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; padding: 6px 0; }
+.home-recent-amount { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.home-recent-amount.pos { color: var(--pos); }
+
+/* 更多 */
+.more-group { display: flex; flex-direction: column; gap: 6px; }
+.more-group-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); padding: 0 4px; }
+.more-row {
+  width: 100%; display: flex; align-items: center; gap: 12px; min-height: 50px; padding: 0 14px;
+  border: none; background: none; font: inherit; color: var(--text); text-align: left; cursor: pointer; position: relative;
+}
+.more-row + .more-row::before {
+  content: ""; position: absolute; top: 0; left: 56px; right: 0; height: 0.5px; background: var(--sep);
+}
+.more-row-icon { width: 30px; height: 30px; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.more-row-label { flex: 1; font-size: 15px; }
+.more-row-hint { font-size: 13px; color: var(--text-secondary); }
+.more-row > svg { color: var(--text-muted); flex-shrink: 0; }
+.ui-variant-card { display: flex; flex-direction: column; gap: 8px; }
+.ui-variant-seg { align-self: flex-start; }
+
+/* 明細：記帳分頁只留流水帳 */
+:root[data-ui="simple"] #logBudgetCard,
+:root[data-ui="simple"] #savingsLiveCard,
+:root[data-ui="simple"] #logSubtabBar { display: none !important; }
+:root[data-ui="simple"] #tab-log #ledgerPanel { display: flex !important; }
+
+/* 記一筆底部面板 */
+.qa-backdrop { position: fixed; inset: 0; z-index: 75; background: rgba(0,0,0,0.38); display: none; align-items: flex-end; justify-content: center; }
+.qa-backdrop.open { display: flex; }
+.qa-sheet {
+  width: 100%; max-width: 560px; max-height: 92vh; overflow-y: auto; background: var(--bg);
+  border-radius: 22px 22px 0 0; padding: 8px 16px calc(20px + env(safe-area-inset-bottom, 0px));
+  box-shadow: 0 -10px 40px rgba(0,0,0,0.22);
+}
+.qa-handle { width: 36px; height: 5px; border-radius: 3px; background: var(--fill-strong); margin: 0 auto 10px; }
+#quickAddBody #expenseForm { box-shadow: none; border: none; background: transparent; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+#quickAddBody #expenseForm .section-label { margin-bottom: 4px; }
+:root[data-ui="simple"] .qa-type-seg { display: grid; }
+:root[data-ui="simple"] #expenseForm:not(.qa-expanded) .qa-advanced { display: none !important; }
+:root[data-ui="simple"] .qa-more-toggle {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px; width: 100%; min-height: 48px;
+  padding: 0 14px; border: 0.5px solid var(--sep); border-radius: 14px; background: var(--surface);
+  font: inherit; font-size: 15px; color: var(--text); cursor: pointer; text-align: left;
+}
+:root[data-ui="simple"] .qa-more-toggle::after { content: '›'; color: var(--text-muted); font-size: 18px; transition: transform 0.15s; }
+:root[data-ui="simple"] .qa-more-toggle[aria-expanded="true"]::after { transform: rotate(90deg); }
+
+/* 計算機：簡潔版改放在金額欄位旁 */
+:root[data-ui="simple"] .amount-calc-btn,
+:root[data-ui="simple"] .input-calc-btn {
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  width: 44px; height: 44px; border: none; border-radius: 12px; background: var(--primary-soft); color: var(--primary); cursor: pointer;
+}
+.input-with-calc { display: flex; gap: 8px; align-items: center; }
+.input-with-calc > input { flex: 1; min-width: 0; }
+
+/* 資產 */
+:root[data-ui="simple"] .simple-assets-head { display: flex; justify-content: space-between; align-items: center; order: -5; }
+.simple-assets-actions { display: flex; gap: 8px; }
+.icon-btn.primary { background: var(--primary); color: #FFFFFF; }
+:root[data-ui="simple"] #tab-assets > #assetsLedgerBar { order: -4; }
+:root[data-ui="simple"] #tab-assets > #assetsIsolatedBanner { order: -3; }
+:root[data-ui="simple"] #tab-assets > #assetsHeroCard { order: -2; }
+:root[data-ui="simple"] #tab-assets > #networthChartCard { order: -1; }
+:root[data-ui="simple"] .simple-stocks-row { display: flex; }
+.simple-stocks-value { font-size: 15px; font-weight: 600; flex-shrink: 0; }
+:root[data-ui="simple"] #tab-assets .asset-action-grid { display: none; }
+.simple-action-list { display: flex; flex-direction: column; gap: 8px; }

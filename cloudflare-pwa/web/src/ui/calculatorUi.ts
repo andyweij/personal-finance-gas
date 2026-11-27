@@ -15,6 +15,16 @@ interface CalcHistoryEntry {
 
 const FAB_POS_STORAGE_KEY = 'finance_calc_fab_pos';
 
+let openForImpl: ((input: HTMLInputElement | null) => void) | null = null;
+
+/**
+ * v2.2.0: open the calculator for a specific field (the 簡潔版 puts a calculator button next to amount fields
+ * instead of the floating button). `null` opens it for a stand-alone calculation.
+ */
+export function openCalculatorFor(input: HTMLInputElement | null): void {
+  openForImpl?.(input);
+}
+
 function isEligibleNumericInput(node: EventTarget | null): node is HTMLInputElement {
   if (!(node instanceof HTMLInputElement)) return false;
   if (node.disabled || node.readOnly) return false;
@@ -316,6 +326,11 @@ export function initFloatingCalculator(): void {
     fab.classList.add('is-open');
     fab.setAttribute('aria-expanded', 'true');
     renderDisplay();
+  };
+
+  openForImpl = (input) => {
+    lastTargetInput = input;
+    openCalculator();
   };
 
   const closeCalculator = (restoreFocus = false) => {
