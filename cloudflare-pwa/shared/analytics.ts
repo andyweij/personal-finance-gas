@@ -1,4 +1,5 @@
 import { STOCK_TX_TYPES } from './constants';
+import { resolveFxRate, type FxRateSource } from './currency';
 import { roundTo } from './format';
 import type {
   AssetItem,
@@ -149,11 +150,10 @@ export interface DividendCalendarSummary {
 export function computeDividendCalendar(
   assets: AssetItem[],
   transactions: StockTransaction[],
-  usdTwdRate: number,
+  fxSource: FxRateSource,
   year: number,
   monthlyConsumptionTwd?: number
 ): DividendCalendarSummary {
-  const safeRate = Number.isFinite(usdTwdRate) && usdTwdRate > 0 ? usdTwdRate : 32.5;
   const assetById = new Map<string, AssetItem>();
   for (const a of assets || []) {
     if (!a || a.deletedAt || a.isWatchlist) continue;
@@ -190,8 +190,9 @@ export function computeDividendCalendar(
     yearSet.add(txYear);
     if (txYear !== year) continue;
 
-    const currency = asset.currency === 'USD' ? 'USD' : 'TWD';
-    const twdAmount = currency === 'USD' ? roundTo(rawAmount * safeRate, 0) : roundTo(rawAmount, 0);
+    const currency = String(asset.currency || 'TWD').toUpperCase();
+    const rate = resolveFxRate(currency, fxSource);
+    const twdAmount = roundTo(rawAmount * rate, 0);
     const bucket = months[txMonth - 1];
     bucket.items.push({
       txId: tx.id,

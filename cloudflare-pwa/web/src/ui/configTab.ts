@@ -13,6 +13,7 @@ import {
   getEffectiveLedgerId,
 } from '../../../shared/calculations';
 import type { RecurringItem, SinkingFundItem } from '../../../shared/types';
+import { normalizeEnabledCurrencies } from '../../../shared/validation';
 import {
   closeModal,
   el,
@@ -58,7 +59,7 @@ export function getActiveSinkingItems(ctx: UiContext): SinkingFundItem[] {
 
 export function renderConfigTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate;
+  const rate = snap.settings;
   const ledgers = getActiveLedgers(ctx);
   const ledgerNameMap = new Map(ledgers.map((l) => [l.id, l.name]));
 
@@ -283,7 +284,11 @@ export function openRecurringModal(ctx: UiContext, existing: RecurringItem | nul
   const r2 = document.createElement('div');
   r2.className = 'row-2';
   r2.appendChild(makeInputField('金額', 'recAmt', 'number', existing?.amount ?? '', '0', true));
-  r2.appendChild(makeSelectField('幣別', 'recCurr', ['TWD', 'USD'], existing?.currency || 'TWD'));
+  const enabledCurrs = normalizeEnabledCurrencies(ctx.engine.getSnapshot().settings.enabledCurrencies);
+  const recCurrOpts = existing?.currency && !enabledCurrs.includes(existing.currency)
+    ? [...enabledCurrs, existing.currency]
+    : enabledCurrs;
+  r2.appendChild(makeSelectField('幣別', 'recCurr', recCurrOpts, existing?.currency || 'TWD'));
   form.appendChild(r2);
 
   const r3 = document.createElement('div');

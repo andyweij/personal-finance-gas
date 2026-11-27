@@ -86,7 +86,7 @@ export function getOrderedStockIds(ctx: UiContext): string[] {
   const portfolio = computeStockPortfolioSummary(
     snap.assetItems,
     snap.stockTransactions || [],
-    snap.settings.usdTwdRate || 32.5
+    snap.settings
   );
   return portfolio.positions.map((p) => p.asset.id);
 }
@@ -213,7 +213,7 @@ function buildSavingsLinkSection(
     snap.assetItems,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],
-    snap.settings.usdTwdRate
+    snap.settings
   );
 
   const wrap = document.createElement('div');
@@ -272,11 +272,10 @@ function buildSavingsLinkSection(
 
 export function renderStocksTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
   const portfolio = computeStockPortfolioSummary(
     snap.assetItems,
     snap.stockTransactions || [],
-    rate
+    snap.settings
   );
   const watchlist = computeWatchlistSummary(snap.assetItems);
   const masked = ctx.state.masked;

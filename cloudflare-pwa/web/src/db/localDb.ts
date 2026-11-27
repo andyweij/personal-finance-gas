@@ -40,6 +40,8 @@ export function createEmptySnapshot(): FinanceSnapshot {
       monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
       emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
       usdTwdRate: DEFAULT_USD_TWD_RATE,
+      enabledCurrencies: ['TWD', 'USD'],
+      fxRates: { USD: DEFAULT_USD_TWD_RATE },
       autoFxEnabled: true,
       fxUpdatedAt: null,
       pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
@@ -226,6 +228,15 @@ export class LocalFinanceDB {
                 quickTemplates: Array.isArray(raw.settings.quickTemplates)
                   ? raw.settings.quickTemplates
                   : [],
+                enabledCurrencies: Array.isArray(raw.settings.enabledCurrencies)
+                  ? raw.settings.enabledCurrencies
+                  : ['TWD', 'USD'],
+                fxRates:
+                  raw.settings.fxRates &&
+                  typeof raw.settings.fxRates === 'object' &&
+                  !Array.isArray(raw.settings.fxRates)
+                    ? raw.settings.fxRates
+                    : { USD: Number(raw.settings.usdTwdRate || DEFAULT_USD_TWD_RATE) },
               }
             : empty.settings,
           ledgers: rawLedgers,

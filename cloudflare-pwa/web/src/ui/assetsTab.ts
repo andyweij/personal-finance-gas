@@ -1,5 +1,7 @@
 import { todayInTimeZone } from '../../../shared/dates';
 import { ASSET_SUB_CATEGORIES, DEFAULT_LEDGER_ID } from '../../../shared/constants';
+import { getCurrencyDecimals, resolveFxRate } from '../../../shared/currency';
+import { roundTo } from '../../../shared/format';
 import {
   compareBySortOrder,
   computeAllSavingsSummary,
@@ -16,7 +18,7 @@ import {
   solveImpliedLoanAnnualRate,
 } from '../../../shared/calculations';
 import type { AssetItem } from '../../../shared/types';
-import { resolveStockModalPriceFields } from '../../../shared/validation';
+import { normalizeEnabledCurrencies, resolveStockModalPriceFields } from '../../../shared/validation';
 import {
   closeModal,
   el,
@@ -80,7 +82,7 @@ function fmtSignedMoney(n: number, masked: boolean): string {
 
 export function renderAssetsTab(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate;
+  const rate = snap.settings;
   const ledgers = getActiveLedgers(ctx);
   const scope = resolveAssetsScope(ctx);
 
@@ -281,11 +283,11 @@ export function renderAssetsTab(ctx: UiContext): void {
         defBadge.textContent = '★ 預設連動';
         title.appendChild(defBadge);
       }
-      if (s.account.currency === 'USD') {
+      if (s.account.currency !== 'TWD') {
         const currBadge = document.createElement('span');
         currBadge.className = 'badge';
         currBadge.style.marginRight = '0';
-        currBadge.textContent = 'USD';
+        currBadge.textContent = s.account.currency;
         title.appendChild(currBadge);
       }
 
@@ -405,8 +407,8 @@ export function renderAssetsTab(ctx: UiContext): void {
       const displayQty = stockPos ? stockPos.currentShares : item.quantityOrAmount;
       const detail = item.ticker || isStock
         ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}`
-        : item.currency === 'USD'
-          ? fmtRaw(item.quantityOrAmount, 'USD', ctx.state.masked)
+        : item.currency !== 'TWD'
+          ? fmtRaw(item.quantityOrAmount, item.currency, ctx.state.masked)
           : item.liquidity;
       sub.appendChild(document.createTextNode(detail));
       if (stockPos && stockPos.hasCostBasis) {
@@ -574,8 +576,8 @@ export function renderAssetsTab(ctx: UiContext): void {
           : '';
       const detail = item.ticker || isStock
         ? `${item.ticker ? item.ticker + ' · ' : ''}${fmtNum(displayQty)} 股 @ ${item.unitPrice}${pnlSuffix}`
-        : item.currency === 'USD'
-          ? fmtRaw(item.quantityOrAmount, 'USD', ctx.state.masked)
+        : item.currency !== 'TWD'
+          ? fmtRaw(item.quantityOrAmount, item.currency, ctx.state.masked)
           : item.liquidity;
       sub.appendChild(document.createTextNode(detail));
       main.appendChild(t);
@@ -788,7 +790,11 @@ export function openSavingsAccountModal(
   r1.appendChild(
     makeInputField('目前基準餘額（可填 0 再分筆存入）', 'svBase', 'number', existing?.quantityOrAmount ?? 0, '500000', true)
   );
-  r1.appendChild(makeSelectField('幣別', 'svCurr', ['TWD', 'USD'], existing?.currency || 'TWD'));
+  const enabledCurrs = normalizeEnabledCurrencies(ctx.engine.getSnapshot().settings.enabledCurrencies);
+  const currOptions = existing?.currency && !enabledCurrs.includes(existing.currency)
+    ? [...enabledCurrs, existing.currency]
+    : enabledCurrs;
+  r1.appendChild(makeSelectField('幣別', 'svCurr', currOptions, existing?.currency || 'TWD'));
   form.appendChild(r1);
 
   form.appendChild(
@@ -918,7 +924,7 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
     freshAccount,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],
-    snap.settings.usdTwdRate
+    snap.settings
   );
 
   const body = openModal(`${freshAccount.itemName} · 存入 / 轉出累加`);
@@ -1102,7 +1108,7 @@ export function openSavingsAdjustmentModal(ctx: UiContext, account: AssetItem): 
 
 export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: string): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
+  const rate = snap.settings;
   const ledgers = getActiveLedgers(ctx);
   const ledgerNameMap = new Map(ledgers.map((l) => [l.id, l.name]));
   const showLedgerTag = ledgers.length > 1;
@@ -1298,8 +1304,13 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
 
     const crossCurr = fromAcc.currency !== toAcc.currency;
     fxWrap.style.display = crossCurr ? 'block' : 'none';
+    const fromRate = resolveFxRate(fromAcc.currency, rate);
+    const toRate = resolveFxRate(toAcc.currency, rate);
+    const crossRate = roundTo(fromRate / (toRate || 1), 4);
     const targetLbl = document.querySelector<HTMLLabelElement>('label[for="trTargetAmt"]');
-    if (targetLbl) targetLbl.textContent = `實際入帳金額 (${toAcc.currency}，依匯率 ${rate} 估算，可修改)`;
+    if (targetLbl) {
+      targetLbl.textContent = `實際入帳金額 (${toAcc.currency}，依匯率 1 ${fromAcc.currency} ≈ ${crossRate} ${toAcc.currency} 估算，可修改)`;
+    }
 
     const rawAmt = parseFloat(amtInp.value);
     const hasAmt = !Number.isNaN(rawAmt) && rawAmt > 0;
@@ -1308,10 +1319,7 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
 
     if (crossCurr && (autoFillTarget || !targetAmtTouched)) {
       if (hasAmt) {
-        const est =
-          fromAcc.currency === 'TWD'
-            ? Math.round((rawAmt / rate) * 100) / 100
-            : Math.round(rawAmt * rate);
+        const est = roundTo((rawAmt * fromRate) / (toRate || 1), getCurrencyDecimals(toAcc.currency));
         targetAmtInp.value = String(est);
       } else {
         targetAmtInp.value = '';
@@ -1408,7 +1416,7 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
 
 export function openReconcileModal(ctx: UiContext, account: AssetItem): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
+  const rate = snap.settings;
   const summary = computeSavingsAccountSummary(
     account,
     snap.cashflowLogs,
@@ -1467,7 +1475,7 @@ export function openReconcileModal(ctx: UiContext, account: AssetItem): void {
 
 export function openLoanReconcileModal(ctx: UiContext, item: AssetItem): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
+  const rate = snap.settings;
   const today = todayYmdLocal();
   const loan = computeLoanAmortizationSummary(item, rate, today);
 
@@ -1561,7 +1569,7 @@ export function openLoanReconcileModal(ctx: UiContext, item: AssetItem): void {
 
 export function openLoanScheduleModal(ctx: UiContext, item: AssetItem): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
+  const rate = snap.settings;
   const today = todayYmdLocal();
   const loan = computeLoanAmortizationSummary(item, rate, today);
 
@@ -1690,7 +1698,11 @@ export function openAssetModal(
   const r3 = document.createElement('div');
   r3.className = 'row-2';
   r3.appendChild(makeInputField('持有股數 / 原幣餘額（基準餘額）', 'asQty', 'number', existing?.quantityOrAmount ?? '', '0', true));
-  r3.appendChild(makeSelectField('幣別', 'asCurr', ['TWD', 'USD'], existing?.currency || 'TWD'));
+  const asEnabledCurrs = normalizeEnabledCurrencies(ctx.engine.getSnapshot().settings.enabledCurrencies);
+  const asCurrOpts = existing?.currency && !asEnabledCurrs.includes(existing.currency)
+    ? [...asEnabledCurrs, existing.currency]
+    : asEnabledCurrs;
+  r3.appendChild(makeSelectField('幣別', 'asCurr', asCurrOpts, existing?.currency || 'TWD'));
   form.appendChild(r3);
 
   const r4 = document.createElement('div');

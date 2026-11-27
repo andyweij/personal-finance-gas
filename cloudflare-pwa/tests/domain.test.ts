@@ -82,6 +82,20 @@ describe('shared/validation', () => {
       })
     ).toThrow(/大於 0/);
 
+    const jpyOk = validateCashFlowInput(
+      {
+        date: '2026-11-23',
+        type: CASHFLOW_TYPES.DAILY_EXPENSE,
+        category: '餐飲',
+        itemName: '拉麵',
+        amount: 1000,
+        currency: 'JPY',
+      },
+      { usdTwdRate: 32.5, fxRates: { JPY: 0.215 } }
+    );
+    expect(jpyOk.currency).toBe('JPY');
+    expect(jpyOk.twdAmount).toBe(215);
+
     expect(() =>
       validateCashFlowInput({
         date: '2026-11-23',
@@ -89,7 +103,7 @@ describe('shared/validation', () => {
         category: '餐飲',
         itemName: '午餐',
         amount: 100,
-        currency: 'JPY',
+        currency: 'XYZ',
       })
     ).toThrow(/不支援的幣別/);
   });

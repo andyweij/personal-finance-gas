@@ -1,3 +1,5 @@
+import { computeCrossTwdRatesFromUsdBase, type FxRatesMap } from '../shared/currency';
+import { normalizeFxRates } from '../shared/validation';
 import { ensureAppSettings } from './sync';
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -147,24 +149,26 @@ export function normalizeTaiwanTicker(rawTicker: string): { code: string; yahooS
   return { code: norm.code, yahooSymbol: norm.yahooSymbol };
 }
 
-export async function fetchUsdTwdRate(fetchImpl: FetchLike = fetch): Promise<number | null> {
-  // Primary: Open Exchange Rates (free, no key required)
+export async function fetchAllTwdFxRates(fetchImpl: FetchLike = fetch): Promise<FxRatesMap | null> {
+  // Primary: Open Exchange Rates (free, 1 single request returns ALL supported currencies)
   try {
     const res = await fetchImpl('https://open.er-api.com/v6/latest/USD', {
       headers: { Accept: 'application/json' },
     });
     if (res.ok) {
-      const json = (await res.json()) as { rates?: { TWD?: number } };
-      const rate = Number(json?.rates?.TWD);
-      if (Number.isFinite(rate) && rate > 10 && rate < 100) {
-        return Math.round(rate * 10000) / 10000;
+      const json = (await res.json()) as { rates?: Record<string, unknown> };
+      if (json?.rates && typeof json.rates === 'object') {
+        const computed = computeCrossTwdRatesFromUsdBase(json.rates);
+        if (computed.USD) {
+          return computed;
+        }
       }
     }
   } catch {
     // Fallback below
   }
 
-  // Fallback: Yahoo Finance TWD=X (query1 -> query2)
+  // Fallback: Yahoo Finance TWD=X for USD/TWD
   for (const host of ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']) {
     try {
       const res = await fetchImpl(`https://${host}/v8/finance/chart/TWD=X?interval=1d&range=5d`, {
@@ -177,7 +181,7 @@ export async function fetchUsdTwdRate(fetchImpl: FetchLike = fetch): Promise<num
         const meta = json?.chart?.result?.[0]?.meta;
         const rate = Number(meta?.regularMarketPrice ?? meta?.previousClose);
         if (Number.isFinite(rate) && rate > 10 && rate < 100) {
-          return Math.round(rate * 10000) / 10000;
+          return { USD: Math.round(rate * 10000) / 10000 };
         }
       }
     } catch {
@@ -186,6 +190,11 @@ export async function fetchUsdTwdRate(fetchImpl: FetchLike = fetch): Promise<num
   }
 
   return null;
+}
+
+export async function fetchUsdTwdRate(fetchImpl: FetchLike = fetch): Promise<number | null> {
+  const rates = await fetchAllTwdFxRates(fetchImpl);
+  return rates?.USD ?? null;
 }
 
 export interface StockQuoteResult {
@@ -688,44 +697,82 @@ export async function refreshMarketData(
       ? targetAutoFx || Boolean(opts?.forceFx)
       : true;
   const fxFits = !opts?.fetchBudget || opts.fetchBudget.remaining() >= MAX_FETCHES_FOR_FX;
-  const liveFx = shouldFetchFx && fxFits ? await fetchUsdTwdRate(fetchImpl) : null;
-  if (liveFx !== null) {
+  const liveFxMap = shouldFetchFx && fxFits ? await fetchAllTwdFxRates(fetchImpl) : null;
+  const liveFx = liveFxMap?.USD ?? null;
+  if (liveFx !== null && liveFxMap) {
     usdTwdRate = liveFx;
     fxUpdated = true;
-    const fxUserIds: string[] = [];
+    const fxRows: Array<{ user_id: string; fx_rates_json?: string | null; hasFxCol: boolean }> = [];
     if (targetUserId) {
-      fxUserIds.push(targetUserId);
+      const row = await db
+        .prepare('SELECT * FROM app_settings WHERE user_id = ?')
+        .bind(targetUserId)
+        .first<Record<string, unknown>>();
+      fxRows.push({
+        user_id: targetUserId,
+        fx_rates_json: (row?.fx_rates_json as string | null) ?? null,
+        hasFxCol: row ? 'fx_rates_json' in row : false,
+      });
     } else {
       const eligible = await db
         .prepare(
-          `SELECT a.user_id FROM app_settings a
+          `SELECT a.* FROM app_settings a
            INNER JOIN users u ON u.id = a.user_id
            WHERE u.is_active = 1 AND COALESCE(a.auto_fx_enabled, 1) = 1`
         )
-        .all<{ user_id: string }>();
+        .all<Record<string, unknown>>();
       for (const r of eligible.results) {
-        fxUserIds.push(r.user_id);
+        fxRows.push({
+          user_id: String(r.user_id),
+          fx_rates_json: (r.fx_rates_json as string | null) ?? null,
+          hasFxCol: 'fx_rates_json' in r,
+        });
       }
     }
 
-    for (const uid of fxUserIds) {
+    for (const row of fxRows) {
       if (opts?.shouldStop?.()) break;
-      await db.batch([
-        db
-          .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
-          .bind(uid, nowIso),
-        db
-          .prepare(
-            `UPDATE app_settings
-             SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ?, version = version + 1,
-                 change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
-             WHERE user_id = ? AND (usd_twd_rate IS NOT ? OR fx_updated_at IS NULL)`
-          )
-          .bind(usdTwdRate, nowIso, nowIso, uid, uid, usdTwdRate),
-        db
-          .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
-          .bind(nowIso, uid),
-      ]);
+      const uid = row.user_id;
+      if (row.hasFxCol) {
+        const mergedRates = normalizeFxRates(
+          { ...normalizeFxRates(row.fx_rates_json, usdTwdRate), ...liveFxMap, USD: usdTwdRate },
+          usdTwdRate
+        );
+        const mergedJson = JSON.stringify(mergedRates);
+        await db.batch([
+          db
+            .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+            .bind(uid, nowIso),
+          db
+            .prepare(
+              `UPDATE app_settings
+               SET usd_twd_rate = ?, fx_rates_json = ?, fx_updated_at = ?, updated_at = ?, version = version + 1,
+                   change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
+               WHERE user_id = ? AND (usd_twd_rate IS NOT ? OR fx_rates_json IS NOT ? OR fx_updated_at IS NULL)`
+            )
+            .bind(usdTwdRate, mergedJson, nowIso, nowIso, uid, uid, usdTwdRate, mergedJson),
+          db
+            .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+            .bind(nowIso, uid),
+        ]);
+      } else {
+        await db.batch([
+          db
+            .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+            .bind(uid, nowIso),
+          db
+            .prepare(
+              `UPDATE app_settings
+               SET usd_twd_rate = ?, fx_updated_at = ?, updated_at = ?, version = version + 1,
+                   change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0) + 1
+               WHERE user_id = ? AND (usd_twd_rate IS NOT ? OR fx_updated_at IS NULL)`
+            )
+            .bind(usdTwdRate, nowIso, nowIso, uid, uid, usdTwdRate),
+          db
+            .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
+            .bind(nowIso, uid),
+        ]);
+      }
     }
   }
 

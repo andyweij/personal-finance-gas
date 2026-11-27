@@ -1,6 +1,7 @@
 import { todayInTimeZone } from '../../../shared/dates';
 import { ALL_CASHFLOW_TYPES, DEFAULT_LEDGER_ID } from '../../../shared/constants';
-import { getEffectiveCategoriesForType } from '../../../shared/validation';
+import { resolveFxRate } from '../../../shared/currency';
+import { getEffectiveCategoriesForType, normalizeEnabledCurrencies } from '../../../shared/validation';
 import {
   aggregatePeriodMetrics,
   computeAllSavingsSummary,
@@ -60,12 +61,36 @@ export function renderLogCategories(ctx: UiContext): void {
   box.appendChild(addCatBtn);
 }
 
+export function renderLogCurrencyButtons(ctx: UiContext): void {
+  const seg = document.getElementById('logCurrencySeg');
+  if (!seg) return;
+  const enabled = normalizeEnabledCurrencies(ctx.engine.getSnapshot().settings.enabledCurrencies);
+  if (!enabled.includes(ctx.state.logCurrency)) {
+    ctx.state.logCurrency = 'TWD';
+  }
+  seg.innerHTML = '';
+  for (const code of enabled) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'mini-seg-btn curr-btn' + (code === ctx.state.logCurrency ? ' active' : '');
+    btn.dataset.curr = code;
+    btn.textContent = code;
+    btn.addEventListener('click', () => {
+      ctx.state.logCurrency = code;
+      renderLogCurrencyButtons(ctx);
+      updateFxPreview(ctx);
+    });
+    seg.appendChild(btn);
+  }
+}
+
 export function updateFxPreview(ctx: UiContext): void {
   const preview = el('fxPreview');
   const val = parseFloat(el<HTMLInputElement>('amountInput').value);
-  const rate = ctx.engine.getSnapshot().settings.usdTwdRate || 32.5;
-  if (ctx.state.logCurrency === 'USD' && !Number.isNaN(val) && val > 0) {
-    preview.textContent = '≈ NT$ ' + fmtNum(Math.round(val * rate));
+  const settings = ctx.engine.getSnapshot().settings;
+  if (ctx.state.logCurrency !== 'TWD' && !Number.isNaN(val) && val > 0) {
+    const rate = resolveFxRate(ctx.state.logCurrency, settings);
+    preview.textContent = `≈ NT$ ${fmtNum(Math.round(val * rate))} (${rate})`;
   } else {
     preview.textContent = '';
   }
@@ -75,13 +100,12 @@ export function updateFxPreview(ctx: UiContext): void {
 export function updateSavingsPreview(ctx: UiContext): void {
   const preview = el('savingsDeltaPreview');
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
   const activeLedger = resolveActiveLedger(ctx);
   const savings = computeAllSavingsSummary(
     snap.assetItems,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],
-    rate,
+    snap.settings,
     activeLedger.id
   );
   const selected = savings.accounts.find((a) => a.account.id === ctx.state.logLinkedAccountId);
@@ -119,7 +143,7 @@ export function updateSavingsPreview(ctx: UiContext): void {
     return;
   }
 
-  const twdDeltaAbs = Math.round(ctx.state.logCurrency === 'USD' ? rawAmt * rate : rawAmt);
+  const twdDeltaAbs = Math.round(rawAmt * resolveFxRate(ctx.state.logCurrency, snap.settings));
   const isInc = isCashFlowIncome(ctx.state.logType);
   const signedDelta = isInc ? twdDeltaAbs : -twdDeltaAbs;
   const afterBal = selected.currentBalanceTwd + signedDelta;
@@ -145,13 +169,12 @@ export function updateSavingsPreview(ctx: UiContext): void {
 
 function renderSavingsStripAndChips(ctx: UiContext): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
   const activeLedger = resolveActiveLedger(ctx);
   const savings = computeAllSavingsSummary(
     snap.assetItems,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],
-    rate,
+    snap.settings,
     activeLedger.id
   );
 
@@ -835,6 +858,7 @@ export function renderLogTab(ctx: UiContext): void {
   }
 
   renderQuickTemplatesStrip(ctx);
+  renderLogCurrencyButtons(ctx);
   renderLogCategories(ctx);
   renderSavingsStripAndChips(ctx);
   renderLedgerSearchControls(ctx, activeLedger, ledgers, ym, searchResult);

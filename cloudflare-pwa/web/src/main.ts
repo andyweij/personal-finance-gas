@@ -2,9 +2,10 @@
 import { getDatePartsInTimeZone } from '../../shared/dates';
 import './styles.css';
 import { DEFAULT_LEDGER_ID } from '../../shared/constants';
+import { CURRENCY_META, SUPPORTED_CURRENCY_CODES, isValidFxRateForCurrency, resolveFxRate } from '../../shared/currency';
 import { computeAllSavingsSummary } from '../../shared/calculations';
 import type { PnlColorScheme } from '../../shared/types';
-import { normalizePnlColorScheme } from '../../shared/validation';
+import { normalizeEnabledCurrencies, normalizePnlColorScheme } from '../../shared/validation';
 import { LocalFinanceDB } from './db/localDb';
 import { SyncEngine, type SyncStatus } from './sync/syncEngine';
 import {
@@ -21,6 +22,7 @@ import {
   bindLedgerSearchEvents,
   getTodayYmd,
   renderLogCategories,
+  renderLogCurrencyButtons,
   renderLogTab,
   updateFxPreview,
   updateSavingsPreview,
@@ -413,9 +415,11 @@ async function bootstrap(): Promise<void> {
         applyPnlSchemeDom(snap.settings.pnlColorScheme);
       }
       const autoFx = snap.settings.autoFxEnabled !== false;
+      const enabledCurrs = normalizeEnabledCurrencies(snap.settings.enabledCurrencies);
+      const extraCount = Math.max(0, enabledCurrs.length - 2);
       const fxEl = el('fxTopPill');
-      fxEl.textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}${autoFx ? '' : ' · 手動'}`;
-      fxEl.title = autoFx ? '自動更新美元匯率（點擊調整）' : '手動固定美元匯率（點擊調整）';
+      fxEl.textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}${extraCount > 0 ? ` · +${extraCount}幣` : ''}${autoFx ? '' : ' · 手動'}`;
+      fxEl.title = autoFx ? '多幣別與自動匯率設定（點擊調整）' : '多幣別與手動匯率設定（點擊調整）';
       // v1.8.15 performance: only the visible tab is rendered now; the others are marked dirty and rendered
       // when they are opened (each tab reads the engine snapshot, not another tab's DOM)
       for (const tab of ALL_TABS) dirtyTabs.add(tab);
@@ -541,6 +545,7 @@ async function bootstrap(): Promise<void> {
   applyAuthMetaToState(state, ctx.engine.getMeta());
 
   el<HTMLInputElement>('dateInput').value = getTodayYmd();
+  renderLogCurrencyButtons(ctx);
   renderLogCategories(ctx);
   ctx.applyUtilityTabVisibility();
   updateSecurityButtons(ctx);
@@ -716,34 +721,158 @@ function bindEvents(ctx: UiContext): void {
     fxPillEl.addEventListener('click', () => {
       const s = ctx.engine.getSnapshot().settings;
       const autoFx = s.autoFxEnabled !== false;
-      const body = openModal('USD / TWD 匯率設定');
-      body.innerHTML = `<div class="form-stack">
-          <div class="field-group">
-            <label for="fxModalRateInput">目前匯率（1 USD = ? TWD）</label>
-            <input id="fxModalRateInput" type="number" step="0.01" min="10.01" max="99.99" value="${Number(s.usdTwdRate || 32.5).toFixed(2)}" />
-          </div>
-          <label class="checkbox-row" style="display:flex;align-items:center;gap:8px;font-size:14px;">
-            <input id="fxModalAutoToggle" type="checkbox" ${autoFx ? 'checked' : ''} />
-            <span>允許系統每日排程自動更新匯率（關閉後將保留您的手動匯率，不被排程覆蓋）</span>
-          </label>
-          <div style="display:flex;gap:10px;margin-top:8px;">
-            <button type="button" class="btn-secondary" id="fxModalCancelBtn" style="flex:1;">取消</button>
-            <button type="button" class="btn-primary" id="fxModalSaveBtn" style="flex:1;">儲存匯率設定</button>
-          </div>
-        </div>`;
-      el('fxModalCancelBtn').addEventListener('click', () => closeModal());
-      el('fxModalSaveBtn').addEventListener('click', async () => {
+      const draftEnabled = new Set<string>(normalizeEnabledCurrencies(s.enabledCurrencies));
+      const draftRates: Record<string, number> = {};
+      for (const code of SUPPORTED_CURRENCY_CODES) {
+        if (code === 'TWD') continue;
+        draftRates[code] = resolveFxRate(code, s);
+      }
+
+      const body = openModal('多幣別與匯率設定');
+      const form = document.createElement('form');
+      form.className = 'reb-modal-form';
+
+      const curSection = document.createElement('div');
+      const curLabel = document.createElement('label');
+      curLabel.className = 'section-label';
+      curLabel.textContent = '啟用幣別（顯示於快速記帳與帳戶表單）';
+      const curChips = document.createElement('div');
+      curChips.className = 'chip-group';
+      curSection.appendChild(curLabel);
+      curSection.appendChild(curChips);
+      form.appendChild(curSection);
+
+      const ratesSection = document.createElement('div');
+      ratesSection.className = 'fx-rates-list';
+      form.appendChild(ratesSection);
+
+      const rateInputs = new Map<string, HTMLInputElement>();
+
+      const renderRatesList = () => {
+        // Persist in-progress edits before re-rendering
+        for (const [code, inp] of rateInputs.entries()) {
+          const v = Number(inp.value);
+          if (Number.isFinite(v) && v > 0) draftRates[code] = v;
+        }
+        rateInputs.clear();
+        ratesSection.innerHTML = '';
+        const list = SUPPORTED_CURRENCY_CODES.filter((c) => c !== 'TWD' && (c === 'USD' || draftEnabled.has(c)));
+        for (const code of list) {
+          const meta = CURRENCY_META[code];
+          const row = document.createElement('div');
+          row.className = 'reb-edit-row';
+          const left = document.createElement('div');
+          left.className = 'reb-edit-left';
+          const titleEl = document.createElement('strong');
+          titleEl.textContent = `1 ${code} (${meta.label})`;
+          const hintEl = document.createElement('span');
+          hintEl.className = 'muted tnum';
+          hintEl.style.fontSize = '11px';
+          hintEl.textContent = `= ? TWD（合理範圍 ${meta.minTwdRate}～${meta.maxTwdRate}）`;
+          left.appendChild(titleEl);
+          left.appendChild(hintEl);
+
+          const inp = document.createElement('input');
+          inp.type = 'number';
+          inp.inputMode = 'decimal';
+          inp.step = meta.defaultTwdRate < 1 ? '0.0001' : '0.01';
+          inp.className = 'tnum reb-pct-input';
+          inp.style.width = '96px';
+          inp.value = String(draftRates[code] ?? meta.defaultTwdRate);
+          rateInputs.set(code, inp);
+
+          row.appendChild(left);
+          row.appendChild(inp);
+          ratesSection.appendChild(row);
+        }
+      };
+
+      const renderCurChips = () => {
+        curChips.innerHTML = '';
+        for (const code of SUPPORTED_CURRENCY_CODES) {
+          const meta = CURRENCY_META[code];
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          const isOn = code === 'TWD' || draftEnabled.has(code);
+          btn.className = 'chip-btn sm' + (isOn ? ' active' : '');
+          btn.textContent = `${code} ${meta.label}`;
+          if (code === 'TWD') {
+            btn.disabled = true;
+          } else {
+            btn.addEventListener('click', () => {
+              if (draftEnabled.has(code)) draftEnabled.delete(code);
+              else draftEnabled.add(code);
+              renderCurChips();
+              renderRatesList();
+            });
+          }
+          curChips.appendChild(btn);
+        }
+      };
+
+      renderCurChips();
+      renderRatesList();
+
+      const autoRow = document.createElement('label');
+      autoRow.className = 'tpl-oneclick-box';
+      const autoCb = document.createElement('input');
+      autoCb.type = 'checkbox';
+      autoCb.checked = autoFx;
+      const autoTxt = document.createElement('span');
+      autoTxt.textContent = '允許系統每日排程自動更新所有外幣匯率（關閉後將保留您的手動匯率，不被排程覆蓋）';
+      autoRow.appendChild(autoCb);
+      autoRow.appendChild(autoTxt);
+      form.appendChild(autoRow);
+
+      const footer = document.createElement('div');
+      footer.className = 'reb-modal-footer';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.className = 'btn btn-outline btn-sm';
+      cancelBtn.textContent = '取消';
+      cancelBtn.addEventListener('click', () => closeModal());
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'submit';
+      saveBtn.className = 'btn btn-primary btn-sm';
+      saveBtn.textContent = '儲存多幣別設定';
+      footer.appendChild(cancelBtn);
+      footer.appendChild(saveBtn);
+      form.appendChild(footer);
+
+      bindSubmit(form, async (e) => {
+        e.preventDefault();
         try {
-          const rate = Number(el<HTMLInputElement>('fxModalRateInput').value);
-          const auto = el<HTMLInputElement>('fxModalAutoToggle').checked;
-          await ctx.engine.saveFxSettings(rate, auto);
+          const nextRates: Record<string, number> = { ...draftRates };
+          for (const [code, inp] of rateInputs.entries()) {
+            const val = Number(inp.value);
+            if (!isValidFxRateForCurrency(code, val)) {
+              const meta = CURRENCY_META[code as keyof typeof CURRENCY_META];
+              throw new Error(`${code} 匯率超出合理範圍（須介於 ${meta.minTwdRate}～${meta.maxTwdRate}）`);
+            }
+            nextRates[code] = val;
+          }
+          const usdRate = nextRates.USD ?? s.usdTwdRate ?? 32.5;
+          const enabledList = SUPPORTED_CURRENCY_CODES.filter((c) => c === 'TWD' || draftEnabled.has(c));
+          await ctx.engine.saveMultiCurrencySettings({
+            usdTwdRate: usdRate,
+            fxRates: nextRates,
+            enabledCurrencies: enabledList,
+            autoFxEnabled: autoCb.checked,
+          });
           closeModal();
-          showToast(auto ? `已更新匯率 ${rate}（自動同步開啟）` : `已固定手動匯率 ${rate}`, 'success');
+          showToast(
+            autoCb.checked
+              ? `已更新多幣別設定（共 ${enabledList.length} 幣別，自動更新開啟）`
+              : `已更新多幣別與手動匯率設定（共 ${enabledList.length} 幣別）`,
+            'success'
+          );
           ctx.scheduleSync();
         } catch (err) {
           showToast(err instanceof Error ? err.message : '匯率格式不正確', 'error');
         }
       });
+
+      body.appendChild(form);
     });
   }
 

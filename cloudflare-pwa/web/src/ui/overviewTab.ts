@@ -55,7 +55,7 @@ export function renderOverviewTab(ctx: UiContext): void {
   const yearly = aggregatePeriodMetrics(yearLogs, monthlySinking * 12, false);
   const nw = computeNetWorthSummary(
     snap.assetItems,
-    snap.settings.usdTwdRate,
+    snap.settings,
     monthly.totalConsumption,
     snap.cashflowLogs,
     snap.savingsAdjustments || [],

@@ -1,4 +1,5 @@
 import { APP_TIMEZONE, CASHFLOW_TYPES } from '../shared/constants';
+import { resolveFxRate } from '../shared/currency';
 import { getDatePartsInTimeZone, previousYearMonth } from '../shared/dates';
 import { countD1Queries } from './d1Budget';
 import { createBudgetedFetch, refreshMarketData, type FetchLike } from './market';
@@ -217,7 +218,7 @@ export async function runMonthlyRecurringD1(
       continue;
     }
 
-    const fxRate = item.currency === 'USD' ? usdRate : 1;
+    const fxRate = resolveFxRate(item.currency, settings);
     const twdAmount = Math.round(item.amount * fxRate);
     let cycleTag = '';
     if (item.cycle === '年繳') cycleTag = '[年繳到期] ';
@@ -346,7 +347,7 @@ export async function runMonthEndSnapshotD1(
     if (!isAssetIncludedInNetWorth(item, full.ledgers)) continue;
     let twdValue = computeAssetEffectiveTwdValue(
       item,
-      full.settings.usdTwdRate,
+      full.settings,
       full.cashflowLogs,
       full.savingsAdjustments,
       full.stockTransactions,
@@ -356,18 +357,18 @@ export async function runMonthEndSnapshotD1(
       // v1.8.13 review: the savings anchor was reset AFTER the snapshot date (e.g. a missed snapshot caught up
       // later). The anchor amount already includes the entries between the snapshot date and the anchor — back
       // them out so the snapshot shows the balance as of its own date.
-      const rate = full.settings.usdTwdRate;
+      const fx = full.settings;
       const logs = exported.cashflowLogs;
       const adjs = exported.savingsAdjustments || [];
       const afterSnapshot = computeSavingsAccountSummary(
         { ...item, quantityOrAmount: 0, balanceAnchorDate: parts.ymd, balanceAnchorAt: '9999-12-31T23:59:59.999Z' },
         logs,
         adjs,
-        rate
+        fx
       ).currentBalanceTwd;
-      const afterAnchor = computeSavingsAccountSummary({ ...item, quantityOrAmount: 0 }, logs, adjs, rate)
+      const afterAnchor = computeSavingsAccountSummary({ ...item, quantityOrAmount: 0 }, logs, adjs, fx)
         .currentBalanceTwd;
-      twdValue = computeAssetTwdValue(item, rate) - (afterSnapshot - afterAnchor);
+      twdValue = computeAssetTwdValue(item, fx) - (afterSnapshot - afterAnchor);
     }
     if (twdValue === 0) continue;
     if (item.majorType === '資產') {

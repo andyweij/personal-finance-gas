@@ -38,7 +38,7 @@ export const RECURRING_CASHFLOW_TYPES: string[] = [
   CASHFLOW_TYPES.INVESTMENT,
 ];
 
-export const CURRENCIES: string[] = ['TWD', 'USD'];
+export const CURRENCIES: string[] = ['TWD', 'USD', 'JPY', 'EUR', 'HKD', 'GBP', 'AUD', 'SGD', 'KRW'];
 export const BILLING_CYCLES: string[] = ['月繳', '年繳', '特定月份', '一次性'];
 export const STATUS_OPTIONS: string[] = ['啟用', '停用'];
 export const SOURCE_OPTIONS: string[] = ['自動入帳', '手機記帳', '手動輸入', '匯入'];

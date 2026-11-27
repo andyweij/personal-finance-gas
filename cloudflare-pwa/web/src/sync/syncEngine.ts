@@ -40,9 +40,13 @@ import type {
   SyncRejection,
   SyncResponse,
 } from '../../../shared/types';
+import { getCurrencyDecimals, resolveFxRate } from '../../../shared/currency';
+import { roundTo } from '../../../shared/format';
 import {
   normalizeCustomCategories,
   normalizeCustomStockCategories,
+  normalizeEnabledCurrencies,
+  normalizeFxRates,
   normalizeLedgerId,
   normalizePnlColorScheme,
   normalizeQuickTemplates,
@@ -357,6 +361,7 @@ export class SyncEngine {
       'deleteCashFlow',
       'saveBudgetSettings',
       'saveFxSettings',
+      'saveMultiCurrencySettings',
       'savePnlColorScheme',
       'saveCustomStockCategories',
       'saveRebalanceTargets',
@@ -1024,7 +1029,7 @@ export class SyncEngine {
   }
 
   async addCashFlow(payload: CashFlowInputPayload): Promise<CashFlowLog> {
-    const validated = validateCashFlowInput(payload, this.snapshot.settings.usdTwdRate);
+    const validated = validateCashFlowInput(payload, this.snapshot.settings);
     const nowIso = new Date().toISOString();
     const id = crypto.randomUUID();
     const record: CashFlowLog = {
@@ -1151,16 +1156,42 @@ export class SyncEngine {
   }
 
   async saveFxSettings(usdTwdRate: number, autoFxEnabled: boolean): Promise<void> {
-    const rate = Number(usdTwdRate);
+    await this.saveMultiCurrencySettings({
+      usdTwdRate,
+      autoFxEnabled,
+      fxRates: { ...(this.snapshot.settings.fxRates || {}), USD: Number(usdTwdRate) },
+      enabledCurrencies: this.snapshot.settings.enabledCurrencies || ['TWD', 'USD'],
+    });
+  }
+
+  async saveMultiCurrencySettings(input: {
+    usdTwdRate: number;
+    autoFxEnabled: boolean;
+    enabledCurrencies?: string[];
+    fxRates?: Record<string, number>;
+  }): Promise<void> {
+    const rate = Number(input.usdTwdRate);
     if (!Number.isFinite(rate) || rate <= 10 || rate >= 100) {
       throw new Error('請輸入有效的 USD/TWD 匯率（介於 10～100）。');
     }
+    const roundedUsd = Math.round(rate * 10000) / 10000;
+    const enabledCurrencies = normalizeEnabledCurrencies(
+      input.enabledCurrencies ?? this.snapshot.settings.enabledCurrencies
+    );
+    const mergedRawRates = {
+      ...(this.snapshot.settings.fxRates || {}),
+      ...(input.fxRates || {}),
+      USD: roundedUsd,
+    };
+    const fxRates = normalizeFxRates(mergedRawRates, roundedUsd);
     const nowIso = new Date().toISOString();
     const baseVersion = this.snapshot.settings.version;
     const nextSettings: AppSettings = {
       ...this.snapshot.settings,
-      usdTwdRate: Math.round(rate * 1000) / 1000,
-      autoFxEnabled: Boolean(autoFxEnabled),
+      usdTwdRate: roundedUsd,
+      enabledCurrencies,
+      fxRates,
+      autoFxEnabled: Boolean(input.autoFxEnabled),
       updatedAt: nowIso,
     };
     const nextSnapshot: FinanceSnapshot = {
@@ -1746,7 +1777,7 @@ export class SyncEngine {
     const currency = payload.currency || account?.currency || 'TWD';
     const v = validateSavingsAdjustmentInput(
       { ...payload, currency },
-      this.snapshot.settings.usdTwdRate
+      this.snapshot.settings
     );
     const nowIso = new Date().toISOString();
     const id = crypto.randomUUID();
@@ -1835,16 +1866,16 @@ export class SyncEngine {
       throw new Error('僅支援活存與定存／現金等帳戶間轉帳（股票請使用持股頁買賣功能）。');
     }
 
-    const rate = this.snapshot.settings.usdTwdRate || 32.5;
+    const fromRate = resolveFxRate(fromAcc.currency, this.snapshot.settings);
+    const toRate = resolveFxRate(toAcc.currency, this.snapshot.settings);
+    const toDecimals = getCurrencyDecimals(toAcc.currency);
     let toAmount: number;
     if (fromAcc.currency === toAcc.currency) {
       toAmount = v.amount;
     } else if (v.targetAmount !== null) {
       toAmount = v.targetAmount;
-    } else if (fromAcc.currency === 'TWD' && toAcc.currency === 'USD') {
-      toAmount = Math.round((v.amount / rate) * 100) / 100;
     } else {
-      toAmount = Math.round(v.amount * rate);
+      toAmount = roundTo((v.amount * fromRate) / (toRate || 1), toDecimals);
     }
 
     if (!fromAcc.isLinkedSavings) {
@@ -1877,7 +1908,7 @@ export class SyncEngine {
           note: `轉帳至 ${toAcc.itemName}${v.note ? ' · ' + v.note : ''}`,
           transferGroupId,
         },
-        rate
+        this.snapshot.settings
       );
       fromAdjustment = {
         id: adjId,
@@ -1929,7 +1960,7 @@ export class SyncEngine {
           note: `轉帳自 ${fromAcc.itemName}${v.note ? ' · ' + v.note : ''}`,
           transferGroupId,
         },
-        rate
+        this.snapshot.settings
       );
       toAdjustment = {
         id: adjId,
@@ -1985,7 +2016,7 @@ export class SyncEngine {
           linkedAccountId: fromAcc.isLinkedSavings ? fromAcc.id : null,
           ledgerId: getEffectiveLedgerId(fromAcc),
         },
-        rate
+        this.snapshot.settings
       );
       feeCashflow = {
         id: cfId,
@@ -2095,7 +2126,7 @@ export class SyncEngine {
           linkedAccountId: payload.linkedAccountId || null,
           ledgerId: cfLedgerId,
         },
-        this.snapshot.settings.usdTwdRate
+        this.snapshot.settings
       );
 
       createdCashflow = {
@@ -2697,6 +2728,8 @@ export class SyncEngine {
             ...(p.monthlyDailyBudget !== undefined ? { monthlyDailyBudget: p.monthlyDailyBudget } : {}),
             ...(p.emergencyTargetMonths !== undefined ? { emergencyTargetMonths: p.emergencyTargetMonths } : {}),
             ...(p.usdTwdRate !== undefined ? { usdTwdRate: p.usdTwdRate } : {}),
+            ...(p.enabledCurrencies !== undefined ? { enabledCurrencies: normalizeEnabledCurrencies(p.enabledCurrencies) } : {}),
+            ...(p.fxRates !== undefined ? { fxRates: normalizeFxRates(p.fxRates, p.usdTwdRate ?? merged.settings.usdTwdRate) } : {}),
             ...(p.autoFxEnabled !== undefined ? { autoFxEnabled: p.autoFxEnabled } : {}),
             ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
             ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
@@ -3318,6 +3351,8 @@ export class SyncEngine {
                 ...(p.monthlyDailyBudget !== undefined ? { monthlyDailyBudget: p.monthlyDailyBudget } : {}),
                 ...(p.emergencyTargetMonths !== undefined ? { emergencyTargetMonths: p.emergencyTargetMonths } : {}),
                 ...(p.usdTwdRate !== undefined ? { usdTwdRate: p.usdTwdRate } : {}),
+                ...(p.enabledCurrencies !== undefined ? { enabledCurrencies: normalizeEnabledCurrencies(p.enabledCurrencies) } : {}),
+                ...(p.fxRates !== undefined ? { fxRates: normalizeFxRates(p.fxRates, p.usdTwdRate ?? merged.settings.usdTwdRate) } : {}),
                 ...(p.autoFxEnabled !== undefined ? { autoFxEnabled: p.autoFxEnabled } : {}),
                 ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
                 ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),

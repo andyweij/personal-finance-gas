@@ -1,4 +1,5 @@
 import { atomicGroupKeyOf, orderMutationsByDependencies } from '../shared/syncOrder';
+import type { FxRateSource } from '../shared/currency';
 import { countD1Queries } from './d1Budget';
 import {
   DEFAULT_EMERGENCY_MONTHS,
@@ -37,6 +38,8 @@ import {
 import {
   normalizeCustomCategories,
   normalizeCustomStockCategories,
+  normalizeEnabledCurrencies,
+  normalizeFxRates,
   normalizeLedgerId,
   normalizePnlColorScheme,
   normalizeQuickTemplates,
@@ -85,10 +88,13 @@ export async function ensureUserSyncState(
 }
 
 function mapAppSettingsRow(row: Record<string, unknown>): AppSettings {
+  const usdTwdRate = Number(row.usd_twd_rate);
   return {
     monthlyDailyBudget: Number(row.monthly_daily_budget),
     emergencyTargetMonths: Number(row.emergency_target_months),
-    usdTwdRate: Number(row.usd_twd_rate),
+    usdTwdRate,
+    enabledCurrencies: normalizeEnabledCurrencies(row.enabled_currencies_json),
+    fxRates: normalizeFxRates(row.fx_rates_json, usdTwdRate),
     autoFxEnabled:
       row.auto_fx_enabled !== undefined && row.auto_fx_enabled !== null ? Number(row.auto_fx_enabled) !== 0 : true,
     fxUpdatedAt: (row.fx_updated_at as string | null) ?? null,
@@ -178,6 +184,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       monthly_daily_budget: number;
       emergency_target_months: number;
       usd_twd_rate: number;
+      enabled_currencies_json?: string | null;
+      fx_rates_json?: string | null;
       auto_fx_enabled?: number | null;
       fx_updated_at: string | null;
       pnl_color_scheme?: string | null;
@@ -194,6 +202,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
       monthlyDailyBudget: row.monthly_daily_budget,
       emergencyTargetMonths: row.emergency_target_months,
       usdTwdRate: row.usd_twd_rate,
+      enabledCurrencies: normalizeEnabledCurrencies(row.enabled_currencies_json),
+      fxRates: normalizeFxRates(row.fx_rates_json, row.usd_twd_rate),
       autoFxEnabled: row.auto_fx_enabled !== undefined && row.auto_fx_enabled !== null ? Number(row.auto_fx_enabled) !== 0 : true,
       fxUpdatedAt: row.fx_updated_at,
       pnlColorScheme: normalizePnlColorScheme(row.pnl_color_scheme),
@@ -234,6 +244,8 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
     monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
     emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
     usdTwdRate: DEFAULT_USD_TWD_RATE,
+    enabledCurrencies: ['TWD', 'USD'],
+    fxRates: { USD: DEFAULT_USD_TWD_RATE },
     autoFxEnabled: true,
     fxUpdatedAt: null,
     pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
@@ -863,7 +875,7 @@ async function applyMutationGroup(
   db: D1Database,
   uid: string,
   group: SyncMutation[],
-  defaultFxRate: number,
+  defaultFxRate: FxRateSource,
   serverTime: string,
   expectedEpoch: number
 ): Promise<void> {
@@ -1029,7 +1041,7 @@ async function applySingleMutation(
   db: D1Database,
   userId: string,
   mutation: SyncMutation,
-  defaultFxRate: number,
+  defaultFxRate: FxRateSource,
   serverTime: string,
   expectedEpoch: number
 ): Promise<void> {
@@ -1074,6 +1086,14 @@ async function applySingleMutation(
     const months = Math.min(60, Math.max(1, Math.round(toSafeNumber(p.emergencyTargetMonths, existing.emergencyTargetMonths))));
     const fx = toSafeNumber(p.usdTwdRate, existing.usdTwdRate);
     const validFx = fx > 10 && fx < 100 ? fx : existing.usdTwdRate;
+    const enabledCurrencies =
+      p.enabledCurrencies !== undefined
+        ? normalizeEnabledCurrencies(p.enabledCurrencies)
+        : existing.enabledCurrencies || ['TWD', 'USD'];
+    const fxRates =
+      p.fxRates !== undefined
+        ? normalizeFxRates({ ...(p.fxRates as Record<string, unknown>), USD: validFx }, validFx)
+        : normalizeFxRates({ ...(existing.fxRates || {}), USD: validFx }, validFx);
     const autoFxEnabled =
       p.autoFxEnabled !== undefined
         ? Boolean(p.autoFxEnabled)
@@ -1113,6 +1133,14 @@ async function applySingleMutation(
     if (!existingRow || 'quick_templates_json' in existingRow) {
       extraCols.push('quick_templates_json = ?');
       extraVals.push(JSON.stringify(quickTemplates));
+    }
+    if (!existingRow || 'enabled_currencies_json' in existingRow) {
+      extraCols.push('enabled_currencies_json = ?');
+      extraVals.push(JSON.stringify(enabledCurrencies));
+    }
+    if (!existingRow || 'fx_rates_json' in existingRow) {
+      extraCols.push('fx_rates_json = ?');
+      extraVals.push(JSON.stringify(fxRates));
     }
     const extraSql = extraCols.length ? `, ${extraCols.join(', ')}` : '';
     const writeStmt = db
@@ -2786,7 +2814,7 @@ export async function processSyncRequest(
     }
     if (pendingMembers.length === 0) return false;
     try {
-      await applyMutationGroup(db, uid, pendingMembers, settings.usdTwdRate, serverTime, expectedEpoch);
+      await applyMutationGroup(db, uid, pendingMembers, settings, serverTime, expectedEpoch);
       for (const m of pendingMembers) ackedMutationIds.push(m.mutationId);
       return false;
     } catch (err) {
@@ -2933,7 +2961,7 @@ export async function processSyncRequest(
     processedMutations += 1;
 
     try {
-      await applySingleMutation(db, uid, mut, settings.usdTwdRate, serverTime, expectedEpoch);
+      await applySingleMutation(db, uid, mut, settings, serverTime, expectedEpoch);
       ackedMutationIds.push(mut.mutationId);
     } catch (err) {
       if (err instanceof EpochMismatchError) {
@@ -3121,6 +3149,10 @@ export async function importFullSnapshot(
   const fxForImport = data.settings
     ? toSafeNumber(data.settings.usdTwdRate, currentSettings.usdTwdRate)
     : currentSettings.usdTwdRate;
+  const fxForImportSource = {
+    usdTwdRate: fxForImport,
+    fxRates: normalizeFxRates(data.settings?.fxRates ?? currentSettings.fxRates, fxForImport),
+  };
 
   const validatedLedgers: Array<{
     id: string;
@@ -3144,7 +3176,7 @@ export async function importFullSnapshot(
   for (const log of data.cashflowLogs || []) {
     validatedLogs.push({
       id: importText(log.id, 'id') || crypto.randomUUID(),
-      v: validateCashFlowInput(log, fxForImport),
+      v: validateCashFlowInput(log, fxForImportSource),
       createdAt: importText(log.createdAt, 'createdAt') || nowIso,
     });
   }
@@ -3197,7 +3229,7 @@ export async function importFullSnapshot(
     createdAt: string;
   }> = [];
   for (const adj of data.savingsAdjustments || []) {
-    const v = validateSavingsAdjustmentInput(adj, fxForImport);
+    const v = validateSavingsAdjustmentInput(adj, fxForImportSource);
     validatedAdjs.push({
       id: importText(adj.id, 'id') || crypto.randomUUID(),
       v,
@@ -3380,6 +3412,13 @@ export async function importFullSnapshot(
     const quickTemplates = normalizeQuickTemplates(
       data.settings.quickTemplates ?? (mode === 'replace' ? [] : currentSettings.quickTemplates)
     );
+    const enabledCurrencies = normalizeEnabledCurrencies(
+      data.settings.enabledCurrencies ?? (mode === 'replace' ? ['TWD', 'USD'] : currentSettings.enabledCurrencies)
+    );
+    const fxRates = normalizeFxRates(
+      data.settings.fxRates ?? (mode === 'replace' ? { USD: fxForImport } : currentSettings.fxRates),
+      fxForImport
+    );
     const autoFxEnabled =
       data.settings.autoFxEnabled !== undefined
         ? Boolean(data.settings.autoFxEnabled)
@@ -3390,7 +3429,7 @@ export async function importFullSnapshot(
       db
         .prepare(
           `UPDATE app_settings
-           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, rebalance_targets_json = ?, custom_categories_json = ?, quick_templates_json = ?, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
+           SET monthly_daily_budget = ?, emergency_target_months = ?, usd_twd_rate = ?, auto_fx_enabled = ?, pnl_color_scheme = ?, custom_stock_categories = ?, rebalance_targets_json = ?, custom_categories_json = ?, quick_templates_json = ?, enabled_currencies_json = ?, fx_rates_json = ?, updated_at = ?, version = version + 1, change_seq = ${CURR_SEQ_SQL}
            WHERE user_id = ?`
         )
         .bind(
@@ -3403,6 +3442,8 @@ export async function importFullSnapshot(
           JSON.stringify(rebalanceTargets),
           JSON.stringify(customCategories),
           JSON.stringify(quickTemplates),
+          JSON.stringify(enabledCurrencies),
+          JSON.stringify(fxRates),
           nowIso,
           uid,
           uid

@@ -881,7 +881,7 @@ export function createApp() {
 
       if (kind === 'cashflow') {
         const settings = await ensureAppSettings(c.env.DB, user.id);
-        const rows = parseCashFlowCsv(csvText, settings.usdTwdRate);
+        const rows = parseCashFlowCsv(csvText, settings);
         const values: unknown[][] = [];
         for (const v of rows) {
           const id = await deterministicId('cf', [v.date, v.type, v.category, v.itemName, v.amount, v.currency, v.fxRate, v.source, v.note]);

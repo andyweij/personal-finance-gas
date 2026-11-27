@@ -2950,3 +2950,20 @@ mark.search-hit {
   white-space: nowrap;
   flex-shrink: 0;
 }
+
+/* Phase 4 (v1.12.0): Multi-currency selector & FX modal */
+.fx-rates-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 36vh;
+  overflow-y: auto;
+}
+#logCurrencySeg {
+  overflow-x: auto;
+  max-width: 58%;
+  scrollbar-width: none;
+}
+#logCurrencySeg::-webkit-scrollbar {
+  display: none;
+}

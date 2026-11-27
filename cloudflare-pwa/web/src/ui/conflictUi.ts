@@ -54,6 +54,8 @@ const FIELD_LABELS: Record<string, string> = {
   monthlyDailyBudget: '每月消費預算',
   emergencyTargetMonths: '預備金目標(月)',
   usdTwdRate: 'USD/TWD 匯率',
+  enabledCurrencies: '啟用幣別清單',
+  fxRates: '多幣別匯率表',
   autoFxEnabled: '自動更新美元匯率',
   pnlColorScheme: '正負配色風格',
   customStockCategories: '自訂持股分類',

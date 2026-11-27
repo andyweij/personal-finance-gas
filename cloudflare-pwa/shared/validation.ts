@@ -25,6 +25,14 @@ import type {
   RebalanceTargetRule,
   StockTransactionType,
 } from './types';
+import {
+  DEFAULT_ENABLED_CURRENCIES,
+  isSupportedCurrency,
+  isValidFxRateForCurrency,
+  resolveFxRate,
+  type FxRatesMap,
+  type FxRateSource,
+} from './currency';
 import { roundTo } from './format';
 
 export interface ParsedLocalDate {
@@ -383,9 +391,70 @@ export interface ValidatedCashFlowInput {
   ledgerId: string;
 }
 
+export function normalizeEnabledCurrencies(value: unknown): string[] {
+  let rawList: unknown[] = [];
+  if (Array.isArray(value)) {
+    rawList = value;
+  } else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) rawList = parsed;
+    } catch {
+      rawList = [];
+    }
+  }
+  const seen = new Set<string>(['TWD']);
+  const out: string[] = ['TWD'];
+  for (const item of rawList) {
+    const code = String(item ?? '').trim().toUpperCase();
+    if (!code || seen.has(code) || !isSupportedCurrency(code)) continue;
+    seen.add(code);
+    out.push(code);
+  }
+  if (out.length === 1 && rawList.length === 0) {
+    return [...DEFAULT_ENABLED_CURRENCIES];
+  }
+  return out;
+}
+
+export function normalizeFxRates(value: unknown, fallbackUsdTwdRate = 32.5): FxRatesMap {
+  let rawObj: Record<string, unknown> | null = null;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    rawObj = value as Record<string, unknown>;
+  } else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        rawObj = parsed as Record<string, unknown>;
+      }
+    } catch {
+      rawObj = null;
+    }
+  }
+  const out: FxRatesMap = {};
+  if (isValidFxRateForCurrency('USD', fallbackUsdTwdRate)) {
+    out.USD = Number(fallbackUsdTwdRate);
+  }
+  if (rawObj) {
+    for (const [rawCode, rawRate] of Object.entries(rawObj)) {
+      const code = String(rawCode || '').trim().toUpperCase();
+      if (code === 'TWD' || !isSupportedCurrency(code)) continue;
+      const rate = Number(rawRate);
+      if (isValidFxRateForCurrency(code, rate)) {
+        out[code] = rate;
+      }
+    }
+  }
+  // Ensure USD stays synced with fallbackUsdTwdRate if explicit USD was missing
+  if (!out.USD && isValidFxRateForCurrency('USD', fallbackUsdTwdRate)) {
+    out.USD = Number(fallbackUsdTwdRate);
+  }
+  return out;
+}
+
 export function validateCashFlowInput(
   payload: CashFlowInputPayload,
-  defaultUsdTwdRate = 32.5
+  fxSource: FxRateSource = 32.5
 ): ValidatedCashFlowInput {
   if (!payload || typeof payload !== 'object') {
     throw new Error('請求格式無效。');
@@ -412,12 +481,9 @@ export function validateCashFlowInput(
     throw new Error(`不支援的幣別：${currency}`);
   }
 
-  const fxRate =
-    currency === 'USD'
-      ? toSafeNumber(payload.fxRate, defaultUsdTwdRate) > 0
-        ? toSafeNumber(payload.fxRate, defaultUsdTwdRate)
-        : defaultUsdTwdRate
-      : 1;
+  const defaultRate = resolveFxRate(currency, fxSource);
+  const explicitFx = toSafeNumber(payload.fxRate, 0);
+  const fxRate = currency === 'TWD' ? 1 : explicitFx > 0 ? explicitFx : defaultRate;
   const twdAmount = Math.round(amount * fxRate);
 
   return {
@@ -745,7 +811,7 @@ export function validateAssetInput(payload: AssetInputPayload) {
   if (Number.isNaN(quantityOrAmount) || !Number.isFinite(quantityOrAmount) || quantityOrAmount < 0) {
     throw new Error('請輸入大於等於 0 的有效數值。');
   }
-  if (!CURRENCIES.includes(currency)) throw new Error('幣別僅支援 TWD / USD。');
+  if (!CURRENCIES.includes(currency)) throw new Error(`不支援的幣別：${currency}`);
   if (Number.isNaN(unitPrice) || !Number.isFinite(unitPrice) || unitPrice < 0) {
     throw new Error('單價需大於等於 0。');
   }
@@ -790,7 +856,7 @@ export interface SavingsAdjustmentInputPayload {
 
 export function validateSavingsAdjustmentInput(
   payload: SavingsAdjustmentInputPayload,
-  usdTwdRate = 32.5
+  fxSource: FxRateSource = 32.5
 ) {
   const accountId = String(payload.accountId || '').trim();
   if (!accountId) throw new Error('請選擇對應的活存帳戶。');
@@ -800,7 +866,7 @@ export function validateSavingsAdjustmentInput(
     throw new Error('存入或轉出金額不可為 0。');
   }
   const currency = String(payload.currency || 'TWD').trim().toUpperCase();
-  const rate = currency === 'USD' ? usdTwdRate : 1;
+  const rate = resolveFxRate(currency, fxSource);
   const twdAmount = Math.round(amount * rate);
   const note = String(payload.note || '').trim().slice(0, 200);
   const transferGroupId = payload.transferGroupId ? String(payload.transferGroupId).trim().slice(0, 80) : null;

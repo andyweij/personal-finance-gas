@@ -30,6 +30,8 @@ export interface AppSettings {
   monthlyDailyBudget: number;
   emergencyTargetMonths: number;
   usdTwdRate: number;
+  enabledCurrencies?: string[];
+  fxRates?: Record<string, number>;
   autoFxEnabled?: boolean;
   fxUpdatedAt?: string | null;
   pnlColorScheme?: PnlColorScheme;

@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.11.0 / D1 Schema `0019`）
+# 資料庫 Schema 設計架構（v1.12.0 / D1 Schema `0020`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（24 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0019_custom_categories_and_templates.sql`](../migrations/0019_custom_categories_and_templates.sql)  
-> **對應版本**：`APP_VERSION = 1.11.0` / `DB_SCHEMA_VERSION = 0019` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
+> **最新 Migration**：[`0020_multi_currency.sql`](../migrations/0020_multi_currency.sql)  
+> **對應版本**：`APP_VERSION = 1.12.0` / `DB_SCHEMA_VERSION = 0020` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
 
 ---
 
@@ -86,6 +86,8 @@ erDiagram
 | `rebalance_targets_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON 陣列，資產再平衡目標比例規則（依分類／標的，合計 100%，`0018`） |
 | `custom_categories_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON 物件，依交易類型儲存之使用者自訂分類清單（每類型上限 30 個，`0019`） |
 | `quick_templates_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON 陣列，常用記帳範本清單（上限 30 筆，支援一鍵直記，`0019`） |
+| `enabled_currencies_json` | `TEXT` | `NOT NULL DEFAULT '["TWD","USD"]'` | JSON 陣列，使用者啟用之幣別清單（固定含 `TWD`，支援 `JPY`/`EUR`/`HKD`/`GBP`/`AUD`/`SGD`/`KRW`，`0020`） |
+| `fx_rates_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON 物件，各外幣對台幣匯率表（`1 外幣 = ? TWD`，`USD` 與 `usd_twd_rate` 雙向同步，`0020`） |
 | `updated_at` | `TEXT` | `NOT NULL` | 最後更新時間 |
 | `version` | `INTEGER` | `NOT NULL DEFAULT 1` | 樂觀鎖版號 |
 
