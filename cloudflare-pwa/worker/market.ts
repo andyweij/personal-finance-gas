@@ -286,6 +286,16 @@ async function fetchYahoo1dPreviousClose(
   return null;
 }
 
+/**
+ * v1.12.6: Yahoo quotes some markets in the currency's minor unit. 'GBp' / 'GBX' = pence (1/100 GBP). Returns the
+ * divisor that converts a Yahoo price into the major unit (1 when the quote is already in the major unit).
+ */
+function yahooMinorUnitDivisor(currency: unknown): number {
+  const c = String(currency ?? '').trim();
+  if (c === 'GBp' || c.toUpperCase() === 'GBX') return 100;
+  return 1;
+}
+
 async function fetchYahooChartQuote(
   symbol: string,
   fetchImpl: FetchLike
@@ -306,6 +316,7 @@ async function fetchYahooChartQuote(
               gmtoffset?: number;
               chartPreviousClose?: number;
               previousClose?: number;
+              currency?: string;
             };
             timestamp?: Array<number | null>;
             indicators?: {
@@ -395,9 +406,14 @@ async function fetchYahooChartQuote(
           }
         }
 
+        // v1.12.6: London listings are usually quoted in pence (meta.currency 'GBp' / 'GBX'). The asset is held in
+        // GBP, so convert before storing; otherwise the market value is overstated 100x. The previous close (5d bars,
+        // meta.previousClose or range=1d of the same symbol) is in the same unit.
+        const minorUnitDivisor = yahooMinorUnitDivisor(meta?.currency);
         return {
-          price: roundStockPrice(candidate),
-          previousClose: prevClose !== null && prevClose > 0 ? roundStockPrice(prevClose) : null,
+          price: roundStockPrice(candidate / minorUnitDivisor),
+          previousClose:
+            prevClose !== null && prevClose > 0 ? roundStockPrice(prevClose / minorUnitDivisor) : null,
         };
       }
     } catch {

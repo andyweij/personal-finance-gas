@@ -1,6 +1,6 @@
 {
   "name": "personal-finance-cloudflare-pwa",
-  "version": "1.12.5",
+  "version": "1.12.6",
   "description": "個人現金流與資產負債管理系統 (Offline-First PWA + Cloudflare Workers + D1)",
   "private": true,
   "type": "module",

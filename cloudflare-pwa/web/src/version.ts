@@ -2,7 +2,7 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.12.5';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.12.6';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0020';
@@ -10,6 +10,7 @@ export const DB_SCHEMA_VERSION = '0020';
 export const SW_CACHE_VERSION = 'finance-pwa';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.12.6：修正英國倫敦交易所股票自動報價被放大 100 倍（Yahoo 以便士報價，現改為換算成英鎊後再寫入現價與昨收）',
   'v1.12.5：收尾修正 v1.12.0 與 v1.12.2 審查剩餘項目（套用已停用幣別的常用範本或自動補齊建議時暫時保留並顯示該幣別按鈕，不再誤轉為 TWD；持股頁所有彈窗改傳完整多幣別設定；非 TWD／USD 的純數字代號自動對應國際市場後綴不誤判為台股；匯率膠囊「+N幣」精準計算 TWD／USD 以外啟用幣別；跨幣轉帳極小匯率改用自適應有效位數顯示；未遷移資料庫僅停用 USD 亦正確拒絕、備份匯入省去重複設定查詢；再平衡排除未設目標列標示「不計入」不混算百分比；當年度配息月均分子僅計截至今日的配息）',
   'v1.12.4：全面修正 v1.11.0 審查建議（常用記帳範本僅開放快速記帳支援的 5 種交易類型且套用不支援類型時明確報錯中止；自動補齊依目前交易類型嚴格過濾並驗證分類有效性避免誤帶他類金額；一鍵直記遇綁定帳本／活存異動時中止並提醒先編輯範本，避免扣錯帳戶；自訂分類新增立即同步高亮、存檔改讀最新快照並為分類／範本刪除補齊防連點與錯誤提示；範本編輯器依所屬帳本過濾活存、跨帳本套用重設頁碼且無金額範本保留原輸入；自動補齊支援鍵盤上下鍵選擇、中文 IME 組字防閃爍與送出自動關閉；範本補發 ID 避開撞號）',
   'v1.12.3：修正匯率自動更新後（匯率帶 4～6 位小數），多幣別匯率設定視窗被瀏覽器的數字格式檢查擋下、無法儲存的問題；再平衡目標比例也可輸入 33.33% 等任意小數；每日預算不再限定為 1000 的倍數，可輸入任意金額',
