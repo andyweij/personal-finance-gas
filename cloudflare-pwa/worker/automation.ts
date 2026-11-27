@@ -646,117 +646,129 @@ export async function runMonthlyInstallmentsD1(
   let completedCount = 0;
   let complete = true;
 
-  for (const plan of activePlans) {
-    if (opts.shouldStop?.()) {
-      complete = false;
-      break;
-    }
-    const diff = monthsBetweenYm(plan.start_ym, yearMonth);
-    const seq = diff + 1;
-    if (seq < 1 || seq > plan.total_installments) {
+  // v1.15.0 review finding 2: post every installment that is due up to `yearMonth` and not posted yet — not only the
+  // one of `yearMonth`. Otherwise a plan whose start month is in the past, or one created after this month's run,
+  // permanently lost the skipped installments while posted_installments jumped past them.
+  // posted_installments is "installments already paid before / posted so far": posting starts after it.
+  planLoop: for (const plan of activePlans) {
+    const totalInst = Number(plan.total_installments);
+    const monthSeq = monthsBetweenYm(plan.start_ym, yearMonth) + 1;
+    if (monthSeq < 1 || monthSeq > totalInst) continue;
+    const dueSeq = monthSeq;
+    let postedSoFar = Number(plan.posted_installments || 0);
+    if (postedSoFar >= dueSeq) {
+      skippedCount += 1; // this month's installment is already posted (idempotent re-run)
       continue;
     }
-    const dedupKey = buildInstallmentDedupKey(plan.id, seq);
-    if (existingKeys.has(dedupKey) || seq <= Number(plan.posted_installments || 0)) {
-      skippedCount += 1;
-      continue;
-    }
-
-    const schedule = computeInstallmentScheduleAmounts(
-      Number(plan.total_amount),
-      Number(plan.total_installments),
-      String(plan.currency || 'TWD')
-    );
-    const amount = schedule[seq - 1] ?? 0;
-    if (amount <= 0) {
-      skippedCount += 1;
-      continue;
-    }
-
-    const entryDate = getInstallmentEntryDate(plan.start_ym, seq, Number(plan.post_day || 1));
-    const fxRate = resolveFxRate(String(plan.currency || 'TWD'), settings);
-    const twdAmount = Math.round(amount * fxRate);
-    const itemName = `${plan.item_name} (${seq}/${plan.total_installments}期)`.slice(0, 80);
-    const finalNote = `[分期 ${seq}/${plan.total_installments}]${plan.note ? ' ' + plan.note : ''}`.slice(0, 200);
-    const ledgerId = String(plan.ledger_id || 'default').trim() || 'default';
-    const nextPosted = Math.max(Number(plan.posted_installments || 0), seq);
-    const nextStatus = nextPosted >= Number(plan.total_installments) ? 'completed' : 'active';
-
-    const ensureSyncStmt = db
-      .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
-      .bind(uid, nowIso);
-    const bumpSyncStmt = db
-      .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
-      .bind(nowIso, uid);
-    const insertCfStmt = db
-      .prepare(
-        `INSERT INTO cashflow_logs
-          (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, installment_plan_id, installment_seq, created_at, updated_at, deleted_at, version, change_seq)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
-         WHERE ${epochGuard}
-         ON CONFLICT DO NOTHING`
-      )
-      .bind(
-        uid,
-        crypto.randomUUID(),
-        entryDate,
-        yearMonth,
-        CASHFLOW_TYPES.DAILY_EXPENSE,
-        String(plan.category || '其他'),
-        itemName,
-        amount,
-        String(plan.currency || 'TWD'),
-        fxRate,
-        twdAmount,
-        finalNote,
-        dedupKey,
-        plan.card_account_id || null,
-        ledgerId,
-        plan.id,
-        seq,
-        nowIso,
-        nowIso,
-        uid,
-        uid,
-        expectedEpoch
-      );
-    const updatePlanStmt = db
-      .prepare(
-        `UPDATE installment_plans
-         SET posted_installments = MAX(posted_installments, ?), status = ?, updated_at = ?, version = version + 1, change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
-         WHERE user_id = ? AND id = ? AND deleted_at IS NULL AND ${epochGuard}
-           AND EXISTS (SELECT 1 FROM cashflow_logs WHERE user_id = ? AND installment_plan_id = ? AND installment_seq = ?)`
-      )
-      .bind(
-        nextPosted,
-        nextStatus,
-        nowIso,
-        uid,
-        uid,
-        plan.id,
-        uid,
-        expectedEpoch,
-        uid,
-        plan.id,
-        seq
-      );
-
-    const results = await db.batch([ensureSyncStmt, bumpSyncStmt, insertCfStmt, updatePlanStmt]);
-    const inserted = Number(results[2]?.meta?.changes ?? 0);
-    if (inserted > 0) {
-      insertedCount += 1;
-      existingKeys.add(dedupKey);
-      if (nextStatus === 'completed') completedCount += 1;
-    } else {
-      const epochNow = await db
-        .prepare('SELECT data_epoch FROM user_sync_state WHERE user_id = ?')
-        .bind(uid)
-        .first<{ data_epoch: number }>();
-      if (Number(epochNow?.data_epoch ?? 1) !== expectedEpoch) {
+    for (let seq = postedSoFar + 1; seq <= dueSeq; seq++) {
+      if (opts.shouldStop?.()) {
         complete = false;
-        break;
+        break planLoop;
       }
-      skippedCount += 1;
+      const dedupKey = buildInstallmentDedupKey(plan.id, seq);
+      if (existingKeys.has(dedupKey)) {
+        skippedCount += 1;
+        continue;
+      }
+
+      const schedule = computeInstallmentScheduleAmounts(
+        Number(plan.total_amount),
+        Number(plan.total_installments),
+        String(plan.currency || 'TWD')
+      );
+      const amount = schedule[seq - 1] ?? 0;
+      if (amount <= 0) {
+        skippedCount += 1;
+        continue;
+      }
+
+      const entryDate = getInstallmentEntryDate(plan.start_ym, seq, Number(plan.post_day || 1));
+      const fxRate = resolveFxRate(String(plan.currency || 'TWD'), settings);
+      const twdAmount = Math.round(amount * fxRate);
+      const itemName = `${plan.item_name} (${seq}/${plan.total_installments}期)`.slice(0, 80);
+      const finalNote = `[分期 ${seq}/${plan.total_installments}]${plan.note ? ' ' + plan.note : ''}`.slice(0, 200);
+      const ledgerId = String(plan.ledger_id || 'default').trim() || 'default';
+      const nextPosted = Math.max(postedSoFar, seq);
+      const nextStatus = nextPosted >= totalInst ? 'completed' : 'active';
+
+      const ensureSyncStmt = db
+        .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
+        .bind(uid, nowIso);
+      const bumpSyncStmt = db
+        .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ?')
+        .bind(nowIso, uid);
+      const insertCfStmt = db
+        .prepare(
+          `INSERT INTO cashflow_logs
+            (user_id, id, date, year_month, type, category, item_name, amount, currency, fx_rate, twd_amount, source, note, recurring_dedup_key, linked_account_id, ledger_id, installment_plan_id, installment_seq, created_at, updated_at, deleted_at, version, change_seq)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '自動入帳', ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
+           WHERE ${epochGuard}
+           ON CONFLICT DO NOTHING`
+        )
+        .bind(
+          uid,
+          crypto.randomUUID(),
+          entryDate,
+          // a back-filled installment belongs to its own month, not to the month being processed
+          entryDate.slice(0, 7),
+          CASHFLOW_TYPES.DAILY_EXPENSE,
+          String(plan.category || '其他'),
+          itemName,
+          amount,
+          String(plan.currency || 'TWD'),
+          fxRate,
+          twdAmount,
+          finalNote,
+          dedupKey,
+          plan.card_account_id || null,
+          ledgerId,
+          plan.id,
+          seq,
+          nowIso,
+          nowIso,
+          uid,
+          uid,
+          expectedEpoch
+        );
+      const updatePlanStmt = db
+        .prepare(
+          `UPDATE installment_plans
+           SET posted_installments = MAX(posted_installments, ?), status = ?, updated_at = ?, version = version + 1, change_seq = COALESCE((SELECT change_seq FROM user_sync_state WHERE user_id = ?), 0)
+           WHERE user_id = ? AND id = ? AND deleted_at IS NULL AND ${epochGuard}
+             AND EXISTS (SELECT 1 FROM cashflow_logs WHERE user_id = ? AND installment_plan_id = ? AND installment_seq = ?)`
+        )
+        .bind(
+          nextPosted,
+          nextStatus,
+          nowIso,
+          uid,
+          uid,
+          plan.id,
+          uid,
+          expectedEpoch,
+          uid,
+          plan.id,
+          seq
+        );
+
+      const results = await db.batch([ensureSyncStmt, bumpSyncStmt, insertCfStmt, updatePlanStmt]);
+      const inserted = Number(results[2]?.meta?.changes ?? 0);
+      if (inserted > 0) {
+        insertedCount += 1;
+        existingKeys.add(dedupKey);
+        postedSoFar = nextPosted;
+        if (nextStatus === 'completed') completedCount += 1;
+      } else {
+        const epochNow = await db
+          .prepare('SELECT data_epoch FROM user_sync_state WHERE user_id = ?')
+          .bind(uid)
+          .first<{ data_epoch: number }>();
+        if (Number(epochNow?.data_epoch ?? 1) !== expectedEpoch) {
+          complete = false;
+          break planLoop;
+        }
+        skippedCount += 1;
+      }
     }
   }
 
@@ -831,10 +843,20 @@ export async function runScheduledAutomation(
       .bind(currentPeriod, lastPeriod)
       .all<{ user_id: string; kind: string; period: string }>();
     const done = new Set((doneRows.results || []).map((r) => `${r.user_id}|${r.kind}|${r.period}`));
+    // v1.15.0 review finding 2: users with at least one installment due up to this month that is not posted yet.
+    // Not gated by this month's "done" mark, so a plan created after the month's run is still posted by the next run;
+    // users with nothing due cost no further queries.
     const activeInstUsers = new Set<string>();
     try {
+      const curMonthIndex = today.year * 12 + today.month;
       const instUserRows = await db
-        .prepare("SELECT DISTINCT user_id FROM installment_plans WHERE status = 'active' AND deleted_at IS NULL")
+        .prepare(
+          `SELECT DISTINCT user_id FROM installment_plans
+           WHERE status = 'active' AND deleted_at IS NULL
+             AND posted_installments < total_installments
+             AND posted_installments < (? - (CAST(substr(start_ym, 1, 4) AS INTEGER) * 12 + CAST(substr(start_ym, 6, 2) AS INTEGER)) + 1)`
+        )
+        .bind(curMonthIndex)
         .all<{ user_id: string }>();
       for (const r of instUserRows.results || []) activeInstUsers.add(String(r.user_id));
     } catch {
@@ -881,7 +903,7 @@ export async function runScheduledAutomation(
         }
       }
       // this month's installment auto-posting (only when user actually has active installment plans)
-      if (activeInstUsers.has(u.id) && !done.has(`${u.id}|installments|${currentPeriod}`)) {
+      if (activeInstUsers.has(u.id)) {
         if (shouldStop(6 + snapshotReserve)) break;
         try {
           const iRes = await runMonthlyInstallmentsD1(db, u.id, today.year, today.month, {

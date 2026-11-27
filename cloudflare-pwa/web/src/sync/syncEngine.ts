@@ -2619,8 +2619,15 @@ export class SyncEngine {
     const currentPlans = this.snapshot.installmentPlans || [];
     const existing = currentPlans.find((p) => p.id === id);
 
-    const postFirst = Boolean(!existing && payload.postFirstNow && v.postedInstallments === 0 && v.status === 'active');
-    const finalPosted = postFirst ? 1 : v.postedInstallments;
+    // v1.15.0 review finding 2: "post now" posts every installment due up to the current month (after the ones
+    // already paid), not only the first — a plan started months ago no longer loses the installments in between.
+    // A plan starting in the future keeps the previous behaviour (installment 1 is posted, dated its own month).
+    const postFirst = Boolean(
+      !existing && payload.postFirstNow && v.status === 'active' && v.postedInstallments < v.totalInstallments
+    );
+    const dueNowSeq = Math.min(v.totalInstallments, monthsBetweenYm(v.startYm, todayInTimeZone().slice(0, 7)) + 1);
+    const postToSeq = postFirst ? Math.max(v.postedInstallments + 1, dueNowSeq) : 0;
+    const finalPosted = postFirst ? Math.max(v.postedInstallments, postToSeq) : v.postedInstallments;
     const finalStatus = finalPosted >= v.totalInstallments ? 'completed' : v.status;
 
     const plan: InstallmentPlan = {
@@ -2650,47 +2657,27 @@ export class SyncEngine {
     ];
 
     let firstCashflow: CashFlowLog | null = null;
+    let postedCashflows: CashFlowLog[] = [];
     if (postFirst) {
-      const schedule = computeInstallmentScheduleAmounts(plan.totalAmount, plan.totalInstallments, plan.currency);
-      const firstAmt = schedule[0] ?? 0;
-      if (firstAmt > 0) {
-        const cfId = crypto.randomUUID();
-        const entryDate = getInstallmentEntryDate(plan.startYm, 1, plan.postDay);
-        const validatedCf = validateCashFlowInput(
-          {
-            date: entryDate,
-            type: CASHFLOW_TYPES.DAILY_EXPENSE,
-            category: plan.category,
-            itemName: `${plan.itemName} (1/${plan.totalInstallments}期)`.slice(0, 80),
-            amount: firstAmt,
-            currency: plan.currency,
-            source: '自動入帳',
-            note: `[分期 1/${plan.totalInstallments}]${plan.note ? ' ' + plan.note : ''}`.slice(0, 200),
-            linkedAccountId: plan.cardAccountId || null,
-            ledgerId: plan.ledgerId,
-            installmentPlanId: plan.id,
-            installmentSeq: 1,
-          },
-          this.snapshot.settings
-        );
-        firstCashflow = {
-          id: cfId,
-          ...validatedCf,
-          recurringDedupKey: buildInstallmentDedupKey(plan.id, 1),
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          deletedAt: null,
-        };
+      postedCashflows = this.buildInstallmentCashflows(
+        plan,
+        v.postedInstallments + 1,
+        postToSeq,
+        this.installmentKeysInSnapshot(),
+        nowIso
+      );
+      firstCashflow = postedCashflows[0] ?? null;
+      for (const cf of postedCashflows) {
         mutations.push({
           mutationId: crypto.randomUUID(),
           entity: 'cashflow',
           op: 'upsert',
-          recordId: cfId,
+          recordId: cf.id,
           clientTimestamp: nowIso,
           baseVersion: null,
           isNewRecord: true,
           ...(atomicGroupId ? { atomicGroupId } : {}),
-          payload: { ...firstCashflow },
+          payload: { ...cf },
         });
       }
     }
@@ -2700,9 +2687,10 @@ export class SyncEngine {
       installmentPlans: mergeById(currentPlans, [plan]).sort(
         (a, b) => b.startYm.localeCompare(a.startYm) || b.createdAt.localeCompare(a.createdAt)
       ),
-      cashflowLogs: firstCashflow
-        ? this.sortCashFlows([firstCashflow, ...this.snapshot.cashflowLogs])
-        : this.snapshot.cashflowLogs,
+      cashflowLogs:
+        postedCashflows.length > 0
+          ? this.sortCashFlows([...postedCashflows, ...this.snapshot.cashflowLogs])
+          : this.snapshot.cashflowLogs,
     };
 
     await this.commitAndMaybeSync(nextSnapshot, mutations);
@@ -2730,55 +2718,26 @@ export class SyncEngine {
     ]);
   }
 
-  async postDueInstallmentsForMonth(yearMonth: string): Promise<{
-    postedCount: number;
-    skippedCount: number;
-  }> {
-    const cleanYm = String(yearMonth || '').trim();
-    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(cleanYm)) {
-      throw new Error('請輸入有效的年月格式（YYYY-MM）。');
-    }
-    const currentPlans = this.snapshot.installmentPlans || [];
-    const existingKeys = new Set<string>();
-    for (const l of this.snapshot.cashflowLogs) {
-      if (l.deletedAt) continue;
-      if (l.installmentPlanId && l.installmentSeq) {
-        existingKeys.add(buildInstallmentDedupKey(l.installmentPlanId, l.installmentSeq));
-      }
-      if (l.recurringDedupKey && l.recurringDedupKey.startsWith('inst:')) {
-        existingKeys.add(l.recurringDedupKey);
-      }
-    }
-
-    const nowIso = new Date().toISOString();
-    const mutations: SyncMutation[] = [];
-    const newLogs: CashFlowLog[] = [];
-    const updatedPlans: InstallmentPlan[] = [];
-    let postedCount = 0;
-    let skippedCount = 0;
-
-    for (const plan of currentPlans) {
-      if (plan.deletedAt || plan.status !== 'active') continue;
-      const seq = monthsBetweenYm(plan.startYm, cleanYm) + 1;
-      if (seq < 1 || seq > plan.totalInstallments) continue;
+  /**
+   * v1.15.0 review finding 2: cash-flow entries for installments `fromSeq`..`toSeq` of a plan (skipping any already
+   * posted), each dated in its own month.
+   */
+  private buildInstallmentCashflows(
+    plan: InstallmentPlan,
+    fromSeq: number,
+    toSeq: number,
+    existingKeys: Set<string>,
+    nowIso: string
+  ): CashFlowLog[] {
+    const schedule = computeInstallmentScheduleAmounts(plan.totalAmount, plan.totalInstallments, plan.currency);
+    const out: CashFlowLog[] = [];
+    for (let seq = Math.max(1, fromSeq); seq <= Math.min(toSeq, plan.totalInstallments); seq++) {
       const dedupKey = buildInstallmentDedupKey(plan.id, seq);
-      if (existingKeys.has(dedupKey) || seq <= plan.postedInstallments) {
-        skippedCount += 1;
-        continue;
-      }
-      const schedule = computeInstallmentScheduleAmounts(plan.totalAmount, plan.totalInstallments, plan.currency);
       const amount = schedule[seq - 1] ?? 0;
-      if (amount <= 0) {
-        skippedCount += 1;
-        continue;
-      }
-
-      const atomicGroupId = `inst-post:${plan.id}:${seq}`;
-      const cfId = crypto.randomUUID();
-      const entryDate = getInstallmentEntryDate(plan.startYm, seq, plan.postDay);
+      if (existingKeys.has(dedupKey) || amount <= 0) continue;
       const validatedCf = validateCashFlowInput(
         {
-          date: entryDate,
+          date: getInstallmentEntryDate(plan.startYm, seq, plan.postDay),
           type: CASHFLOW_TYPES.DAILY_EXPENSE,
           category: plan.category,
           itemName: `${plan.itemName} (${seq}/${plan.totalInstallments}期)`.slice(0, 80),
@@ -2793,49 +2752,94 @@ export class SyncEngine {
         },
         this.snapshot.settings
       );
-      const cf: CashFlowLog = {
-        id: cfId,
+      out.push({
+        id: crypto.randomUUID(),
         ...validatedCf,
         recurringDedupKey: dedupKey,
         createdAt: nowIso,
         updatedAt: nowIso,
         deletedAt: null,
-      };
-      const nextPosted = Math.max(plan.postedInstallments, seq);
+      });
+      existingKeys.add(dedupKey);
+    }
+    return out;
+  }
+
+  private installmentKeysInSnapshot(): Set<string> {
+    const keys = new Set<string>();
+    for (const l of this.snapshot.cashflowLogs) {
+      if (l.deletedAt) continue;
+      if (l.installmentPlanId && l.installmentSeq) keys.add(buildInstallmentDedupKey(l.installmentPlanId, l.installmentSeq));
+      if (l.recurringDedupKey && l.recurringDedupKey.startsWith('inst:')) keys.add(l.recurringDedupKey);
+    }
+    return keys;
+  }
+
+  async postDueInstallmentsForMonth(yearMonth: string): Promise<{
+    postedCount: number;
+    skippedCount: number;
+  }> {
+    const cleanYm = String(yearMonth || '').trim();
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(cleanYm)) {
+      throw new Error('請輸入有效的年月格式（YYYY-MM）。');
+    }
+    const currentPlans = this.snapshot.installmentPlans || [];
+    const existingKeys = this.installmentKeysInSnapshot();
+
+    const nowIso = new Date().toISOString();
+    const mutations: SyncMutation[] = [];
+    const newLogs: CashFlowLog[] = [];
+    const updatedPlans: InstallmentPlan[] = [];
+    let postedCount = 0;
+    let skippedCount = 0;
+
+    for (const plan of currentPlans) {
+      if (plan.deletedAt || plan.status !== 'active') continue;
+      // v1.15.0 review finding 2: every installment due up to `cleanYm` that is not posted yet (not only that month's)
+      const dueSeq = monthsBetweenYm(plan.startYm, cleanYm) + 1;
+      if (dueSeq < 1 || dueSeq > plan.totalInstallments) continue;
+      if (dueSeq <= plan.postedInstallments) {
+        skippedCount += 1;
+        continue;
+      }
+      const cfs = this.buildInstallmentCashflows(plan, plan.postedInstallments + 1, dueSeq, existingKeys, nowIso);
+      const nextPosted = Math.max(plan.postedInstallments, dueSeq);
       const updatedPlan: InstallmentPlan = {
         ...plan,
         postedInstallments: nextPosted,
         status: nextPosted >= plan.totalInstallments ? 'completed' : 'active',
         updatedAt: nowIso,
       };
-      newLogs.push(cf);
+      // one atomic unit per plan: all back-filled entries + a single plan update (one baseVersion, no self-conflict)
+      const atomicGroupId = `inst-post:${plan.id}:${plan.postedInstallments + 1}-${dueSeq}`;
+      newLogs.push(...cfs);
       updatedPlans.push(updatedPlan);
-      mutations.push(
-        {
+      for (const cf of cfs) {
+        mutations.push({
           mutationId: crypto.randomUUID(),
           entity: 'cashflow',
           op: 'upsert',
-          recordId: cfId,
+          recordId: cf.id,
           clientTimestamp: nowIso,
           baseVersion: null,
           isNewRecord: true,
           atomicGroupId,
           payload: { ...cf },
-        },
-        {
-          mutationId: crypto.randomUUID(),
-          entity: 'installment_plan',
-          op: 'upsert',
-          recordId: plan.id,
-          clientTimestamp: nowIso,
-          baseVersion: plan.version ?? null,
-          isNewRecord: false,
-          atomicGroupId,
-          payload: { ...updatedPlan },
-        }
-      );
-      existingKeys.add(dedupKey);
-      postedCount += 1;
+        });
+      }
+      mutations.push({
+        mutationId: crypto.randomUUID(),
+        entity: 'installment_plan',
+        op: 'upsert',
+        recordId: plan.id,
+        clientTimestamp: nowIso,
+        baseVersion: plan.version ?? null,
+        isNewRecord: false,
+        atomicGroupId,
+        payload: { ...updatedPlan },
+      });
+      postedCount += cfs.length;
+      if (cfs.length === 0) skippedCount += 1;
     }
 
     if (mutations.length > 0) {
@@ -2997,9 +3001,10 @@ export class SyncEngine {
       v.isLinkedSavings || v.isAmortizingLoan
         ? v.balanceAnchorDate ?? existing?.balanceAnchorDate ?? todayYmd
         : v.balanceAnchorDate ?? null;
-    const balanceAnchorAt = v.isLinkedSavings
-      ? v.balanceAnchorAt ?? existing?.balanceAnchorAt ?? nowIso
-      : null;
+    // v1.15.0 review finding 1: credit cards use the same date + time anchor as linked savings. Without the time,
+    // every charge dated on the anchor day counted as "after" the reconciled balance and was added a second time.
+    const balanceAnchorAt =
+      v.isLinkedSavings || v.isCreditCard ? v.balanceAnchorAt ?? existing?.balanceAnchorAt ?? nowIso : null;
     const sortOrder =
       payload.sortOrder !== undefined
         ? v.sortOrder
