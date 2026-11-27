@@ -138,6 +138,8 @@
       </div>
 
       <form class="card" id="expenseForm" autocomplete="off">
+        <div class="tpl-strip" id="quickTemplatesBar" aria-label="常用記帳範本"></div>
+
         <label class="section-label">交易類型</label>
         <div class="chip-group" id="logTypeChips">
           <button type="button" class="chip-btn active" data-type="日常花費">日常花費</button>
@@ -172,9 +174,10 @@
             <label class="section-label" for="dateInput">日期</label>
             <input id="dateInput" class="tnum" type="date" required />
           </div>
-          <div class="field" style="margin-bottom:0">
+          <div class="field ac-field" style="margin-bottom:0">
             <label class="section-label" for="itemNameInput">項目名稱</label>
-            <input id="itemNameInput" type="text" placeholder="留空則同分類" maxlength="80" />
+            <input id="itemNameInput" type="text" placeholder="留空則同分類" maxlength="80" autocomplete="off" />
+            <div class="ac-dropdown" id="itemNameSuggestions" role="listbox" aria-label="項目名稱建議" style="display:none"></div>
           </div>
         </div>
 
@@ -200,7 +203,10 @@
           </span>
         </label>
 
-        <button type="submit" class="btn btn-primary btn-block" id="submitBtn">寫入流水帳</button>
+        <div class="entry-submit-row">
+          <button type="submit" class="btn btn-primary" id="submitBtn" style="flex:1">寫入流水帳</button>
+          <button type="button" class="btn btn-outline" id="saveAsTemplateBtn" title="將目前表單存為常用範本">☆ 存範本</button>
+        </div>
       </form>
 
       <div id="ledgerPanel" style="display:none;flex-direction:column;gap:12px">

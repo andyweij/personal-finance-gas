@@ -10,6 +10,22 @@ export interface RebalanceTargetRule {
   targetPct: number;
 }
 
+export type CustomCategoriesMap = Record<string, string[]>;
+
+export interface QuickEntryTemplate {
+  id: string;
+  label: string;
+  type: string;
+  category: string;
+  itemName: string;
+  amount: number | null;
+  currency: string;
+  linkedAccountId?: string | null;
+  ledgerId?: string;
+  note: string;
+  oneClick?: boolean;
+}
+
 export interface AppSettings {
   monthlyDailyBudget: number;
   emergencyTargetMonths: number;
@@ -19,6 +35,8 @@ export interface AppSettings {
   pnlColorScheme?: PnlColorScheme;
   customStockCategories?: string[];
   rebalanceTargets?: RebalanceTargetRule[];
+  customCategories?: CustomCategoriesMap;
+  quickTemplates?: QuickEntryTemplate[];
   updatedAt: string;
   version?: number;
 }

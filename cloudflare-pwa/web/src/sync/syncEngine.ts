@@ -41,9 +41,11 @@ import type {
   SyncResponse,
 } from '../../../shared/types';
 import {
+  normalizeCustomCategories,
   normalizeCustomStockCategories,
   normalizeLedgerId,
   normalizePnlColorScheme,
+  normalizeQuickTemplates,
   normalizeRebalanceTargets,
   normalizeStockCategory,
   validateRebalanceTargetsForSave,
@@ -358,6 +360,8 @@ export class SyncEngine {
       'savePnlColorScheme',
       'saveCustomStockCategories',
       'saveRebalanceTargets',
+      'saveCustomCategories',
+      'saveQuickTemplates',
       'saveRecurring',
       'reorderRecurring',
       'deleteRecurring',
@@ -1255,6 +1259,64 @@ export class SyncEngine {
       },
     ]);
     return validated;
+  }
+
+  async saveCustomCategories(
+    categoriesMap: import('../../../shared/types').CustomCategoriesMap
+  ): Promise<import('../../../shared/types').CustomCategoriesMap> {
+    const normalized = normalizeCustomCategories(categoriesMap);
+    const nowIso = new Date().toISOString();
+    const baseVersion = this.snapshot.settings.version;
+    const nextSettings: AppSettings = {
+      ...this.snapshot.settings,
+      customCategories: normalized,
+      updatedAt: nowIso,
+    };
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      settings: nextSettings,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'settings',
+        op: 'upsert',
+        recordId: '1',
+        clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
+        payload: { ...nextSettings },
+      },
+    ]);
+    return normalized;
+  }
+
+  async saveQuickTemplates(
+    templates: import('../../../shared/types').QuickEntryTemplate[]
+  ): Promise<import('../../../shared/types').QuickEntryTemplate[]> {
+    const normalized = normalizeQuickTemplates(templates);
+    const nowIso = new Date().toISOString();
+    const baseVersion = this.snapshot.settings.version;
+    const nextSettings: AppSettings = {
+      ...this.snapshot.settings,
+      quickTemplates: normalized,
+      updatedAt: nowIso,
+    };
+    const nextSnapshot: FinanceSnapshot = {
+      ...this.snapshot,
+      settings: nextSettings,
+    };
+    await this.commitAndMaybeSync(nextSnapshot, [
+      {
+        mutationId: crypto.randomUUID(),
+        entity: 'settings',
+        op: 'upsert',
+        recordId: '1',
+        clientTimestamp: nowIso,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
+        payload: { ...nextSettings },
+      },
+    ]);
+    return normalized;
   }
 
   async saveRecurring(payload: RecurringInputPayload & { id?: string }): Promise<RecurringItem> {
@@ -2639,6 +2701,8 @@ export class SyncEngine {
             ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
             ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
             ...(p.rebalanceTargets !== undefined ? { rebalanceTargets: normalizeRebalanceTargets(p.rebalanceTargets) } : {}),
+            ...(p.customCategories !== undefined ? { customCategories: normalizeCustomCategories(p.customCategories) } : {}),
+            ...(p.quickTemplates !== undefined ? { quickTemplates: normalizeQuickTemplates(p.quickTemplates) } : {}),
           },
         };
       } else if (pendingMut.op === 'delete') {
@@ -3258,6 +3322,8 @@ export class SyncEngine {
                 ...(p.pnlColorScheme !== undefined ? { pnlColorScheme: p.pnlColorScheme } : {}),
                 ...(p.customStockCategories !== undefined ? { customStockCategories: p.customStockCategories } : {}),
                 ...(p.rebalanceTargets !== undefined ? { rebalanceTargets: normalizeRebalanceTargets(p.rebalanceTargets) } : {}),
+                ...(p.customCategories !== undefined ? { customCategories: normalizeCustomCategories(p.customCategories) } : {}),
+                ...(p.quickTemplates !== undefined ? { quickTemplates: normalizeQuickTemplates(p.quickTemplates) } : {}),
               };
               merged = { ...merged, settings: rebasedSettings };
               if (canRebaseVersion && effectiveServerVersion !== undefined) {

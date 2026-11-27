@@ -58,6 +58,8 @@ const FIELD_LABELS: Record<string, string> = {
   pnlColorScheme: '正負配色風格',
   customStockCategories: '自訂持股分類',
   rebalanceTargets: '再平衡目標比例',
+  customCategories: '自訂記帳分類',
+  quickTemplates: '常用記帳範本',
   stockCategory: '持股分類',
   sortOrder: '排序順序',
   shares: '股數',

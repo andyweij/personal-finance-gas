@@ -45,6 +45,8 @@ export function createEmptySnapshot(): FinanceSnapshot {
       pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
       customStockCategories: [],
       rebalanceTargets: [],
+      customCategories: {},
+      quickTemplates: [],
       updatedAt: '',
     },
     ledgers: [createDefaultLedger()],
@@ -214,6 +216,15 @@ export class LocalFinanceDB {
                   : [],
                 rebalanceTargets: Array.isArray(raw.settings.rebalanceTargets)
                   ? raw.settings.rebalanceTargets
+                  : [],
+                customCategories:
+                  raw.settings.customCategories &&
+                  typeof raw.settings.customCategories === 'object' &&
+                  !Array.isArray(raw.settings.customCategories)
+                    ? raw.settings.customCategories
+                    : {},
+                quickTemplates: Array.isArray(raw.settings.quickTemplates)
+                  ? raw.settings.quickTemplates
                   : [],
               }
             : empty.settings,

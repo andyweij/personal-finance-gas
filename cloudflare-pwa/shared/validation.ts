@@ -15,8 +15,16 @@ import {
   SOURCE_OPTIONS,
   STATUS_OPTIONS,
   STOCK_TX_TYPES,
+  WEBAPP_CATEGORY_MAP,
 } from './constants';
-import type { PnlColorScheme, RebalanceTargetKind, RebalanceTargetRule, StockTransactionType } from './types';
+import type {
+  CustomCategoriesMap,
+  PnlColorScheme,
+  QuickEntryTemplate,
+  RebalanceTargetKind,
+  RebalanceTargetRule,
+  StockTransactionType,
+} from './types';
 import { roundTo } from './format';
 
 export interface ParsedLocalDate {
@@ -161,6 +169,162 @@ export function validateRebalanceTargetsForSave(rules: unknown): RebalanceTarget
     }
   }
   return normalized;
+}
+
+export function normalizeCustomCategories(value: unknown): CustomCategoriesMap {
+  let rawObj: Record<string, unknown> | null = null;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    rawObj = value as Record<string, unknown>;
+  } else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        rawObj = parsed as Record<string, unknown>;
+      }
+    } catch {
+      rawObj = null;
+    }
+  }
+  if (!rawObj) return {};
+
+  const validTypes = new Set(ALL_CASHFLOW_TYPES);
+  const out: CustomCategoriesMap = {};
+  for (const [typeKey, rawList] of Object.entries(rawObj)) {
+    if (!validTypes.has(typeKey) || !Array.isArray(rawList)) continue;
+    const defaults = new Set(WEBAPP_CATEGORY_MAP[typeKey] || []);
+    const seen = new Set<string>();
+    const cleaned: string[] = [];
+    for (const item of rawList) {
+      const name = String(item ?? '').trim().slice(0, 20);
+      if (!name || defaults.has(name) || seen.has(name)) continue;
+      seen.add(name);
+      cleaned.push(name);
+      if (cleaned.length >= 30) break;
+    }
+    if (cleaned.length > 0) {
+      out[typeKey] = cleaned;
+    }
+  }
+  return out;
+}
+
+export function getEffectiveCategoriesForType(
+  type: string,
+  customCategories?: CustomCategoriesMap | null
+): string[] {
+  const defaults = WEBAPP_CATEGORY_MAP[type] || ['其他'];
+  const custom = customCategories?.[type] || [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of [...defaults, ...custom]) {
+    const clean = String(c || '').trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+  }
+  return out;
+}
+
+export function normalizeQuickTemplates(value: unknown): QuickEntryTemplate[] {
+  let rawList: unknown[] = [];
+  if (Array.isArray(value)) {
+    rawList = value;
+  } else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) rawList = parsed;
+    } catch {
+      rawList = [];
+    }
+  }
+  const validTypes = new Set(ALL_CASHFLOW_TYPES);
+  const validCurrs = new Set(CURRENCIES);
+  const seen = new Set<string>();
+  const out: QuickEntryTemplate[] = [];
+
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const label = String(obj.label ?? '').trim().slice(0, 24);
+    const type = String(obj.type ?? '').trim();
+    const category = String(obj.category ?? '').trim().slice(0, 24);
+    if (!label || !validTypes.has(type) || !category) continue;
+    const id = String(obj.id ?? '').trim().slice(0, 64) || `tpl-${out.length + 1}`;
+    if (seen.has(id)) continue;
+
+    let amount: number | null = null;
+    if (obj.amount !== null && obj.amount !== undefined && String(obj.amount).trim() !== '') {
+      const num = Number(obj.amount);
+      if (Number.isFinite(num) && num > 0) {
+        amount = roundTo(num, 2);
+      }
+    }
+    const rawCurr = String(obj.currency ?? 'TWD').trim().toUpperCase();
+    const currency = validCurrs.has(rawCurr) ? rawCurr : 'TWD';
+    const itemName = String(obj.itemName ?? '').trim().slice(0, 80) || category;
+    const linkedRaw = String(obj.linkedAccountId ?? '').trim().slice(0, 64);
+    const linkedAccountId = linkedRaw || null;
+    const ledgerId = normalizeLedgerId(obj.ledgerId);
+    const note = String(obj.note ?? '').trim().slice(0, 120);
+    const oneClick = Boolean(obj.oneClick) && amount !== null && amount > 0;
+
+    seen.add(id);
+    out.push({
+      id,
+      label,
+      type,
+      category,
+      itemName,
+      amount,
+      currency,
+      linkedAccountId,
+      ledgerId,
+      note,
+      oneClick,
+    });
+    if (out.length >= 30) break;
+  }
+  return out;
+}
+
+export function validateQuickTemplateInput(raw: Partial<QuickEntryTemplate>): QuickEntryTemplate {
+  const label = String(raw.label ?? '').trim().slice(0, 24);
+  if (!label) throw new Error('請輸入範本名稱。');
+  const type = String(raw.type ?? '').trim();
+  if (!ALL_CASHFLOW_TYPES.includes(type)) throw new Error(`不支援的交易類型：${type}`);
+  const category = String(raw.category ?? '').trim().slice(0, 24);
+  if (!category) throw new Error('請選擇或輸入分類。');
+
+  let amount: number | null = null;
+  if (raw.amount !== null && raw.amount !== undefined && String(raw.amount).trim() !== '') {
+    const parsed = Number(raw.amount);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error('範本金額必須大於 0，或留空讓記帳時填寫。');
+    }
+    amount = roundTo(parsed, 2);
+  }
+  const oneClick = Boolean(raw.oneClick);
+  if (oneClick && (amount === null || amount <= 0)) {
+    throw new Error('啟用「一鍵直記」必須填寫大於 0 的金額。');
+  }
+  const rawCurr = String(raw.currency ?? 'TWD').trim().toUpperCase();
+  if (!CURRENCIES.includes(rawCurr)) {
+    throw new Error(`不支援的幣別：${rawCurr}`);
+  }
+
+  return {
+    id: String(raw.id ?? '').trim().slice(0, 64) || `tpl-${Date.now().toString(36)}`,
+    label,
+    type,
+    category,
+    itemName: String(raw.itemName ?? '').trim().slice(0, 80) || category,
+    amount,
+    currency: rawCurr,
+    linkedAccountId: String(raw.linkedAccountId ?? '').trim().slice(0, 64) || null,
+    ledgerId: normalizeLedgerId(raw.ledgerId),
+    note: String(raw.note ?? '').trim().slice(0, 120),
+    oneClick,
+  };
 }
 
 export function parseLocalDate(ymd: string): ParsedLocalDate {

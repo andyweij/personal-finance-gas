@@ -25,6 +25,7 @@ import {
   updateFxPreview,
   updateSavingsPreview,
 } from './ui/logTab';
+import { bindQuickTemplatesAndAutocompleteEvents } from './ui/quickTemplatesUi';
 import { renderOverviewTab, renderTrendChart } from './ui/overviewTab';
 import {
   getActiveSinkingItems,
@@ -827,6 +828,7 @@ function bindEvents(ctx: UiContext): void {
   });
 
   bindLedgerSearchEvents(ctx);
+  bindQuickTemplatesAndAutocompleteEvents(ctx);
 
   const shiftMonth = (delta: number) => {
     let y = ctx.state.selectedYear;
