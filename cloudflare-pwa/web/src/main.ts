@@ -54,6 +54,7 @@ import {
 } from './ui/stocksTab';
 import { bindUtilityTabEvents, renderUtilityTab } from './ui/utilityTab';
 import { openCreateSplitModal } from './ui/splitsUi';
+import { openJoinSharedLedgerModal } from './ui/sharedLedgerUi';
 import { cancelReorder, startReorder } from './ui/reorderHelper';
 import {
   closeLockScreen,
@@ -288,6 +289,7 @@ async function bootstrap(): Promise<void> {
   const inviteParam = (urlParams.get('invite') || '').trim();
   const resetParam = (urlParams.get('reset') || '').trim();
   const userParam = (urlParams.get('user') || '').trim();
+  const joinLedgerParam = (urlParams.get('joinLedger') || '').trim();
 
   const validChartType: StockChartType =
     storedChartType === 'pie' || storedChartType === 'hbar' || storedChartType === 'treemap'
@@ -620,6 +622,16 @@ async function bootstrap(): Promise<void> {
         }
         showSecurityNotices(auth.securityNotices);
         void ctx.engine.syncNow();
+        if (joinLedgerParam) {
+          try {
+            const cleanUrl = new URL(window.location.href);
+            cleanUrl.searchParams.delete('joinLedger');
+            window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
+          } catch {
+            // ignore
+          }
+          openJoinSharedLedgerModal(ctx, joinLedgerParam);
+        }
       } else if (!auth.initialized) {
         await ctx.engine.updateLocalPinCache(false, null, null);
         await ctx.engine.updateLocalBiometricCache(false, []);

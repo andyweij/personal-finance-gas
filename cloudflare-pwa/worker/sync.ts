@@ -2,6 +2,7 @@ import { normalizeRecurringPostDay } from '../shared/recurring';
 import { atomicGroupKeyOf, orderMutationsByDependencies } from '../shared/syncOrder';
 import type { FxRateSource } from '../shared/currency';
 import { countD1Queries } from './d1Budget';
+import { isMissingSharedLedgerTableError } from './sharedLedgers';
 import {
   ALLOWED_SYNC_ENTITIES,
   buildChunkedImportSql,
@@ -24,6 +25,7 @@ import {
   DEFAULT_LEDGER_ID,
   DEFAULT_LEDGER_NAME,
   D1_QUERIES_PER_INVOCATION_FREE,
+  SHARED_LEDGER_ENTITY_SET,
   SYNC_MAX_MUTATIONS_PER_REQUEST,
   DEFAULT_MONTHLY_DAILY_BUDGET,
   DEFAULT_PNL_COLOR_SCHEME,
@@ -44,6 +46,8 @@ import type {
   RentUtilityRecord,
   RentUtilityRents,
   SavingsAdjustment,
+  SharedLedgerRole,
+  SharedLedgerSyncState,
   SinkingFundItem,
   SplitReceivable,
   SplitReceivableStatus,
@@ -147,21 +151,37 @@ function mapRentUtilityRow(row: Record<string, unknown>): RentUtilityRents {
   };
 }
 
+export interface RawLedgerMembership {
+  ledger_id: string;
+  owner_user_id: string;
+  role: SharedLedgerRole;
+  include_in_net_worth: number;
+  revoked_at: string | null;
+}
+
 /**
  * H5 (v1.8.13): creates the per-user baseline rows (sync state, settings, rent settings, default ledger) if
  * missing and reads them back — all in ONE D1 call, instead of 4–6 separate ensure* round trips per request.
+ * Phase 9 (v2.0.0): also reads `ledger_members` in the same batch (+0 D1 calls for users without shared ledgers).
  */
 export async function ensureSyncBaseline(
   db: D1Database,
   userId: string
-): Promise<{ settings: AppSettings; rents: RentUtilityRents; changeSeq: number; dataEpoch: number }> {
+): Promise<{
+  settings: AppSettings;
+  rents: RentUtilityRents;
+  changeSeq: number;
+  dataEpoch: number;
+  memberships: RawLedgerMembership[];
+  hasSharedLedgerSchema: boolean;
+}> {
   const uid = assertUserId(userId);
   const nowIso = new Date().toISOString();
   const bump = () =>
     db
       .prepare('UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0')
       .bind(nowIso, uid);
-  const results = await db.batch([
+  const baseStmts = [
     db
       .prepare('INSERT OR IGNORE INTO user_sync_state (user_id, change_seq, data_epoch, updated_at) VALUES (?, 0, 1, ?)')
       .bind(uid, nowIso),
@@ -190,16 +210,40 @@ export async function ensureSyncBaseline(
     db.prepare('SELECT * FROM app_settings WHERE user_id = ?').bind(uid),
     db.prepare('SELECT * FROM rent_utility_settings WHERE user_id = ?').bind(uid),
     db.prepare('SELECT change_seq, data_epoch FROM user_sync_state WHERE user_id = ?').bind(uid),
-  ]);
+  ];
+
+  let results: D1Result<unknown>[];
+  let hasSharedLedgerSchema = true;
+  try {
+    results = await db.batch([
+      ...baseStmts,
+      db
+        .prepare(
+          `SELECT ledger_id, owner_user_id, role, include_in_net_worth, revoked_at
+           FROM ledger_members
+           WHERE member_user_id = ?`
+        )
+        .bind(uid),
+    ]);
+  } catch (err) {
+    if (!isMissingSharedLedgerTableError(err)) throw err;
+    hasSharedLedgerSchema = false;
+    results = await db.batch(baseStmts);
+  }
   const settingsRow = (results[7]?.results?.[0] ?? null) as Record<string, unknown> | null;
   const rentsRow = (results[8]?.results?.[0] ?? null) as Record<string, unknown> | null;
   const stateRow = (results[9]?.results?.[0] ?? null) as Record<string, unknown> | null;
   if (!settingsRow || !rentsRow || !stateRow) throw new Error('sync baseline rows could not be read');
+  const memberships = hasSharedLedgerSchema
+    ? ((results[10]?.results || []) as RawLedgerMembership[])
+    : [];
   return {
     settings: mapAppSettingsRow(settingsRow),
     rents: mapRentUtilityRow(rentsRow),
     changeSeq: Number(stateRow.change_seq ?? 0),
     dataEpoch: Number(stateRow.data_epoch ?? 1),
+    memberships,
+    hasSharedLedgerSchema,
   };
 }
 
@@ -338,6 +382,7 @@ function mapCashFlowRow(r: Record<string, unknown>): CashFlowLog {
     installmentPlanId: r.installment_plan_id ? String(r.installment_plan_id) : null,
     installmentSeq:
       r.installment_seq !== null && r.installment_seq !== undefined ? Number(r.installment_seq) : null,
+    ...(r.updated_by ? { updatedByUserId: String(r.updated_by) } : {}),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -361,6 +406,7 @@ function mapRecurringRow(r: Record<string, unknown>): RecurringItem {
     linkedAccountId: r.linked_account_id ? String(r.linked_account_id) : null,
     ledgerId: normalizeLedgerId(r.ledger_id),
     sortOrder: Number(r.sort_order ?? 0),
+    ...(r.updated_by ? { updatedByUserId: String(r.updated_by) } : {}),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -432,6 +478,7 @@ function mapSplitReceivableRow(r: Record<string, unknown>): SplitReceivable {
     sourceAccountId: r.source_account_id ? String(r.source_account_id) : null,
     sourceAdjustmentId: r.source_adjustment_id ? String(r.source_adjustment_id) : null,
     note: String(r.note || ''),
+    ...(r.updated_by ? { updatedByUserId: String(r.updated_by) } : {}),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -454,6 +501,7 @@ function mapInstallmentPlanRow(r: Record<string, unknown>): InstallmentPlan {
     currency: String(r.currency || 'TWD'),
     status: String(r.status || 'active') as InstallmentPlanStatus,
     note: String(r.note || ''),
+    ...(r.updated_by ? { updatedByUserId: String(r.updated_by) } : {}),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -505,6 +553,7 @@ function mapAssetRow(r: Record<string, unknown>): AssetItem {
     ledgerId: normalizeLedgerId(r.ledger_id),
     excludeFromNetWorth: Number(r.exclude_from_net_worth || 0) === 1,
     sortOrder: Number(r.sort_order ?? 0),
+    ...(r.updated_by ? { updatedByUserId: String(r.updated_by) } : {}),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -521,6 +570,7 @@ function mapSavingsAdjustmentRow(r: Record<string, unknown>): SavingsAdjustment 
     twdAmount: Number(r.twd_amount),
     note: String(r.note || ''),
     transferGroupId: r.transfer_group_id ? String(r.transfer_group_id) : null,
+    ...(r.updated_by ? { updatedByUserId: String(r.updated_by) } : {}),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     deletedAt: r.deleted_at ? String(r.deleted_at) : null,
@@ -673,6 +723,8 @@ interface RefCheck {
   kind: RefKind;
   id: string;
   label: string;
+  /** Phase 9 (SL-4): when set on an asset ref inside a shared ledger, the asset MUST live in this exact ledger. */
+  requiredLedgerId?: string;
 }
 
 function collectChangedRefs(
@@ -709,7 +761,11 @@ function refGuardSql(db: D1Database, uid: string, refs: RefCheck[]): { sql: stri
   const binds: unknown[] = [];
   for (const ref of refs) {
     const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
-    if (lenient) {
+    if (ref.kind === 'asset' && ref.requiredLedgerId) {
+      // SL-4: cross-tenant shared writes NEVER allow lenient mode and MUST stay within the same shared ledger
+      sql += ` AND EXISTS (SELECT 1 FROM asset_items WHERE user_id = ? AND id = ? AND ledger_id = ? AND deleted_at IS NULL)`;
+      binds.push(uid, ref.id, ref.requiredLedgerId);
+    } else if (lenient) {
       sql += ` AND (EXISTS (SELECT 1 FROM ${table} WHERE user_id = ? AND id = ? AND deleted_at IS NULL) OR NOT EXISTS (SELECT 1 FROM ${table} WHERE user_id = ? AND id = ?))`;
       binds.push(uid, ref.id, uid, ref.id);
     } else {
@@ -724,6 +780,16 @@ async function rejectMissingRefs(db: D1Database, uid: string, refs: RefCheck[]):
   const lenient = isLegacyRefRequest(db);
   for (const ref of refs) {
     const table = ref.kind === 'ledger' ? 'ledgers' : 'asset_items';
+    if (ref.kind === 'asset' && ref.requiredLedgerId) {
+      const row = await db
+        .prepare('SELECT id FROM asset_items WHERE user_id = ? AND id = ? AND ledger_id = ? AND deleted_at IS NULL')
+        .bind(uid, ref.id, ref.requiredLedgerId)
+        .first();
+      if (!row) {
+        throw new RejectError(`${ref.label}不屬於此共同帳本、不存在或已刪除，伺服器拒絕此筆異動。`);
+      }
+      continue;
+    }
     const row = await db
       .prepare(
         lenient
@@ -810,7 +876,7 @@ async function readExistingRow(
   recordId: string
 ): Promise<Record<string, unknown> | null> {
   const prefetch = getRowPrefetch(db);
-  const key = `${table}:${recordId}`;
+  const key = `${uid}:${table}:${recordId}`;
   if (prefetch?.has(key)) {
     const row = prefetch.get(key) ?? null;
     prefetch.delete(key);
@@ -909,25 +975,26 @@ const ALLOWED_SYNC_OPS = new Set<string>(['upsert', 'delete']);
 
 async function recordIdempotencyOnly(
   db: D1Database,
-  uid: string,
+  storageUid: string,
   mutationId: string,
   serverTime: string,
-  expectedEpoch: number
+  expectedEpoch: number,
+  actorUid = storageUid
 ): Promise<void> {
   const res = await db
     .prepare(
       `INSERT OR IGNORE INTO sync_idempotency (user_id, mutation_id, applied_at)
        SELECT ?, ?, ? WHERE ${EPOCH_GUARD_SQL}`
     )
-    .bind(uid, mutationId, serverTime, uid, expectedEpoch)
+    .bind(actorUid, mutationId, serverTime, storageUid, expectedEpoch)
     .run();
   if (Number(res?.meta?.changes ?? 0) === 0) {
     const already = await db
       .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
-      .bind(uid, mutationId)
+      .bind(actorUid, mutationId)
       .first();
     if (already) return;
-    const currEpoch = await getCurrentDataEpoch(db, uid);
+    const currEpoch = await getCurrentDataEpoch(db, storageUid);
     if (currEpoch !== expectedEpoch) {
       throw new EpochMismatchError();
     }
@@ -975,19 +1042,30 @@ function getGroupContext(db: D1Database): GroupCollector | undefined {
   return (db as unknown as { [GROUP_COLLECTOR]?: GroupCollector })[GROUP_COLLECTOR];
 }
 
+interface SharedWriteScope {
+  actorUid: string;
+  storageUid: string;
+  sharedLedgerId: string | null;
+  sharedRole: SharedLedgerRole | null;
+  ownedSharedLedgerIds: ReadonlySet<string>;
+  hasUpdatedByCols: boolean;
+}
+
 async function applyMutationGroup(
   db: D1Database,
-  uid: string,
+  storageUid: string,
   group: SyncMutation[],
   defaultFxRate: FxRateSource,
   serverTime: string,
-  expectedEpoch: number
+  expectedEpoch: number,
+  sharedScope?: SharedWriteScope
 ): Promise<void> {
+  const actorUid = sharedScope?.actorUid ?? storageUid;
   const collector: GroupCollector = { items: [], groupMutations: group };
   const collectingDb = withGroupCollector(db, collector);
   for (const m of group) {
     try {
-      await applySingleMutation(collectingDb, uid, m, defaultFxRate, serverTime, expectedEpoch);
+      await applySingleMutation(collectingDb, storageUid, m, defaultFxRate, serverTime, expectedEpoch, sharedScope);
     } catch (err) {
       if (err instanceof VersionConflictError) {
         // Inside a transfer a conflict cannot be resolved for one leg alone: reject the whole group (the client
@@ -1015,12 +1093,12 @@ async function applyMutationGroup(
     for (const item of collector.items) {
       const done = await db
         .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
-        .bind(uid, item.mutation.mutationId)
+        .bind(actorUid, item.mutation.mutationId)
         .first();
       if (!done) pending.push(item.mutation.mutationId);
     }
     if (pending.length === 0) return; // an identical concurrent retry committed the whole group
-    if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+    if ((await getCurrentDataEpoch(db, storageUid)) !== expectedEpoch) {
       throw new EpochMismatchError();
     }
     if (/malformed JSON/i.test(msg) || msg.includes(GROUP_GUARD_MARKER)) {
@@ -1050,7 +1128,7 @@ function groupKeyOf(m: SyncMutation): string | null {
 
 async function commitAtomicMutation(
   db: D1Database,
-  uid: string,
+  storageUid: string,
   mutation: SyncMutation,
   serverTime: string,
   expectedEpoch: number,
@@ -1058,19 +1136,20 @@ async function commitAtomicMutation(
   postStatements: D1PreparedStatement[],
   refetchCurrent: () => Promise<{ row: Record<string, unknown> | null; mapped: Record<string, unknown> | null }>,
   legacyClientTs?: string,
-  onZeroChanges?: () => Promise<void>
+  onZeroChanges?: () => Promise<void>,
+  actorUid = storageUid
 ): Promise<void> {
   const idempStmt = db
     .prepare(
       'INSERT INTO sync_idempotency (user_id, mutation_id, applied_at) SELECT ?, ?, ? WHERE changes() > 0'
     )
-    .bind(uid, mutation.mutationId, serverTime);
+    .bind(actorUid, mutation.mutationId, serverTime);
 
   const bumpSeqStmt = db
     .prepare(
       'UPDATE user_sync_state SET change_seq = change_seq + 1, updated_at = ? WHERE user_id = ? AND changes() > 0'
     )
-    .bind(serverTime, uid);
+    .bind(serverTime, storageUid);
 
   const extraStmts: D1PreparedStatement[] = [];
   if (legacyClientTs) {
@@ -1080,7 +1159,7 @@ async function commitAtomicMutation(
           `INSERT OR REPLACE INTO sync_lww_timestamps (user_id, entity, record_id, client_ts)
            SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?)`
         )
-        .bind(uid, mutation.entity, mutation.recordId, legacyClientTs, uid, mutation.mutationId)
+        .bind(actorUid, mutation.entity, mutation.recordId, legacyClientTs, actorUid, mutation.mutationId)
     );
   }
 
@@ -1100,12 +1179,12 @@ async function commitAtomicMutation(
       // S1: Check if an identical concurrent retry already succeeded and recorded idempotency
       const already = await db
         .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
-        .bind(uid, mutation.mutationId)
+        .bind(actorUid, mutation.mutationId)
         .first();
       if (already) return;
 
       // Q5 / N4: Check if a concurrent replace import bumped data_epoch BEFORE reporting conflict/rejection
-      const currEpoch = await getCurrentDataEpoch(db, uid);
+      const currEpoch = await getCurrentDataEpoch(db, storageUid);
       if (currEpoch !== expectedEpoch) {
         throw new EpochMismatchError();
       }
@@ -1134,7 +1213,7 @@ async function commitAtomicMutation(
     }
     const already = await db
       .prepare('SELECT mutation_id FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?')
-      .bind(uid, mutation.mutationId)
+      .bind(actorUid, mutation.mutationId)
       .first();
     if (already) return;
     throw err;
@@ -1147,14 +1226,16 @@ async function applySingleMutation(
   mutation: SyncMutation,
   defaultFxRate: FxRateSource,
   serverTime: string,
-  expectedEpoch: number
+  expectedEpoch: number,
+  sharedScope?: SharedWriteScope
 ): Promise<void> {
   const uid = assertUserId(userId);
+  const actorUid = sharedScope?.actorUid ?? uid;
   let legacyCompareTs: string | null = null;
   if (mutation.baseVersion === undefined) {
     const lwwRow = await db
       .prepare('SELECT client_ts FROM sync_lww_timestamps WHERE user_id = ? AND entity = ? AND record_id = ?')
-      .bind(uid, mutation.entity, mutation.recordId)
+      .bind(actorUid, mutation.entity, mutation.recordId)
       .first<{ client_ts: string }>();
     legacyCompareTs = lwwRow?.client_ts ?? null;
   }
@@ -1387,7 +1468,8 @@ async function applySingleMutation(
       defaultFxRate,
       serverTime,
       expectedEpoch,
-      legacyCompareTs
+      legacyCompareTs,
+      sharedScope
     );
     return;
   }
@@ -1408,9 +1490,27 @@ type RowSyncEntity =
   | 'stock_tx'
   | 'utility_record';
 
+const LEDGER_COLUMN_ENTITIES: ReadonlySet<RowSyncEntity> = new Set([
+  'cashflow',
+  'asset',
+  'recurring',
+  'split_receivable',
+  'installment_plan',
+]);
+
+const UPDATED_BY_ENTITIES: ReadonlySet<RowSyncEntity> = new Set([
+  'cashflow',
+  'asset',
+  'recurring',
+  'savings_adjustment',
+  'split_receivable',
+  'installment_plan',
+]);
+
 interface RowMutationCtx {
   db: D1Database;
   uid: string;
+  actorUid: string;
   mutation: SyncMutation;
   recordId: string;
   existing: Record<string, unknown> | null;
@@ -1447,8 +1547,13 @@ async function applyRowEntityMutation(
   defaultFxRate: FxRateSource,
   serverTime: string,
   expectedEpoch: number,
-  legacyCompareTs: string | null
+  legacyCompareTs: string | null,
+  sharedScope?: SharedWriteScope
 ): Promise<void> {
+  const actorUid = sharedScope?.actorUid ?? uid;
+  const sharedLedgerId = sharedScope?.sharedLedgerId ?? null;
+  const ownedSharedLedgerIds = sharedScope?.ownedSharedLedgerIds ?? new Set<string>();
+  const isDelegatedSharedWrite = Boolean(sharedLedgerId && actorUid !== uid);
   const meta = SYNC_ENTITY_BY_NAME[entity];
   const keyColumn = meta.keyColumn as 'id' | 'period';
   const recordId = handler.normalizeRecordId ? handler.normalizeRecordId(mutation) : mutation.recordId;
@@ -1463,6 +1568,28 @@ async function applyRowEntityMutation(
     throw err;
   }
 
+  // SL-1 / SL-5: Verify an existing row truly belongs to the target shared ledger before version check or mutation
+  // (prevents an editor from probing/modifying/deleting the owner's private records via ID guessing).
+  if (sharedLedgerId && existing) {
+    if (entity === 'ledger') {
+      if (recordId !== sharedLedgerId) {
+        throw new RejectError('目標帳本與共同帳本識別碼不一致，伺服器拒絕操作。');
+      }
+    } else if (LEDGER_COLUMN_ENTITIES.has(entity)) {
+      if (normalizeLedgerId(existing.ledger_id) !== sharedLedgerId) {
+        throw new RejectError('目標紀錄不屬於此共同帳本，伺服器拒絕操作。');
+      }
+    } else if (entity === 'savings_adjustment') {
+      const accRow = await db
+        .prepare('SELECT ledger_id FROM asset_items WHERE user_id = ? AND id = ?')
+        .bind(uid, String(existing.account_id || ''))
+        .first<{ ledger_id?: string }>();
+      if (!accRow || normalizeLedgerId(accRow.ledger_id) !== sharedLedgerId) {
+        throw new RejectError('目標餘額調整紀錄不屬於此共同帳本，伺服器拒絕操作。');
+      }
+    }
+  }
+
   const check = checkVersionOrThrow(
     mutation,
     existing,
@@ -1471,7 +1598,7 @@ async function applyRowEntityMutation(
     legacyCompareTs
   );
   if (!check.shouldApply) {
-    await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+    await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch, actorUid);
     return;
   }
 
@@ -1486,9 +1613,28 @@ async function applyRowEntityMutation(
     };
   };
 
+  // SL-2: Atomic SQL membership + role guard for delegated member writes (prevents revocation TOCTOU)
+  const membershipGuardSql = isDelegatedSharedWrite
+    ? " AND EXISTS (SELECT 1 FROM ledger_members WHERE ledger_id = ? AND owner_user_id = ? AND member_user_id = ? AND role IN ('owner', 'editor') AND revoked_at IS NULL)"
+    : '';
+  const membershipGuardBinds = isDelegatedSharedWrite ? [sharedLedgerId!, uid, actorUid] : [];
+  const checkMembershipStillWritable = async () => {
+    if (!isDelegatedSharedWrite) return;
+    const row = await db
+      .prepare(
+        "SELECT role FROM ledger_members WHERE ledger_id = ? AND owner_user_id = ? AND member_user_id = ? AND role IN ('owner', 'editor') AND revoked_at IS NULL"
+      )
+      .bind(sharedLedgerId!, uid, actorUid)
+      .first();
+    if (!row) {
+      throw new RejectError('您在此共同帳本的編輯權限已變更或遭移除，伺服器拒絕此筆異動。');
+    }
+  };
+
   const ctx: RowMutationCtx = {
     db,
     uid,
+    actorUid,
     mutation,
     recordId,
     existing,
@@ -1499,7 +1645,7 @@ async function applyRowEntityMutation(
   if (mutation.op === 'delete') {
     handler.beforeDeleteCheck?.(ctx);
     if (!existing) {
-      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch);
+      await recordIdempotencyOnly(db, uid, mutation.mutationId, serverTime, expectedEpoch, actorUid);
       return;
     }
     const delPlan = handler.prepareDeleteGuard
@@ -1514,8 +1660,8 @@ async function applyRowEntityMutation(
       nextVersion: check.nextVersion,
       expectedVersion: Number(existing.version ?? 1),
       expectedEpoch,
-      extraGuardSql: delPlan.extraGuardSql,
-      extraGuardBinds: delPlan.extraGuardBinds,
+      extraGuardSql: `${delPlan.extraGuardSql || ''}${membershipGuardSql}`,
+      extraGuardBinds: [...(delPlan.extraGuardBinds || []), ...membershipGuardBinds],
     });
     const delStmt = db.prepare(built.sql).bind(...built.binds);
     await commitAtomicMutation(
@@ -1528,14 +1674,51 @@ async function applyRowEntityMutation(
       [],
       refetchRow,
       check.legacyClientTs,
-      delPlan.onZeroChanges
+      isDelegatedSharedWrite || delPlan.onZeroChanges
+        ? async () => {
+            await checkMembershipStillWritable();
+            await delPlan.onZeroChanges?.();
+          }
+        : undefined,
+      actorUid
     );
     return;
   }
 
   const plan = await handler.prepareUpsert(ctx);
-  const refs = plan.refs ?? [];
+
+  // SL-5: Anti-smuggling — forbid moving records across personal <-> shared or shared A <-> shared B boundaries
+  if (LEDGER_COLUMN_ENTITIES.has(entity)) {
+    const ledgerCol = plan.columns.find((c) => c.col === 'ledger_id');
+    const targetLedgerId = normalizeLedgerId(ledgerCol?.value);
+    if (sharedLedgerId) {
+      if (targetLedgerId !== sharedLedgerId) {
+        throw new RejectError('共同帳本內的紀錄不可變更所屬帳本。');
+      }
+    } else if (existing && ownedSharedLedgerIds.size > 0) {
+      const prevLedgerId = normalizeLedgerId(existing.ledger_id);
+      if (ownedSharedLedgerIds.has(prevLedgerId) && targetLedgerId !== prevLedgerId) {
+        throw new RejectError('已共用的帳本紀錄不可移出至其他帳本。');
+      }
+      if (!ownedSharedLedgerIds.has(prevLedgerId) && ownedSharedLedgerIds.has(targetLedgerId)) {
+        throw new RejectError('個人帳本紀錄不可直接移入已共用的帳本。');
+      }
+    }
+  }
+
+  // SL-4: Same-scope reference guard — shared writes may ONLY link to assets belonging to the SAME shared ledger
+  const rawRefs = plan.refs ?? [];
+  const refs: RefCheck[] = sharedLedgerId
+    ? rawRefs.map((r) => (r.kind === 'asset' ? { ...r, requiredLedgerId: sharedLedgerId } : r))
+    : rawRefs;
   const guard = refs.length > 0 ? refGuardSql(db, uid, refs) : { sql: '', binds: [] };
+
+  // Phase 9 attribution: record actorUid into updated_by when 0025 columns exist
+  const columns: ColumnAssignment[] =
+    sharedScope?.hasUpdatedByCols && UPDATED_BY_ENTITIES.has(entity)
+      ? [...plan.columns, { col: 'updated_by', value: actorUid }]
+      : plan.columns;
+
   const p = mutation.payload || {};
   const built = buildRowUpsertSql({
     table: meta.table,
@@ -1543,14 +1726,14 @@ async function applyRowEntityMutation(
     isUpdate: Boolean(existing),
     uid,
     recordId,
-    columns: plan.columns,
+    columns,
     createdAt: String(p.createdAt || check.writeTs),
     writeTs: check.writeTs,
     nextVersion: check.nextVersion,
     expectedVersion: existing ? Number(existing.version ?? 1) : undefined,
     expectedEpoch,
-    guardSql: guard.sql,
-    guardBinds: guard.binds,
+    guardSql: `${guard.sql}${membershipGuardSql}`,
+    guardBinds: [...guard.binds, ...membershipGuardBinds],
   });
   const writeStmt = db.prepare(built.sql).bind(...built.binds);
 
@@ -1564,7 +1747,13 @@ async function applyRowEntityMutation(
     plan.postStatements ?? [],
     refetchRow,
     check.legacyClientTs,
-    refs.length > 0 ? () => rejectMissingRefs(db, uid, refs) : undefined
+    refs.length > 0 || isDelegatedSharedWrite
+      ? async () => {
+          await checkMembershipStillWritable();
+          if (refs.length > 0) await rejectMissingRefs(db, uid, refs);
+        }
+      : undefined,
+    actorUid
   );
 }
 
@@ -1577,6 +1766,20 @@ const ROW_ENTITY_HANDLERS: Readonly<Record<RowSyncEntity, RowEntityHandler>> = {
       }
     },
     async prepareDeleteGuard({ db, uid, recordId }) {
+      try {
+        const otherMembers = await db
+          .prepare(
+            'SELECT COUNT(*) AS cnt FROM ledger_members WHERE ledger_id = ? AND owner_user_id = ? AND member_user_id != ? AND revoked_at IS NULL'
+          )
+          .bind(recordId, uid, uid)
+          .first<{ cnt: number }>();
+        if (Number(otherMembers?.cnt || 0) > 0) {
+          throw new RejectError('此共同帳本仍有其他活躍成員，請先移除所有成員後再刪除帳本。');
+        }
+      } catch (err) {
+        if (err instanceof RejectError) throw err;
+        if (!isMissingSharedLedgerTableError(err)) throw err;
+      }
       const countLinkedRecords = async () => {
         // H5: one query instead of three
         const row = await db
@@ -2017,7 +2220,7 @@ const ROW_ENTITY_HANDLERS: Readonly<Record<RowSyncEntity, RowEntityHandler>> = {
 
   asset: {
     mapRow: mapAssetRow,
-    async prepareUpsert({ db, uid, mutation, recordId, existing, writeTs }) {
+    async prepareUpsert({ db, uid, actorUid, mutation, recordId, existing, writeTs }) {
       const p = mutation.payload || {};
       const isManualPriceOverride = Boolean(p.manualPriceOverride);
       const isActiveExisting = Boolean(existing && !existing.deleted_at);
@@ -2176,7 +2379,7 @@ const ROW_ENTITY_HANDLERS: Readonly<Record<RowSyncEntity, RowEntityHandler>> = {
                WHERE user_id = ? AND ledger_id = ? AND is_default_savings = 1 AND id != ?
                  AND EXISTS (SELECT 1 FROM sync_idempotency WHERE user_id = ? AND mutation_id = ?)`
             )
-            .bind(writeTs, uid, uid, v.ledgerId, recordId, uid, mutation.mutationId)
+            .bind(writeTs, uid, uid, v.ledgerId, recordId, actorUid, mutation.mutationId)
         );
       }
 
@@ -2526,8 +2729,287 @@ export async function querySyncDelta(
 export const SYNC_AUTH_QUERY_RESERVE = 5;
 /** H5: worst case D1 queries one mutation can use (legacy LWW read, row read, commit, and the 0-row diagnosis). */
 const PER_MUTATION_QUERY_WORST = 10;
-/** H5: queries kept for the response (delta read + a possible full resync). */
-const SYNC_TAIL_QUERY_RESERVE = 3;
+/** H5 / Phase 9: queries kept for the response (personal delta + optional shared delta batch + resync). */
+const SYNC_TAIL_QUERY_RESERVE = 4;
+
+interface SharedLedgerReadResult {
+  sharedLedgers: SharedLedgerSyncState[];
+  userDisplayNames: Map<string, string>;
+  joinedLedgers: Ledger[];
+  joinedCashflow: CashFlowLog[];
+  joinedAssets: AssetItem[];
+  joinedRecurring: RecurringItem[];
+  joinedAdjustments: SavingsAdjustment[];
+  joinedSplits: SplitReceivable[];
+  joinedInstallments: InstallmentPlan[];
+}
+
+function enrichUpdatedByName<T extends { updatedByUserId?: string | null; updatedByName?: string | null }>(
+  items: T[] | undefined,
+  names: Map<string, string>
+): void {
+  if (!items || names.size === 0) return;
+  for (const item of items) {
+    if (item.updatedByUserId) {
+      const name = names.get(item.updatedByUserId);
+      if (name) item.updatedByName = name;
+    }
+  }
+}
+
+/**
+ * Phase 9 (v2.0.0): reads member directory, owner sync cursors, and delta rows for ALL joined shared ledgers
+ * in ONE single D1 batch (or 0 queries when the user has no active shared ledgers).
+ */
+async function readSharedLedgersDelta(
+  db: D1Database,
+  actorUid: string,
+  activeMemberships: RawLedgerMembership[],
+  personalState: { changeSeq: number; dataEpoch: number },
+  sharedCursors: Record<string, { sinceSeq: number; clientEpoch: number }> | undefined,
+  forceFullSharedIds: ReadonlySet<string>,
+  epochMismatchSharedIds: ReadonlySet<string>
+): Promise<SharedLedgerReadResult> {
+  const empty: SharedLedgerReadResult = {
+    sharedLedgers: [],
+    userDisplayNames: new Map(),
+    joinedLedgers: [],
+    joinedCashflow: [],
+    joinedAssets: [],
+    joinedRecurring: [],
+    joinedAdjustments: [],
+    joinedSplits: [],
+    joinedInstallments: [],
+  };
+  if (activeMemberships.length === 0) return empty;
+
+  const ledgerIds = Array.from(new Set(activeMemberships.map((m) => m.ledger_id)));
+  const joinedMemberships = activeMemberships.filter((m) => m.owner_user_id !== actorUid);
+  const distinctJoinedOwners = Array.from(new Set(joinedMemberships.map((m) => m.owner_user_id)));
+
+  // Step A: Read member directory + owner sync states in 1 batch (if joined exist, also read owner states)
+  const metaStmts: D1PreparedStatement[] = [
+    db
+      .prepare(
+        `SELECT lm.ledger_id, lm.owner_user_id, lm.member_user_id, lm.role, u.username, u.display_name
+         FROM ledger_members lm
+         JOIN users u ON u.id = lm.member_user_id
+         WHERE lm.revoked_at IS NULL AND lm.ledger_id IN (${ledgerIds.map(() => '?').join(', ')})
+         ORDER BY CASE lm.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END, lm.joined_at ASC`
+      )
+      .bind(...ledgerIds),
+  ];
+  if (distinctJoinedOwners.length > 0) {
+    metaStmts.push(
+      db
+        .prepare(
+          `SELECT user_id, change_seq, data_epoch
+           FROM user_sync_state
+           WHERE user_id IN (${distinctJoinedOwners.map(() => '?').join(', ')})`
+        )
+        .bind(...distinctJoinedOwners)
+    );
+  }
+  const metaRes = await db.batch(metaStmts);
+  const allMemberRows = (metaRes[0]?.results || []) as Array<{
+    ledger_id: string;
+    owner_user_id: string;
+    member_user_id: string;
+    role: SharedLedgerRole;
+    username: string;
+    display_name: string;
+  }>;
+  const ownerStateMap = new Map<string, { changeSeq: number; dataEpoch: number }>();
+  ownerStateMap.set(actorUid, personalState);
+  if (distinctJoinedOwners.length > 0) {
+    for (const r of (metaRes[1]?.results || []) as Array<{
+      user_id: string;
+      change_seq: number;
+      data_epoch: number;
+    }>) {
+      ownerStateMap.set(String(r.user_id), {
+        changeSeq: Number(r.change_seq ?? 0),
+        dataEpoch: Number(r.data_epoch ?? 1),
+      });
+    }
+  }
+
+  const userDisplayNames = new Map<string, string>();
+  const membersByLedger = new Map<string, Array<{ userId: string; displayName: string; role: SharedLedgerRole }>>();
+  for (const r of allMemberRows) {
+    const displayName = r.display_name || r.username;
+    userDisplayNames.set(r.member_user_id, displayName);
+    const list = membersByLedger.get(r.ledger_id) || [];
+    list.push({ userId: r.member_user_id, displayName, role: r.role });
+    membersByLedger.set(r.ledger_id, list);
+  }
+
+  // Step B: For joined shared ledgers, fetch all 7 shareable entity slices across all joined ledgers in 1 single D1 batch
+  const dataStmts: D1PreparedStatement[] = [];
+  const joinedPlans: Array<{
+    m: RawLedgerMembership;
+    ownerState: { changeSeq: number; dataEpoch: number };
+    full: boolean;
+    epochMismatch: boolean;
+    startIdx: number;
+  }> = [];
+
+  for (const m of joinedMemberships) {
+    const ownerState = ownerStateMap.get(m.owner_user_id) || { changeSeq: 0, dataEpoch: 1 };
+    const clientCur = sharedCursors?.[m.ledger_id];
+    const hasClientEpoch =
+      clientCur && typeof clientCur.clientEpoch === 'number' && Number.isFinite(clientCur.clientEpoch);
+    const curEpochMismatch =
+      epochMismatchSharedIds.has(m.ledger_id) ||
+      Boolean(hasClientEpoch && clientCur!.clientEpoch !== ownerState.dataEpoch);
+    const isFull =
+      curEpochMismatch ||
+      forceFullSharedIds.has(m.ledger_id) ||
+      !clientCur ||
+      typeof clientCur.sinceSeq !== 'number' ||
+      !Number.isFinite(clientCur.sinceSeq);
+
+    const startIdx = dataStmts.length;
+    joinedPlans.push({ m, ownerState, full: isFull, epochMismatch: curEpochMismatch, startIdx });
+
+    const seqClause = isFull ? ' AND deleted_at IS NULL' : ' AND change_seq > ? AND change_seq <= ?';
+    const seqBinds = isFull ? [] : [Number(clientCur!.sinceSeq), ownerState.changeSeq];
+
+    // 0: ledgers (always fetch live row on full, or seq window on incremental; on incremental also fetch if changed)
+    dataStmts.push(
+      db
+        .prepare(`SELECT * FROM ledgers WHERE user_id = ? AND id = ?${isFull ? ' AND deleted_at IS NULL' : ''}`)
+        .bind(m.owner_user_id, m.ledger_id)
+    );
+    // 1: cashflow_logs
+    dataStmts.push(
+      db
+        .prepare(`SELECT * FROM cashflow_logs WHERE user_id = ? AND ledger_id = ?${seqClause} ORDER BY date DESC`)
+        .bind(m.owner_user_id, m.ledger_id, ...seqBinds)
+    );
+    // 2: asset_items
+    dataStmts.push(
+      db
+        .prepare(`SELECT * FROM asset_items WHERE user_id = ? AND ledger_id = ?${seqClause} ORDER BY sort_order ASC, created_at ASC`)
+        .bind(m.owner_user_id, m.ledger_id, ...seqBinds)
+    );
+    // 3: recurring_items
+    dataStmts.push(
+      db
+        .prepare(`SELECT * FROM recurring_items WHERE user_id = ? AND ledger_id = ?${seqClause} ORDER BY sort_order ASC, created_at ASC`)
+        .bind(m.owner_user_id, m.ledger_id, ...seqBinds)
+    );
+    // 4: savings_adjustments (linked via shared ledger's asset_items)
+    dataStmts.push(
+      db
+        .prepare(
+          `SELECT * FROM savings_adjustments
+           WHERE user_id = ?
+             AND account_id IN (SELECT id FROM asset_items WHERE user_id = ? AND ledger_id = ?)${seqClause}
+           ORDER BY date DESC`
+        )
+        .bind(m.owner_user_id, m.owner_user_id, m.ledger_id, ...seqBinds)
+    );
+    // 5: split_receivables
+    dataStmts.push(
+      db
+        .prepare(`SELECT * FROM split_receivables WHERE user_id = ? AND ledger_id = ?${seqClause} ORDER BY date DESC, created_at DESC`)
+        .bind(m.owner_user_id, m.ledger_id, ...seqBinds)
+    );
+    // 6: installment_plans
+    dataStmts.push(
+      db
+        .prepare(`SELECT * FROM installment_plans WHERE user_id = ? AND ledger_id = ?${seqClause} ORDER BY start_ym DESC, created_at DESC`)
+        .bind(m.owner_user_id, m.ledger_id, ...seqBinds)
+    );
+  }
+
+  const dataResults = dataStmts.length > 0 ? await db.batch(dataStmts) : [];
+  const rowsAt = (idx: number) => (dataResults[idx]?.results || []) as Record<string, unknown>[];
+
+  const joinedLedgers: Ledger[] = [];
+  const joinedCashflow: CashFlowLog[] = [];
+  const joinedAssets: AssetItem[] = [];
+  const joinedRecurring: RecurringItem[] = [];
+  const joinedAdjustments: SavingsAdjustment[] = [];
+  const joinedSplits: SplitReceivable[] = [];
+  const joinedInstallments: InstallmentPlan[] = [];
+  const joinedStateByLedger = new Map<string, SharedLedgerSyncState>();
+
+  for (const plan of joinedPlans) {
+    const { m, ownerState, full, epochMismatch, startIdx } = plan;
+    const ledgerRow = rowsAt(startIdx)[0];
+    if (!ledgerRow || ledgerRow.deleted_at) continue;
+    const members = membersByLedger.get(m.ledger_id) || [];
+    const ownerDisplayName = userDisplayNames.get(m.owner_user_id) || '擁有者';
+    const mappedLedger: Ledger = {
+      ...mapLedgerRow(ledgerRow),
+      // Per-member net worth preference overrides owner's flag for this member
+      includeInNetWorth: Number(m.include_in_net_worth ?? 0) === 1,
+      isShared: true,
+      ownerUserId: m.owner_user_id,
+      ownerDisplayName,
+      myRole: m.role,
+      memberCount: members.length,
+    };
+    joinedLedgers.push(mappedLedger);
+    joinedCashflow.push(...rowsAt(startIdx + 1).map(mapCashFlowRow));
+    joinedAssets.push(...rowsAt(startIdx + 2).map(mapAssetRow));
+    joinedRecurring.push(...rowsAt(startIdx + 3).map(mapRecurringRow));
+    joinedAdjustments.push(...rowsAt(startIdx + 4).map(mapSavingsAdjustmentRow));
+    joinedSplits.push(...rowsAt(startIdx + 5).map(mapSplitReceivableRow));
+    joinedInstallments.push(...rowsAt(startIdx + 6).map(mapInstallmentPlanRow));
+
+    joinedStateByLedger.set(m.ledger_id, {
+      ledgerId: m.ledger_id,
+      ownerUserId: m.owner_user_id,
+      ownerDisplayName,
+      myRole: m.role,
+      includeInNetWorth: Number(m.include_in_net_worth ?? 0) === 1,
+      memberCount: members.length,
+      members,
+      changeSeq: ownerState.changeSeq,
+      dataEpoch: ownerState.dataEpoch,
+      ...(full ? { fullResyncRequired: true } : {}),
+      ...(epochMismatch ? { epochMismatch: true } : {}),
+    });
+  }
+
+  const sharedLedgers: SharedLedgerSyncState[] = [];
+  for (const m of activeMemberships) {
+    if (m.owner_user_id !== actorUid) {
+      const st = joinedStateByLedger.get(m.ledger_id);
+      if (st) sharedLedgers.push(st);
+      continue;
+    }
+    const members = membersByLedger.get(m.ledger_id) || [];
+    // Only mark as actively shared on the owner's side if at least 1 other member exists or membership exists
+    const ownerDisplayName = userDisplayNames.get(actorUid) || '擁有者';
+    sharedLedgers.push({
+      ledgerId: m.ledger_id,
+      ownerUserId: actorUid,
+      ownerDisplayName,
+      myRole: 'owner',
+      includeInNetWorth: Number(m.include_in_net_worth ?? 0) === 1,
+      memberCount: members.length,
+      members,
+      changeSeq: personalState.changeSeq,
+      dataEpoch: personalState.dataEpoch,
+    });
+  }
+
+  return {
+    sharedLedgers,
+    userDisplayNames,
+    joinedLedgers,
+    joinedCashflow,
+    joinedAssets,
+    joinedRecurring,
+    joinedAdjustments,
+    joinedSplits,
+    joinedInstallments,
+  };
+}
 
 export async function processSyncRequest(
   rawDb: D1Database,
@@ -2548,6 +3030,32 @@ export async function processSyncRequest(
   const baseline = await ensureSyncBaseline(db, uid);
   const settings = baseline.settings;
   const syncStateBefore = { changeSeq: baseline.changeSeq, dataEpoch: baseline.dataEpoch };
+
+  // Phase 9 (v2.0.0): active & revoked shared ledger memberships (0 extra D1 calls when empty)
+  const activeMemberships = baseline.memberships.filter((m) => !m.revoked_at);
+  const activeByLedgerId = new Map<string, RawLedgerMembership>(
+    activeMemberships.map((m) => [m.ledger_id, m])
+  );
+  const ownedSharedLedgerIds = new Set<string>(
+    activeMemberships.filter((m) => m.owner_user_id === uid && m.role === 'owner').map((m) => m.ledger_id)
+  );
+  const joinedMemberships = activeMemberships.filter((m) => m.owner_user_id !== uid);
+  const revokedSharedSet = new Set<string>(
+    baseline.memberships
+      .filter((m) => m.owner_user_id !== uid && Boolean(m.revoked_at))
+      .map((m) => m.ledger_id)
+  );
+  if (req.sharedCursors && typeof req.sharedCursors === 'object') {
+    for (const lid of Object.keys(req.sharedCursors)) {
+      if (!activeByLedgerId.has(lid)) {
+        revokedSharedSet.add(lid);
+      }
+    }
+  }
+  const revokedSharedLedgerIds = Array.from(revokedSharedSet);
+  const sharedEpochMismatchIds = new Set<string>();
+  const forceFullSharedIds = new Set<string>();
+
   // Review R-A (v1.8.12): apply records before the mutations that reference them (older clients can send a
   // renamed/coalesced account after the cashflow that is linked to it), so the M3 guards do not reject them.
   const mutations = Array.isArray(req.mutations) ? orderMutationsByDependencies(req.mutations) : [];
@@ -2555,10 +3063,72 @@ export async function processSyncRequest(
   const rejected: Array<{ mutationId: string; reason: string }> = [];
   const conflicts: SyncConflict[] = [];
 
+  const mergeSharedIntoDelta = async (
+    delta: SyncDelta,
+    personalState: { changeSeq: number; dataEpoch: number },
+    forceAllSharedFull: boolean
+  ): Promise<{ sharedLedgers?: SharedLedgerSyncState[]; revokedSharedLedgerIds?: string[] }> => {
+    if (activeMemberships.length === 0) {
+      return revokedSharedLedgerIds.length > 0 ? { revokedSharedLedgerIds } : {};
+    }
+    const forceSet = forceAllSharedFull
+      ? new Set(activeMemberships.map((m) => m.ledger_id))
+      : forceFullSharedIds;
+    const shared = await readSharedLedgersDelta(
+      db,
+      uid,
+      activeMemberships,
+      personalState,
+      req.sharedCursors,
+      forceSet,
+      sharedEpochMismatchIds
+    );
+    // Tag owner's own shared ledgers in delta.ledgers with shared metadata
+    const stateByLedger = new Map(shared.sharedLedgers.map((s) => [s.ledgerId, s]));
+    if (delta.ledgers) {
+      for (const l of delta.ledgers) {
+        const st = stateByLedger.get(l.id);
+        if (st && st.ownerUserId === uid) {
+          l.isShared = true;
+          l.ownerUserId = uid;
+          l.ownerDisplayName = st.ownerDisplayName;
+          l.myRole = 'owner';
+          l.memberCount = st.memberCount;
+        }
+      }
+    }
+    if (shared.joinedLedgers.length > 0) {
+      delta.ledgers = [...(delta.ledgers || []), ...shared.joinedLedgers];
+      delta.cashflowLogs = [...delta.cashflowLogs, ...shared.joinedCashflow];
+      delta.assetItems = [...delta.assetItems, ...shared.joinedAssets];
+      delta.recurringItems = [...delta.recurringItems, ...shared.joinedRecurring];
+      delta.savingsAdjustments = [...(delta.savingsAdjustments || []), ...shared.joinedAdjustments];
+      delta.splitReceivables = [...(delta.splitReceivables || []), ...shared.joinedSplits];
+      delta.installmentPlans = [...(delta.installmentPlans || []), ...shared.joinedInstallments];
+    }
+    // Enrich updatedByName for all shareable entities
+    enrichUpdatedByName(delta.cashflowLogs, shared.userDisplayNames);
+    enrichUpdatedByName(delta.assetItems, shared.userDisplayNames);
+    enrichUpdatedByName(delta.recurringItems, shared.userDisplayNames);
+    enrichUpdatedByName(delta.savingsAdjustments, shared.userDisplayNames);
+    enrichUpdatedByName(delta.splitReceivables, shared.userDisplayNames);
+    enrichUpdatedByName(delta.installmentPlans, shared.userDisplayNames);
+
+    return {
+      ...(shared.sharedLedgers.length > 0 ? { sharedLedgers: shared.sharedLedgers } : {}),
+      ...(revokedSharedLedgerIds.length > 0 ? { revokedSharedLedgerIds } : {}),
+    };
+  };
+
   const buildFullResyncResponse = async (markEpochMismatch: boolean): Promise<SyncResponse> => {
     // Q2 / N2 / R-4: the full snapshot, its cursor and its epoch are read in one D1 batch (one transaction), so
     // they are consistent: a concurrent write lands either before (included) or after (cursor is lower).
     const full = await readDeltaWithState(db, uid, { kind: 'full' });
+    const sharedMeta = await mergeSharedIntoDelta(
+      full.delta,
+      { changeSeq: full.changeSeq, dataEpoch: full.dataEpoch },
+      true
+    );
     return {
       ok: true,
       serverTime,
@@ -2570,6 +3140,7 @@ export async function processSyncRequest(
       rejected,
       conflicts,
       delta: full.delta,
+      ...sharedMeta,
     };
   };
 
@@ -2613,12 +3184,120 @@ export async function processSyncRequest(
       (m.payload === undefined ||
         m.payload === null ||
         (typeof m.payload === 'object' && !Array.isArray(m.payload))) &&
-      (m.atomicGroupId === undefined || m.atomicGroupId === null || typeof m.atomicGroupId === 'string');
+      (m.atomicGroupId === undefined || m.atomicGroupId === null || typeof m.atomicGroupId === 'string') &&
+      (m.sharedLedgerId === undefined || m.sharedLedgerId === null || typeof m.sharedLedgerId === 'string');
     if (!hasValidEnvelope) return 'Invalid mutation format';
     if (!ALLOWED_SYNC_ENTITIES.has(String(m.entity)) || !ALLOWED_SYNC_OPS.has(String(m.op))) {
       return `不支援的同步類型或操作：${String(m.entity)}:${String(m.op)}`;
     }
     return null;
+  };
+
+  // Phase 9: load owner data_epochs when incoming mutations may target joined shared ledgers (0 calls otherwise)
+  const joinedOwnerEpochs = new Map<string, number>();
+  if (mutations.length > 0 && joinedMemberships.length > 0) {
+    const distinctOwners = Array.from(new Set(joinedMemberships.map((m) => m.owner_user_id)));
+    const rows = await db
+      .prepare(
+        `SELECT user_id, data_epoch FROM user_sync_state WHERE user_id IN (${distinctOwners.map(() => '?').join(', ')})`
+      )
+      .bind(...distinctOwners)
+      .all<{ user_id: string; data_epoch: number }>();
+    for (const r of rows.results || []) {
+      joinedOwnerEpochs.set(String(r.user_id), Number(r.data_epoch ?? 1));
+    }
+  }
+
+  type ResolvedMutationTarget =
+    | { ok: true; storageUid: string; expectedEpoch: number; scope: SharedWriteScope }
+    | { ok: false; kind: 'reject'; reason: string }
+    | { ok: false; kind: 'shared_epoch_mismatch'; ledgerId: string };
+
+  const resolveMutationTarget = (m: SyncMutation): ResolvedMutationTarget => {
+    const hintedSharedId =
+      typeof m.sharedLedgerId === 'string' && m.sharedLedgerId.trim() ? m.sharedLedgerId.trim() : null;
+    const payloadLid =
+      m.payload && typeof m.payload.ledgerId === 'string' && m.payload.ledgerId.trim()
+        ? m.payload.ledgerId.trim()
+        : null;
+    const payloadMem = payloadLid ? activeByLedgerId.get(payloadLid) : undefined;
+    const recordMem = m.entity === 'ledger' ? activeByLedgerId.get(m.recordId) : undefined;
+    const implicitJoinedLid =
+      !hintedSharedId &&
+      ((payloadMem && payloadMem.owner_user_id !== uid ? payloadLid : null) ||
+        (recordMem && recordMem.owner_user_id !== uid ? m.recordId : null));
+    const targetSharedId = hintedSharedId || implicitJoinedLid;
+
+    if (!targetSharedId) {
+      return {
+        ok: true,
+        storageUid: uid,
+        expectedEpoch,
+        scope: {
+          actorUid: uid,
+          storageUid: uid,
+          sharedLedgerId: null,
+          sharedRole: null,
+          ownedSharedLedgerIds,
+          hasUpdatedByCols: baseline.hasSharedLedgerSchema,
+        },
+      };
+    }
+
+    if (targetSharedId === DEFAULT_LEDGER_ID) {
+      return { ok: false, kind: 'reject', reason: '預設個人主帳本不支援共同帳本同步操作。' };
+    }
+    const membership = activeByLedgerId.get(targetSharedId);
+    if (!membership) {
+      return {
+        ok: false,
+        kind: 'reject',
+        reason: '您沒有此共同帳本的存取權限，或成員資格已被移除。',
+      };
+    }
+    if (!SHARED_LEDGER_ENTITY_SET.has(m.entity)) {
+      return { ok: false, kind: 'reject', reason: '此資料類型不支援在共同帳本內同步。' };
+    }
+    if (m.entity === 'ledger') {
+      if (membership.role !== 'owner' || membership.owner_user_id !== uid) {
+        return { ok: false, kind: 'reject', reason: '僅共同帳本擁有者可修改或刪除帳本設定。' };
+      }
+    } else if (membership.role === 'viewer') {
+      return {
+        ok: false,
+        kind: 'reject',
+        reason: '您在此共同帳本為「僅檢視」權限，無法新增、修改或刪除資料。',
+      };
+    }
+
+    const storageUid = membership.owner_user_id;
+    let targetEpoch = expectedEpoch;
+    if (storageUid !== uid) {
+      const ownerEpoch = joinedOwnerEpochs.get(storageUid) ?? 1;
+      const clientSharedEpoch = req.sharedCursors?.[targetSharedId]?.clientEpoch;
+      if (
+        typeof clientSharedEpoch === 'number' &&
+        Number.isFinite(clientSharedEpoch) &&
+        clientSharedEpoch !== ownerEpoch
+      ) {
+        return { ok: false, kind: 'shared_epoch_mismatch', ledgerId: targetSharedId };
+      }
+      targetEpoch = ownerEpoch;
+    }
+
+    return {
+      ok: true,
+      storageUid,
+      expectedEpoch: targetEpoch,
+      scope: {
+        actorUid: uid,
+        storageUid,
+        sharedLedgerId: targetSharedId,
+        sharedRole: membership.role,
+        ownedSharedLedgerIds,
+        hasUpdatedByCols: baseline.hasSharedLedgerSchema,
+      },
+    };
   };
 
   const isApplied = async (mutationId: string): Promise<boolean> =>
@@ -2629,7 +3308,7 @@ export async function processSyncRequest(
         .first()
     );
 
-  /** M4: applies an atomic group; returns true when the request must stop (epoch changed). */
+  /** M4: applies an atomic group; returns true when the request must stop (personal epoch changed). */
   const processGroup = async (members: SyncMutation[]): Promise<boolean> => {
     const pendingMembers: SyncMutation[] = [];
     for (const m of members) {
@@ -2637,12 +3316,56 @@ export async function processSyncRequest(
       else pendingMembers.push(m);
     }
     if (pendingMembers.length === 0) return false;
+
+    // Resolve and verify every member targets the exact same domain (personal or single shared ledger)
+    let groupTarget: Extract<ResolvedMutationTarget, { ok: true }> | null = null;
+    for (const m of pendingMembers) {
+      const resolved = resolveMutationTarget(m);
+      if (!resolved.ok) {
+        if (resolved.kind === 'shared_epoch_mismatch') {
+          sharedEpochMismatchIds.add(resolved.ledgerId);
+          return false; // leave unacked so client freezes this shared ledger's outbox
+        }
+        for (const member of pendingMembers) {
+          rejected.push({ mutationId: member.mutationId, reason: resolved.reason });
+        }
+        return false;
+      }
+      if (!groupTarget) {
+        groupTarget = resolved;
+      } else if (
+        groupTarget.storageUid !== resolved.storageUid ||
+        groupTarget.scope.sharedLedgerId !== resolved.scope.sharedLedgerId
+      ) {
+        for (const member of pendingMembers) {
+          rejected.push({
+            mutationId: member.mutationId,
+            reason: '同一筆原子異動不可跨個人與共同帳本或跨不同共同帳本。',
+          });
+        }
+        return false;
+      }
+    }
+    if (!groupTarget) return false;
+
     try {
-      await applyMutationGroup(db, uid, pendingMembers, settings, serverTime, expectedEpoch);
+      await applyMutationGroup(
+        db,
+        groupTarget.storageUid,
+        pendingMembers,
+        settings,
+        serverTime,
+        groupTarget.expectedEpoch,
+        groupTarget.scope
+      );
       for (const m of pendingMembers) ackedMutationIds.push(m.mutationId);
       return false;
     } catch (err) {
       if (err instanceof EpochMismatchError) {
+        if (groupTarget.storageUid !== uid && groupTarget.scope.sharedLedgerId) {
+          sharedEpochMismatchIds.add(groupTarget.scope.sharedLedgerId);
+          return false;
+        }
         epochChangedDuringMutations = true;
         return true;
       }
@@ -2654,7 +3377,11 @@ export async function processSyncRequest(
         throw err;
       }
       // V4: a rejection evaluated against data restored by a concurrent replace import is meaningless
-      if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+      if ((await getCurrentDataEpoch(db, groupTarget.storageUid)) !== groupTarget.expectedEpoch) {
+        if (groupTarget.storageUid !== uid && groupTarget.scope.sharedLedgerId) {
+          sharedEpochMismatchIds.add(groupTarget.scope.sharedLedgerId);
+          return false;
+        }
         epochChangedDuringMutations = true;
         return true;
       }
@@ -2711,11 +3438,15 @@ export async function processSyncRequest(
     for (const m of valid.slice(0, SYNC_MAX_MUTATIONS_PER_REQUEST * 2)) {
       const spec = ENTITY_ROW_TABLE[String(m.entity)];
       if (!spec || typeof m.recordId !== 'string') continue;
-      const key = `${spec.table}:${m.recordId}`;
+      const target = resolveMutationTarget(m);
+      if (!target.ok) continue;
+      const key = `${target.storageUid}:${spec.table}:${m.recordId}`;
       if (rowKeys.includes(key)) continue;
       rowKeys.push(key);
       stmts.push(
-        db.prepare(`SELECT * FROM ${spec.table} WHERE user_id = ? AND ${spec.keyColumn} = ?`).bind(uid, m.recordId)
+        db
+          .prepare(`SELECT * FROM ${spec.table} WHERE user_id = ? AND ${spec.keyColumn} = ?`)
+          .bind(target.storageUid, m.recordId)
       );
     }
     if (stmts.length > 0) {
@@ -2731,7 +3462,7 @@ export async function processSyncRequest(
         const fallbackStmts = stmts.slice(0, idemStatements);
         prefetchedRowKeys = [];
         rowKeys.forEach((key, idx) => {
-          const isOpt = OPTIONAL_SYNC_TABLES.some((tbl) => key.startsWith(`${tbl}:`));
+          const isOpt = OPTIONAL_SYNC_TABLES.some((tbl) => key.includes(`:${tbl}:`));
           if (!isOpt) {
             prefetchedRowKeys.push(key);
             fallbackStmts.push(stmts[idemStatements + idx]);
@@ -2806,15 +3537,39 @@ export async function processSyncRequest(
       ackedMutationIds.push(mut.mutationId);
       continue;
     }
+
+    const target = resolveMutationTarget(mut);
+    if (!target.ok) {
+      handledIdx.add(idx);
+      if (target.kind === 'shared_epoch_mismatch') {
+        sharedEpochMismatchIds.add(target.ledgerId);
+      } else {
+        rejected.push({ mutationId: mut.mutationId, reason: target.reason });
+      }
+      continue;
+    }
+
     if (!fitsBudget(1)) break; // H5: leave the rest for the next request
     handledIdx.add(idx);
     processedMutations += 1;
 
     try {
-      await applySingleMutation(db, uid, mut, settings, serverTime, expectedEpoch);
+      await applySingleMutation(
+        db,
+        target.storageUid,
+        mut,
+        settings,
+        serverTime,
+        target.expectedEpoch,
+        target.scope
+      );
       ackedMutationIds.push(mut.mutationId);
     } catch (err) {
       if (err instanceof EpochMismatchError) {
+        if (target.storageUid !== uid && target.scope.sharedLedgerId) {
+          sharedEpochMismatchIds.add(target.scope.sharedLedgerId);
+          continue;
+        }
         // Q5 / N4: Concurrent replace import bumped data_epoch mid-request.
         // Stop immediately so neither this nor any remaining stale-epoch mutation is applied or acked.
         epochChangedDuringMutations = true;
@@ -2832,8 +3587,12 @@ export async function processSyncRequest(
           ackedMutationIds.push(mut.mutationId);
         } else {
           // Q5 / N4: Also check if epoch changed (e.g. replace import reset row version before checkVersionOrThrow)
-          const currEpoch = await getCurrentDataEpoch(db, uid);
-          if (currEpoch !== expectedEpoch) {
+          const currEpoch = await getCurrentDataEpoch(db, target.storageUid);
+          if (currEpoch !== target.expectedEpoch) {
+            if (target.storageUid !== uid && target.scope.sharedLedgerId) {
+              sharedEpochMismatchIds.add(target.scope.sharedLedgerId);
+              continue;
+            }
             epochChangedDuringMutations = true;
             break;
           }
@@ -2842,7 +3601,11 @@ export async function processSyncRequest(
       } else if (err instanceof RejectError) {
         // V4: A rejection evaluated against data restored by a concurrent replace import is meaningless
         // for a stale-epoch client — stop and let the client freeze it instead of dropping it as an error.
-        if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+        if ((await getCurrentDataEpoch(db, target.storageUid)) !== target.expectedEpoch) {
+          if (target.storageUid !== uid && target.scope.sharedLedgerId) {
+            sharedEpochMismatchIds.add(target.scope.sharedLedgerId);
+            continue;
+          }
           epochChangedDuringMutations = true;
           break;
         }
@@ -2860,7 +3623,11 @@ export async function processSyncRequest(
           )
         ) {
           // V4: same epoch re-check as the RejectError branch
-          if ((await getCurrentDataEpoch(db, uid)) !== expectedEpoch) {
+          if ((await getCurrentDataEpoch(db, target.storageUid)) !== target.expectedEpoch) {
+            if (target.storageUid !== uid && target.scope.sharedLedgerId) {
+              sharedEpochMismatchIds.add(target.scope.sharedLedgerId);
+              continue;
+            }
             epochChangedDuringMutations = true;
             break;
           }
@@ -2907,6 +3674,12 @@ export async function processSyncRequest(
     return buildFullResyncResponse(true);
   }
 
+  const sharedMeta = await mergeSharedIntoDelta(
+    read.delta,
+    { changeSeq: read.changeSeq, dataEpoch: read.dataEpoch },
+    !useSeqCursor && !req.since
+  );
+
   return {
     ok: true,
     serverTime,
@@ -2918,6 +3691,7 @@ export async function processSyncRequest(
     conflicts,
     delta: read.delta,
     ...(writeProbeOk ? { writeProbeOk: true } : {}),
+    ...sharedMeta,
   };
 }
 

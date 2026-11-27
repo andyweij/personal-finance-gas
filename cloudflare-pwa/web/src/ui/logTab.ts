@@ -538,6 +538,9 @@ function createLedgerRow(
     sub.appendChild(document.createTextNode(' · '));
     appendHighlightedText(sub, item.note, tokens);
   }
+  if (item.updatedByName) {
+    sub.appendChild(document.createTextNode(` · ✍️ ${item.updatedByName}`));
+  }
   main.appendChild(t);
   main.appendChild(sub);
   leading.appendChild(dotBox);
@@ -550,21 +553,28 @@ function createLedgerRow(
   amt.style.color = isInc ? 'var(--pos)' : isInv ? 'var(--primary)' : 'var(--text)';
   amt.textContent = (isInc ? '+' : '-') + fmtMoney(item.twdAmount, ctx.state.masked, '');
 
-  const delBtn = document.createElement('button');
-  delBtn.type = 'button';
-  delBtn.className = 'icon-btn sm';
-  delBtn.style.color = 'var(--text-muted)';
-  delBtn.title = '刪除此筆紀錄';
-  delBtn.innerHTML = TRASH_SVG;
-  delBtn.addEventListener('click', async () => {
-    if (!confirm(`確定刪除「${item.itemName || item.category}」(${item.date})？`)) return;
-    await ctx.engine.deleteCashFlow(item.id);
-    showToast(`已刪除：${item.itemName || item.category}`, 'success');
-    ctx.scheduleSync();
-  });
-
+  const isReadOnlyItem = ctx.engine.isLedgerReadOnly(getEffectiveLedgerId(item));
   right.appendChild(amt);
-  right.appendChild(delBtn);
+  if (!isReadOnlyItem) {
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'icon-btn sm';
+    delBtn.style.color = 'var(--text-muted)';
+    delBtn.title = '刪除此筆紀錄';
+    delBtn.innerHTML = TRASH_SVG;
+    delBtn.addEventListener('click', async () => {
+      if (!confirm(`確定刪除「${item.itemName || item.category}」(${item.date})？`)) return;
+      try {
+        await ctx.engine.deleteCashFlow(item.id);
+        showToast(`已刪除：${item.itemName || item.category}`, 'success');
+        ctx.scheduleSync();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : '刪除失敗', 'error');
+      }
+    });
+    right.appendChild(delBtn);
+  }
+
   row.appendChild(leading);
   row.appendChild(right);
   return row;
@@ -894,7 +904,21 @@ export function renderLogTab(ctx: UiContext): void {
   });
 
   const isolatedBanner = el('logIsolatedBanner');
-  if (!activeLedger.includeInNetWorth) {
+  const submitLogBtn = document.getElementById('submitLogBtn') as HTMLButtonElement | null;
+  const isViewerLedger = Boolean(activeLedger.isShared && activeLedger.myRole === 'viewer');
+  if (submitLogBtn) {
+    submitLogBtn.disabled = isViewerLedger;
+    submitLogBtn.title = isViewerLedger ? '此共同帳本為僅檢視權限，無法新增紀錄' : '';
+  }
+  if (isViewerLedger) {
+    isolatedBanner.style.display = 'flex';
+    isolatedBanner.textContent = `🤝 共同帳本「${activeLedger.name}」（僅檢視模式）：此帳本為唯讀權限，僅可查詢與匯出，無法新增或修改紀錄`;
+  } else if (activeLedger.isShared) {
+    isolatedBanner.style.display = 'flex';
+    const roleTxt = activeLedger.myRole === 'owner' ? '擁有者' : '可編輯';
+    const nwTxt = activeLedger.includeInNetWorth ? '計入您的個人總資產' : '獨立不計入個人總資產';
+    isolatedBanner.textContent = `🤝 共同帳本「${activeLedger.name}」（${roleTxt} · ${nwTxt}）：異動將同步給帳本內所有成員`;
+  } else if (!activeLedger.includeInNetWorth) {
     isolatedBanner.style.display = 'flex';
     isolatedBanner.textContent = `獨立帳本「${activeLedger.name}」：此帳本流水帳與活存完全隔離，不計入個人總資產與儲蓄率`;
   } else {

@@ -114,3 +114,17 @@ export const WEBAPP_CATEGORY_MAP: Record<string, string[]> = {
  */
 export const SYNC_MAX_MUTATIONS_PER_REQUEST = 20;
 export const D1_QUERIES_PER_INVOCATION_FREE = 50;
+
+export const SHARED_LEDGER_ROLES = ['owner', 'editor', 'viewer'] as const;
+export const SHARED_LEDGER_INVITE_ROLES = ['editor', 'viewer'] as const;
+export const MAX_MEMBERS_PER_SHARED_LEDGER = 10;
+export const MAX_JOINED_SHARED_LEDGERS = 5;
+export const SHARED_LEDGER_ENTITY_SET: ReadonlySet<string> = new Set([
+  'ledger',
+  'cashflow',
+  'asset',
+  'savings_adjustment',
+  'recurring',
+  'split_receivable',
+  'installment_plan',
+]);

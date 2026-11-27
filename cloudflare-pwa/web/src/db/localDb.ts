@@ -11,6 +11,8 @@ import type {
   CachedPasskeyDto,
   FinanceSnapshot,
   Ledger,
+  SharedLedgerCursor,
+  SharedLedgerSyncState,
   SyncConflict,
   SyncMutation,
   SyncRejection,
@@ -72,6 +74,9 @@ export interface LocalMeta {
   syncCursor?: number | null;
   dataEpoch?: number | null;
   pendingFullResync?: boolean;
+  /** Phase 9 (v2.0.0): per-shared-ledger cursors & active shared metadata */
+  sharedCursors?: Record<string, SharedLedgerCursor>;
+  sharedLedgers?: SharedLedgerSyncState[];
   pinEnabled: boolean;
   pinSalt: string | null;
   pinHash: string | null;

@@ -46,6 +46,15 @@ import {
   SYNC_AUTH_QUERY_RESERVE,
 } from './sync';
 import {
+  createSharedLedgerInvite,
+  joinSharedLedgerByCode,
+  listSharedLedgersForUser,
+  removeOrLeaveSharedLedger,
+  revokeSharedLedgerInvite,
+  updateSharedLedgerMemberRole,
+  updateSharedLedgerPreference,
+} from './sharedLedgers';
+import {
   runMonthEndSnapshotD1,
   runMonthlyRecurringD1,
   runScheduledAutomation,
@@ -665,6 +674,124 @@ export function createApp() {
       return c.json({ ok: true, user: updated });
     } catch (err) {
       return routeErrorResponse(c, err, '更新成員狀態失敗');
+    }
+  });
+
+  // Shared Ledgers API (Phase 9 / v2.0.0 — strictly scoped to authUser.id membership)
+  app.get('/api/shared-ledgers', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const ledgers = await listSharedLedgersForUser(c.env.DB, user.id);
+      return c.json({ ok: true, ledgers });
+    } catch (err) {
+      return routeErrorResponse(c, err, '讀取共同帳本失敗');
+    }
+  });
+
+  app.post('/api/shared-ledgers/:ledgerId/invites', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as {
+        role?: string;
+        note?: string;
+        expiresInDays?: number;
+      };
+      const created = await createSharedLedgerInvite(c.env.DB, user.id, c.req.param('ledgerId') || '', body);
+      return c.json({ ok: true, ...created });
+    } catch (err) {
+      return routeErrorResponse(c, err, '產生共同帳本邀請碼失敗');
+    }
+  });
+
+  app.delete('/api/shared-ledgers/:ledgerId/invites/:inviteId', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const ok = await revokeSharedLedgerInvite(
+        c.env.DB,
+        user.id,
+        c.req.param('ledgerId') || '',
+        c.req.param('inviteId') || ''
+      );
+      if (!ok) {
+        return c.json({ error: '找不到可作廢的邀請碼。' }, 404);
+      }
+      return c.json({ ok: true });
+    } catch (err) {
+      return routeErrorResponse(c, err, '作廢共同帳本邀請碼失敗');
+    }
+  });
+
+  app.post('/api/shared-ledgers/join', requireAuth, async (c) => {
+    const user = c.get('authUser');
+    const ip = getRateLimitIp(c);
+    const ipKey = `shl_join:${ip}`;
+    const userKey = `shl_join_u:${user.id}`;
+    const ipLimit = await checkRateLimit(c.env.DB, ipKey);
+    const userLimit = !ipLimit.blocked ? await peekRateLimit(c.env.DB, userKey, 15) : { blocked: false };
+    if (ipLimit.blocked || userLimit.blocked) {
+      const retry = Math.max(ipLimit.retryAfterSec || 0, userLimit.retryAfterSec || 0) || 900;
+      return c.json({ error: `嘗試次數過多，請於 ${Math.ceil(retry / 60)} 分鐘後再試。` }, 429);
+    }
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { code?: string };
+      const joined = await joinSharedLedgerByCode(c.env.DB, user.id, String(body.code || ''));
+      await clearRateLimit(c.env.DB, ipKey);
+      await clearRateLimit(c.env.DB, userKey);
+      return c.json({ ok: true, ...joined });
+    } catch (err) {
+      await checkRateLimit(c.env.DB, userKey, 15);
+      return routeErrorResponse(c, err, '加入共同帳本失敗');
+    }
+  });
+
+  app.patch('/api/shared-ledgers/:ledgerId/members/:memberUserId', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as { role?: string };
+      await updateSharedLedgerMemberRole(
+        c.env.DB,
+        user.id,
+        c.req.param('ledgerId') || '',
+        c.req.param('memberUserId') || '',
+        body.role
+      );
+      return c.json({ ok: true });
+    } catch (err) {
+      return routeErrorResponse(c, err, '更新成員權限失敗');
+    }
+  });
+
+  app.delete('/api/shared-ledgers/:ledgerId/members/:memberUserId', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const res = await removeOrLeaveSharedLedger(
+        c.env.DB,
+        user.id,
+        c.req.param('ledgerId') || '',
+        c.req.param('memberUserId') || ''
+      );
+      return c.json({ ok: true, ...res });
+    } catch (err) {
+      return routeErrorResponse(c, err, '移除或退出共同帳本失敗');
+    }
+  });
+
+  app.patch('/api/shared-ledgers/:ledgerId/preferences', requireAuth, async (c) => {
+    try {
+      const user = c.get('authUser');
+      const body = (await c.req.json().catch(() => ({}))) as { includeInNetWorth?: boolean };
+      if (typeof body.includeInNetWorth !== 'boolean') {
+        return c.json({ error: 'includeInNetWorth 必須為布林值。' }, 400);
+      }
+      await updateSharedLedgerPreference(
+        c.env.DB,
+        user.id,
+        c.req.param('ledgerId') || '',
+        body.includeInNetWorth
+      );
+      return c.json({ ok: true });
+    } catch (err) {
+      return routeErrorResponse(c, err, '更新共同帳本設定失敗');
     }
   });
 

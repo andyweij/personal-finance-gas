@@ -15,7 +15,7 @@
 | **Phase 6** | `v1.14.0` | 代墊款 / 拆帳追蹤 | `0023` (`split_receivables`) | ✅ 已完成 |
 | **Phase 7** | `v1.15.0` | 信用卡帳單週期 & 分期付款管理 | `0024` (`asset_items` + `installment_plans`) | ✅ 已完成 |
 | **Phase 8** | `v1.16.0` | *(建議前置重構)* `sync.ts` Entity Registry 輕量化 | 無 | ✅ 已完成 |
-| **Phase 9** | `v2.0.0` | 選擇性「共同帳本」（需先寫獨立 SDD 與安全審查） | `0025+` | ⬜ 待實作 |
+| **Phase 9** | `v2.0.0` | 選擇性「共同帳本」（需先寫獨立 SDD 與安全審查） | `0025` (`ledger_members` + `ledger_invites` + `updated_by`) | ✅ 已完成 |
 
 ---
 
@@ -68,3 +68,10 @@
 - **核心重構**：`worker/sync.ts` 導入通用 `applyRowEntityMutation` 執行器與宣告式 `ROW_ENTITY_HANDLERS`（涵蓋全部 11 個資料列實體及各自特殊守衛／可選欄位／伺服器報價所有權），`readDeltaWithState`、`processSyncRequest` 預取與 `importFullSnapshot` 全面改由 Entity Registry 驅動，大幅消除重複 SQL 與參數對齊樣板碼
 - **測試套件**：`tests/entity-registry.test.ts`（Registry 契約與 1:1 對齊驗證、SQL 建構器佔位符／綁定參數一致性測試、全 13 實體端對端同步與匯出匯入回歸測試），搭配既有 46 個測試檔作為 Golden Regression Suite 100% 通過
 - **Migration**：無（`DB_SCHEMA_VERSION` 維持 `'0024'`，100% 行為等價重構）
+
+## Phase 9（`v2.0.0`）完成紀錄
+- **獨立 SDD 與安全審查**：`docs/SDD_shared_ledgers.md`（涵蓋 Owner-Anchored 架構決策、SL-1～SL-10 威脅模型、D1 50-query 預算證明與離線撤銷清理機制）
+- **新增 Migration**：`migrations/0025_shared_ledgers.sql`（新建 `ledger_members` 與 `ledger_invites` 兩張表，無 `DEFAULT 'owner'`；並於 6 張可共享業務表新增可選 `updated_by` 異動歸屬欄位）
+- **後端授權與同步整合**：`worker/sharedLedgers.ts`（一次性 `SHL-XXXX-XXXX-XXXX` SHA-256 邀請碼產生／原子核銷／作廢、角色切換、移除／退出與個人淨值偏好）、`worker/index.ts`（7 條 `/api/shared-ledgers/*` 路由＋雙重限速＋`X-Expected-User` 防護）、`worker/sync.ts`（整合 `ensureSyncBaseline` +0 額外查詢、原子 SQL 成員守衛防撤銷 TOCTOU、SL-4 同域資產參照守衛、SL-5 跨帳本反走私守衛、單一 batch 讀取所有加入共同帳本 Delta 與 `revokedSharedLedgerIds`）
+- **前端離線與介面**：`web/src/db/localDb.ts`、`web/src/sync/syncEngine.ts`（`sharedCursors` 持久化、自動帶入 `sharedLedgerId`、本地 `viewer` 唯讀守衛、遭移除原子清除快取與待送異動）、`web/src/ui/sharedLedgerUi.ts`、`web/src/ui/ledgerUi.ts`、`web/src/ui/logTab.ts`、`web/src/main.ts`（支援 `/?joinLedger=...` 專屬連結）
+- **測試與滲透驗證套件**：`tests/shared-ledgers.test.ts`（覆蓋完整多人協作生命週期、SL-1～SL-9 安全滲透測試、IndexedDB 遭移除自動清理與 D1 查詢預算驗證）

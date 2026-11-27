@@ -8,7 +8,7 @@
  *   "有更新" prompt (the page posts { type: 'SKIP_WAITING' }).
  * - Only navigation requests fall back to the cached app shell; a failed script / style / image request is a
  *   network error, never an HTML page.
- * - URLs with a query string (e.g. /?reset=CODE, /?invite=CODE) are never written to the cache.
+ * - URLs with a query string (e.g. /?reset=CODE, /?invite=CODE, /?joinLedger=CODE) are never written to the cache.
  */
 const CACHE_PREFIX = 'finance-pwa';
 const BUILD_HASH = '__BUILD_HASH__';

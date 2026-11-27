@@ -2,6 +2,7 @@ import { DEFAULT_LEDGER_ID } from '../../../shared/constants';
 import { ensureActiveLedgers, getEffectiveLedgerId } from '../../../shared/calculations';
 import type { Ledger } from '../../../shared/types';
 import { closeModal, el, makeInputField, openModal, showToast, bindSubmit } from './helpers';
+import { openJoinSharedLedgerModal, openSharedLedgerManageModal } from './sharedLedgerUi';
 import type { UiContext } from './state';
 
 export function getActiveLedgers(ctx: UiContext): Ledger[] {
@@ -55,18 +56,27 @@ export function renderLedgerSwitcherBar(
     pillsWrap.appendChild(btn);
   };
 
+  const sharedTagFor = (l: Ledger): string | undefined => {
+    if (l.isShared) {
+      if (l.myRole === 'viewer') return '僅檢視';
+      return l.includeInNetWorth ? '共用' : '共用·獨立';
+    }
+    return l.includeInNetWorth ? undefined : '獨立';
+  };
+  const labelFor = (l: Ledger): string => (l.isShared ? `🤝 ${l.name}` : l.name);
+
   if (opts.mode === 'scope') {
     addPill('net_worth', '個人總資產帳本');
     for (const l of ledgers) {
       if (ledgers.length === 1 && l.id === DEFAULT_LEDGER_ID) continue;
-      addPill(l.id, l.name, l.includeInNetWorth ? undefined : '獨立');
+      addPill(l.id, labelFor(l), sharedTagFor(l));
     }
     if (ledgers.length > 1) {
       addPill('all', '全部合併');
     }
   } else {
     for (const l of ledgers) {
-      addPill(l.id, l.name, l.includeInNetWorth ? undefined : '獨立');
+      addPill(l.id, labelFor(l), sharedTagFor(l));
     }
   }
 
@@ -134,6 +144,15 @@ export function openLedgerManagerModal(ctx: UiContext): void {
       title.appendChild(defBadge);
     }
 
+    if (l.isShared) {
+      const shBadge = document.createElement('span');
+      shBadge.className = 'badge';
+      shBadge.style.marginRight = '0';
+      const roleTxt = l.myRole === 'owner' ? '擁有者' : l.myRole === 'viewer' ? '僅檢視' : '可編輯';
+      shBadge.textContent = `🤝 共用 · ${roleTxt}${l.memberCount ? ` (${l.memberCount}人)` : ''}`;
+      title.appendChild(shBadge);
+    }
+
     const sub = document.createElement('div');
     sub.className = 'item-sub tnum';
     const budgetHint =
@@ -146,12 +165,24 @@ export function openLedgerManagerModal(ctx: UiContext): void {
 
     const right = document.createElement('div');
     right.className = 'item-right';
-    const editBtn = document.createElement('button');
-    editBtn.type = 'button';
-    editBtn.className = 'btn btn-outline btn-sm';
-    editBtn.textContent = '編輯';
-    editBtn.addEventListener('click', () => openLedgerEditModal(ctx, l));
-    right.appendChild(editBtn);
+    right.style.cssText = 'display:flex;gap:6px;align-items:center';
+    const isJoinedMember = Boolean(l.isShared && l.myRole && l.myRole !== 'owner');
+    if (l.id !== DEFAULT_LEDGER_ID) {
+      const shareBtn = document.createElement('button');
+      shareBtn.type = 'button';
+      shareBtn.className = 'btn btn-outline btn-sm';
+      shareBtn.textContent = isJoinedMember ? '🤝 設定' : '🤝 共用';
+      shareBtn.addEventListener('click', () => openSharedLedgerManageModal(ctx, l));
+      right.appendChild(shareBtn);
+    }
+    if (!isJoinedMember) {
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'btn btn-outline btn-sm';
+      editBtn.textContent = '編輯';
+      editBtn.addEventListener('click', () => openLedgerEditModal(ctx, l));
+      right.appendChild(editBtn);
+    }
 
     row.appendChild(main);
     row.appendChild(right);
@@ -160,18 +191,24 @@ export function openLedgerManagerModal(ctx: UiContext): void {
   body.appendChild(listWrap);
 
   const footer = document.createElement('div');
-  footer.style.cssText = 'display:grid;grid-template-columns:1fr 2fr;gap:8px';
+  footer.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 1.3fr;gap:8px';
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
   closeBtn.className = 'btn btn-outline';
   closeBtn.textContent = '關閉';
   closeBtn.addEventListener('click', closeModal);
+  const joinBtn = document.createElement('button');
+  joinBtn.type = 'button';
+  joinBtn.className = 'btn btn-outline';
+  joinBtn.textContent = '🤝 加入帳本';
+  joinBtn.addEventListener('click', () => openJoinSharedLedgerModal(ctx));
   const addBtn = document.createElement('button');
   addBtn.type = 'button';
   addBtn.className = 'btn btn-primary';
-  addBtn.textContent = '+ 新增獨立帳本';
+  addBtn.textContent = '+ 新增帳本';
   addBtn.addEventListener('click', () => openLedgerEditModal(ctx, null));
   footer.appendChild(closeBtn);
+  footer.appendChild(joinBtn);
   footer.appendChild(addBtn);
   body.appendChild(footer);
 }
@@ -352,9 +389,11 @@ export function buildLedgerSelectField(
   const sel = document.createElement('select');
   sel.id = selectId;
   for (const l of ledgers) {
+    if (l.myRole === 'viewer' && l.id !== selectedLedgerId) continue;
     const opt = document.createElement('option');
     opt.value = l.id;
-    opt.textContent = l.includeInNetWorth ? l.name : `${l.name}（獨立・不計入總資產）`;
+    const prefix = l.isShared ? '🤝 ' : '';
+    opt.textContent = l.includeInNetWorth ? `${prefix}${l.name}` : `${prefix}${l.name}（獨立・不計入總資產）`;
     if (l.id === selectedLedgerId) opt.selected = true;
     sel.appendChild(opt);
   }

@@ -43,6 +43,61 @@ export interface AppSettings {
   version?: number;
 }
 
+export type SharedLedgerRole = 'owner' | 'editor' | 'viewer';
+
+export interface SharedLedgerMemberDto {
+  userId: string;
+  username: string;
+  displayName: string;
+  role: SharedLedgerRole;
+  includeInNetWorth: boolean;
+  joinedAt: string;
+}
+
+export interface SharedLedgerInviteDto {
+  id: string;
+  ledgerId: string;
+  role: 'editor' | 'viewer';
+  note: string;
+  expiresAt: string;
+  usedBy: string | null;
+  usedByName?: string | null;
+  usedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+  status: 'active' | 'used' | 'revoked' | 'expired';
+}
+
+export interface SharedLedgerSummaryDto {
+  ledgerId: string;
+  ledgerName: string;
+  ownerUserId: string;
+  ownerDisplayName: string;
+  myRole: SharedLedgerRole;
+  includeInNetWorth: boolean;
+  members: SharedLedgerMemberDto[];
+  invites?: SharedLedgerInviteDto[];
+}
+
+export interface SharedLedgerCursor {
+  sinceSeq: number;
+  clientEpoch: number;
+}
+
+export interface SharedLedgerSyncState {
+  ledgerId: string;
+  ownerUserId: string;
+  ownerDisplayName: string;
+  myRole: SharedLedgerRole;
+  includeInNetWorth: boolean;
+  memberCount: number;
+  members: Array<{ userId: string; displayName: string; role: SharedLedgerRole }>;
+  changeSeq: number;
+  dataEpoch: number;
+  fullResyncRequired?: boolean;
+  epochMismatch?: boolean;
+}
+
 export interface Ledger {
   id: string;
   name: string;
@@ -54,6 +109,12 @@ export interface Ledger {
   updatedAt: string;
   deletedAt?: string | null;
   version?: number;
+  /** Phase 9 (v2.0.0): optional shared-ledger metadata populated by sync */
+  isShared?: boolean;
+  ownerUserId?: string;
+  ownerDisplayName?: string;
+  myRole?: SharedLedgerRole;
+  memberCount?: number;
 }
 
 export interface CashFlowLog {
@@ -74,6 +135,8 @@ export interface CashFlowLog {
   ledgerId?: string;
   installmentPlanId?: string | null;
   installmentSeq?: number | null;
+  updatedByUserId?: string | null;
+  updatedByName?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -96,6 +159,8 @@ export interface RecurringItem {
   linkedAccountId?: string | null;
   ledgerId?: string;
   sortOrder?: number;
+  updatedByUserId?: string | null;
+  updatedByName?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -150,6 +215,8 @@ export interface AssetItem {
   ledgerId?: string;
   excludeFromNetWorth?: boolean;
   sortOrder?: number;
+  updatedByUserId?: string | null;
+  updatedByName?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -291,6 +358,8 @@ export interface SavingsAdjustment {
   twdAmount: number;
   note: string;
   transferGroupId?: string | null;
+  updatedByUserId?: string | null;
+  updatedByName?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -401,6 +470,8 @@ export interface SplitReceivable {
   sourceAccountId?: string | null;
   sourceAdjustmentId?: string | null;
   note: string;
+  updatedByUserId?: string | null;
+  updatedByName?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -423,6 +494,8 @@ export interface InstallmentPlan {
   currency: string;
   status: InstallmentPlanStatus;
   note: string;
+  updatedByUserId?: string | null;
+  updatedByName?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -513,6 +586,8 @@ export interface SyncMutation {
    * server in one D1 batch — all succeed or none do — and the client never splits them across requests.
    */
   atomicGroupId?: string;
+  /** Phase 9 (v2.0.0): target shared ledger ID (server always re-verifies membership & owner). */
+  sharedLedgerId?: string | null;
   sentAt?: string;
   attempts?: number;
   retryCount?: number;
@@ -563,6 +638,8 @@ export interface SyncRequest {
    * that is still in their outbox; see refGuardSql in worker/sync.ts.
    */
   refsOrdered?: boolean;
+  /** Phase 9 (v2.0.0): per-shared-ledger incremental cursors keyed by ledgerId. */
+  sharedCursors?: Record<string, SharedLedgerCursor>;
 }
 
 export interface SyncDelta {
@@ -595,6 +672,10 @@ export interface SyncResponse {
   delta: SyncDelta;
   /** V1: true when the requested writeProbe D1 write succeeded. */
   writeProbeOk?: boolean;
+  /** Phase 9 (v2.0.0): active shared-ledger states & member display names for this user. */
+  sharedLedgers?: SharedLedgerSyncState[];
+  /** Phase 9 (v2.0.0): shared ledger IDs revoked/left since last sync so client purges local cache. */
+  revokedSharedLedgerIds?: string[];
 }
 
 export interface PeriodMetrics {

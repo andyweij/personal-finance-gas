@@ -35,6 +35,11 @@ import type {
   RentUtilityRecord,
   RentUtilityRents,
   SavingsAdjustment,
+  SharedLedgerCursor,
+  SharedLedgerInviteDto,
+  SharedLedgerRole,
+  SharedLedgerSummaryDto,
+  SharedLedgerSyncState,
   SinkingFundItem,
   SplitReceivable,
   StockTransaction,
@@ -3800,22 +3805,289 @@ export class SyncEngine {
     return nextRents;
   }
 
+  private resolveMutationSharedLedgerId(m: SyncMutation, snap: FinanceSnapshot): string | null {
+    const sharedStates = this.meta.sharedLedgers || [];
+    const sharedIds = new Set<string>(sharedStates.map((s) => s.ledgerId));
+    for (const l of snap.ledgers || []) {
+      if (l.isShared) sharedIds.add(l.id);
+    }
+    for (const l of this.snapshot.ledgers || []) {
+      if (l.isShared) sharedIds.add(l.id);
+    }
+    if (sharedIds.size === 0) return null;
+
+    if (typeof m.sharedLedgerId === 'string' && sharedIds.has(m.sharedLedgerId)) {
+      return m.sharedLedgerId;
+    }
+    if (m.entity === 'ledger' && sharedIds.has(m.recordId)) {
+      return m.recordId;
+    }
+    const payloadLid =
+      m.payload && typeof m.payload.ledgerId === 'string' ? m.payload.ledgerId.trim() : '';
+    if (payloadLid && sharedIds.has(payloadLid)) {
+      return payloadLid;
+    }
+    // For delete or savings_adjustment, inspect existing snapshot / nextSnapshot record to find its ledgerId
+    const lookupIn = (s: FinanceSnapshot): string | null => {
+      if (m.entity === 'cashflow') {
+        const row = s.cashflowLogs.find((x) => x.id === m.recordId);
+        return row?.ledgerId && sharedIds.has(row.ledgerId) ? row.ledgerId : null;
+      }
+      if (m.entity === 'asset') {
+        const row = s.assetItems.find((x) => x.id === m.recordId);
+        return row?.ledgerId && sharedIds.has(row.ledgerId) ? row.ledgerId : null;
+      }
+      if (m.entity === 'recurring') {
+        const row = s.recurringItems.find((x) => x.id === m.recordId);
+        return row?.ledgerId && sharedIds.has(row.ledgerId) ? row.ledgerId : null;
+      }
+      if (m.entity === 'split_receivable') {
+        const row = (s.splitReceivables || []).find((x) => x.id === m.recordId);
+        return row?.ledgerId && sharedIds.has(row.ledgerId) ? row.ledgerId : null;
+      }
+      if (m.entity === 'installment_plan') {
+        const row = (s.installmentPlans || []).find((x) => x.id === m.recordId);
+        return row?.ledgerId && sharedIds.has(row.ledgerId) ? row.ledgerId : null;
+      }
+      if (m.entity === 'savings_adjustment') {
+        const accId =
+          (m.payload && typeof m.payload.accountId === 'string' && m.payload.accountId) ||
+          (s.savingsAdjustments || []).find((x) => x.id === m.recordId)?.accountId ||
+          '';
+        if (!accId) return null;
+        const acc = s.assetItems.find((a) => a.id === accId);
+        return acc?.ledgerId && sharedIds.has(acc.ledgerId) ? acc.ledgerId : null;
+      }
+      return null;
+    };
+    return lookupIn(this.snapshot) || lookupIn(snap);
+  }
+
+  getSharedLedgers(): SharedLedgerSyncState[] {
+    return this.meta.sharedLedgers || [];
+  }
+
+  getLedgerRole(ledgerId: string): SharedLedgerRole | null {
+    const lid = String(ledgerId || '').trim();
+    if (!lid || lid === DEFAULT_LEDGER_ID) return null;
+    const fromMeta = (this.meta.sharedLedgers || []).find((s) => s.ledgerId === lid);
+    if (fromMeta) return fromMeta.myRole;
+    const fromSnap = (this.snapshot.ledgers || []).find((l) => l.id === lid);
+    return fromSnap?.myRole ?? null;
+  }
+
+  isLedgerReadOnly(ledgerId: string): boolean {
+    return this.getLedgerRole(ledgerId) === 'viewer';
+  }
+
+  private buildApiHeaders(withJson = false): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (withJson) headers['content-type'] = 'application/json';
+    if (this.expectedUserId) headers['x-expected-user'] = this.expectedUserId;
+    return headers;
+  }
+
+  async fetchSharedLedgers(): Promise<SharedLedgerSummaryDto[]> {
+    const res = await this.fetchImpl('/api/shared-ledgers', {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: this.buildApiHeaders(false),
+    });
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; ledgers?: SharedLedgerSummaryDto[]; error?: string };
+    if (!res.ok) throw new Error(data.error || '讀取共同帳本失敗');
+    return Array.isArray(data.ledgers) ? data.ledgers : [];
+  }
+
+  async createSharedLedgerInvite(
+    ledgerId: string,
+    opts: { role?: 'editor' | 'viewer'; note?: string; expiresInDays?: number } = {}
+  ): Promise<{ invite: SharedLedgerInviteDto; code: string }> {
+    const res = await this.fetchImpl(`/api/shared-ledgers/${encodeURIComponent(ledgerId)}/invites`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: this.buildApiHeaders(true),
+      body: JSON.stringify(opts),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      invite?: SharedLedgerInviteDto;
+      code?: string;
+      error?: string;
+    };
+    if (!res.ok || !data.invite || !data.code) {
+      throw new Error(data.error || '產生共同帳本邀請碼失敗');
+    }
+    return { invite: data.invite, code: data.code };
+  }
+
+  async revokeSharedLedgerInvite(ledgerId: string, inviteId: string): Promise<void> {
+    const res = await this.fetchImpl(
+      `/api/shared-ledgers/${encodeURIComponent(ledgerId)}/invites/${encodeURIComponent(inviteId)}`,
+      {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: this.buildApiHeaders(false),
+      }
+    );
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) throw new Error(data.error || '作廢共同帳本邀請碼失敗');
+  }
+
+  async joinSharedLedger(
+    code: string
+  ): Promise<{ ledgerId: string; ledgerName: string; ownerUserId: string; ownerDisplayName: string; role: 'editor' | 'viewer' }> {
+    const res = await this.fetchImpl('/api/shared-ledgers/join', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: this.buildApiHeaders(true),
+      body: JSON.stringify({ code }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      ledgerId?: string;
+      ledgerName?: string;
+      ownerUserId?: string;
+      ownerDisplayName?: string;
+      role?: 'editor' | 'viewer';
+      error?: string;
+    };
+    if (!res.ok || !data.ledgerId) throw new Error(data.error || '加入共同帳本失敗');
+    await this.syncNow(false);
+    return {
+      ledgerId: data.ledgerId,
+      ledgerName: data.ledgerName || '共同帳本',
+      ownerUserId: data.ownerUserId || '',
+      ownerDisplayName: data.ownerDisplayName || '擁有者',
+      role: data.role || 'editor',
+    };
+  }
+
+  async updateSharedLedgerMemberRole(
+    ledgerId: string,
+    memberUserId: string,
+    role: 'editor' | 'viewer'
+  ): Promise<void> {
+    const res = await this.fetchImpl(
+      `/api/shared-ledgers/${encodeURIComponent(ledgerId)}/members/${encodeURIComponent(memberUserId)}`,
+      {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: this.buildApiHeaders(true),
+        body: JSON.stringify({ role }),
+      }
+    );
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) throw new Error(data.error || '變更成員角色失敗');
+  }
+
+  async removeOrLeaveSharedLedger(
+    ledgerId: string,
+    memberUserId: string
+  ): Promise<{ removedSelf: boolean }> {
+    const res = await this.fetchImpl(
+      `/api/shared-ledgers/${encodeURIComponent(ledgerId)}/members/${encodeURIComponent(memberUserId)}`,
+      {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: this.buildApiHeaders(false),
+      }
+    );
+    const data = (await res.json().catch(() => ({}))) as { removedSelf?: boolean; error?: string };
+    if (!res.ok) throw new Error(data.error || '移除或退出共同帳本失敗');
+    await this.syncNow(false);
+    return { removedSelf: Boolean(data.removedSelf) };
+  }
+
+  async updateSharedLedgerPreference(ledgerId: string, includeInNetWorth: boolean): Promise<void> {
+    const res = await this.fetchImpl(`/api/shared-ledgers/${encodeURIComponent(ledgerId)}/preferences`, {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: this.buildApiHeaders(true),
+      body: JSON.stringify({ includeInNetWorth }),
+    });
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) throw new Error(data.error || '更新共同帳本設定失敗');
+    await this.syncNow(false);
+  }
+
+  private purgeLedgerDataFromSnapshot(snap: FinanceSnapshot, ledgerIds: ReadonlySet<string>): FinanceSnapshot {
+    if (ledgerIds.size === 0) return snap;
+    const purgedAssetIds = new Set(
+      snap.assetItems.filter((a) => ledgerIds.has(getEffectiveLedgerId(a))).map((a) => a.id)
+    );
+    return {
+      ...snap,
+      ledgers: ensureActiveLedgers((snap.ledgers || []).filter((l) => !ledgerIds.has(l.id))),
+      cashflowLogs: snap.cashflowLogs.filter((c) => !ledgerIds.has(getEffectiveLedgerId(c))),
+      assetItems: snap.assetItems.filter((a) => !ledgerIds.has(getEffectiveLedgerId(a))),
+      recurringItems: snap.recurringItems.filter((r) => !ledgerIds.has(getEffectiveLedgerId(r))),
+      savingsAdjustments: (snap.savingsAdjustments || []).filter((adj) => !purgedAssetIds.has(adj.accountId)),
+      splitReceivables: (snap.splitReceivables || []).filter((sp) => !ledgerIds.has(getEffectiveLedgerId(sp))),
+      installmentPlans: (snap.installmentPlans || []).filter((ip) => !ledgerIds.has(getEffectiveLedgerId(ip))),
+    };
+  }
+
+  private applySharedLedgerMetadataToSnapshot(
+    snap: FinanceSnapshot,
+    sharedLedgers: SharedLedgerSyncState[] | undefined
+  ): FinanceSnapshot {
+    const byId = new Map((sharedLedgers || []).map((s) => [s.ledgerId, s]));
+    const nextLedgers = ensureActiveLedgers(snap.ledgers).map((l) => {
+      const st = byId.get(l.id);
+      if (st) {
+        return {
+          ...l,
+          includeInNetWorth: st.myRole === 'owner' ? l.includeInNetWorth : st.includeInNetWorth,
+          isShared: true,
+          ownerUserId: st.ownerUserId,
+          ownerDisplayName: st.ownerDisplayName,
+          myRole: st.myRole,
+          memberCount: st.memberCount,
+        };
+      }
+      if (l.isShared) {
+        const cleaned = { ...l };
+        delete cleaned.isShared;
+        delete cleaned.ownerUserId;
+        delete cleaned.ownerDisplayName;
+        delete cleaned.myRole;
+        delete cleaned.memberCount;
+        return cleaned;
+      }
+      return l;
+    });
+    return { ...snap, ledgers: nextLedgers };
+  }
+
   private async commitAndMaybeSync(
     nextSnapshot: FinanceSnapshot,
     mutations: SyncMutation[]
   ): Promise<void> {
-    const normalizedMutations = mutations.map((m) =>
-      m.isNewRecord !== undefined
-        ? m
-        : {
-            ...m,
-            isNewRecord:
-              m.op === 'upsert' &&
-              m.entity !== 'settings' &&
-              m.entity !== 'utility_rents' &&
-              (m.baseVersion === null || m.baseVersion === 0),
-          }
-    );
+    const normalizedMutations = mutations.map((m) => {
+      const sharedLedgerId = this.resolveMutationSharedLedgerId(m, nextSnapshot);
+      if (sharedLedgerId) {
+        const role = this.getLedgerRole(sharedLedgerId);
+        if (role === 'viewer') {
+          throw new Error('您在此共同帳本為「僅檢視」權限，無法新增、修改或刪除資料。');
+        }
+        if (m.entity === 'ledger' && role && role !== 'owner') {
+          throw new Error('僅共同帳本擁有者可修改或刪除帳本設定。');
+        }
+      }
+      return {
+        ...m,
+        ...(sharedLedgerId ? { sharedLedgerId } : {}),
+        ...(m.isNewRecord !== undefined
+          ? {}
+          : {
+              isNewRecord:
+                m.op === 'upsert' &&
+                m.entity !== 'settings' &&
+                m.entity !== 'utility_rents' &&
+                (m.baseVersion === null || m.baseVersion === 0),
+            }),
+      };
+    });
     try {
       await this.db.commitLocalMutation(nextSnapshot, normalizedMutations, this.inFlightMutationIds);
     } catch (err) {
@@ -4443,6 +4715,7 @@ export class SyncEngine {
       let reqSince: string | null = null;
       let reqSinceSeq: number | null = null;
       let reqClientEpoch: number | null = null;
+      let reqSharedCursors: Record<string, SharedLedgerCursor> | undefined = undefined;
 
       await this.runSerialized(async () => {
         // R2 & Q1: Shrink batch size to 1 after a failure or while isolating a poison-pill mutation
@@ -4470,6 +4743,7 @@ export class SyncEngine {
         reqSinceSeq = fullPullPass ? null : (this.meta.syncCursor ?? null);
         // Q5 / N4: Always transmit known dataEpoch even during fullPullPass so stale-epoch mutations are caught
         reqClientEpoch = this.meta.dataEpoch ?? null;
+        reqSharedCursors = fullPullPass ? undefined : this.meta.sharedCursors;
       });
 
       this.updateStatus({
@@ -4502,6 +4776,9 @@ export class SyncEngine {
             clientEpoch: reqClientEpoch,
             mutations: batch,
             refsOrdered: true,
+            ...(reqSharedCursors && Object.keys(reqSharedCursors).length > 0
+              ? { sharedCursors: reqSharedCursors }
+              : {}),
           }),
         });
 
@@ -4614,11 +4891,27 @@ export class SyncEngine {
           const batchIdSet = new Set(batch.map((m) => m.mutationId));
           const currentOutbox = await this.db.getOutbox();
 
+          const nextSharedLedgers = Array.isArray(data.sharedLedgers) ? data.sharedLedgers : [];
+          const nextSharedCursors: Record<string, SharedLedgerCursor> = {};
+          for (const st of nextSharedLedgers) {
+            if (st.myRole !== 'owner') {
+              nextSharedCursors[st.ledgerId] = { sinceSeq: st.changeSeq, clientEpoch: st.dataEpoch };
+            }
+          }
+          const revokedSharedSet = new Set<string>(
+            Array.isArray(data.revokedSharedLedgerIds) ? data.revokedSharedLedgerIds : []
+          );
+          const sharedFullResyncSet = new Set<string>(
+            nextSharedLedgers.filter((s) => s.fullResyncRequired || s.epochMismatch).map((s) => s.ledgerId)
+          );
+
           const nextMeta: LocalMeta = {
             ...this.meta,
             lastSyncedAt: data.serverTime,
             ...(typeof data.syncCursor === 'number' ? { syncCursor: data.syncCursor } : {}),
             ...(typeof data.dataEpoch === 'number' ? { dataEpoch: data.dataEpoch } : {}),
+            sharedCursors: nextSharedCursors,
+            sharedLedgers: nextSharedLedgers,
           };
 
           const epochChanged =
@@ -4807,7 +5100,39 @@ export class SyncEngine {
             }
           }
 
-          let merged = this.mergeDelta(this.snapshot, data.delta, applyAsFull);
+          // Phase 9 (SL-7): Purge local cache for revoked shared ledgers and any shared ledgers needing full resync
+          let baseSnapshotForMerge = this.snapshot;
+          const purgeIds = new Set<string>([...revokedSharedSet, ...sharedFullResyncSet]);
+          if (!applyAsFull && purgeIds.size > 0) {
+            baseSnapshotForMerge = this.purgeLedgerDataFromSnapshot(baseSnapshotForMerge, purgeIds);
+          }
+          if (revokedSharedSet.size > 0) {
+            const revokedAt = data.serverTime || new Date().toISOString();
+            const byMutId = new Map<string, SyncRejection>(nextRejections.map((r) => [r.mutationId, r]));
+            for (const m of currentOutbox) {
+              if (!clearedSet.has(m.mutationId) && m.sharedLedgerId && revokedSharedSet.has(m.sharedLedgerId)) {
+                outboxIdsToClear.push(m.mutationId);
+                clearedSet.add(m.mutationId);
+                byMutId.set(m.mutationId, {
+                  mutationId: m.mutationId,
+                  entity: m.entity,
+                  op: m.op,
+                  recordId: m.recordId,
+                  resolutionStatus: 'rolled_back',
+                  reason: '您已被移除或已退出此共同帳本，未送出之本機異動已取消並清除快取。',
+                  ...(m.payload ? { clientPayload: m.payload } : {}),
+                  rejectedAt: revokedAt,
+                });
+              }
+            }
+            nextRejections = Array.from(byMutId.values());
+          }
+
+          let merged = this.mergeDelta(baseSnapshotForMerge, data.delta, applyAsFull);
+          if (revokedSharedSet.size > 0) {
+            merged = this.purgeLedgerDataFromSnapshot(merged, revokedSharedSet);
+          }
+          merged = this.applySharedLedgerMetadataToSnapshot(merged, nextSharedLedgers);
           for (const rb of rejectedCreatesToRollback) {
             merged = this.removeRecordFromSnapshot(merged, rb.entity, rb.recordId);
           }
