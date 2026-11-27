@@ -540,9 +540,11 @@ describe('Phase 2 (v1.10.0) — Analytics, Dividend Calendar & Rebalance', () =>
       const txs: StockTransaction[] = [
         makeStockTx({ id: 't-linked', assetId: 'a-voo', date: '2026-03-15', totalAmount: 100, linkedCashflowId: 'cf-div-1' }),
         makeStockTx({ id: 't-unlinked', assetId: 'a-voo', date: '2026-06-15', totalAmount: 100 }),
+        // N6: pre-recorded future dividend after referenceDateYmd must NOT inflate YTD monthly average
+        makeStockTx({ id: 't-future', assetId: 'a-voo', date: '2026-12-15', totalAmount: 200 }),
       ];
 
-      // Current FX is 35, but linked tx must stay 3150; unlinked uses 3500; referenceDateYmd = 2026-06-20 -> 6 elapsed months
+      // Current FX is 35, but linked tx must stay 3150; unlinked uses 3500; future uses 7000; referenceDateYmd = 2026-06-20 -> 6 elapsed months
       const cal = computeDividendCalendar(assets, txs, 35, 2026, 10_000, {
         cashflowLogs: [linkedCf],
         referenceDateYmd: '2026-06-20',
@@ -552,7 +554,7 @@ describe('Phase 2 (v1.10.0) — Analytics, Dividend Calendar & Rebalance', () =>
       expect(cal.months[5].totalTwd).toBe(3500);
       expect(cal.months[5].items[0].usedHistoricalFx).toBe(false);
       expect(cal.hasEstimatedFx).toBe(true);
-      expect(cal.annualTotalTwd).toBe(6650);
+      expect(cal.annualTotalTwd).toBe(13_650);
       expect(cal.averageMonthsCount).toBe(6);
       expect(cal.monthlyAverageTwd).toBe(Math.round(6650 / 6));
 

@@ -1,6 +1,6 @@
 import { todayInTimeZone } from '../../../shared/dates';
 import { ALL_CASHFLOW_TYPES, DEFAULT_LEDGER_ID } from '../../../shared/constants';
-import { resolveFxRate } from '../../../shared/currency';
+import { isSupportedCurrency, resolveFxRate } from '../../../shared/currency';
 import { getEffectiveCategoriesForType, normalizeEnabledCurrencies } from '../../../shared/validation';
 import {
   aggregatePeriodMetrics,
@@ -65,16 +65,24 @@ export function renderLogCurrencyButtons(ctx: UiContext): void {
   const seg = document.getElementById('logCurrencySeg');
   if (!seg) return;
   const enabled = normalizeEnabledCurrencies(ctx.engine.getSnapshot().settings.enabledCurrencies);
-  if (!enabled.includes(ctx.state.logCurrency)) {
+  const curr = String(ctx.state.logCurrency || 'TWD').trim().toUpperCase();
+  if (!isSupportedCurrency(curr)) {
     ctx.state.logCurrency = 'TWD';
   }
+  const displayCodes =
+    isSupportedCurrency(ctx.state.logCurrency) && !enabled.includes(ctx.state.logCurrency)
+      ? [...enabled, ctx.state.logCurrency]
+      : enabled;
   seg.innerHTML = '';
-  for (const code of enabled) {
+  for (const code of displayCodes) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'mini-seg-btn curr-btn' + (code === ctx.state.logCurrency ? ' active' : '');
     btn.dataset.curr = code;
     btn.textContent = code;
+    if (!enabled.includes(code)) {
+      btn.title = `${code}（未啟用幣別，由範本或歷史建議暫時帶入）`;
+    }
     btn.addEventListener('click', () => {
       ctx.state.logCurrency = code;
       renderLogCurrencyButtons(ctx);

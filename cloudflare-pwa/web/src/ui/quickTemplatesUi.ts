@@ -560,6 +560,7 @@ export function renderQuickTemplatesStrip(ctx: UiContext): void {
       el<HTMLInputElement>('itemNameInput').value = tpl.itemName || '';
       el<HTMLInputElement>('noteInput').value = tpl.note || '';
       closeAutocompleteDropdown();
+      renderLogCurrencyButtons(ctx);
       syncLogFormTypeAndCurrencyDom(ctx);
       renderLogCategories(ctx);
       renderLogTab(ctx);
@@ -674,14 +675,11 @@ export function bindQuickTemplatesAndAutocompleteEvents(ctx: UiContext): void {
           renderLogCategories(ctx);
           const amtInput = el<HTMLInputElement>('amountInput');
           // Never overwrite an amount the user already typed
-          if (!amtInput.value.trim() && s.suggestedAmount > 0) {
+          if (!amtInput.value.trim() && s.suggestedAmount > 0 && isSupportedCurrency(s.currency)) {
             amtInput.value = String(s.suggestedAmount);
-            const enabledCurrs = normalizeEnabledCurrencies(latestSnap.settings.enabledCurrencies);
-            if (isSupportedCurrency(s.currency) && enabledCurrs.includes(s.currency)) {
-              ctx.state.logCurrency = s.currency;
-              renderLogCurrencyButtons(ctx);
-              syncLogFormTypeAndCurrencyDom(ctx);
-            }
+            ctx.state.logCurrency = s.currency;
+            renderLogCurrencyButtons(ctx);
+            syncLogFormTypeAndCurrencyDom(ctx);
             updateFxPreview(ctx);
           }
         }

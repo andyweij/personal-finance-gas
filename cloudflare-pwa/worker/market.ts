@@ -111,8 +111,26 @@ export function normalizeMarketTicker(
     };
   }
 
-  // 5. Bare Taiwan stock / ETF / Bond ETF numeric code (e.g. 2330, 0050, 00679B, 2881B)
-  const hintIsUs = hint?.subCategory === '美股/ETF' || hint?.currency === 'USD';
+  // 5. Bare numeric ticker: route non-TWD/USD currencies to their international Yahoo suffix (never misroute to TWSE)
+  const hintCurrency = String(hint?.currency || '').trim().toUpperCase();
+  const hintIsUs = hint?.subCategory === '美股/ETF' || hintCurrency === 'USD';
+  const NON_TW_YAHOO_SUFFIX: Record<string, string> = {
+    HKD: '.HK',
+    JPY: '.T',
+    KRW: '.KS',
+    SGD: '.SI',
+    AUD: '.AX',
+    GBP: '.L',
+    EUR: '.DE',
+  };
+  if (hintCurrency && NON_TW_YAHOO_SUFFIX[hintCurrency] && !cleaned.includes('.') && !cleaned.includes(':')) {
+    const suffix = NON_TW_YAHOO_SUFFIX[hintCurrency];
+    return {
+      market: 'US',
+      code: cleaned,
+      yahooSymbol: `${cleaned}${suffix}`,
+    };
+  }
   if (!hintIsUs && TW_NUMERIC_CODE_RE.test(cleaned)) {
     return {
       market: 'TW',

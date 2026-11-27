@@ -417,7 +417,7 @@ async function bootstrap(): Promise<void> {
       }
       const autoFx = snap.settings.autoFxEnabled !== false;
       const enabledCurrs = normalizeEnabledCurrencies(snap.settings.enabledCurrencies);
-      const extraCount = Math.max(0, enabledCurrs.length - 2);
+      const extraCount = enabledCurrs.filter((c) => c !== 'TWD' && c !== 'USD').length;
       const fxEl = el('fxTopPill');
       fxEl.textContent = `USD ${Number(snap.settings.usdTwdRate || 32.5).toFixed(2)}${extraCount > 0 ? ` · +${extraCount}幣` : ''}${autoFx ? '' : ' · 手動'}`;
       fxEl.title = autoFx ? '多幣別與自動匯率設定（點擊調整）' : '多幣別與手動匯率設定（點擊調整）';

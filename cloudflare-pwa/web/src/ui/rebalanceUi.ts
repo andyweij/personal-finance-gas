@@ -558,7 +558,7 @@ export function renderRebalanceCard(
       td2.className = 'num';
       td2.textContent =
         row.isUntargeted && plan.excludeUntargeted && mode === 'full'
-          ? `${fmtPct(row.currentPct, 1)} · 保留`
+          ? '不計入'
           : `${fmtPct(row.currentPct, 1)} → ${fmtPct(row.targetPct, 0)}`;
 
       const td3 = document.createElement('td');

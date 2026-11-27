@@ -28,7 +28,7 @@ import type {
   SyncRequest,
 } from '../shared/types';
 import { runMonthEndSnapshotD1, runMonthlyRecurringD1 } from '../worker/automation';
-import { fetchAllTwdFxRates, refreshMarketData } from '../worker/market';
+import { fetchAllTwdFxRates, normalizeMarketTicker, refreshMarketData } from '../worker/market';
 import { exportFullSnapshot, importFullSnapshot, processSyncRequest } from '../worker/sync';
 import { LocalFinanceDB } from '../web/src/db/localDb';
 import { SyncEngine } from '../web/src/sync/syncEngine';
@@ -343,6 +343,49 @@ describe('Phase 4 (v1.12.0) — Multi-Currency Support (JPY / EUR / HKD / GBP / 
       const afterRestore = await exportFullSnapshot(rawD1, 'u-fx-auto');
       expect(afterRestore.settings.enabledCurrencies).toEqual(['TWD', 'USD', 'JPY', 'EUR']);
       expect(afterRestore.settings.fxRates?.JPY).toBe(0.2);
+    });
+  });
+
+  describe('4. v1.12.0 & v1.12.2 Review Follow-up Regression Tests (4-2, N2)', () => {
+    it('4-2: routes bare numeric tickers with HKD/JPY/KRW currencies to international Yahoo suffixes instead of TWSE', () => {
+      const hk = normalizeMarketTicker('0700', { currency: 'HKD' });
+      expect(hk?.yahooSymbol).toBe('0700.HK');
+      expect(hk?.market).toBe('US');
+
+      const jp = normalizeMarketTicker('7203', { currency: 'JPY' });
+      expect(jp?.yahooSymbol).toBe('7203.T');
+      expect(jp?.market).toBe('US');
+
+      const tw = normalizeMarketTicker('2330', { currency: 'TWD' });
+      expect(tw?.yahooSymbol).toBe('2330.TW');
+      expect(tw?.market).toBe('TW');
+    });
+
+    it('N2: rejects disabling USD (enabledCurrencies = ["TWD"]) on pre-0020 DB instead of silently skipping', async () => {
+      const dbPre20 = createTestD1({ stopBefore: '0020' });
+      await seedUser(dbPre20, 'u-pre20');
+
+      const res = await processSyncRequest(dbPre20, 'u-pre20', {
+        sinceSeq: 0,
+        clientEpoch: 1,
+        mutations: [
+          {
+            mutationId: 'm-twd-only',
+            entity: 'settings',
+            op: 'upsert',
+            recordId: '1',
+            clientTimestamp: '2026-11-27T03:00:00.000Z',
+            baseVersion: 1,
+            payload: {
+              monthlyDailyBudget: 30000,
+              enabledCurrencies: ['TWD'],
+            },
+          },
+        ],
+      });
+      expect(res.ackedMutationIds).not.toContain('m-twd-only');
+      expect(res.rejected).toHaveLength(1);
+      expect(res.rejected[0].reason).toMatch(/尚未完成升級|資料庫遷移/);
     });
   });
 });

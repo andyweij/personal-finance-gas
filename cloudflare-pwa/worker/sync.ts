@@ -175,45 +175,18 @@ export async function ensureSyncBaseline(
   };
 }
 
-export async function ensureAppSettings(db: D1Database, userId: string): Promise<AppSettings> {
+async function ensureAppSettingsWithRow(
+  db: D1Database,
+  userId: string
+): Promise<{ settings: AppSettings; row: Record<string, unknown> | null }> {
   const uid = assertUserId(userId);
   const row = await db
     .prepare('SELECT * FROM app_settings WHERE user_id = ?')
     .bind(uid)
-    .first<{
-      monthly_daily_budget: number;
-      emergency_target_months: number;
-      usd_twd_rate: number;
-      enabled_currencies_json?: string | null;
-      fx_rates_json?: string | null;
-      auto_fx_enabled?: number | null;
-      fx_updated_at: string | null;
-      pnl_color_scheme?: string | null;
-      custom_stock_categories?: string | null;
-      rebalance_targets_json?: string | null;
-      custom_categories_json?: string | null;
-      quick_templates_json?: string | null;
-      updated_at: string;
-      version?: number;
-    }>();
+    .first<Record<string, unknown>>();
 
   if (row) {
-    return {
-      monthlyDailyBudget: row.monthly_daily_budget,
-      emergencyTargetMonths: row.emergency_target_months,
-      usdTwdRate: row.usd_twd_rate,
-      enabledCurrencies: normalizeEnabledCurrencies(row.enabled_currencies_json),
-      fxRates: normalizeFxRates(row.fx_rates_json, row.usd_twd_rate),
-      autoFxEnabled: row.auto_fx_enabled !== undefined && row.auto_fx_enabled !== null ? Number(row.auto_fx_enabled) !== 0 : true,
-      fxUpdatedAt: row.fx_updated_at,
-      pnlColorScheme: normalizePnlColorScheme(row.pnl_color_scheme),
-      customStockCategories: normalizeCustomStockCategories(row.custom_stock_categories),
-      rebalanceTargets: normalizeRebalanceTargets(row.rebalance_targets_json),
-      customCategories: normalizeCustomCategories(row.custom_categories_json),
-      quickTemplates: normalizeQuickTemplates(row.quick_templates_json),
-      updatedAt: row.updated_at,
-      version: Number(row.version ?? 1),
-    };
+    return { settings: mapAppSettingsRow(row), row };
   }
 
   const nowIso = new Date().toISOString();
@@ -241,21 +214,29 @@ export async function ensureAppSettings(db: D1Database, userId: string): Promise
   ]);
 
   return {
-    monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
-    emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
-    usdTwdRate: DEFAULT_USD_TWD_RATE,
-    enabledCurrencies: ['TWD', 'USD'],
-    fxRates: { USD: DEFAULT_USD_TWD_RATE },
-    autoFxEnabled: true,
-    fxUpdatedAt: null,
-    pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
-    customStockCategories: [],
-    rebalanceTargets: [],
-    customCategories: {},
-    quickTemplates: [],
-    updatedAt: nowIso,
-    version: 1,
+    row: null,
+    settings: {
+      monthlyDailyBudget: DEFAULT_MONTHLY_DAILY_BUDGET,
+      emergencyTargetMonths: DEFAULT_EMERGENCY_MONTHS,
+      usdTwdRate: DEFAULT_USD_TWD_RATE,
+      enabledCurrencies: ['TWD', 'USD'],
+      fxRates: { USD: DEFAULT_USD_TWD_RATE },
+      autoFxEnabled: true,
+      fxUpdatedAt: null,
+      pnlColorScheme: DEFAULT_PNL_COLOR_SCHEME,
+      customStockCategories: [],
+      rebalanceTargets: [],
+      customCategories: {},
+      quickTemplates: [],
+      updatedAt: nowIso,
+      version: 1,
+    },
   };
+}
+
+export async function ensureAppSettings(db: D1Database, userId: string): Promise<AppSettings> {
+  const { settings } = await ensureAppSettingsWithRow(db, userId);
+  return settings;
 }
 
 export async function ensureDefaultLedger(db: D1Database, userId: string): Promise<void> {
@@ -1147,7 +1128,8 @@ async function applySingleMutation(
       {
         col: 'enabled_currencies_json',
         hasNonDefaultPayload:
-          p.enabledCurrencies !== undefined && enabledCurrencies.some((c) => c !== 'TWD' && c !== 'USD'),
+          p.enabledCurrencies !== undefined &&
+          (enabledCurrencies.length !== 2 || enabledCurrencies[0] !== 'TWD' || enabledCurrencies[1] !== 'USD'),
         value: JSON.stringify(enabledCurrencies),
         label: '多幣別清單',
       },
@@ -3172,7 +3154,7 @@ export async function importFullSnapshot(
       throw new Error(`匯入資料格式錯誤：${field} 必須是物件。`);
     }
   }
-  const currentSettings = await ensureAppSettings(db, uid);
+  const { settings: currentSettings, row: ensuredSettingsRow } = await ensureAppSettingsWithRow(db, uid);
 
   // 1. Pre-validate ALL records in memory BEFORE mutating any database table
   const fxForImport = data.settings
@@ -3429,10 +3411,12 @@ export async function importFullSnapshot(
   }
 
   if (data.settings) {
-    const existingSettingsRow = await db
-      .prepare('SELECT * FROM app_settings WHERE user_id = ?')
-      .bind(uid)
-      .first<Record<string, unknown>>();
+    const existingSettingsRow =
+      ensuredSettingsRow ??
+      (await db
+        .prepare('SELECT * FROM app_settings WHERE user_id = ?')
+        .bind(uid)
+        .first<Record<string, unknown>>());
     const customStockCategories = normalizeCustomStockCategories(
       data.settings.customStockCategories ?? currentSettings.customStockCategories
     );
@@ -3488,7 +3472,7 @@ export async function importFullSnapshot(
         col: 'enabled_currencies_json',
         hasNonDefaultPayload:
           data.settings.enabledCurrencies !== undefined &&
-          enabledCurrencies.some((c) => c !== 'TWD' && c !== 'USD'),
+          (enabledCurrencies.length !== 2 || enabledCurrencies[0] !== 'TWD' || enabledCurrencies[1] !== 'USD'),
         value: JSON.stringify(enabledCurrencies),
         label: '多幣別清單',
       },

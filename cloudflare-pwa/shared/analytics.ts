@@ -276,19 +276,33 @@ export function computeDividendCalendar(
   }
 
   let averageMonthsCount = 12;
+  let ytdCutoffYmd: string | null = null;
   if (options?.referenceDateYmd) {
-    const refMatch = /^(\d{4})-(\d{2})-\d{2}$/.exec(options.referenceDateYmd.trim());
+    const refTrimmed = options.referenceDateYmd.trim();
+    const refMatch = /^(\d{4})-(\d{2})-\d{2}$/.exec(refTrimmed);
     if (refMatch) {
       const refYear = Number(refMatch[1]);
       const refMonth = Number(refMatch[2]);
       if (year === refYear && refMonth >= 1 && refMonth <= 12) {
         averageMonthsCount = refMonth;
+        ytdCutoffYmd = refTrimmed;
       }
     }
   }
 
   const annualTotalTwd = roundTo(annualRaw, 0);
-  const monthlyAverageTwd = roundTo(annualTotalTwd / averageMonthsCount, 0);
+  const averageNumeratorTwd = ytdCutoffYmd
+    ? roundTo(
+        months.reduce(
+          (sum, b) =>
+            sum +
+            b.items.reduce((s, it) => (it.date <= ytdCutoffYmd! ? s + it.twdAmount : s), 0),
+          0
+        ),
+        0
+      )
+    : annualTotalTwd;
+  const monthlyAverageTwd = roundTo(averageNumeratorTwd / averageMonthsCount, 0);
   const cons = Number(monthlyConsumptionTwd || 0);
   const expenseCoveragePct =
     Number.isFinite(cons) && cons > 0 ? roundTo((monthlyAverageTwd / cons) * 100, 1) : null;

@@ -1306,10 +1306,12 @@ export function openAccountTransferModal(ctx: UiContext, presetFromAccountId?: s
     fxWrap.style.display = crossCurr ? 'block' : 'none';
     const fromRate = resolveFxRate(fromAcc.currency, rate);
     const toRate = resolveFxRate(toAcc.currency, rate);
-    const crossRate = roundTo(fromRate / (toRate || 1), 4);
+    const rawCross = fromRate / (toRate || 1);
+    const crossRateLabel =
+      rawCross > 0 && rawCross < 0.01 ? Number(rawCross.toPrecision(4)).toString() : String(roundTo(rawCross, 4));
     const targetLbl = document.querySelector<HTMLLabelElement>('label[for="trTargetAmt"]');
     if (targetLbl) {
-      targetLbl.textContent = `實際入帳金額 (${toAcc.currency}，依匯率 1 ${fromAcc.currency} ≈ ${crossRate} ${toAcc.currency} 估算，可修改)`;
+      targetLbl.textContent = `實際入帳金額 (${toAcc.currency}，依匯率 1 ${fromAcc.currency} ≈ ${crossRateLabel} ${toAcc.currency} 估算，可修改)`;
     }
 
     const rawAmt = parseFloat(amtInp.value);

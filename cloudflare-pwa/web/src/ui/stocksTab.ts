@@ -1612,9 +1612,8 @@ export function openStockBaselineModal(
 ): void {
   const isConverting = Boolean(opts?.convertFromWatchlist && existing);
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
   const pos = existing
-    ? computeStockPositionSummary(existing, snap.stockTransactions || [], rate)
+    ? computeStockPositionSummary(existing, snap.stockTransactions || [], snap.settings)
     : null;
 
   const modalTitle = isConverting
@@ -2052,9 +2051,8 @@ export function openStockTradeModal(
   mode: 'buy' | 'sell'
 ): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
   const freshAsset = snap.assetItems.find((a) => a.id === asset.id && !a.deletedAt) || asset;
-  const pos = computeStockPositionSummary(freshAsset, snap.stockTransactions || [], rate);
+  const pos = computeStockPositionSummary(freshAsset, snap.stockTransactions || [], snap.settings);
   const curr = freshAsset.currency || 'TWD';
   const isBuy = mode === 'buy';
 
@@ -2369,9 +2367,8 @@ export function openStockTradeModal(
 
 export function openStockDividendModal(ctx: UiContext, asset: AssetItem): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
   const freshAsset = snap.assetItems.find((a) => a.id === asset.id && !a.deletedAt) || asset;
-  const pos = computeStockPositionSummary(freshAsset, snap.stockTransactions || [], rate);
+  const pos = computeStockPositionSummary(freshAsset, snap.stockTransactions || [], snap.settings);
   const curr = freshAsset.currency || 'TWD';
 
   const body = openModal(`登錄配息 / 配股 · ${freshAsset.itemName}`);
@@ -2650,9 +2647,8 @@ function txTypeMeta(txType: StockTransaction['txType']): { label: string; cls: s
 
 export function openStockHistoryModal(ctx: UiContext, asset: AssetItem): void {
   const snap = ctx.engine.getSnapshot();
-  const rate = snap.settings.usdTwdRate || 32.5;
   const freshAsset = snap.assetItems.find((a) => a.id === asset.id && !a.deletedAt) || asset;
-  const pos = computeStockPositionSummary(freshAsset, snap.stockTransactions || [], rate);
+  const pos = computeStockPositionSummary(freshAsset, snap.stockTransactions || [], snap.settings);
   const curr = freshAsset.currency || 'TWD';
   const masked = ctx.state.masked;
 
@@ -2884,11 +2880,10 @@ export function openStockCategoryManagerModal(ctx: UiContext): void {
   const renderContent = () => {
     body.innerHTML = '';
     const snap = ctx.engine.getSnapshot();
-    const rate = snap.settings.usdTwdRate || 32.5;
     const portfolio = computeStockPortfolioSummary(
       snap.assetItems,
       snap.stockTransactions || [],
-      rate
+      snap.settings
     );
     const customCats = snap.settings.customStockCategories || [];
     const allCats = getAllStockCategories(ctx);
