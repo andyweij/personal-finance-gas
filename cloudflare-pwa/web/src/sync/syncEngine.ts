@@ -1,3 +1,4 @@
+import { normalizeRecurringPostDay } from '../../../shared/recurring';
 import { todayInTimeZone } from '../../../shared/dates';
 import { mutationReferenceKeys, orderMutationsByDependencies } from '../../../shared/syncOrder';
 import {
@@ -1070,6 +1071,8 @@ export class SyncEngine {
         currency: record.currency,
         cycle: '月繳',
         billingSpec: '',
+        // v1.13.1: post on the same day of month as the entry it was created from
+        postDay: normalizeRecurringPostDay(Number(String(record.date || '').slice(8, 10))),
         status: '啟用',
         note: record.note ? `[手機加入每月常態] ${record.note}` : '手機記帳加入每月常態',
         linkedAccountId: record.linkedAccountId,
@@ -1356,10 +1359,14 @@ export class SyncEngine {
   }
 
   async saveRecurring(payload: RecurringInputPayload & { id?: string }): Promise<RecurringItem> {
-    const v = validateRecurringInput(payload);
     const nowIso = new Date().toISOString();
     const id = payload.id || crypto.randomUUID();
     const existing = this.snapshot.recurringItems.find((r) => r.id === id);
+    // v1.13.1: callers that do not send postDay (status toggle of an older item, …) keep the stored posting day
+    const v = validateRecurringInput({
+      ...payload,
+      postDay: payload.postDay !== undefined && payload.postDay !== null ? payload.postDay : existing?.postDay,
+    });
     const sortOrder =
       payload.sortOrder !== undefined
         ? v.sortOrder

@@ -29,6 +29,7 @@ const FIELD_LABELS: Record<string, string> = {
   status: '狀態',
   cycle: '週期',
   billingSpec: '生效月份',
+  postDay: '入帳日',
   totalAmount: '預估總額',
   months: '分攤月數',
   dueNote: '預計繳款月',

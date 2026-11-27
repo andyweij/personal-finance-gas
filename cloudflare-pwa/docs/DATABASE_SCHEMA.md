@@ -1,8 +1,8 @@
-# 資料庫 Schema 設計架構（v1.13.0 / D1 Schema `0021`）
+# 資料庫 Schema 設計架構（v1.13.1 / D1 Schema `0022`）
 
 > **系統架構**：Cloudflare D1（SQLite）雲端主資料庫（25 張資料表）＋ 瀏覽器 IndexedDB 離線優先快取（`LocalFinanceDB`）  
-> **最新 Migration**：[`0021_financial_goals.sql`](../migrations/0021_financial_goals.sql)  
-> **對應版本**：`APP_VERSION = 1.13.0` / `DB_SCHEMA_VERSION = 0021` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
+> **最新 Migration**：[`0022_recurring_post_day.sql`](../migrations/0022_recurring_post_day.sql)  
+> **對應版本**：`APP_VERSION = 1.13.1` / `DB_SCHEMA_VERSION = 0022` / `SW_CACHE_VERSION = finance-pwa`（v1.8.14 起實際快取名稱為 `finance-pwa-<建置雜湊>`，由建置自動產生）
 
 ---
 
@@ -202,7 +202,7 @@ erDiagram
 #### 7. `recurring_items`（每月／定期固定收支規則）
 - **主鍵**：`PRIMARY KEY (user_id, id)`
 - **索引**：`idx_recurring_user_updated (user_id, updated_at)`、`idx_recurring_user_sort (user_id, sort_order, created_at)`、`idx_recurring_user_ledger (user_id, ledger_id)`
-- **欄位**：`user_id`, `id`, `ledger_id`（`0011`）, `item_name`, `category`, `type`, `amount`, `currency`, `cycle`（月繳／年繳／特定月／一次性）, `billing_spec`, `status`（啟用／停用）, `linked_account_id`, `sort_order`, `note`, `created_at`, `updated_at`, `deleted_at`, `version`。
+- **欄位**：`user_id`, `id`, `ledger_id`（`0011`）, `item_name`, `category`, `type`, `amount`, `currency`, `cycle`（月繳／年繳／特定月／一次性）, `billing_spec`, `post_day`（`0022`，每月入帳日 1～31，預設 1；該月沒有這天則記在月底）, `status`（啟用／停用）, `linked_account_id`, `sort_order`, `note`, `created_at`, `updated_at`, `deleted_at`, `version`。
 
 ---
 
@@ -266,7 +266,7 @@ flowchart LR
 
 ---
 
-## 5. Migration 演進總覽（`0001` → `0021`）
+## 5. Migration 演進總覽（`0001` → `0022`）
 
 | 版本 | 檔案 | 主要變更 |
 | --- | --- | --- |
@@ -291,6 +291,7 @@ flowchart LR
 | `0019` | `0019_custom_categories_and_templates.sql` | `app_settings` 新增 `custom_categories_json` 與 `quick_templates_json`（自訂分類與常用範本，v1.11.0） |
 | `0020` | `0020_multi_currency.sql` | `app_settings` 新增 `enabled_currencies_json` 與 `fx_rates_json`（多幣別與交叉匯率表，v1.12.0） |
 | `0021` | `0021_financial_goals.sql` | 新增 `financial_goals` 同步表（複合主鍵 `(user_id, id)`、無 `DEFAULT 'owner'`、支援 5 種目標追蹤與達成日期推估，v1.13.0） |
+| `0022` | `0022_recurring_post_day.sql` | `recurring_items` 新增 `post_day INTEGER NOT NULL DEFAULT 1`（固定收支每月入帳日，自動入帳的流水帳記在此日；既有項目維持 1 日，v1.13.1） |
 
 ---
 

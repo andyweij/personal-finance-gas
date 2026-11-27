@@ -69,3 +69,28 @@ export function buildMonthlyDedupKey(
 export function buildRecurringItemMonthKey(recurringItemId: string, yearMonth: string): string {
   return `rec:${String(recurringItemId).trim()}:${yearMonth.trim()}`;
 }
+
+/** v1.13.1: posting day of a recurring item (day of month the auto-posted entry is dated). */
+export const DEFAULT_RECURRING_POST_DAY = 1;
+
+/**
+ * v1.13.1: normalizes a stored / received posting day to an integer 1..31. Anything missing or invalid means the
+ * pre-v1.13.1 behaviour (the 1st).
+ */
+export function normalizeRecurringPostDay(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_RECURRING_POST_DAY;
+  const day = Math.round(n);
+  return day >= 1 && day <= 31 ? day : DEFAULT_RECURRING_POST_DAY;
+}
+
+/**
+ * v1.13.1: the date (YYYY-MM-DD) an auto-posted entry of `yearMonth` gets for a posting day. A day the month does
+ * not have (e.g. 31 in November, 29-31 in February) becomes the month's last day.
+ */
+export function resolveRecurringEntryDate(yearMonth: string, postDay: unknown): string {
+  const [y, m] = yearMonth.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const day = Math.min(normalizeRecurringPostDay(postDay), lastDay);
+  return `${yearMonth}-${String(day).padStart(2, '0')}`;
+}

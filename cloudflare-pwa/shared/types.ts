@@ -87,6 +87,8 @@ export interface RecurringItem {
   currency: string;
   cycle: string;
   billingSpec: string;
+  /** v1.13.1: day of month (1-31) the auto-posted entry is dated; a missing day = 1, clamped to the month's end */
+  postDay?: number;
   status: string;
   note: string;
   linkedAccountId?: string | null;

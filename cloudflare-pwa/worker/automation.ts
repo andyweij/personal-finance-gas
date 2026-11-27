@@ -13,7 +13,12 @@ import {
   isAssetIncludedInNetWorth,
   isLedgerIncludedInNetWorth,
 } from '../shared/calculations';
-import { buildMonthlyDedupKey, buildRecurringItemMonthKey, shouldPostRecurringItem } from '../shared/recurring';
+import {
+  buildMonthlyDedupKey,
+  buildRecurringItemMonthKey,
+  resolveRecurringEntryDate,
+  shouldPostRecurringItem,
+} from '../shared/recurring';
 import { assertUserId, ensureAppSettings, exportFullSnapshot } from './sync';
 
 /**
@@ -94,7 +99,6 @@ export async function runMonthlyRecurringD1(
   const year = targetYear || nowParts.year;
   const month = targetMonth || nowParts.month;
   const yearMonth = `${year}-${String(month).padStart(2, '0')}`;
-  const entryDate = `${yearMonth}-01`;
   const usdRate = settings.usdTwdRate;
   const nowIso = new Date().toISOString();
 
@@ -168,6 +172,8 @@ export async function runMonthlyRecurringD1(
       note: string;
       linked_account_id: string | null;
       ledger_id?: string | null;
+      /** v1.13.1 (migration 0022); absent before the migration = the 1st */
+      post_day?: number | null;
     }>();
 
   let insertedCount = 0;
@@ -244,7 +250,8 @@ export async function runMonthlyRecurringD1(
       .bind(
         uid,
         crypto.randomUUID(),
-        entryDate,
+        // v1.13.1: dated on the item's posting day (clamped to the month's last day); default the 1st
+        resolveRecurringEntryDate(yearMonth, item.post_day),
         yearMonth,
         item.type,
         item.category || '其他',

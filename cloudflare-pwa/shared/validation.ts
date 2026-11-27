@@ -548,6 +548,8 @@ export interface RecurringInputPayload {
   currency?: string;
   cycle?: string;
   billingSpec?: string;
+  /** v1.13.1: day of month (1-31) the auto-posted entry is dated; omitted = 1 */
+  postDay?: number | string | null;
   status?: string;
   note?: string;
   linkedAccountId?: string | null;
@@ -576,7 +578,30 @@ export function validateRecurringInput(payload: RecurringInputPayload) {
   if (!BILLING_CYCLES.includes(cycle)) throw new Error(`不支援的週期：${cycle}`);
   if (!STATUS_OPTIONS.includes(status)) throw new Error(`不支援的狀態：${status}`);
 
-  return { itemName, category, type, amount, currency, cycle, billingSpec, status, note, linkedAccountId, ledgerId, sortOrder };
+  // v1.13.1: posting day 1-31 (a day the month lacks is posted on its last day)
+  let postDay = 1;
+  const rawPostDay = payload.postDay;
+  if (rawPostDay !== undefined && rawPostDay !== null && String(rawPostDay).trim() !== '') {
+    const n = Number(rawPostDay);
+    if (!Number.isInteger(n) || n < 1 || n > 31) throw new Error('入帳日需為 1～31 的整數。');
+    postDay = n;
+  }
+
+  return {
+    itemName,
+    category,
+    type,
+    amount,
+    currency,
+    cycle,
+    billingSpec,
+    postDay,
+    status,
+    note,
+    linkedAccountId,
+    ledgerId,
+    sortOrder,
+  };
 }
 
 export interface SinkingInputPayload {
