@@ -172,8 +172,8 @@ const deleteMut = (mutationId: string, entity: string, recordId: string, baseVer
   clientTimestamp: '2026-05-02T00:00:00.000Z',
 });
 
-describe('aa75631 re-review — R1: the SL-4 guard on EXISTING references blocks legitimate deletes', () => {
-  it.fails('a shared record linked to a since-deleted shared account can still be deleted', async () => {
+describe('aa75631 re-review — R1 (fixed): the SL-4 guard on existing references must not block legitimate edits/deletes', () => {
+  it('a shared record linked to a since-deleted shared account can still be deleted', async () => {
     const { db, epoch } = await setup();
     const created = await processSyncRequest(db, 'alice', {
       clientEpoch: epoch,
@@ -198,7 +198,7 @@ describe('aa75631 re-review — R1: the SL-4 guard on EXISTING references blocks
     expect(bobDel.ackedMutationIds).toEqual(['b_del']);
   });
 
-  it.fails('the owner can delete their own pre-sharing record that is linked to a personal account', async () => {
+  it('the owner can delete their own pre-sharing record that is linked to a personal account', async () => {
     const { db, epoch } = await setup({ linkPrivateBeforeSharing: true });
     const res = await processSyncRequest(db, 'alice', {
       clientEpoch: epoch,
@@ -206,6 +206,60 @@ describe('aa75631 re-review — R1: the SL-4 guard on EXISTING references blocks
       mutations: [deleteMut('a_del_pre', 'cashflow', 'cf_pre', 1)] as never,
     });
     expect(res.rejected).toEqual([]);
+  });
+
+  it('an editor can still edit a record linked to a since-deleted shared account (keeping the link)', async () => {
+    const { db, epoch } = await setup();
+    await processSyncRequest(db, 'alice', {
+      clientEpoch: epoch,
+      refsOrdered: true,
+      mutations: [cashflowMut('a_cf', 'cf_joint', 20, 'ast_joint', { sharedLedgerId: 'led_home' })] as never,
+    });
+    await processSyncRequest(db, 'alice', {
+      clientEpoch: epoch,
+      refsOrdered: true,
+      mutations: [deleteMut('a_del_acct', 'asset', 'ast_joint', 1)] as never,
+    });
+    const res = await processSyncRequest(db, 'bob', {
+      refsOrdered: true,
+      mutations: [
+        cashflowMut('b_edit', 'cf_joint', 25, 'ast_joint', { sharedLedgerId: 'led_home', baseVersion: 1 }),
+      ] as never,
+    });
+    expect(res.rejected).toEqual([]);
+    expect(res.ackedMutationIds).toEqual(['b_edit']);
+  });
+
+  it('the owner can edit their own pre-sharing cross-ledger record keeping its link, but not add a new one', async () => {
+    const { db, epoch } = await setup({ linkPrivateBeforeSharing: true });
+    const keep = await processSyncRequest(db, 'alice', {
+      clientEpoch: epoch,
+      refsOrdered: true,
+      mutations: [cashflowMut('a_keep', 'cf_pre', 12, 'ast_priv', { baseVersion: 1 })] as never,
+    });
+    expect(keep.rejected).toEqual([]);
+    const relink = await processSyncRequest(db, 'alice', {
+      clientEpoch: epoch,
+      refsOrdered: true,
+      mutations: [cashflowMut('a_new', 'cf_new', 5, 'ast_priv')] as never,
+    });
+    expect(relink.ackedMutationIds).toEqual([]);
+  });
+
+  it('control: an editor cannot unlink or re-link a record from the owner’s personal account', async () => {
+    const { db } = await setup({ linkPrivateBeforeSharing: true });
+    for (const target of [null, 'ast_joint']) {
+      const res = await processSyncRequest(db, 'bob', {
+        refsOrdered: true,
+        mutations: [
+          cashflowMut(`b_relink_${target}`, 'cf_pre', 10, target as string, { sharedLedgerId: 'led_home', baseVersion: 1 }),
+        ] as never,
+      });
+      expect(res.ackedMutationIds).toEqual([]);
+      expect(res.rejected[0]?.reason).toMatch(/僅帳本擁有者/);
+    }
+    const row = await db.prepare("SELECT linked_account_id FROM cashflow_logs WHERE id = 'cf_pre'").first<{ linked_account_id: string }>();
+    expect(row?.linked_account_id).toBe('ast_priv');
   });
 
   it('control: an editor still cannot delete a shared record linked to the owner’s personal account', async () => {

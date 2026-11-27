@@ -455,6 +455,17 @@ export async function joinSharedLedgerByCode(
   ]);
 
   if (Number(redeemRes[0]?.meta?.changes ?? 0) !== 1) {
+    // aa75631 review (finding 9): the atomic UPDATE also fails when a limit is reached — the code is then NOT used
+    // up, so do not tell the user it is (one extra query on this failure path only).
+    const stillUsable = await db
+      .prepare('SELECT 1 AS ok FROM ledger_invites WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?')
+      .bind(invite.id, nowIso)
+      .first();
+    if (stillUsable) {
+      throw new Error(
+        `無法加入：此共同帳本可能已達 ${MAX_MEMBERS_PER_SHARED_LEDGER} 位成員上限、您已加入 ${MAX_JOINED_SHARED_LEDGERS} 個共同帳本，或帳本狀態剛有變更。此邀請碼尚未被使用，仍可再試。`
+      );
+    }
     throw new Error('此邀請碼剛已被使用或失效，請向帳本擁有者索取新邀請碼。');
   }
 
