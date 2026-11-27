@@ -1,6 +1,6 @@
 {
   "name": "personal-finance-cloudflare-pwa",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "個人現金流與資產負債管理系統 (Offline-First PWA + Cloudflare Workers + D1)",
   "private": true,
   "type": "module",
@@ -12,6 +12,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e:pwa": "npm run build:web && node tests/e2e/pwa-offline.e2e.mjs",
+    "test:e2e:ui": "npm run build:web && node tests/e2e/ui-variants.e2e.mjs",
+    "test:e2e": "npm run build:web && node tests/e2e/pwa-offline.e2e.mjs && node tests/e2e/ui-variants.e2e.mjs",
     "db:migrate:local": "wrangler d1 migrations apply finance-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply finance-db --remote",
     "db:backup:remote": "wrangler d1 export finance-db --remote --output=d1-backup.sql",
