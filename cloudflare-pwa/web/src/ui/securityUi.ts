@@ -30,6 +30,7 @@ import {
   setLoading,
   showToast, bindSubmit } from './helpers';
 import { APP_VERSION, BUILD_COMMIT, DB_SCHEMA_VERSION } from '../version';
+import { getCurrentUiVariant } from './uiVariant';
 import type { UiContext } from './state';
 import { applyAuthMetaToState } from './state';
 
@@ -820,6 +821,43 @@ export function openSecurityModal(ctx: UiContext): void {
 
     body.appendChild(accCard);
   }
+
+  // v2.2.0: 介面版本（簡潔版／經典版），只存在這台裝置
+  const variantCard = document.createElement('div');
+  variantCard.style.cssText = 'padding:12px 13px;border-radius:12px;background:var(--surface-alt);margin-bottom:14px';
+  const variantTitle = document.createElement('div');
+  variantTitle.style.cssText = 'font-size:13px;font-weight:700;margin-bottom:3px';
+  variantTitle.textContent = '介面版本（只套用在這台裝置）';
+  const variantSub = document.createElement('div');
+  variantSub.className = 'muted';
+  variantSub.style.cssText = 'font-size:11px;margin-bottom:10px';
+  variantSub.textContent = '簡潔版：首頁、明細、＋記一筆、資產、更多；經典版：原本的 5 分頁。兩者共用同一份資料。';
+  const variantSeg = document.createElement('div');
+  variantSeg.className = 'mini-seg';
+  variantSeg.setAttribute('role', 'radiogroup');
+  variantSeg.setAttribute('aria-label', '介面版本');
+  const renderVariantSeg = () => {
+    variantSeg.innerHTML = '';
+    const current = getCurrentUiVariant();
+    for (const [id, label] of [['simple', '簡潔版'], ['classic', '經典版']] as const) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'mini-seg-btn' + (current === id ? ' active' : '');
+      b.setAttribute('role', 'radio');
+      b.setAttribute('aria-checked', current === id ? 'true' : 'false');
+      b.textContent = label;
+      b.addEventListener('click', () => {
+        ctx.setUiVariant(id);
+        renderVariantSeg();
+      });
+      variantSeg.appendChild(b);
+    }
+  };
+  renderVariantSeg();
+  variantCard.appendChild(variantTitle);
+  variantCard.appendChild(variantSub);
+  variantCard.appendChild(variantSeg);
+  body.appendChild(variantCard);
 
   // 0.5 Display Preference: Positive / Negative Color Scheme (synced per user)
   const schemeCard = document.createElement('div');

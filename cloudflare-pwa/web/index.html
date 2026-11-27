@@ -84,8 +84,120 @@
   </header>
 
   <main class="container">
+    <!-- ==================== v2.2.0 簡潔版：首頁 ==================== -->
+    <section class="tab-view" id="tab-home">
+      <div class="simple-page-title">首頁</div>
+      <div class="ledger-bar" id="homeLedgerBar"></div>
+      <div class="card home-hero">
+        <div class="home-hero-head">
+          <span id="homeHeroTitle">本月還可以花</span>
+          <span class="muted tnum" id="homeHeroMeta"></span>
+        </div>
+        <div class="big-num" id="homeHeroValue">NT$ --</div>
+        <div class="progress-track" id="homeHeroTrack"><div class="progress-fill" id="homeHeroFill"></div></div>
+        <div class="hero-footer tnum">
+          <span id="homeHeroSpent"></span>
+          <span id="homeHeroDaily"></span>
+        </div>
+      </div>
+      <div class="home-stats" id="homeStats"></div>
+      <div class="section-heading">
+        <span>最近交易</span>
+        <button type="button" class="link-btn" data-goto-tab="log">全部明細</button>
+      </div>
+      <div class="list-group" id="homeRecentList"></div>
+      <button type="button" class="card compact home-link" data-goto-tab="overview">
+        <span class="home-link-text">
+          <span class="home-link-title">年度趨勢與大項統計</span>
+          <span class="muted tnum" id="homeOverviewHint">淨現金流、投資流出、緊急預備金</span>
+        </span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+      </button>
+    </section>
+
+    <!-- ==================== v2.2.0 簡潔版：更多 ==================== -->
+    <section class="tab-view" id="tab-more">
+      <div class="simple-page-title">更多</div>
+      <div class="more-group">
+        <div class="more-group-title">每月自動化</div>
+        <div class="list-group">
+          <button type="button" class="more-row" data-more-action="recurring">
+            <span class="more-row-icon" style="background:#2F6FD0" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2.1l4 4-4 4"/><path d="M3 12.2v-2a4 4 0 0 1 4-4h12.8M7 21.9l-4-4 4-4"/><path d="M21 11.8v2a4 4 0 0 1-4 4H4.2"/></svg></span>
+            <span class="more-row-label">固定收支</span><span class="more-row-hint tnum" id="moreRecurringHint"></span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="more-row" data-more-action="sinking">
+            <span class="more-row-icon" style="background:#E8913A" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg></span>
+            <span class="more-row-label">大額攤提</span><span class="more-row-hint tnum" id="moreSinkingHint"></span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="more-row" data-more-action="budget">
+            <span class="more-row-icon" style="background:#34A853" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></span>
+            <span class="more-row-label">預算與緊急預備金</span><span class="more-row-hint tnum" id="moreBudgetHint"></span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="more-group">
+        <div class="more-group-title">規劃與工具</div>
+        <div class="list-group">
+          <button type="button" class="more-row" data-more-action="goals">
+            <span class="more-row-icon" style="background:#C2185B" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></span>
+            <span class="more-row-label">財務目標</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="more-row" data-more-action="splits">
+            <span class="more-row-icon" style="background:#6E3FBF" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+            <span class="more-row-label">代墊與拆帳</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="more-row" data-more-action="utility">
+            <span class="more-row-icon" style="background:#0A84A8" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.7s-6 6.3-6 11.3a6 6 0 0 0 12 0c0-5-6-11.3-6-11.3Z"/></svg></span>
+            <span class="more-row-label">5F／6F 水電分攤</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="more-row" data-more-action="calc">
+            <span class="more-row-icon" style="background:#636366" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M8 6h8M8 10h.01M12 10h.01M16 10h.01M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01M16 18h.01"/></svg></span>
+            <span class="more-row-label">計算機</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="more-group">
+        <div class="more-group-title">帳本與帳號</div>
+        <div class="list-group">
+          <button type="button" class="more-row" data-more-action="ledgers">
+            <span class="more-row-icon" style="background:#5856D6" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V2H6.5A2.5 2.5 0 0 0 4 4.5v15Z"/></svg></span>
+            <span class="more-row-label">帳本與共享</span><span class="more-row-hint tnum" id="moreLedgersHint"></span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="more-row" data-more-action="settings">
+            <span class="more-row-icon" style="background:#3A3A3C" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+            <span class="more-row-label">帳號、安全、配色與備份</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="more-row" data-more-action="help">
+            <span class="more-row-icon" style="background:#8E8E93" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg></span>
+            <span class="more-row-label">使用說明</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="more-group">
+        <div class="more-group-title">介面版本</div>
+        <div class="card compact ui-variant-card">
+          <div class="mini-seg ui-variant-seg" role="radiogroup" aria-label="介面版本">
+            <button type="button" class="mini-seg-btn" role="radio" data-ui-variant="simple">簡潔版</button>
+            <button type="button" class="mini-seg-btn" role="radio" data-ui-variant="classic">經典版</button>
+          </div>
+          <div class="muted">兩個版本共用同一份資料，切換不影響帳目，只套用在這台裝置。</div>
+        </div>
+      </div>
+    </section>
+
     <!-- ==================== TAB 1: 記帳 ==================== -->
     <section class="tab-view active" id="tab-log">
+      <div class="simple-page-title">明細</div>
       <div class="ledger-bar" id="logLedgerBar"></div>
       <div class="ledger-isolated-banner" id="logIsolatedBanner" style="display:none"></div>
 
@@ -138,10 +250,16 @@
       </div>
 
       <form class="card" id="expenseForm" autocomplete="off">
+        <div class="seg-bar cols-3 qa-type-seg" id="qaTypeSeg" role="radiogroup" aria-label="交易類型">
+          <button type="button" class="seg-btn" role="radio" data-qa-type="日常花費">支出</button>
+          <button type="button" class="seg-btn" role="radio" data-qa-type="其他收入">收入</button>
+          <button type="button" class="seg-btn" role="radio" data-qa-type="投資流出">投資</button>
+        </div>
+
         <div class="tpl-strip" id="quickTemplatesBar" aria-label="常用記帳範本"></div>
 
-        <label class="section-label">交易類型</label>
-        <div class="chip-group" id="logTypeChips">
+        <label class="section-label qa-advanced">交易類型</label>
+        <div class="chip-group qa-advanced" id="logTypeChips">
           <button type="button" class="chip-btn active" data-type="日常花費">日常花費</button>
           <button type="button" class="chip-btn" data-type="稅金與大額">稅金 / 大額</button>
           <button type="button" class="chip-btn" data-type="其他收入">其他收入</button>
@@ -159,8 +277,11 @@
             <button type="button" class="mini-seg-btn curr-btn" data-curr="USD">USD</button>
           </div>
           <input id="amountInput" class="amount-input" type="number" inputmode="decimal" step="any" min="0.01" placeholder="0" required />
+          <button type="button" class="amount-calc-btn" id="amountCalcBtn" aria-label="用計算機輸入金額">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M8 6h8M8 11h.01M12 11h.01M16 11h.01M8 15h.01M12 15h.01M16 15h.01M8 19h.01M12 19h.01M16 19h.01"/></svg>
+          </button>
         </div>
-        <div class="quick-row">
+        <div class="quick-row qa-advanced">
           <button type="button" class="chip-btn sm tnum" data-add="100">+100</button>
           <button type="button" class="chip-btn sm tnum" data-add="500">+500</button>
           <button type="button" class="chip-btn sm tnum" data-add="1000">+1000</button>
@@ -181,12 +302,17 @@
           </div>
         </div>
 
-        <div class="field" style="margin-top:12px">
+        <button type="button" class="qa-more-toggle" id="qaMoreToggle" aria-expanded="false" aria-controls="expenseForm">
+          <span>更多選項</span>
+          <span class="muted" id="qaMoreSummary">類型、帳戶、備註、拆帳、範本</span>
+        </button>
+
+        <div class="field qa-advanced" style="margin-top:12px">
           <label class="section-label" for="noteInput">備註（選填）</label>
           <input id="noteInput" type="text" placeholder="例如：Apple Pay、中信卡、所得稅" maxlength="200" />
         </div>
 
-        <div class="field" id="logSavingsField">
+        <div class="field qa-advanced" id="logSavingsField">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px">
             <label class="section-label" style="margin-bottom:0">連動活存 / 信用卡</label>
             <span class="muted" style="font-size:11px">活存即時加減 · 刷卡計入未繳帳單</span>
@@ -195,7 +321,7 @@
           <div class="savings-preview tnum" id="savingsDeltaPreview" style="display:none"></div>
         </div>
 
-        <label id="recurringToggleBox" style="display:none;align-items:center;gap:10px;padding:11px 13px;margin-bottom:14px;border-radius:12px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;">
+        <label id="recurringToggleBox" class="qa-advanced" style="display:none;align-items:center;gap:10px;padding:11px 13px;margin-bottom:14px;border-radius:12px;background:var(--surface-alt);border:0.5px solid var(--sep);font-size:13px;cursor:pointer;">
           <input id="makeRecurringCheckbox" type="checkbox" style="width:18px;height:18px;accent-color:var(--primary)" />
           <span>
             <strong>設為每月固定自動入帳</strong>
@@ -205,8 +331,8 @@
 
         <div class="entry-submit-row">
           <button type="submit" class="btn btn-primary" id="submitBtn" style="flex:1">寫入流水帳</button>
-          <button type="button" class="btn btn-outline" id="openSplitExpenseBtn" title="記錄代墊或與朋友拆帳">拆帳</button>
-          <button type="button" class="btn btn-outline" id="saveAsTemplateBtn" title="將目前表單存為常用範本">☆ 存範本</button>
+          <button type="button" class="btn btn-outline qa-advanced" id="openSplitExpenseBtn" title="記錄代墊或與朋友拆帳">拆帳</button>
+          <button type="button" class="btn btn-outline qa-advanced" id="saveAsTemplateBtn" title="將目前表單存為常用範本">☆ 存範本</button>
         </div>
       </form>
 
@@ -357,6 +483,13 @@
 
     <!-- ==================== TAB 2: 總覽 ==================== -->
     <section class="tab-view" id="tab-overview">
+      <div class="simple-subhead">
+        <button type="button" class="simple-back" data-simple-back aria-label="返回">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+          <span data-simple-back-label>返回</span>
+        </button>
+        <span class="simple-subhead-title">年度趨勢與統計</span>
+      </div>
       <div class="ledger-bar" id="overviewLedgerBar"></div>
       <div class="month-nav">
         <button type="button" class="btn btn-outline btn-sm" id="prevMonthBtn">上月</button>
@@ -429,7 +562,7 @@
     <section class="tab-view" id="tab-assets">
       <div class="ledger-bar" id="assetsLedgerBar"></div>
       <div class="ledger-isolated-banner" id="assetsIsolatedBanner" style="display:none"></div>
-      <div class="card">
+      <div class="card" id="assetsHeroCard">
         <div style="display:flex;justify-content:space-between;align-items:center">
           <span id="assetsHeroTitle" style="font-size:13px;font-weight:600;color:var(--text-secondary)">整合淨資產 (TWD)</span>
           <span class="fx-pill" id="debtRatioBadge">負債比 --%</span>
@@ -461,6 +594,27 @@
         </div>
       </div>
 
+      <div class="simple-assets-head">
+        <div class="simple-page-title">資產</div>
+        <div class="simple-assets-actions">
+          <button type="button" class="icon-btn" id="simpleAssetsRefreshBtn" aria-label="更新股價與匯率">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+          </button>
+          <button type="button" class="icon-btn primary" id="simpleAssetsAddBtn" aria-label="新增帳戶、資產、轉帳或快照">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <button type="button" class="card compact simple-stocks-row" id="simpleStocksRow" data-goto-tab="stocks">
+        <span class="home-link-text">
+          <span class="home-link-title">台股持股 <span class="muted" id="simpleStocksCount"></span></span>
+          <span class="muted tnum" id="simpleStocksSub">市值、損益、配息與再平衡</span>
+        </span>
+        <span class="simple-stocks-value tnum" id="simpleStocksValue">NT$ --</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+      </button>
+
       <div class="asset-action-grid">
         <button type="button" class="btn btn-primary btn-sm" id="addSavingsBtn">+ 新增活存</button>
         <button type="button" class="btn btn-tinted btn-sm" id="addAssetBtn">+ 新增資產</button>
@@ -471,7 +625,7 @@
 
       <div>
         <div class="section-heading">
-          <span>活存帳戶區（與流水帳即時連動）</span>
+          <span><span class="label-classic">活存帳戶區（與流水帳即時連動）</span><span class="label-simple">現金與活存</span></span>
           <span class="section-heading-right">
             <span class="tnum" id="assetsSavingsTotalLabel">合計 NT$ --</span>
             <button type="button" class="section-sort-btn" id="reorderSavingsBtn" style="display:none">⇅ 排序</button>
@@ -486,7 +640,7 @@
 
       <div>
         <div class="section-heading">
-          <span>自動更新區（股票 / 美金）</span>
+          <span><span class="label-classic">自動更新區（股票 / 美金）</span><span class="label-simple">投資（自動更新報價）</span></span>
           <span class="section-heading-right">
             <span>每日自動更新行情</span>
             <button type="button" class="section-sort-btn" id="reorderAutoAssetsBtn" style="display:none">⇅ 排序</button>
@@ -497,7 +651,7 @@
 
       <div>
         <div class="section-heading">
-          <span>每月手動快照區（資產與負債）</span>
+          <span><span class="label-classic">每月手動快照區（資產與負債）</span><span class="label-simple">其他資產與負債</span></span>
           <span class="section-heading-right">
             <span>月底直接更新餘額</span>
             <button type="button" class="section-sort-btn" id="reorderManualAssetsBtn" style="display:none">⇅ 排序</button>
@@ -527,6 +681,13 @@
 
     <!-- ==================== TAB 4: 持股與損益 ==================== -->
     <section class="tab-view" id="tab-stocks">
+      <div class="simple-subhead">
+        <button type="button" class="simple-back" data-simple-back aria-label="返回">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+          <span data-simple-back-label>返回</span>
+        </button>
+        <span class="simple-subhead-title">台股持股</span>
+      </div>
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
           <div style="display:flex;align-items:center;gap:6px">
@@ -599,6 +760,13 @@
 
     <!-- ==================== TAB 5: 工具（固定收支 / 大額攤提 / 水電分攤） ==================== -->
     <section class="tab-view" id="tab-tools">
+      <div class="simple-subhead">
+        <button type="button" class="simple-back" data-simple-back aria-label="返回">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+          <span data-simple-back-label>返回</span>
+        </button>
+        <span class="simple-subhead-title">工具</span>
+      </div>
       <div class="seg-bar cols-3" id="toolsSubtabBar">
         <button type="button" class="seg-btn active" data-tools-sub="recurring">固定收支</button>
         <button type="button" class="seg-btn" data-tools-sub="sinking">大額攤提</button>
@@ -846,6 +1014,44 @@
       <span>工具</span>
     </button>
   </nav>
+
+  <!-- v2.2.0 簡潔版底部導覽：首頁／明細／＋記一筆／資產／更多 -->
+  <nav class="simple-nav" id="simpleNav" aria-label="主要導覽">
+    <button type="button" class="nav-btn" data-simple-tab="home">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 10 9-7 9 7v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M9 22V12h6v10"/></svg>
+      <span>首頁</span>
+    </button>
+    <button type="button" class="nav-btn" data-simple-tab="log">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+      <span>明細</span>
+    </button>
+    <button type="button" class="simple-nav-add" id="simpleAddBtn" aria-label="記一筆">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+    <button type="button" class="nav-btn" data-simple-tab="assets">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
+      <span>資產</span>
+    </button>
+    <button type="button" class="nav-btn" data-simple-tab="more">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>
+      <span>更多</span>
+    </button>
+  </nav>
+
+  <!-- v2.2.0 簡潔版「記一筆」底部面板：開啟時把記帳表單（#expenseForm）搬進來 -->
+  <div class="qa-backdrop" id="quickAddBackdrop">
+    <div class="qa-sheet" id="quickAddSheet" role="dialog" aria-modal="true" aria-labelledby="quickAddTitle">
+      <div class="qa-handle" aria-hidden="true"></div>
+      <div class="modal-head">
+        <span class="modal-title" id="quickAddTitle">記一筆</span>
+        <button type="button" class="icon-btn sm" id="quickAddCloseBtn" aria-label="關閉記一筆">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="ledger-bar" id="quickAddLedgerBar"></div>
+      <div id="quickAddBody"></div>
+    </div>
+  </div>
 
   <!-- 裝置適配彈窗 -->
   <div class="modal-backdrop" id="modalBackdrop">

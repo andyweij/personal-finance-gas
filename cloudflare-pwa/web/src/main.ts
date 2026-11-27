@@ -70,7 +70,20 @@ import {
 import { initBottomNavScrub } from './ui/tabBarScrub';
 import { openConflictsModal } from './ui/conflictUi';
 import { openHelpGuideModal } from './ui/helpGuideUi';
-import { initFloatingCalculator } from './ui/calculatorUi';
+import { initFloatingCalculator, openCalculatorFor } from './ui/calculatorUi';
+import { renderHomeTab, renderSimpleStocksRow } from './ui/homeTab';
+import { bindMoreTabEvents, renderMoreTab } from './ui/moreTab';
+import { renderLedgerSwitcherBar, resolveActiveLedger } from './ui/ledgerUi';
+import {
+  CLASSIC_TABS,
+  SIMPLE_SECONDARY_PARENT,
+  getCurrentUiVariant,
+  readUiVariant,
+  resolveTabForVariant,
+  simpleNavHighlight,
+  writeUiVariant,
+  type UiVariant,
+} from './ui/uiVariant';
 import type {
   AppUiState,
   StockCardDisplayMode,
@@ -172,7 +185,9 @@ function registerServiceWorker(): void {
 }
 
 type AppTab = AppUiState['activeTab'];
-const ALL_TABS: AppTab[] = ['log', 'overview', 'assets', 'stocks', 'tools'];
+// v2.2.0: apply the stored 介面版本 before anything renders, so the 經典版 layout never flashes first
+document.documentElement.dataset.ui = readUiVariant(localStorage);
+const ALL_TABS: AppTab[] = ['home', 'log', 'overview', 'assets', 'stocks', 'tools', 'more'];
 const dirtyTabs = new Set<AppTab>(ALL_TABS);
 let renderTabImpl: ((tab: AppTab) => void) | null = null;
 
@@ -303,7 +318,7 @@ async function bootstrap(): Promise<void> {
 
   const state: AppUiState = {
     masked: localStorage.getItem('finance_masked') === '1',
-    activeTab: 'log',
+    activeTab: readUiVariant(localStorage) === 'simple' ? 'home' : 'log',
     activeLedgerId: localStorage.getItem('finance_active_ledger_id') || DEFAULT_LEDGER_ID,
     assetsLedgerScope: 'net_worth',
     overviewLedgerScope: 'net_worth',
@@ -438,6 +453,8 @@ async function bootstrap(): Promise<void> {
       }, 300);
     },
     navigateToTab: () => {},
+    setUiVariant: () => {},
+    openQuickAdd: () => {},
     applyUtilityTabVisibility: () => {
       const show =
         ctx.state.currentUser !== null
@@ -503,10 +520,14 @@ async function bootstrap(): Promise<void> {
   };
 
   renderTabImpl = (tab) => {
-    if (tab === 'log') renderLogTab(ctx);
+    if (tab === 'home') renderHomeTab(ctx);
+    else if (tab === 'more') renderMoreTab(ctx);
+    else if (tab === 'log') renderLogTab(ctx);
     else if (tab === 'overview') renderOverviewTab(ctx);
-    else if (tab === 'assets') renderAssetsTab(ctx);
-    else if (tab === 'stocks') renderStocksTab(ctx);
+    else if (tab === 'assets') {
+      renderAssetsTab(ctx);
+      renderSimpleStocksRow(ctx);
+    } else if (tab === 'stocks') renderStocksTab(ctx);
     else {
       renderConfigTab(ctx);
       renderUtilityTab(ctx);
@@ -659,20 +680,29 @@ async function bootstrap(): Promise<void> {
 function bindEvents(ctx: UiContext): void {
   // Bottom Nav (支援點擊切換 ＋ 按住左右滑動高亮膠囊、放開切換分頁)
   const navButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('#bottomNav .nav-btn'));
-  const tabOrder: Array<AppUiState['activeTab']> = ['log', 'overview', 'assets', 'stocks', 'tools'];
+  const simpleNavButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('#simpleNav [data-simple-tab]'));
+  const tabOrder: Array<AppUiState['activeTab']> = CLASSIC_TABS;
+  const TAB_LABELS: Partial<Record<AppTab, string>> = { home: '首頁', log: '明細', assets: '資產', more: '更多' };
+  // v2.2.0 簡潔版：從哪一頁點進總覽／持股／工具，返回鍵就回到那一頁
+  let simpleReturnTab: AppTab | null = null;
 
-  const activateTabByIndex = (idx: number) => {
-    const safeIdx = Math.max(0, Math.min(navButtons.length - 1, idx));
-    const btn = navButtons[safeIdx];
-    const tab = (btn.dataset.tab as AppUiState['activeTab']) || tabOrder[safeIdx];
+  const showTab = (tab: AppTab) => {
     if (ctx.state.activeTab !== tab && ctx.state.reorderSection) {
       cancelReorder(ctx);
     }
     ctx.state.activeTab = tab;
     renderTabIfDirty(tab); // v1.8.15: tabs are rendered lazily
-    navButtons.forEach((b, i) => b.classList.toggle('active', i === safeIdx));
+    navButtons.forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+    const highlighted = simpleNavHighlight(tab);
+    simpleNavButtons.forEach((b) => b.classList.toggle('active', b.dataset.simpleTab === highlighted));
     document.querySelectorAll('.tab-view').forEach((v) => v.classList.toggle('active', v.id === 'tab-' + tab));
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const activateTabByIndex = (idx: number) => {
+    const safeIdx = Math.max(0, Math.min(navButtons.length - 1, idx));
+    const btn = navButtons[safeIdx];
+    showTab((btn.dataset.tab as AppUiState['activeTab']) || tabOrder[safeIdx]);
   };
 
   const navScrub = initBottomNavScrub({
@@ -684,8 +714,24 @@ function bindEvents(ctx: UiContext): void {
   });
 
   ctx.navigateToTab = (tab) => {
-    const idx = Math.max(0, tabOrder.indexOf(tab));
-    activateTabByIndex(idx);
+    const variant = getCurrentUiVariant();
+    const target = resolveTabForVariant(tab, variant);
+    if (variant === 'simple') {
+      document.getElementById('quickAddBackdrop')?.classList.remove('open');
+      if (SIMPLE_SECONDARY_PARENT[target]) {
+        const from = ctx.state.activeTab;
+        if (!SIMPLE_SECONDARY_PARENT[from]) simpleReturnTab = from;
+        const label = TAB_LABELS[simpleReturnTab || SIMPLE_SECONDARY_PARENT[target]!] || '返回';
+        document.querySelectorAll<HTMLElement>(`#tab-${target} [data-simple-back-label]`).forEach((n) => {
+          n.textContent = label;
+        });
+      } else {
+        simpleReturnTab = null;
+      }
+      showTab(target);
+      return;
+    }
+    showTab(target);
     navScrub.syncPill(false);
   };
 
@@ -695,6 +741,151 @@ function bindEvents(ctx: UiContext): void {
       navScrub.syncPill(false);
     });
   });
+
+  simpleNavButtons.forEach((btn) => {
+    btn.addEventListener('click', () => ctx.navigateToTab(btn.dataset.simpleTab as AppTab));
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-simple-back]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const current = ctx.state.activeTab;
+      ctx.navigateToTab(simpleReturnTab || SIMPLE_SECONDARY_PARENT[current] || 'home');
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-goto-tab]').forEach((btn) => {
+    btn.addEventListener('click', () => ctx.navigateToTab(btn.dataset.gotoTab as AppTab));
+  });
+
+  // v2.2.0 簡潔版「記一筆」底部面板（沿用 #expenseForm，搬進面板）
+  const expenseForm = el<HTMLFormElement>('expenseForm');
+  const quickAddBackdrop = el('quickAddBackdrop');
+  const QA_SEG_FOR_TYPE: Record<string, string> = {
+    日常花費: '日常花費',
+    稅金與大額: '日常花費',
+    固定支出: '日常花費',
+    其他收入: '其他收入',
+    投資流出: '投資流出',
+  };
+  const syncQaTypeSeg = () => {
+    const active = QA_SEG_FOR_TYPE[ctx.state.logType] || '';
+    document.querySelectorAll<HTMLButtonElement>('#qaTypeSeg [data-qa-type]').forEach((b) => {
+      const on = b.dataset.qaType === active;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+  };
+  document.querySelectorAll<HTMLButtonElement>('#qaTypeSeg [data-qa-type]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelector<HTMLButtonElement>(`#logTypeChips [data-type="${btn.dataset.qaType}"]`)?.click();
+      syncQaTypeSeg();
+    });
+  });
+  el('logTypeChips').addEventListener('click', () => window.setTimeout(syncQaTypeSeg, 0));
+  el('qaMoreToggle').addEventListener('click', () => {
+    const expanded = expenseForm.classList.toggle('qa-expanded');
+    el('qaMoreToggle').setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  });
+  el('amountCalcBtn').addEventListener('click', () => openCalculatorFor(el<HTMLInputElement>('amountInput')));
+
+  const renderQuickAddLedgerBar = () => {
+    renderLedgerSwitcherBar(ctx, el('quickAddLedgerBar'), {
+      mode: 'single',
+      selectedValue: resolveActiveLedger(ctx).id,
+      onSelect: (nextId) => {
+        ctx.state.activeLedgerId = nextId;
+        localStorage.setItem('finance_active_ledger_id', nextId);
+        ctx.state.logLinkedAccountTouched = false;
+        ctx.state.ledgerPage = 1;
+        renderLogTab(ctx);
+        renderQuickAddLedgerBar();
+        syncQaTypeSeg();
+      },
+    });
+  };
+  const closeQuickAdd = () => {
+    quickAddBackdrop.classList.remove('open');
+    closeAutocompleteDropdown();
+  };
+  ctx.openQuickAdd = () => {
+    if (getCurrentUiVariant() !== 'simple') {
+      ctx.navigateToTab('log');
+      document.querySelector<HTMLButtonElement>('#logSubtabBar [data-log-sub="entry"]')?.click();
+      return;
+    }
+    if (!el<HTMLInputElement>('dateInput').value) el<HTMLInputElement>('dateInput').value = getTodayYmd();
+    renderLogTab(ctx); // refreshes the form's chips, templates and linked accounts
+    renderQuickAddLedgerBar();
+    syncQaTypeSeg();
+    quickAddBackdrop.classList.add('open');
+    el<HTMLInputElement>('amountInput').focus();
+  };
+  el('simpleAddBtn').addEventListener('click', () => ctx.openQuickAdd());
+  el('quickAddCloseBtn').addEventListener('click', closeQuickAdd);
+  quickAddBackdrop.addEventListener('click', (e) => {
+    if (e.target === quickAddBackdrop) closeQuickAdd();
+  });
+  quickAddBackdrop.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !el('modalBackdrop').classList.contains('open') && !el('calcBackdrop').classList.contains('open')) {
+      closeQuickAdd();
+    }
+  });
+  expenseForm.addEventListener('finance:entry-saved', () => {
+    if (getCurrentUiVariant() === 'simple') closeQuickAdd();
+  });
+
+  // v2.2.0 簡潔版資產頁：一顆「＋」收納原本的 5 顆操作按鈕
+  el('simpleAssetsRefreshBtn').addEventListener('click', () => el('refreshMarketBtn').click());
+  el('simpleAssetsAddBtn').addEventListener('click', () => {
+    const body = openModal('資產操作');
+    const list = document.createElement('div');
+    list.className = 'simple-action-list';
+    const actions: Array<[string, string, string]> = [
+      ['addSavingsBtn', '新增活存帳戶', 'btn btn-primary'],
+      ['addAssetBtn', '新增資產或負債', 'btn btn-tinted'],
+      ['transferAccountBtn', '帳戶互轉（活存／定存）', 'btn btn-tinted'],
+      ['runSnapshotBtn', '記錄本月淨值快照', 'btn btn-outline'],
+    ];
+    for (const [id, label, cls] of actions) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = cls + ' btn-block';
+      b.textContent = label;
+      b.addEventListener('click', () => {
+        closeModal();
+        el(id).click();
+      });
+      list.appendChild(b);
+    }
+    body.appendChild(list);
+  });
+
+  bindMoreTabEvents(ctx);
+
+  const applyUiVariant = (variant: UiVariant) => {
+    document.documentElement.dataset.ui = variant;
+    if (variant === 'simple') {
+      el('quickAddBody').appendChild(expenseForm);
+      expenseForm.style.display = '';
+    } else {
+      closeQuickAdd();
+      const ledgerPanel = el('ledgerPanel');
+      ledgerPanel.parentNode?.insertBefore(expenseForm, ledgerPanel);
+      expenseForm.classList.remove('qa-expanded');
+      el('qaMoreToggle').setAttribute('aria-expanded', 'false');
+      expenseForm.style.display = ctx.state.logSubtab === 'entry' ? '' : 'none';
+    }
+    simpleReturnTab = null;
+    for (const tab of ALL_TABS) dirtyTabs.add(tab);
+    showTab(resolveTabForVariant(ctx.state.activeTab, variant));
+    if (variant === 'classic') window.requestAnimationFrame(() => navScrub.syncPill(false));
+  };
+  ctx.setUiVariant = (variant) => {
+    if (variant === getCurrentUiVariant()) return;
+    writeUiVariant(localStorage, variant);
+    if (variant === 'simple') ctx.state.activeTab = 'home';
+    applyUiVariant(variant);
+    showToast(variant === 'simple' ? '已切換為簡潔版' : '已切換為經典版', 'success');
+  };
+  applyUiVariant(readUiVariant(localStorage));
 
   // Topbar actions
   el('syncStatusPill').addEventListener('click', async () => {
@@ -962,7 +1153,8 @@ function bindEvents(ctx: UiContext): void {
     document.querySelectorAll<HTMLButtonElement>('#logSubtabBar .seg-btn').forEach((b) => {
       b.classList.toggle('active', b.dataset.logSub === sub);
     });
-    el('expenseForm').style.display = sub === 'entry' ? '' : 'none';
+    // v2.2.0: in the 簡潔版 the form lives in the 記一筆 sheet and is always shown there
+    el('expenseForm').style.display = sub === 'entry' || getCurrentUiVariant() === 'simple' ? '' : 'none';
     el('ledgerPanel').style.display = sub === 'ledger' ? 'flex' : 'none';
   };
   document.querySelectorAll<HTMLButtonElement>('#logSubtabBar .seg-btn').forEach((btn) => {
@@ -1010,7 +1202,8 @@ function bindEvents(ctx: UiContext): void {
       el<HTMLInputElement>('dateInput').value = ctx.state.selectedCalendarDay;
       updateSavingsPreview(ctx);
     }
-    switchLogSubtab('entry');
+    if (getCurrentUiVariant() === 'simple') ctx.openQuickAdd();
+    else switchLogSubtab('entry');
     showToast(`已帶入日期 ${ctx.state.selectedCalendarDay}`);
   });
 
@@ -1110,6 +1303,7 @@ function bindEvents(ctx: UiContext): void {
         `已記帳：${created.itemName} (${fmtMoney(created.twdAmount, ctx.state.masked)})${savingsSuffix}${makeRecurring ? ' + 已加入每月固定' : ''}`,
         'success'
       );
+      el('expenseForm').dispatchEvent(new CustomEvent('finance:entry-saved'));
       ctx.scheduleSync();
     } catch (err) {
       showToast(err instanceof Error ? err.message : '寫入失敗', 'error');

@@ -31,7 +31,7 @@ import { createDefaultLedgerSearchState, type UiContext } from './state';
  * v1.15.0 review finding 5: accounts an entry can be linked to — linked savings and credit cards (a card charge links
  * the entry to the card). Used for the account name shown on a row, the account filter and account-name search.
  */
-function linkableAccountNames(snap: { assetItems: AssetItem[] }): Map<string, string> {
+export function linkableAccountNames(snap: { assetItems: AssetItem[] }): Map<string, string> {
   return new Map(
     snap.assetItems
       .filter((a) => !a.deletedAt && (a.isLinkedSavings || a.isCreditCard))
@@ -483,7 +483,7 @@ function formatEffectiveRangeLabel(
   return `${from} ～ ${to}${swapped ? '（已對調）' : ''}`;
 }
 
-function createLedgerRow(
+export function createLedgerRow(
   ctx: UiContext,
   item: CashFlowLog,
   savingsNameById: Map<string, string>,
