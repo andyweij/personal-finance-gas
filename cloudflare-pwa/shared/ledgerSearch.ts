@@ -1,4 +1,4 @@
-import { filterCashFlowsByLedgerScope, isCashFlowIncome } from './calculations';
+import { filterCashFlowsByLedgerScope, getEffectiveLedgerId, isCashFlowIncome } from './calculations';
 import { CASHFLOW_TYPES, DEFAULT_LEDGER_ID } from './constants';
 import { previousYearMonth, todayInTimeZone } from './dates';
 import { roundTo } from './format';
@@ -9,7 +9,10 @@ export type LedgerDatePreset = 'month' | '3m' | 'year' | 'all' | 'custom';
 export interface LedgerSearchFilter {
   query: string;
   datePreset: LedgerDatePreset;
+  /** Selected YYYY-MM on screen (used for 'month' preset) */
   anchorYm?: string;
+  /** Today's YYYY-MM in APP_TIMEZONE (used for '3m' and 'year' presets; defaults to todayInTimeZone()) */
+  todayYm?: string;
   dateFrom?: string;
   dateTo?: string;
   types?: string[];
@@ -19,6 +22,11 @@ export interface LedgerSearchFilter {
   minAmount?: number | null;
   maxAmount?: number | null;
   ledgerScope: 'net_worth' | 'all' | string;
+}
+
+export interface LedgerSearchOptions {
+  /** Optional map of linked savings account id -> display name so users can search by account name */
+  accountNameById?: Map<string, string> | Record<string, string>;
 }
 
 export interface LedgerSearchSummary {
@@ -72,30 +80,35 @@ export function resolveDatePresetRange(
   preset: LedgerDatePreset,
   anchorYm?: string,
   customFrom?: string,
-  customTo?: string
+  customTo?: string,
+  todayYm?: string
 ): { from: string | null; to: string | null; swapped: boolean } {
-  const safeYm = anchorYm && YM_RE.test(anchorYm.trim()) ? anchorYm.trim() : todayInTimeZone().slice(0, 7);
+  const safeTodayYm =
+    todayYm && YM_RE.test(todayYm.trim()) ? todayYm.trim() : todayInTimeZone().slice(0, 7);
+  const safeAnchorYm =
+    anchorYm && YM_RE.test(anchorYm.trim()) ? anchorYm.trim() : safeTodayYm;
 
   if (preset === 'all') {
     return { from: null, to: null, swapped: false };
   }
   if (preset === 'month') {
     return {
-      from: `${safeYm}-01`,
-      to: lastDayOfMonthYmd(safeYm),
+      from: `${safeAnchorYm}-01`,
+      to: lastDayOfMonthYmd(safeAnchorYm),
       swapped: false,
     };
   }
+  // v1.9.0 review #1: '3m' and 'year' are anchored to TODAY (APP_TIMEZONE), not a historical browsed month
   if (preset === '3m') {
-    const startYm = previousYearMonth(previousYearMonth(safeYm));
+    const startYm = previousYearMonth(previousYearMonth(safeTodayYm));
     return {
       from: `${startYm}-01`,
-      to: lastDayOfMonthYmd(safeYm),
+      to: lastDayOfMonthYmd(safeTodayYm),
       swapped: false,
     };
   }
   if (preset === 'year') {
-    const year = safeYm.slice(0, 4);
+    const year = safeTodayYm.slice(0, 4);
     return {
       from: `${year}-01-01`,
       to: `${year}-12-31`,
@@ -134,11 +147,21 @@ export function isLedgerSearchActive(
   return false;
 }
 
+function lookupName(
+  source: Map<string, string> | Record<string, string> | undefined,
+  key: string | null | undefined
+): string {
+  if (!source || !key) return '';
+  if (source instanceof Map) return source.get(key) || '';
+  return source[key] || '';
+}
+
 export function searchCashFlowLogs(
   logs: CashFlowLog[],
   filter: LedgerSearchFilter,
   ledgers?: Ledger[] | null,
-  activeLedgerId: string = DEFAULT_LEDGER_ID
+  activeLedgerId: string = DEFAULT_LEDGER_ID,
+  options?: LedgerSearchOptions
 ): LedgerSearchResult {
   const scope = String(filter.ledgerScope || activeLedgerId).trim() || activeLedgerId;
   const scoped = filterCashFlowsByLedgerScope(logs, scope, ledgers);
@@ -147,8 +170,14 @@ export function searchCashFlowLogs(
     filter.datePreset,
     filter.anchorYm,
     filter.dateFrom,
-    filter.dateTo
+    filter.dateTo,
+    filter.todayYm
   );
+
+  const ledgerNameById =
+    scope !== activeLedgerId && ledgers && ledgers.length > 0
+      ? new Map(ledgers.filter((l) => !l.deletedAt).map((l) => [l.id, l.name]))
+      : null;
 
   const typeSet = filter.types && filter.types.length > 0 ? new Set(filter.types) : null;
   const category = String(filter.category ?? '').trim();
@@ -180,7 +209,9 @@ export function searchCashFlowLogs(
     if (maxAmt !== null && amt > maxAmt) continue;
 
     if (tokens.length > 0) {
-      const haystack = `${item.itemName}\n${item.note}\n${item.category}\n${item.type}\n${item.date}`.toLowerCase();
+      const accName = lookupName(options?.accountNameById, item.linkedAccountId);
+      const ledgerName = ledgerNameById ? ledgerNameById.get(getEffectiveLedgerId(item)) || '' : '';
+      const haystack = `${item.itemName}\n${item.note}\n${item.category}\n${item.type}\n${item.date}\n${accName}\n${ledgerName}`.toLowerCase();
       let allMatch = true;
       for (const tok of tokens) {
         if (!haystack.includes(tok)) {
@@ -264,6 +295,22 @@ export function splitHighlightSegments(text: string, tokens: string[]): Highligh
   }
 
   const lower = src.toLowerCase();
+  // v1.9.0 review #4: some Unicode characters (e.g. 'İ' U+0130) expand in UTF-16 length on toLowerCase().
+  // Build an index map only on that rare slow path so highlight offsets never drift in `src`.
+  let origStart: number[] | null = null;
+  let origEnd: number[] | null = null;
+  if (lower.length !== src.length) {
+    origStart = [];
+    origEnd = [];
+    for (let i = 0; i < src.length; i++) {
+      const chLower = src[i].toLowerCase();
+      for (let k = 0; k < chLower.length; k++) {
+        origStart.push(i);
+        origEnd.push(i + 1);
+      }
+    }
+  }
+
   const ranges: Array<[number, number]> = [];
   for (const rawTok of tokens) {
     const tok = rawTok.toLowerCase();
@@ -272,8 +319,17 @@ export function splitHighlightSegments(text: string, tokens: string[]): Highligh
     while (pos < lower.length) {
       const idx = lower.indexOf(tok, pos);
       if (idx === -1) break;
-      ranges.push([idx, idx + tok.length]);
-      pos = idx + tok.length;
+      const endLower = idx + tok.length;
+      if (origStart && origEnd) {
+        const s = origStart[idx];
+        const e = origEnd[endLower - 1];
+        if (s !== undefined && e !== undefined && e > s) {
+          ranges.push([s, e]);
+        }
+      } else {
+        ranges.push([idx, endLower]);
+      }
+      pos = endLower;
     }
   }
 

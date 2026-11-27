@@ -1,4 +1,4 @@
-import { DEFAULT_USD_TWD_RATE } from './constants';
+import { DEFAULT_LEDGER_ID, DEFAULT_LEDGER_NAME, DEFAULT_USD_TWD_RATE } from './constants';
 import type { CashFlowLog, NetWorthHistory } from './types';
 import {
   validateAssetInput,
@@ -109,7 +109,13 @@ export function detectGoogleSheetCsvKind(csvText: string): GoogleSheetCsvKind | 
   return null;
 }
 
-export function exportCashFlowCsv(logs: CashFlowLog[]): string {
+export interface ExportCashFlowCsvOptions {
+  /** v1.9.0 review #2: when provided (e.g. cross-ledger export), appends a 12th '帳本' column */
+  ledgerNameById?: Map<string, string> | Record<string, string>;
+}
+
+export function exportCashFlowCsv(logs: CashFlowLog[], options?: ExportCashFlowCsvOptions): string {
+  const includeLedgerCol = Boolean(options?.ledgerNameById);
   const headers = [
     '日期',
     '年月',
@@ -122,27 +128,35 @@ export function exportCashFlowCsv(logs: CashFlowLog[]): string {
     '入帳匯率',
     '來源',
     '備註',
+    ...(includeLedgerCol ? ['帳本'] : []),
   ];
+  const resolveLedgerName = (ledgerId?: string): string => {
+    const lid = String(ledgerId || '').trim() || DEFAULT_LEDGER_ID;
+    const map = options?.ledgerNameById;
+    if (!map) return '';
+    if (map instanceof Map) return map.get(lid) || (lid === DEFAULT_LEDGER_ID ? DEFAULT_LEDGER_NAME : lid);
+    return map[lid] || (lid === DEFAULT_LEDGER_ID ? DEFAULT_LEDGER_NAME : lid);
+  };
   const lines = [headers.map(escapeCsvCell).join(',')];
   for (const l of logs) {
     if (l.deletedAt) continue;
-    lines.push(
-      [
-        l.date,
-        l.yearMonth,
-        l.type,
-        l.category,
-        l.itemName,
-        l.amount,
-        l.currency,
-        l.twdAmount,
-        l.fxRate,
-        l.source,
-        l.note,
-      ]
-        .map(escapeCsvCell)
-        .join(',')
-    );
+    const cols: unknown[] = [
+      l.date,
+      l.yearMonth,
+      l.type,
+      l.category,
+      l.itemName,
+      l.amount,
+      l.currency,
+      l.twdAmount,
+      l.fxRate,
+      l.source,
+      l.note,
+    ];
+    if (includeLedgerCol) {
+      cols.push(resolveLedgerName(l.ledgerId));
+    }
+    lines.push(cols.map(escapeCsvCell).join(','));
   }
   return `\uFEFF${lines.join('\n')}`;
 }

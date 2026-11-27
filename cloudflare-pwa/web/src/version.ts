@@ -2,7 +2,7 @@ declare const __APP_VERSION__: string | undefined;
 declare const __BUILD_COMMIT__: string | undefined;
 declare const __BUILD_TIME__: string | undefined;
 
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.11.0';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.11.1';
 export const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev';
 export const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'local';
 export const DB_SCHEMA_VERSION = '0019';
@@ -10,6 +10,7 @@ export const DB_SCHEMA_VERSION = '0019';
 export const SW_CACHE_VERSION = 'finance-pwa';
 
 export const VERSION_HIGHLIGHTS: string[] = [
+  'v1.11.1：修正 v1.9.0 審查建議 4 項（流水帳「今年」「近 3 月」改以台北今天日期為基準而非畫面上選取的舊月份；跨帳本範圍匯出 CSV 附加「帳本」欄；搜尋納入連動活存與跨帳本名稱並僅高亮搜尋欄位；修正含展開型小寫字元如 İ 時的高亮位移問題）',
   'v1.11.0：自訂消費分類、常用記帳範本與輸入自動補齊（快速記帳頁可針對各交易類型新增／管理自訂分類且不影響歷史帳目與總覽統計；新增常用範本快捷列與「☆ 存範本」按鈕，支援一鍵套用表單或⚡一鍵直記並具失效帳戶／帳本安全降級；項目名稱輸入自動依歷史頻率與近期加權提供候選並帶出分類與常見金額）',
   'v1.10.0：淨資產歷史走勢圖、持股配息月曆與資產再平衡試算（資產頁新增可互動 SVG 淨資產折線／資產結構堆疊面積圖，支援近 12 月／全部切換與單月明細檢視；持股頁新增年度配息月曆柱狀圖、月均被動收入與消費覆蓋率，以及支援「只買不賣水填法」與「買賣調倉」的資產再平衡試算，目標比例同步存於雲端設定）',
   'v1.9.0：流水帳跨月全文搜尋與條件篩選加總（支援多詞 AND 關鍵字搜尋與 XSS 安全高亮、本月／近 3 月／今年／全部／自訂日期、交易類型複選、分類、連動活存、金額區間與多帳本範圍篩選；即時加總支出／收入／投資／淨現金流並支援一鍵匯出篩選結果 CSV，純本機 IndexedDB 0ms 查詢）',

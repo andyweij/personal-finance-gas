@@ -380,8 +380,25 @@ function createLedgerRow(
     ledgerNameById && ctx.state.ledgerSearch.scopeMode !== 'active'
       ? ledgerNameById.get(getEffectiveLedgerId(item)) || null
       : null;
-  const subText = `${item.date}${ledgerTag ? ` · [${ledgerTag}]` : ''} · ${item.type} · ${item.category}${accName ? ` · 活存:${accName}` : ''}${item.note ? ' · ' + item.note : ''}`;
-  appendHighlightedText(sub, subText, tokens);
+  // v1.9.0 review #3: highlight only searchable fields (skip static separators & "活存:" prefix)
+  appendHighlightedText(sub, item.date, tokens);
+  if (ledgerTag) {
+    sub.appendChild(document.createTextNode(' · ['));
+    appendHighlightedText(sub, ledgerTag, tokens);
+    sub.appendChild(document.createTextNode(']'));
+  }
+  sub.appendChild(document.createTextNode(' · '));
+  appendHighlightedText(sub, item.type, tokens);
+  sub.appendChild(document.createTextNode(' · '));
+  appendHighlightedText(sub, item.category, tokens);
+  if (accName) {
+    sub.appendChild(document.createTextNode(' · 活存:'));
+    appendHighlightedText(sub, accName, tokens);
+  }
+  if (item.note) {
+    sub.appendChild(document.createTextNode(' · '));
+    appendHighlightedText(sub, item.note, tokens);
+  }
   main.appendChild(t);
   main.appendChild(sub);
   leading.appendChild(dotBox);
@@ -699,13 +716,23 @@ export function bindLedgerSearchEvents(ctx: UiContext): void {
     const activeLedger = resolveActiveLedger(ctx);
     const ledgers = getActiveLedgers(ctx);
     const ym = getSelectedYearMonth(ctx.state.selectedYear, ctx.state.selectedMonth);
+    const savingsNameById = new Map(
+      snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
+    );
     const filter = buildLedgerSearchFilter(ctx, activeLedger.id, ym);
-    const result = searchCashFlowLogs(snap.cashflowLogs, filter, ledgers, activeLedger.id);
+    const result = searchCashFlowLogs(snap.cashflowLogs, filter, ledgers, activeLedger.id, {
+      accountNameById: savingsNameById,
+    });
     if (!result.items.length) {
       showToast('目前沒有可匯出的篩選紀錄');
       return;
     }
-    const csv = exportCashFlowCsv(result.items);
+    // v1.9.0 review #2: include ledger name column when exporting across multiple ledgers
+    const csvOpts =
+      ctx.state.ledgerSearch.scopeMode !== 'active'
+        ? { ledgerNameById: new Map(ledgers.map((l) => [l.id, l.name])) }
+        : undefined;
+    const csv = exportCashFlowCsv(result.items, csvOpts);
     downloadTextFile(`cashflow-search-${getTodayYmd()}.csv`, csv, 'text/csv;charset=utf-8');
     showToast(`已匯出 ${result.items.length} 筆篩選結果 CSV`, 'success');
   });
@@ -757,8 +784,13 @@ export function renderLogTab(ctx: UiContext): void {
     ? snap.settings.monthlyDailyBudget
     : Number(activeLedger.monthlyDailyBudget || 0);
 
+  const savingsNameById = new Map(
+    snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
+  );
   const searchFilter = buildLedgerSearchFilter(ctx, activeLedger.id, ym);
-  const searchResult = searchCashFlowLogs(snap.cashflowLogs, searchFilter, ledgers, activeLedger.id);
+  const searchResult = searchCashFlowLogs(snap.cashflowLogs, searchFilter, ledgers, activeLedger.id, {
+    accountNameById: savingsNameById,
+  });
 
   el('logMonthBadge').textContent = ym;
   el('ledgerMonthLabel').textContent = ym;
@@ -807,9 +839,6 @@ export function renderLogTab(ctx: UiContext): void {
   renderSavingsStripAndChips(ctx);
   renderLedgerSearchControls(ctx, activeLedger, ledgers, ym, searchResult);
 
-  const savingsNameById = new Map(
-    snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings).map((a) => [a.id, a.itemName])
-  );
   const ledgerNameById = new Map(ledgers.map((l) => [l.id, l.name]));
   renderLedgerList(
     ctx,
