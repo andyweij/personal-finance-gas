@@ -11,6 +11,7 @@ import {
   DEFAULT_STOCK_CATEGORIES,
   LIQUIDITY_LEVELS,
   PNL_COLOR_SCHEMES,
+  QUICK_ENTRY_TYPES,
   RECURRING_CASHFLOW_TYPES,
   SOURCE_OPTIONS,
   STATUS_OPTIONS,
@@ -265,8 +266,15 @@ export function normalizeQuickTemplates(value: unknown): QuickEntryTemplate[] {
   }
   const validTypes = new Set(ALL_CASHFLOW_TYPES);
   const validCurrs = new Set(CURRENCIES);
+  const explicitIds = new Set<string>();
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+    const rawId = String((item as Record<string, unknown>).id ?? '').trim().slice(0, 64);
+    if (rawId) explicitIds.add(rawId);
+  }
   const seen = new Set<string>();
   const out: QuickEntryTemplate[] = [];
+  let autoSeq = 1;
 
   for (const item of rawList) {
     if (!item || typeof item !== 'object') continue;
@@ -275,7 +283,14 @@ export function normalizeQuickTemplates(value: unknown): QuickEntryTemplate[] {
     const type = String(obj.type ?? '').trim();
     const category = String(obj.category ?? '').trim().slice(0, 24);
     if (!label || !validTypes.has(type) || !category) continue;
-    const id = String(obj.id ?? '').trim().slice(0, 64) || `tpl-${out.length + 1}`;
+    let id = String(obj.id ?? '').trim().slice(0, 64);
+    if (!id) {
+      while (seen.has(`tpl-${autoSeq}`) || explicitIds.has(`tpl-${autoSeq}`)) {
+        autoSeq += 1;
+      }
+      id = `tpl-${autoSeq}`;
+      autoSeq += 1;
+    }
     if (seen.has(id)) continue;
 
     let amount: number | null = null;
@@ -317,7 +332,9 @@ export function validateQuickTemplateInput(raw: Partial<QuickEntryTemplate>): Qu
   const label = String(raw.label ?? '').trim().slice(0, 24);
   if (!label) throw new Error('請輸入範本名稱。');
   const type = String(raw.type ?? '').trim();
-  if (!ALL_CASHFLOW_TYPES.includes(type)) throw new Error(`不支援的交易類型：${type}`);
+  if (!QUICK_ENTRY_TYPES.includes(type)) {
+    throw new Error(`快速記帳範本不支援「${type}」類型，請改選快速記帳支援的交易類型。`);
+  }
   const category = String(raw.category ?? '').trim().slice(0, 24);
   if (!category) throw new Error('請選擇或輸入分類。');
 

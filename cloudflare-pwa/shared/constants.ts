@@ -38,6 +38,14 @@ export const RECURRING_CASHFLOW_TYPES: string[] = [
   CASHFLOW_TYPES.INVESTMENT,
 ];
 
+export const QUICK_ENTRY_TYPES: string[] = [
+  CASHFLOW_TYPES.DAILY_EXPENSE,
+  CASHFLOW_TYPES.TAX_LARGE,
+  CASHFLOW_TYPES.OTHER_INCOME,
+  CASHFLOW_TYPES.INVESTMENT,
+  CASHFLOW_TYPES.FIXED_EXPENSE,
+];
+
 export const CURRENCIES: string[] = ['TWD', 'USD', 'JPY', 'EUR', 'HKD', 'GBP', 'AUD', 'SGD', 'KRW'];
 export const BILLING_CYCLES: string[] = ['月繳', '年繳', '特定月份', '一次性'];
 export const STATUS_OPTIONS: string[] = ['啟用', '停用'];

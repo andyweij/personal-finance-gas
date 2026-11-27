@@ -324,4 +324,140 @@ describe('Phase 3 (v1.11.0) — Custom Categories, Quick Templates & Autocomplet
       expect(afterLegacy.settings.quickTemplates).toEqual([]);
     });
   });
+
+  describe('5. v1.11.0 Review Fixes Regression Tests (#1, #2, #3, 5-7)', () => {
+    it('#1: rejects quick templates with unsupported quick-entry types (固定收入 / 訂閱扣款)', () => {
+      for (const badType of [CASHFLOW_TYPES.FIXED_INCOME, CASHFLOW_TYPES.SUBSCRIPTION]) {
+        expect(() =>
+          validateQuickTemplateInput({
+            label: '不支援類型',
+            type: badType,
+            category: '其他',
+            itemName: '測試',
+            amount: 1000,
+          })
+        ).toThrow(/不支援/);
+      }
+
+      // Valid quick-entry types still pass
+      for (const okType of [
+        CASHFLOW_TYPES.DAILY_EXPENSE,
+        CASHFLOW_TYPES.TAX_LARGE,
+        CASHFLOW_TYPES.OTHER_INCOME,
+        CASHFLOW_TYPES.INVESTMENT,
+        CASHFLOW_TYPES.FIXED_EXPENSE,
+      ]) {
+        const res = validateQuickTemplateInput({
+          label: `測試-${okType}`,
+          type: okType,
+          category: '其他',
+          itemName: '測試',
+          amount: 100,
+        });
+        expect(res.type).toBe(okType);
+      }
+    });
+
+    it('#2: filters autocomplete suggestions strictly by current type so income items never leak into daily expenses', () => {
+      const mixedLogs: CashFlowLog[] = [
+        makeLog({
+          id: 'inc-1',
+          date: '2026-11-26',
+          type: CASHFLOW_TYPES.OTHER_INCOME,
+          category: '獎金',
+          itemName: '年終獎金',
+          amount: 50000,
+        }),
+        makeLog({
+          id: 'exp-1',
+          date: '2026-11-20',
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: '餐飲',
+          itemName: '年糕火鍋',
+          amount: 450,
+        }),
+      ];
+
+      const dailyResults = buildAutocompleteSuggestions(mixedLogs, {
+        query: '年',
+        type: CASHFLOW_TYPES.DAILY_EXPENSE,
+        activeLedgerId: DEFAULT_LEDGER_ID,
+        todayYmd: '2026-11-27',
+      });
+      expect(dailyResults).toHaveLength(1);
+      expect(dailyResults[0].itemName).toBe('年糕火鍋');
+      expect(dailyResults[0].category).toBe('餐飲');
+      expect(dailyResults[0].suggestedAmount).toBe(450);
+
+      const incomeResults = buildAutocompleteSuggestions(mixedLogs, {
+        query: '年',
+        type: CASHFLOW_TYPES.OTHER_INCOME,
+        activeLedgerId: DEFAULT_LEDGER_ID,
+        todayYmd: '2026-11-27',
+      });
+      expect(incomeResults).toHaveLength(1);
+      expect(incomeResults[0].itemName).toBe('年終獎金');
+      expect(incomeResults[0].category).toBe('獎金');
+      expect(incomeResults[0].suggestedAmount).toBe(50000);
+    });
+
+    it('#3: rejects customCategories / quickTemplates on pre-0019 DB instead of silently dropping', async () => {
+      const dbPre19 = createTestD1({ stopBefore: '0019' });
+      await seedUser(dbPre19, 'u-pre19');
+
+      const res = await processSyncRequest(dbPre19, 'u-pre19', {
+        sinceSeq: 0,
+        clientEpoch: 1,
+        mutations: [
+          {
+            mutationId: 'm-cat-pre19',
+            entity: 'settings',
+            op: 'upsert',
+            recordId: '1',
+            clientTimestamp: '2026-11-27T02:00:00.000Z',
+            baseVersion: 1,
+            payload: {
+              monthlyDailyBudget: 30000,
+              customCategories: { [CASHFLOW_TYPES.DAILY_EXPENSE]: ['寵物'] },
+            },
+          },
+        ],
+      });
+      expect(res.ackedMutationIds).not.toContain('m-cat-pre19');
+      expect(res.rejected).toHaveLength(1);
+      expect(res.rejected[0].reason).toMatch(/尚未完成升級|資料庫遷移/);
+    });
+
+    it('5-7: fallback IDs in normalizeQuickTemplates never collide with explicit IDs and never drop valid templates', () => {
+      const normalized = normalizeQuickTemplates([
+        {
+          // missing id -> must skip tpl-1 & tpl-2 because later items explicitly use them
+          label: '無ID一',
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: '餐飲',
+          itemName: '咖啡',
+          amount: 60,
+        },
+        {
+          id: 'tpl-1',
+          label: '明確一',
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: '交通',
+          itemName: '捷運',
+          amount: 35,
+        },
+        {
+          id: 'tpl-2',
+          label: '明確二',
+          type: CASHFLOW_TYPES.DAILY_EXPENSE,
+          category: '餐飲',
+          itemName: '便當',
+          amount: 120,
+        },
+      ]);
+      expect(normalized).toHaveLength(3);
+      expect(new Set(normalized.map((t) => t.id)).size).toBe(3);
+      expect(normalized.map((t) => t.label)).toEqual(['無ID一', '明確一', '明確二']);
+    });
+  });
 });

@@ -1,5 +1,6 @@
 import { buildAutocompleteSuggestions, resolveQuickTemplateForEntry } from '../../../shared/autocomplete';
-import { ALL_CASHFLOW_TYPES, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
+import { getEffectiveLedgerId } from '../../../shared/calculations';
+import { QUICK_ENTRY_TYPES, WEBAPP_CATEGORY_MAP } from '../../../shared/constants';
 import { formatCurrencyRaw, isSupportedCurrency } from '../../../shared/currency';
 import type { QuickEntryTemplate } from '../../../shared/types';
 import {
@@ -19,8 +20,14 @@ import {
 } from './logTab';
 import type { UiContext } from './state';
 
-const QUICK_ENTRY_TYPES = ['日常花費', '稅金與大額', '其他收入', '投資流出', '固定支出'];
 const RECURRING_ELIGIBLE_LOG = ['其他收入', '投資流出', '固定支出'];
+
+export function closeAutocompleteDropdown(): void {
+  const dropdown = document.getElementById('itemNameSuggestions');
+  if (!dropdown) return;
+  dropdown.style.display = 'none';
+  dropdown.innerHTML = '';
+}
 
 function syncLogFormTypeAndCurrencyDom(ctx: UiContext): void {
   document.querySelectorAll<HTMLButtonElement>('#logTypeChips .chip-btn').forEach((btn) => {
@@ -91,15 +98,26 @@ export function openCustomCategoriesModal(ctx: UiContext, logType: string): void
         del.className = 'cat-custom-del';
         del.setAttribute('aria-label', `刪除分類 ${name}`);
         del.textContent = '✕';
+        let deleting = false;
         del.addEventListener('click', async () => {
-          const nextList = customList.filter((c) => c !== name);
-          const nextMap = { ...customMap };
-          if (nextList.length) nextMap[logType] = nextList;
-          else delete nextMap[logType];
-          await ctx.engine.saveCustomCategories(nextMap);
-          showToast(`已移除分類「${name}」`, 'success');
-          ctx.scheduleSync();
-          renderContent();
+          if (deleting) return;
+          deleting = true;
+          del.disabled = true;
+          try {
+            const latestMap = { ...(ctx.engine.getSnapshot().settings.customCategories || {}) };
+            const latestList = [...(latestMap[logType] || [])];
+            const nextList = latestList.filter((c) => c !== name);
+            if (nextList.length) latestMap[logType] = nextList;
+            else delete latestMap[logType];
+            await ctx.engine.saveCustomCategories(latestMap);
+            showToast(`已移除分類「${name}」`, 'success');
+            ctx.scheduleSync();
+            renderContent();
+          } catch (err) {
+            showToast(err instanceof Error ? err.message : '移除分類失敗', 'error');
+            deleting = false;
+            del.disabled = false;
+          }
         });
         pill.appendChild(txt);
         pill.appendChild(del);
@@ -126,20 +144,31 @@ export function openCustomCategoriesModal(ctx: UiContext, logType: string): void
       e.preventDefault();
       const name = inp.value.trim().slice(0, 20);
       if (!name) return;
-      if (defaults.includes(name) || customList.includes(name)) {
+      const latestMap = { ...(ctx.engine.getSnapshot().settings.customCategories || {}) };
+      const latestList = [...(latestMap[logType] || [])];
+      if (defaults.includes(name) || latestList.includes(name)) {
         showToast(`分類「${name}」已經存在`, 'error');
         return;
       }
-      if (customList.length >= 30) {
+      if (latestList.length >= 30) {
         showToast('每種交易類型最多可新增 30 個自訂分類', 'error');
         return;
       }
-      const nextMap = { ...customMap, [logType]: [...customList, name] };
-      await ctx.engine.saveCustomCategories(nextMap);
-      ctx.state.logCategory = name;
-      showToast(`已新增分類「${name}」`, 'success');
-      ctx.scheduleSync();
-      renderContent();
+      try {
+        const nextMap = { ...latestMap, [logType]: [...latestList, name] };
+        if (ctx.state.logType === logType) {
+          ctx.state.logCategory = name;
+        }
+        await ctx.engine.saveCustomCategories(nextMap);
+        if (ctx.state.logType === logType) {
+          renderLogCategories(ctx);
+        }
+        showToast(`已新增分類「${name}」`, 'success');
+        ctx.scheduleSync();
+        renderContent();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : '新增分類失敗', 'error');
+      }
     });
     body.appendChild(form);
   };
@@ -216,12 +245,23 @@ export function openQuickTemplateModal(
       delBtn.className = 'btn btn-outline btn-sm';
       delBtn.style.color = 'var(--danger)';
       delBtn.textContent = '刪除';
+      let deletingTpl = false;
       delBtn.addEventListener('click', async () => {
-        const next = templates.filter((x) => x.id !== tpl.id);
-        await ctx.engine.saveQuickTemplates(next);
-        showToast(`已刪除範本「${tpl.label}」`, 'success');
-        ctx.scheduleSync();
-        renderManager();
+        if (deletingTpl) return;
+        deletingTpl = true;
+        delBtn.disabled = true;
+        try {
+          const latestTemplates = ctx.engine.getSnapshot().settings.quickTemplates || [];
+          const next = latestTemplates.filter((x) => x.id !== tpl.id);
+          await ctx.engine.saveQuickTemplates(next);
+          showToast(`已刪除範本「${tpl.label}」`, 'success');
+          ctx.scheduleSync();
+          renderManager();
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : '刪除範本失敗', 'error');
+          deletingTpl = false;
+          delBtn.disabled = false;
+        }
       });
       actions.appendChild(editBtn);
       actions.appendChild(delBtn);
@@ -273,11 +313,13 @@ export function openQuickTemplateModal(
     form.appendChild(makeField('範本按鈕名稱', labelInp));
 
     const typeSel = document.createElement('select');
-    for (const t of ALL_CASHFLOW_TYPES) {
+    const selectedType =
+      base.type && QUICK_ENTRY_TYPES.includes(base.type) ? base.type : '日常花費';
+    for (const t of QUICK_ENTRY_TYPES) {
       const o = document.createElement('option');
       o.value = t;
       o.textContent = t;
-      if (t === (base.type || '日常花費')) o.selected = true;
+      if (t === selectedType) o.selected = true;
       typeSel.appendChild(o);
     }
 
@@ -343,7 +385,10 @@ export function openQuickTemplateModal(
     noneOpt.value = '';
     noneOpt.textContent = '不連動活存';
     accSel.appendChild(noneOpt);
-    const savingsAccs = snap.assetItems.filter((a) => !a.deletedAt && a.isLinkedSavings);
+    const targetLedgerId = base.ledgerId || activeLedger.id;
+    const savingsAccs = snap.assetItems.filter(
+      (a) => !a.deletedAt && a.isLinkedSavings && getEffectiveLedgerId(a) === targetLedgerId
+    );
     for (const a of savingsAccs) {
       const o = document.createElement('option');
       o.value = a.id;
@@ -454,9 +499,22 @@ export function renderQuickTemplatesStrip(ctx: UiContext): void {
     btn.textContent = `${tpl.oneClick ? '⚡ ' : ''}${tpl.label}${amtHint}`;
     btn.title = tpl.oneClick ? `一鍵直記：${tpl.itemName}` : `套用範本：${tpl.itemName}`;
     btn.addEventListener('click', async () => {
+      if (!QUICK_ENTRY_TYPES.includes(tpl.type)) {
+        showToast(`範本「${tpl.label}」的類型「${tpl.type}」不支援快速記帳，請先編輯範本調整類型。`, 'error');
+        return;
+      }
+
       const resolved = resolveQuickTemplateForEntry(tpl, ctx.state.activeLedgerId, ledgers, snap.assetItems);
 
       if (tpl.oneClick && tpl.amount !== null && tpl.amount > 0) {
+        if (resolved.fallbackLedger || resolved.fallbackAccount) {
+          const targetLabel = resolved.fallbackLedger ? '帳本' : '連動活存帳戶';
+          showToast(
+            `範本「${tpl.label}」綁定的${targetLabel}已異動或刪除，為避免記錯帳戶已中止一鍵直記，請先編輯範本重新指定。`,
+            'error'
+          );
+          return;
+        }
         if (oneClickBusy) return;
         oneClickBusy = true;
         try {
@@ -471,9 +529,10 @@ export function renderQuickTemplatesStrip(ctx: UiContext): void {
             linkedAccountId: resolved.linkedAccountId,
             ledgerId: resolved.ledgerId,
           });
-          const fb =
-            resolved.fallbackAccount || resolved.fallbackLedger ? '（原綁定帳戶已異動，已自動切換）' : '';
-          showToast(`⚡ 已一鍵記帳：${created.itemName} (${fmtMoney(created.twdAmount, ctx.state.masked)})${fb}`, 'success');
+          showToast(
+            `⚡ 已一鍵記帳：${created.itemName} (${fmtMoney(created.twdAmount, ctx.state.masked)})`,
+            'success'
+          );
           ctx.scheduleSync();
         } catch (err) {
           showToast(err instanceof Error ? err.message : '一鍵記帳失敗', 'error');
@@ -486,17 +545,21 @@ export function renderQuickTemplatesStrip(ctx: UiContext): void {
       // Fill form mode
       if (resolved.ledgerId !== ctx.state.activeLedgerId) {
         ctx.state.activeLedgerId = resolved.ledgerId;
+        ctx.state.ledgerPage = 1;
         localStorage.setItem('finance_active_ledger_id', resolved.ledgerId);
       }
-      ctx.state.logType = QUICK_ENTRY_TYPES.includes(tpl.type) ? tpl.type : '日常花費';
+      ctx.state.logType = tpl.type;
       ctx.state.logCategory = tpl.category;
       ctx.state.logCurrency = tpl.currency || 'TWD';
       ctx.state.logLinkedAccountId = resolved.linkedAccountId;
       ctx.state.logLinkedAccountTouched = true;
 
-      el<HTMLInputElement>('amountInput').value = tpl.amount !== null ? String(tpl.amount) : '';
+      if (tpl.amount !== null) {
+        el<HTMLInputElement>('amountInput').value = String(tpl.amount);
+      }
       el<HTMLInputElement>('itemNameInput').value = tpl.itemName || '';
       el<HTMLInputElement>('noteInput').value = tpl.note || '';
+      closeAutocompleteDropdown();
       syncLogFormTypeAndCurrencyDom(ctx);
       renderLogCategories(ctx);
       renderLogTab(ctx);
@@ -549,13 +612,25 @@ export function bindQuickTemplatesAndAutocompleteEvents(ctx: UiContext): void {
   if (!input || !dropdown) return;
 
   let hideTimer: number | undefined;
+  let activeIdx = -1;
+  let isComposing = false;
+  let currentButtons: HTMLButtonElement[] = [];
 
   const hide = () => {
+    activeIdx = -1;
+    currentButtons = [];
     dropdown.style.display = 'none';
     dropdown.innerHTML = '';
   };
 
+  const syncActiveHighlight = () => {
+    currentButtons.forEach((b, i) => {
+      b.classList.toggle('active', i === activeIdx);
+    });
+  };
+
   const renderSuggestions = () => {
+    if (isComposing) return;
     const snap = ctx.engine.getSnapshot();
     const suggestions = buildAutocompleteSuggestions(snap.cashflowLogs, {
       query: input.value,
@@ -569,6 +644,8 @@ export function bindQuickTemplatesAndAutocompleteEvents(ctx: UiContext): void {
       return;
     }
     dropdown.innerHTML = '';
+    activeIdx = -1;
+    currentButtons = [];
     for (const s of suggestions) {
       const opt = document.createElement('button');
       opt.type = 'button';
@@ -587,27 +664,42 @@ export function bindQuickTemplatesAndAutocompleteEvents(ctx: UiContext): void {
       });
       opt.addEventListener('click', () => {
         input.value = s.itemName;
-        ctx.state.logCategory = s.category;
-        renderLogCategories(ctx);
-        const amtInput = el<HTMLInputElement>('amountInput');
-        // Never overwrite an amount the user already typed
-        if (!amtInput.value.trim() && s.suggestedAmount > 0) {
-          amtInput.value = String(s.suggestedAmount);
-          const enabledCurrs = normalizeEnabledCurrencies(ctx.engine.getSnapshot().settings.enabledCurrencies);
-          if (isSupportedCurrency(s.currency) && enabledCurrs.includes(s.currency)) {
-            ctx.state.logCurrency = s.currency;
-            renderLogCurrencyButtons(ctx);
-            syncLogFormTypeAndCurrencyDom(ctx);
+        const latestSnap = ctx.engine.getSnapshot();
+        const effectiveCats = getEffectiveCategoriesForType(
+          ctx.state.logType,
+          latestSnap.settings.customCategories
+        );
+        if (s.type === ctx.state.logType && effectiveCats.includes(s.category)) {
+          ctx.state.logCategory = s.category;
+          renderLogCategories(ctx);
+          const amtInput = el<HTMLInputElement>('amountInput');
+          // Never overwrite an amount the user already typed
+          if (!amtInput.value.trim() && s.suggestedAmount > 0) {
+            amtInput.value = String(s.suggestedAmount);
+            const enabledCurrs = normalizeEnabledCurrencies(latestSnap.settings.enabledCurrencies);
+            if (isSupportedCurrency(s.currency) && enabledCurrs.includes(s.currency)) {
+              ctx.state.logCurrency = s.currency;
+              renderLogCurrencyButtons(ctx);
+              syncLogFormTypeAndCurrencyDom(ctx);
+            }
+            updateFxPreview(ctx);
           }
-          updateFxPreview(ctx);
         }
         hide();
       });
       dropdown.appendChild(opt);
+      currentButtons.push(opt);
     }
     dropdown.style.display = 'flex';
   };
 
+  input.addEventListener('compositionstart', () => {
+    isComposing = true;
+  });
+  input.addEventListener('compositionend', () => {
+    isComposing = false;
+    renderSuggestions();
+  });
   input.addEventListener('input', renderSuggestions);
   input.addEventListener('focus', () => {
     window.clearTimeout(hideTimer);
@@ -617,6 +709,25 @@ export function bindQuickTemplatesAndAutocompleteEvents(ctx: UiContext): void {
     hideTimer = window.setTimeout(hide, 160);
   });
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') hide();
+    if (isComposing) return;
+    if (e.key === 'Escape') {
+      hide();
+      return;
+    }
+    if (!currentButtons.length || dropdown.style.display === 'none') return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIdx = (activeIdx + 1) % currentButtons.length;
+      syncActiveHighlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIdx = activeIdx <= 0 ? currentButtons.length - 1 : activeIdx - 1;
+      syncActiveHighlight();
+    } else if (e.key === 'Enter' && activeIdx >= 0 && currentButtons[activeIdx]) {
+      e.preventDefault();
+      currentButtons[activeIdx].click();
+    } else if (e.key === 'Enter') {
+      hide();
+    }
   });
 }

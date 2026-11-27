@@ -2935,7 +2935,8 @@ mark.search-hit {
 .ac-item:last-child {
   border-bottom: none;
 }
-.ac-item:hover {
+.ac-item:hover,
+.ac-item.active {
   background: var(--primary-soft);
 }
 .ac-name {

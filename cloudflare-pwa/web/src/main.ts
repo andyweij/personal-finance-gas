@@ -27,7 +27,7 @@ import {
   updateFxPreview,
   updateSavingsPreview,
 } from './ui/logTab';
-import { bindQuickTemplatesAndAutocompleteEvents } from './ui/quickTemplatesUi';
+import { bindQuickTemplatesAndAutocompleteEvents, closeAutocompleteDropdown } from './ui/quickTemplatesUi';
 import { renderOverviewTab, renderTrendChart } from './ui/overviewTab';
 import {
   getActiveSinkingItems,
@@ -1054,6 +1054,7 @@ function bindEvents(ctx: UiContext): void {
       el<HTMLInputElement>('itemNameInput').value = '';
       el<HTMLInputElement>('noteInput').value = '';
       el<HTMLInputElement>('makeRecurringCheckbox').checked = false;
+      closeAutocompleteDropdown();
       updateFxPreview(ctx);
 
       let savingsSuffix = '';
@@ -1063,7 +1064,7 @@ function bindEvents(ctx: UiContext): void {
           snap.assetItems,
           snap.cashflowLogs,
           snap.savingsAdjustments || [],
-          snap.settings.usdTwdRate,
+          snap.settings,
           ctx.state.activeLedgerId
         );
         const acc = sav.accounts.find((a) => a.account.id === linkedAccountId);

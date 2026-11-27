@@ -108,6 +108,7 @@ export function buildAutocompleteSuggestions(
 
   for (const log of logs || []) {
     if (!log || log.deletedAt) continue;
+    if (opts.type && log.type !== opts.type) continue;
     const rawName = String(log.itemName || '').trim();
     if (!rawName) continue;
     const lowerName = rawName.toLowerCase();
@@ -116,9 +117,8 @@ export function buildAutocompleteSuggestions(
     const daysAgo = daysBetweenYmd(log.date, todayYmd);
     const recencyWeight = 1 / (1 + daysAgo / 45);
     const ledgerBoost = getEffectiveLedgerId(log) === activeLedgerId ? 2 : 0.7;
-    const typeBoost = opts.type ? (log.type === opts.type ? 1.5 : 0.6) : 1;
     const matchBoost = q ? (lowerName.startsWith(q) ? 2 : 1) : 1;
-    const contribution = recencyWeight * ledgerBoost * typeBoost * matchBoost;
+    const contribution = recencyWeight * ledgerBoost * matchBoost;
 
     let b = buckets.get(lowerName);
     if (!b) {
