@@ -426,6 +426,10 @@ function mapSinkingRow(r: Record<string, unknown>): SinkingFundItem {
     dueNote: String(r.due_note || ''),
     status: String(r.status),
     note: String(r.note || ''),
+    // v2.1.0 (0026): before the migration these columns are absent → legacy (unscheduled) item
+    startYm: r.start_ym ? String(r.start_ym) : null,
+    repeatYearly: Number(r.repeat_yearly ?? 0) === 1,
+    fundKind: r.fund_kind === 'amortize' ? 'amortize' : 'save_first',
     sortOrder: Number(r.sort_order ?? 0),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
@@ -866,6 +870,23 @@ async function hasRecurringPostDayColumn(db: D1Database): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** v2.1.0: whether migration 0026 (sinking_fund_items.start_ym / repeat_yearly / fund_kind) has been applied. */
+async function hasSinkingScheduleColumns(db: D1Database): Promise<boolean> {
+  try {
+    await db.prepare('SELECT start_ym, repeat_yearly, fund_kind FROM sinking_fund_items LIMIT 0').all();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const SINKING_SCHEDULE_MIGRATION_ERROR =
+  '伺服器資料庫尚未完成升級（缺少攤提「開始月份」欄位），請先執行資料庫遷移 0026 後再重試。';
+
+function isDefaultSinkingSchedule(v: { startYm: string | null; repeatYearly: boolean; fundKind: string }): boolean {
+  return v.startYm === null && !v.repeatYearly && v.fundKind === 'save_first';
 }
 
 const RECURRING_POST_DAY_MIGRATION_ERROR =
@@ -2092,8 +2113,12 @@ const ROW_ENTITY_HANDLERS: Readonly<Record<RowSyncEntity, RowEntityHandler>> = {
 
   sinking: {
     mapRow: mapSinkingRow,
-    prepareUpsert({ mutation, existing }) {
+    async prepareUpsert({ db, mutation, existing }) {
       const p = mutation.payload || {};
+      // v2.1.0: a client older than v2.1.0 does not send the schedule fields — keep what is stored instead of
+      // silently turning a scheduled item back into an unlimited one
+      const keep = (field: string, col: string): unknown =>
+        p[field] !== undefined ? p[field] : existing && col in existing ? existing[col] : undefined;
       const v = runValidation(() =>
         validateSinkingInput({
           itemName: String(p.itemName || ''),
@@ -2103,6 +2128,9 @@ const ROW_ENTITY_HANDLERS: Readonly<Record<RowSyncEntity, RowEntityHandler>> = {
           dueNote: String(p.dueNote || ''),
           status: String(p.status || '啟用'),
           note: String(p.note || ''),
+          startYm: keep('startYm', 'start_ym') as string | null | undefined,
+          repeatYearly: keep('repeatYearly', 'repeat_yearly') as boolean | number | undefined,
+          fundKind: keep('fundKind', 'fund_kind') as string | undefined,
           sortOrder:
             p.sortOrder !== undefined
               ? normalizeSortOrder(p.sortOrder, 0)
@@ -2111,6 +2139,17 @@ const ROW_ENTITY_HANDLERS: Readonly<Record<RowSyncEntity, RowEntityHandler>> = {
                 : 0,
         })
       );
+
+      // 0026 not applied: a schedule is rejected (never silently dropped); a default item is written without it
+      const scheduleColumnsKnown = existing
+        ? 'start_ym' in existing
+        : isDefaultSinkingSchedule(v)
+          ? false
+          : await hasSinkingScheduleColumns(db);
+      if (!scheduleColumnsKnown && !isDefaultSinkingSchedule(v)) {
+        throw new RejectError(SINKING_SCHEDULE_MIGRATION_ERROR);
+      }
+
       return {
         columns: [
           { col: 'item_name', value: v.itemName },
@@ -2121,6 +2160,13 @@ const ROW_ENTITY_HANDLERS: Readonly<Record<RowSyncEntity, RowEntityHandler>> = {
           { col: 'status', value: v.status },
           { col: 'note', value: v.note },
           { col: 'sort_order', value: v.sortOrder },
+          ...(scheduleColumnsKnown
+            ? [
+                { col: 'start_ym', value: v.startYm },
+                { col: 'repeat_yearly', value: v.repeatYearly ? 1 : 0 },
+                { col: 'fund_kind', value: v.fundKind },
+              ]
+            : []),
         ],
       };
     },
@@ -4403,12 +4449,21 @@ export async function importFullSnapshot(
     ])
   );
 
+  // v2.1.0: schedule columns only when migration 0026 is applied; without it a scheduled item fails the import loudly
+  const sinkingScheduleCols = await hasSinkingScheduleColumns(db);
+  if (!sinkingScheduleCols && validatedSinking.some((r) => !isDefaultSinkingSchedule(r.v))) {
+    throw new Error('伺服器資料庫尚未完成升級（缺少攤提「開始月份」欄位），請先執行資料庫遷移 0026 後再匯入備份。');
+  }
   const sinkingRange = chunkedEntity(
     'sinking_fund_items',
     'id',
-    ['id', 'item_name', 'category', 'total_amount', 'months', 'due_note', 'status', 'note', 'sort_order', 'created_at', 'updated_at'],
+    [
+      'id', 'item_name', 'category', 'total_amount', 'months', 'due_note', 'status', 'note', 'sort_order', 'created_at', 'updated_at',
+      ...(sinkingScheduleCols ? ['start_ym', 'repeat_yearly', 'fund_kind'] : []),
+    ],
     validatedSinking.map(({ id, v, createdAt }) => [
       id, v.itemName, v.category, v.totalAmount, v.months, v.dueNote, v.status, v.note, v.sortOrder, createdAt, nowIso,
+      ...(sinkingScheduleCols ? [v.startYm, v.repeatYearly ? 1 : 0, v.fundKind] : []),
     ])
   );
 

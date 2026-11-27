@@ -5,7 +5,7 @@ import type { UiContext } from './state';
 const ENTITY_LABELS: Record<SyncEntity, string> = {
   cashflow: '流水帳',
   recurring: '固定收支',
-  sinking: '不定期攤提',
+  sinking: '大額攤提',
   asset: '資產 / 負債 / 活存',
   savings_adjustment: '活存存轉紀錄',
   stock_tx: '持股交易 / 配息',

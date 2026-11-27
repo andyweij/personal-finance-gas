@@ -5,7 +5,7 @@ import { getEffectiveCategoriesForType, normalizeEnabledCurrencies } from '../..
 import {
   aggregatePeriodMetrics,
   computeAllSavingsSummary,
-  computeSinkingMonthlyReserve,
+  computeSinkingReserveForMonth,
   getEffectiveLedgerId,
   isCashFlowIncome,
 } from '../../../shared/calculations';
@@ -929,11 +929,7 @@ export function renderLogTab(ctx: UiContext): void {
     (l) => !l.deletedAt && l.yearMonth === ym && getEffectiveLedgerId(l) === activeLedger.id
   );
   const isDefaultLedger = activeLedger.id === DEFAULT_LEDGER_ID;
-  const monthlySinking = isDefaultLedger
-    ? snap.sinkingItems
-        .filter((s) => !s.deletedAt)
-        .reduce((sum, s) => sum + computeSinkingMonthlyReserve(s), 0)
-    : 0;
+  const monthlySinking = isDefaultLedger ? computeSinkingReserveForMonth(snap.sinkingItems, ym) : 0;
   const monthly = aggregatePeriodMetrics(monthLogs, monthlySinking, isDefaultLedger);
 
   const hasBudgetLimit =
