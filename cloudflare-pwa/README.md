@@ -41,6 +41,24 @@ npm run typecheck   # TypeScript 靜態型別檢查
 npm run build:web   # 建置前端 PWA 至 dist/web
 ```
 
+端到端測試需要 Playwright 的 Chromium（`npm install --no-save playwright` 後執行 `npx playwright install chromium`）：
+
+```bash
+npm run test:e2e:pwa   # PWA 離線開啟與更新提示
+npm run test:e2e:ui    # 經典版與簡潔版：每個分頁與入口各點一次，有 JS 錯誤即失敗
+```
+
+每個 PR 與推到 `main` 時，GitHub Actions（`.github/workflows/ci.yml`）會自動跑型別檢查、單元測試、建置與以上兩個端到端測試。
+
+### 新增功能時：兩個介面版本
+
+經典版與簡潔版共用同一份資料、同步與計算，只有「入口」分開：
+
+1. 功能本體（`shared/` 的邏輯、既有分頁裡的區塊或彈窗）只寫一份。
+2. 在 `web/src/ui/featureEntries.ts` 加一筆，寫明經典版與簡潔版各從哪裡進去。簡潔版入口是「更多」頁的一列時，`moreTab.ts` 的 `MORE_ACTIONS` 沒補上處理會編譯失敗。
+3. 記帳表單的次要欄位加上 `qa-advanced` class，簡潔版會收進「更多選項」。
+4. `tests/feature-entries.test.ts` 會對照 `web/index.html` 檢查兩邊的入口都存在；`tests/e2e/ui-variants.e2e.mjs` 會在兩個版本實際點過一次。
+
 ---
 
 ## 部署至 Cloudflare（免費方案，免綁信用卡）

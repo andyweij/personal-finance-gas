@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cloudflare-pwa:
+    name: cloudflare-pwa (typecheck, unit, e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: cloudflare-pwa
+    steps:
+      - uses: actions/checkout@v4
+
+      # tests/helpers/mockD1.ts uses node:sqlite, which needs Node 22+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloudflare-pwa/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build:web
+
+      # The e2e scripts require('playwright'); it is not a project dependency, so install it for this run only
+      - name: Install Playwright Chromium
+        run: |
+          npm install --no-save playwright@1.63.0
+          npx playwright install --with-deps chromium
+
+      - name: E2E — PWA offline & update flow
+        run: node tests/e2e/pwa-offline.e2e.mjs
+
+      - name: E2E — both UI variants (經典版 / 簡潔版)
+        run: node tests/e2e/ui-variants.e2e.mjs
+
+  gas:
+    name: GAS project (typecheck, build, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      # tests read the compiled files in dist/
+      - run: npm run build
+      - run: npm test

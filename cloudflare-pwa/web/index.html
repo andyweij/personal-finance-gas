@@ -106,7 +106,7 @@
         <button type="button" class="link-btn" data-goto-tab="log">全部明細</button>
       </div>
       <div class="list-group" id="homeRecentList"></div>
-      <button type="button" class="card compact home-link" data-goto-tab="overview">
+      <button type="button" class="card compact home-link" id="homeOverviewLink" data-goto-tab="overview">
         <span class="home-link-text">
           <span class="home-link-title">年度趨勢與大項統計</span>
           <span class="muted tnum" id="homeOverviewHint">淨現金流、投資流出、緊急預備金</span>
@@ -118,75 +118,12 @@
     <!-- ==================== v2.2.0 簡潔版：更多 ==================== -->
     <section class="tab-view" id="tab-more">
       <div class="simple-page-title">更多</div>
-      <div class="more-group">
-        <div class="more-group-title">每月自動化</div>
-        <div class="list-group">
-          <button type="button" class="more-row" data-more-action="recurring">
-            <span class="more-row-icon" style="background:#2F6FD0" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2.1l4 4-4 4"/><path d="M3 12.2v-2a4 4 0 0 1 4-4h12.8M7 21.9l-4-4 4-4"/><path d="M21 11.8v2a4 4 0 0 1-4 4H4.2"/></svg></span>
-            <span class="more-row-label">固定收支</span><span class="more-row-hint tnum" id="moreRecurringHint"></span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <button type="button" class="more-row" data-more-action="sinking">
-            <span class="more-row-icon" style="background:#E8913A" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg></span>
-            <span class="more-row-label">大額攤提</span><span class="more-row-hint tnum" id="moreSinkingHint"></span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <button type="button" class="more-row" data-more-action="budget">
-            <span class="more-row-icon" style="background:#34A853" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></span>
-            <span class="more-row-label">預算與緊急預備金</span><span class="more-row-hint tnum" id="moreBudgetHint"></span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-        </div>
-      </div>
-      <div class="more-group">
-        <div class="more-group-title">規劃與工具</div>
-        <div class="list-group">
-          <button type="button" class="more-row" data-more-action="goals">
-            <span class="more-row-icon" style="background:#C2185B" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></span>
-            <span class="more-row-label">財務目標</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <button type="button" class="more-row" data-more-action="splits">
-            <span class="more-row-icon" style="background:#6E3FBF" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
-            <span class="more-row-label">代墊與拆帳</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <button type="button" class="more-row" data-more-action="utility">
-            <span class="more-row-icon" style="background:#0A84A8" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.7s-6 6.3-6 11.3a6 6 0 0 0 12 0c0-5-6-11.3-6-11.3Z"/></svg></span>
-            <span class="more-row-label">5F／6F 水電分攤</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <button type="button" class="more-row" data-more-action="calc">
-            <span class="more-row-icon" style="background:#636366" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M8 6h8M8 10h.01M12 10h.01M16 10h.01M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01M16 18h.01"/></svg></span>
-            <span class="more-row-label">計算機</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-        </div>
-      </div>
-      <div class="more-group">
-        <div class="more-group-title">帳本與帳號</div>
-        <div class="list-group">
-          <button type="button" class="more-row" data-more-action="ledgers">
-            <span class="more-row-icon" style="background:#5856D6" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V2H6.5A2.5 2.5 0 0 0 4 4.5v15Z"/></svg></span>
-            <span class="more-row-label">帳本與共享</span><span class="more-row-hint tnum" id="moreLedgersHint"></span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <button type="button" class="more-row" data-more-action="settings">
-            <span class="more-row-icon" style="background:#3A3A3C" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
-            <span class="more-row-label">帳號、安全、配色與備份</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <button type="button" class="more-row" data-more-action="help">
-            <span class="more-row-icon" style="background:#8E8E93" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg></span>
-            <span class="more-row-label">使用說明</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-        </div>
-      </div>
+      <!-- 「更多」的入口列由 web/src/ui/featureEntries.ts 產生 -->
+      <div class="more-entries" id="moreEntries"></div>
       <div class="more-group">
         <div class="more-group-title">介面版本</div>
         <div class="card compact ui-variant-card">
-          <div class="mini-seg ui-variant-seg" role="radiogroup" aria-label="介面版本">
+          <div class="mini-seg ui-variant-seg" id="moreUiVariantSeg" role="radiogroup" aria-label="介面版本">
             <button type="button" class="mini-seg-btn" role="radio" data-ui-variant="simple">簡潔版</button>
             <button type="button" class="mini-seg-btn" role="radio" data-ui-variant="classic">經典版</button>
           </div>
